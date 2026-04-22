@@ -19,11 +19,10 @@ import re
 pr_title = os.environ.get("PR_TITLE", "").strip()
 
 # Define rules
-allowed_modules = ["fsdp", "megatron", "veomni", "sglang", "vllm", "vllm_omni", "trtllm", "rollout", "trainer"]
-allowed_modules += ["tests", "training_utils", "recipe", "hardware", "deployment"]
-allowed_modules += ["ray", "worker", "single_controller", "misc", "docker", "ci"]
-allowed_modules += ["perf", "model", "algo", "env", "tool", "ckpt", "doc", "data", "cfg", "reward"]
-allowed_modules += ["fully_async", "one_step_off", "diffusion", "omni"]
+allowed_modules = ["fsdp", "vllm_omni", "rollout", "trainer", "ci", "training_utils", "recipe"]
+allowed_modules += ["ray", "worker", "single_controller", "misc", "perf", "model", "algo"]
+allowed_modules += ["env", "tool", "ckpt", "doc", "data", "cfg", "reward", "diffusion", "omni"]
+allowed_modules += ["tests", "docker"]
 allowed_types = ["feat", "fix", "refactor", "chore", "test"]
 
 # Check for [1/N] prefix and extract the rest of the title
