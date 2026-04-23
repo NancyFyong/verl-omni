@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 import ray
 from omegaconf import DictConfig
+
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager
 from verl.protocol import DataProto
 
@@ -86,7 +87,7 @@ def init_config() -> DictConfig:
         config.actor_rollout_ref.rollout.max_sequence_length = max_length
         config.actor_rollout_ref.rollout.nnodes = 1
 
-        config.actor_rollout_ref.rollout.external_lib = "verl_omni.custom_pipelines.qwen_image.vllm_omni_rollout_adapter"
+        config.actor_rollout_ref.rollout.external_lib = "verl_omni.custom_pipelines.vllm_omni_rollout"
         config.reward.reward_manager.name = "image"
         config.trainer.n_gpus_per_node = 4
 

@@ -7,17 +7,16 @@ WORKSPACE=${WORKSPACE:-$HOME}
 ocr_train_path=$WORKSPACE/data/ocr/train.parquet
 ocr_test_path=$WORKSPACE/data/ocr/test.parquet
 
-model_name=Qwen/Qwen-Image
+ENGINE=vllm_omni
+REWARD_ENGINE=vllm
+
+reward_path=examples/flowgrpo_trainer/reward_fn.py
 reward_model_name=Qwen/Qwen3-VL-8B-Instruct
-reward_function_path=examples/flowgrpo_trainer/reward_fn.py
 
 NUM_GPUS_ACTOR_ROLLOUT=4
 NUM_GPUS_REWARD=1
 ROLLOUT_TP=1
 REWARD_TP=1
-
-ENGINE=vllm_omni
-REWARD_ENGINE=vllm
 
 
 python3 -m verl_omni.trainer.main_flowgrpo \
@@ -53,7 +52,7 @@ python3 -m verl_omni.trainer.main_flowgrpo \
     actor_rollout_ref.rollout.algo.sde_window_range="[0,5]" \
     actor_rollout_ref.rollout.val_kwargs.num_inference_steps=50 \
     actor_rollout_ref.rollout.val_kwargs.algo.noise_level=0.0 \
-    actor_rollout_ref.rollout.external_lib=verl_omni.custom_pipelines.qwen_image.vllm_omni_rollout_adapter \
+    actor_rollout_ref.rollout.external_lib=verl_omni.custom_pipelines.vllm_omni_rollout \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=32 \
     reward.num_workers=$((NUM_GPUS_REWARD / REWARD_TP)) \
     reward.reward_manager.name=visual \
@@ -67,7 +66,7 @@ python3 -m verl_omni.trainer.main_flowgrpo \
     reward.reward_model.rollout.free_cache_engine=False \
     reward.reward_model.rollout.tensor_model_parallel_size=1 \
     reward.reward_model.rollout.enforce_eager=False \
-    reward.custom_reward_function.path=$reward_function_path \
+    reward.custom_reward_function.path=$reward_path \
     reward.custom_reward_function.name=compute_score_ocr \
     trainer.logger='["console", "wandb"]' \
     trainer.project_name=flow_grpo \
