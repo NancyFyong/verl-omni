@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from . import (
-    diffusers_training,  # noqa: F401
-    vllm_omni_rollout,  # noqa: F401
-)
+"""
+Import vLLM-Omni rollout adapters so registered pipelines can be resolved by
+architecture at runtime.
+"""
+
+from .qwen_image.vllm_omni_rollout_adapter import QwenImagePipelineWithLogProb
+
+__all__ = ["QwenImagePipelineWithLogProb"]

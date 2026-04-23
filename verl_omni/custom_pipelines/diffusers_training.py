@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from . import (
-    diffusers_training,  # noqa: F401
-    vllm_omni_rollout,  # noqa: F401
-)
+"""
+Import diffusers training adapters so registered model handlers can be resolved
+by architecture at runtime.
+"""
+
+from .qwen_image.diffusers_training_adapter import QwenImage
+
+__all__ = ["QwenImage"]

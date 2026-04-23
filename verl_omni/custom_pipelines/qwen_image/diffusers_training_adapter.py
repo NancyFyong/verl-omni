@@ -23,14 +23,16 @@ import torch
 from diffusers.models.transformers.transformer_qwenimage import QwenImageTransformer2DModel
 from diffusers.pipelines.qwenimage.pipeline_qwenimage import calculate_shift
 from tensordict import TensorDict
-
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_name
+
 from verl_omni.custom_pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 from verl_omni.models.diffusion_model import DiffusionModelBase
 from verl_omni.workers.config import DiffusionModelConfig
 
 from .common import QWEN_IMAGE_VAE_SCALE_FACTOR, apply_true_cfg, build_img_shapes
+
+__all__ = ["QwenImage"]
 
 
 def _build_qwen_image_scheduler(model_path: str) -> FlowMatchSDEDiscreteScheduler:
@@ -161,6 +163,3 @@ class QwenImage(DiffusionModelBase):
             return_logprobs=True,
         )
         return log_prob, prev_sample_mean, std_dev_t
-
-
-__all__ = ["QwenImage"]
