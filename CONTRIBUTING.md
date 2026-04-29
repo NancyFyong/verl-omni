@@ -71,6 +71,14 @@ python -m http.server -d _build/html/
 
 Open your browser at http://localhost:8000 to explore the docs.
 
+## Model Integrations
+
+To integrate a new diffusion model for FlowGRPO training (new
+`DiffusionModelBase` + `VllmOmniPipelineBase` pair), follow the step-by-step
+guide:
+
+- [How to Integrate a New Diffusion Model for FlowGRPO Training](docs/contributing/integrating_a_diffusion_model.md)
+
 ## Pull Requests & Code Reviews
 
 Thanks for submitting a PR! To streamline reviews:
