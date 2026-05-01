@@ -21,6 +21,7 @@ import ray
 from omegaconf import DictConfig
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager
 from verl.protocol import DataProto
+from verl.workers.rollout.llm_server import LLMServerManager
 
 from verl_omni.agent_loop import DiffusionAgentLoopWorker
 
@@ -109,7 +110,11 @@ def test_single_turn(init_config):
     )
     try:
         AgentLoopManager.agent_loop_workers_class = ray.remote(DiffusionAgentLoopWorker)
-        agent_loop_manager = AgentLoopManager.create(init_config)
+        llm_server_manager = LLMServerManager.create(config=init_config)
+        agent_loop_manager = AgentLoopManager.create(
+            config=init_config,
+            llm_client=llm_server_manager.get_client(),
+        )
 
         system_prompt = (
             "Describe the image by detailing the color, shape, size, texture, quantity, text, "
