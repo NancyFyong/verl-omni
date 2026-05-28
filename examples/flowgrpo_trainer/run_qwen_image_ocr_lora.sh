@@ -18,6 +18,9 @@ REWARD_TP=4
 ENGINE=vllm_omni
 REWARD_ENGINE=vllm
 
+# Optional reproducibility (yaml defaults are null / unseeded):
+#   data.seed=42
+#   actor_rollout_ref.rollout.seed=42
 
 python3 -m verl_omni.trainer.main_diffusion \
     data.train_files=$ocr_train_path \

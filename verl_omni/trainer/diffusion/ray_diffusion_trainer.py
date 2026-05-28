@@ -956,6 +956,12 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
+
+                # Per-step rollout seed for reproducibility
+                rollout_seed_cfg = self.config.actor_rollout_ref.rollout.get("seed")
+                if rollout_seed_cfg is not None:
+                    gen_batch.meta_info["rollout_seed"] = int(rollout_seed_cfg) + self.global_steps - 1
+
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
