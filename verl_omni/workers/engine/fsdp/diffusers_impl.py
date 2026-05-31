@@ -19,12 +19,11 @@ import logging
 import os
 import warnings
 from abc import ABC, abstractmethod
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from typing import Callable, Optional
 
 import torch
 import torch.distributed
-from peft import LoraConfig
 from tensordict import TensorDict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
@@ -53,7 +52,7 @@ from verl.utils.fsdp_utils import (
 )
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import convert_weight_keys
-from verl.utils.py_functional import append_to_dict, convert_to_regular_types
+from verl.utils.py_functional import append_to_dict
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig
 from verl.workers.engine.base import BaseEngine, BaseEngineCtx, EngineRegistry
 from verl.workers.engine.fsdp.utils import create_device_mesh, get_sharding_strategy
@@ -67,6 +66,7 @@ from verl_omni.pipelines.utils import (
 )
 from verl_omni.utils.fsdp_utils import collect_lora_params
 from verl_omni.workers.config import DiffusionModelConfig
+from verl_omni.workers.engine.lora_adapter_mixin import LoRAAdapterMixin
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -74,7 +74,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
-class DiffusersFSDPEngine(BaseEngine, ABC):
+class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
     """Base Diffusers engine using PyTorch FullyShardedDataParallel (FSDP).
 
     Supports model sharding, activation/optimizer offloading, LoRA, and sequence parallelism.
@@ -227,49 +227,6 @@ class DiffusersFSDPEngine(BaseEngine, ABC):
 
             module.can_generate = lambda: False
             module.config.save_pretrained = save_config.__get__(module.config)
-
-        return module
-
-    def _build_lora_module(self, module):
-        from peft.tuners.tuners_utils import BaseTunerLayer
-
-        lora_adapter_path = getattr(self.model_config, "lora_adapter_path", None)
-        if lora_adapter_path is not None:
-            from verl.utils.fs import copy_to_local
-
-            print(f"Loading pre-trained LoRA adapter to from: {lora_adapter_path}")
-            # Copy adapter to local if needed
-            local_adapter_path = copy_to_local(lora_adapter_path, use_shm=self.model_config.use_shm)
-
-            module.load_lora_adapter(local_adapter_path)
-        else:
-            # Convert config to regular Python types before creating PEFT model
-            lora_config = {
-                "r": self.model_config.lora_rank,
-                "lora_alpha": self.model_config.lora_alpha,
-                "init_lora_weights": self.model_config.lora_init_weights,
-                "target_modules": convert_to_regular_types(self.model_config.target_modules),
-                "target_parameters": convert_to_regular_types(self.model_config.target_parameters),
-                "exclude_modules": convert_to_regular_types(self.model_config.exclude_modules),
-                "bias": "none",
-            }
-            module.add_adapter(LoraConfig(**lora_config))
-
-        # Optionally convert LoRA parameters to a target dtype (e.g., fp32).
-        lora_dtype = getattr(self.model_config, "lora_dtype", None)
-        if lora_dtype is not None:
-            from verl.utils.torch_dtypes import PrecisionType
-
-            target_dtype = PrecisionType.to_dtype(lora_dtype)
-            for name, param in module.named_parameters():
-                if param.requires_grad:
-                    orig_dtype = param.dtype
-                    param.data = param.data.to(target_dtype)
-                    logger.debug("LoRA param %s: %s -> %s", name, orig_dtype, param.dtype)
-
-            for submodule in module.modules():
-                if isinstance(submodule, BaseTunerLayer):
-                    submodule.cast_input_dtype_enabled = False
 
         return module
 
@@ -688,7 +645,9 @@ class DiffusersFSDPEngine(BaseEngine, ABC):
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(self.optimizer)
 
-    def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
+    def get_per_tensor_param(
+        self, layered_summon=False, base_sync_done=False, adapter_name: str | None = None, **kwargs
+    ):
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
 
         load_fsdp_model_to_gpu(self.module)
@@ -700,12 +659,15 @@ class DiffusersFSDPEngine(BaseEngine, ABC):
         peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
         if hasattr(peft_model, "peft_config"):  # LoRA
             peft_config = peft_model.peft_config.get("default", None)
-            params = collect_lora_params(
-                module=self.module,
-                layered_summon=layered_summon,
-                base_sync_done=base_sync_done,
-                is_diffusers=True,
-            )
+            adapter_ctx = self.use_adapter(adapter_name) if adapter_name is not None else nullcontext()
+            with adapter_ctx:
+                params = collect_lora_params(
+                    module=self.module,
+                    layered_summon=layered_summon,
+                    base_sync_done=base_sync_done,
+                    is_diffusers=True,
+                    adapter_name=adapter_name or "default",
+                )
             if not base_sync_done:
                 params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
         else:
@@ -737,14 +699,6 @@ class DiffusersFSDPEngine(BaseEngine, ABC):
         per_tensor_param = ((f"transformer.{name}", tensor) for name, tensor in per_tensor_param)
         peft_config_dict = peft_config.to_dict() if peft_config is not None else None
         return per_tensor_param, peft_config_dict
-
-    @contextmanager
-    def disable_adapter(self):
-        try:
-            self.module.disable_adapters()
-            yield
-        finally:
-            self.module.enable_adapters()
 
 
 @EngineRegistry.register(model_type="diffusion_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])

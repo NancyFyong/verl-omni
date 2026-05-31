@@ -13,6 +13,7 @@ trainer drives them through a unified RPC layer.
    verl_omni.workers.engine_workers.TrainingWorker
    verl_omni.workers.engine_workers.ActorRolloutRefWorker
    verl_omni.workers.engine.fsdp.diffusers_impl.DiffusersFSDPEngine
+   verl_omni.workers.engine.lora_adapter_mixin.LoRAAdapterMixin
    verl_omni.workers.engine.fsdp.diffusers_impl.PPODiffusersFSDPEngine
    verl_omni.workers.config.DiffusionModelConfig
    verl_omni.workers.config.DiffusionActorConfig
@@ -71,6 +72,15 @@ and adds PPO forward/backward and batch I/O helpers.
              get_data_parallel_rank, get_data_parallel_size, get_data_parallel_group,
              save_checkpoint, load_checkpoint, get_per_tensor_param,
              to, disable_adapter
+
+LoRA Adapter Mixin
+~~~~~~~~~~~~~~~~~~
+
+Reusable PEFT/LoRA helpers for named policy adapters (e.g. ``default`` and ``old``).
+Used by :class:`~verl_omni.workers.engine.fsdp.diffusers_impl.DiffusersFSDPEngine`.
+
+.. autoclass:: verl_omni.workers.engine.lora_adapter_mixin.LoRAAdapterMixin
+   :members: use_adapter, disable_adapter
 
 Loss Functions
 ~~~~~~~~~~~~~~~~~
