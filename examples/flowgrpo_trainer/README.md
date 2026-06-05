@@ -130,6 +130,24 @@ bash examples/flowgrpo_trainer/run_qwen_image_ocr_veomni.sh
 
 The two backends are not configured by the same Hydra keys, so do not mix `fsdp_config` and `veomni_config` overrides in a single run — `diffusion/model_engine=...` selects the schema, and overrides for the other engine will be rejected as unknown keys.
 
+### Image Editing (Qwen-Image-Edit-Plus)
+
+FlowGRPO also supports image-to-image editing models. The Qwen-Image-Edit-2511 script
+uses the `QwenImageEditPlusPipeline` adapter with condition-image latent concatenation
+and norm-preserving CFG:
+
+```bash
+bash examples/flowgrpo_trainer/run_qwen_image_edit_lora.sh
+```
+
+Prepare the image-editing dataset with:
+
+```bash
+python3 examples/flowgrpo_trainer/data_process/qwenimageedit_sharegpt4o.py \
+    --input_dir ~/data/sharegpt4o_image_mini \
+    --output_dir ~/data/sharegpt4o_image_mini_qwen_image_edit
+```
+
 ## Performance
 
 > All experiments were conducted on *NVIDIA H800* GPUs using the OCR reward.
