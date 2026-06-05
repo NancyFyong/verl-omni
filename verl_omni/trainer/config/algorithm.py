@@ -15,7 +15,6 @@
 """Diffusion-specific algorithm config additions for verl_omni."""
 
 from dataclasses import dataclass, field
-from typing import Optional
 
 from verl.base_config import BaseConfig
 from verl.trainer.config.algorithm import RolloutCorrectionConfig
@@ -42,8 +41,8 @@ class DiffusionAlgoConfig(BaseConfig):
     # ^ Valid: "uniform", "logit_normal",
     #          "discrete", "discrete_with_init", "discrete_wo_init"
     nft_time_shift: float = 3.0
-    nft_timestep_range: Optional[list] = None  # [0.0, 0.9] — fraction of denoise axis
-    nft_adv_clip_range: Optional[list] = None  # [-5.0, 5.0]
+    nft_timestep_range: list[float] | None = None  # [0.0, 0.9] — fraction of denoise axis
+    nft_adv_clip_range: list[float] | None = None  # [-5.0, 5.0]
     # ^ Reserved for parity with flow-factory's range-based advantage
     # clipping. The verl-omni NFT loss currently consumes a single float
     # (``actor.diffusion_loss.adv_clip_max``) rather than a range; this

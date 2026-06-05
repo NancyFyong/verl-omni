@@ -1,6 +1,6 @@
 # VeRL-Omni 自定义 vLLM 奖励函数 — 快速参考
 
-Last updated: 06/04/2026.
+Last updated: 06/05/2026
 
 ## 三个关键配置参数
 
