@@ -300,6 +300,32 @@ bash examples/flowgrpo_trainer/run_qwen_image_ocr_lora_sp2.sh
 ```
 
 
+### Image Editing (Qwen-Image-Edit-Plus)
+
+FlowGRPO supports image-to-image editing models via the `QwenImageEditPlusPipeline`
+adapter. This handles condition-image latent concatenation and norm-preserving
+(rescaled) CFG during rollout.
+
+```bash
+bash examples/flowgrpo_trainer/run_qwen_image_edit_lora.sh
+```
+
+Key differences from the text-to-image OCR example:
+
+- `actor_rollout_ref.model.path=Qwen/Qwen-Image-Edit-2511`
+- `ROLLOUT_TP=2` — the edit model is larger and benefits from tensor parallelism
+- `data.max_prompt_length=512` — editing prompts tend to be longer
+- The parquet data must include a `condition_image` column (source image for editing)
+
+Prepare the image-editing dataset with:
+
+```bash
+python3 examples/nft_trainer/data_process/qwen_image_edit.py \
+    --input_dir ~/dataset/image_edit/ \
+    --output_dir ~/data/image_edit
+```
+
+
 ## Citation
 
 ```bibtex

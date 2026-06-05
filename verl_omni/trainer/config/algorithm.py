@@ -20,8 +20,6 @@ from typing import Optional
 from verl.base_config import BaseConfig
 from verl.trainer.config.algorithm import RolloutCorrectionConfig
 
-from verl_omni.trainer.diffusion.diffusion_trainer_utils import OLD_POLICY_DECAY_SCHEDULES
-
 __all__ = ["DiffusionAlgoConfig", "RolloutCorrectionConfig"]
 
 
@@ -34,26 +32,29 @@ class DiffusionAlgoConfig(BaseConfig):
     adv_estimator: str = "flow_grpo"
     norm_adv_by_std_in_grpo: bool = True
     global_std: bool = True
-    old_policy_decay_schedule: str = "copy"
-    old_policy_decay: Optional[float] = None
-    old_policy_update_interval: int = 1
-    timestep_fraction: float = 1.0
-    adv_mode: str = "continuous"
-    paired_preference: bool = False  # True for pair-based algorithms (e.g. DPO)
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
 
+    # NFT-specific config
+    nft_beta: float = 1.0
+    nft_off_policy: bool = False
+    nft_num_train_timesteps: int = 0  # 0 = derive from num_inference_steps * timestep_range
+    nft_time_sampling_strategy: str = "discrete"
+    # ^ Valid: "uniform", "logit_normal",
+    #          "discrete", "discrete_with_init", "discrete_wo_init"
+    nft_time_shift: float = 3.0
+    nft_timestep_range: Optional[list] = None  # [0.0, 0.9] — fraction of denoise axis
+    nft_adv_clip_range: Optional[list] = None  # [-5.0, 5.0]
+    # ^ Reserved for parity with flow-factory's range-based advantage
+    # clipping. The verl-omni NFT loss currently consumes a single float
+    # (``actor.diffusion_loss.adv_clip_max``) rather than a range; this
+    # field is wired through the config dataclass for future use and
+    # for keeping example sh files self-documenting, but it is NOT
+    # read by any code path today. To change effective clipping, edit
+    # ``actor.diffusion_loss.adv_clip_max`` instead.
+    nft_kl_beta: float = 0.0
+
     def __post_init__(self):
-        valid_adv_modes = {"continuous", "positive_only", "negative_only", "one_only", "binary"}
-        if self.adv_mode not in valid_adv_modes:
-            raise ValueError(f"Invalid adv_mode: {self.adv_mode}. Must be one of {sorted(valid_adv_modes)}")
-        if self.old_policy_decay_schedule not in OLD_POLICY_DECAY_SCHEDULES:
-            raise ValueError(
-                f"Invalid old_policy_decay_schedule: {self.old_policy_decay_schedule}. "
-                f"Must be one of {sorted(OLD_POLICY_DECAY_SCHEDULES)}"
-            )
-        if self.old_policy_decay is not None and not 0 <= self.old_policy_decay <= 1:
-            raise ValueError(f"old_policy_decay must be in [0, 1], got {self.old_policy_decay}.")
-        if self.old_policy_update_interval <= 0:
-            raise ValueError(f"old_policy_update_interval must be positive, got {self.old_policy_update_interval}.")
-        if not 0 < self.timestep_fraction <= 1:
-            raise ValueError(f"timestep_fraction must be in (0, 1], got {self.timestep_fraction}.")
+        if self.nft_timestep_range is None:
+            object.__setattr__(self, "nft_timestep_range", [0.0, 0.9])
+        if self.nft_adv_clip_range is None:
+            object.__setattr__(self, "nft_adv_clip_range", [-5.0, 5.0])

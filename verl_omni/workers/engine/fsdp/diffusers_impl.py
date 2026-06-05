@@ -19,11 +19,12 @@ import logging
 import os
 import warnings
 from abc import ABC, abstractmethod
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Callable, Optional
 
 import torch
 import torch.distributed
+from peft import LoraConfig
 from tensordict import TensorDict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
@@ -52,7 +53,7 @@ from verl.utils.fsdp_utils import (
 )
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import convert_weight_keys
-from verl.utils.py_functional import append_to_dict
+from verl.utils.py_functional import append_to_dict, convert_to_regular_types
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig
 from verl.workers.engine.base import BaseEngine, BaseEngineCtx, EngineRegistry
 from verl.workers.engine.fsdp.utils import create_device_mesh, get_sharding_strategy
@@ -60,14 +61,12 @@ from verl.workers.engine.utils import enable_full_determinism, prepare_micro_bat
 
 from verl_omni.pipelines.utils import (
     build_scheduler,
-    forward,
     forward_and_sample_previous_step,
     prepare_model_inputs,
     prepare_noisy_latents,
 )
 from verl_omni.utils.fsdp_utils import collect_lora_params
 from verl_omni.workers.config import DiffusionModelConfig
-from verl_omni.workers.engine.lora_adapter_mixin import LoRAAdapterMixin
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -75,7 +74,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
-class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
+class DiffusersFSDPEngine(BaseEngine, ABC):
     """Base Diffusers engine using PyTorch FullyShardedDataParallel (FSDP).
 
     Supports model sharding, activation/optimizer offloading, LoRA, and sequence parallelism.
@@ -189,52 +188,6 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
 
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
-    def _build_module_from_registry(self, torch_dtype: torch.dtype) -> Optional[torch.nn.Module]:
-        """Try loading via ``DiffusionModelBase.build_module()``.
-
-        Returns ``None`` if the registry has no custom loader, so the
-        caller falls back to ``diffusers.AutoModel``.
-        """
-        from verl_omni.pipelines.model_base import DiffusionModelBase
-
-        model_cls = DiffusionModelBase.get_class(self.model_config)
-        module = model_cls.build_module(self.model_config, torch_dtype)
-        if module is None:
-            return None
-
-        logger.warning(
-            "Built %s via DiffusionModelBase custom loader; engine-level hooks "
-            "(attention processors, gradient-checkpointing wrappers, LoRA, "
-            "dtype upcast) may be partially effective or silently inactive. "
-            "See the docstring of _build_module_from_registry.",
-            type(module).__name__,
-        )
-
-        try:
-            module.to(torch_dtype)
-        except AttributeError:
-            raise TypeError(
-                f"{type(module).__name__} returned by build_module() has no to() method. "
-                "Custom models must be torch.nn.Module instances."
-            ) from None
-
-        if self.model_config.enable_gradient_checkpointing:
-            try:
-                module.enable_gradient_checkpointing()
-            except AttributeError:
-                raise NotImplementedError(
-                    f"Gradient checkpointing is enabled in config, but {type(module).__name__} "
-                    "does not implement enable_gradient_checkpointing(). "
-                    "Either implement it or set enable_gradient_checkpointing=False."
-                ) from None
-            logger.info(
-                "Gradient checkpointing enabled on %s via enable_gradient_checkpointing().",
-                type(module).__name__,
-            )
-
-        module.can_generate = lambda: False
-        return module
-
     def _build_module(self):
         from diffusers import AutoModel
         from verl.utils.torch_dtypes import PrecisionType
@@ -247,11 +200,6 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
 
         torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
-        module = self._build_module_from_registry(torch_dtype)
-        if module is not None:
-            return module
-
-        # Default path: load via diffusers AutoModel
         init_context = get_init_weight_context_manager(use_meta_tensor=True, mesh=self.device_mesh)
 
         with init_context(), warnings.catch_warnings():
@@ -279,6 +227,49 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
 
             module.can_generate = lambda: False
             module.config.save_pretrained = save_config.__get__(module.config)
+
+        return module
+
+    def _build_lora_module(self, module):
+        from peft.tuners.tuners_utils import BaseTunerLayer
+
+        lora_adapter_path = getattr(self.model_config, "lora_adapter_path", None)
+        if lora_adapter_path is not None:
+            from verl.utils.fs import copy_to_local
+
+            print(f"Loading pre-trained LoRA adapter to from: {lora_adapter_path}")
+            # Copy adapter to local if needed
+            local_adapter_path = copy_to_local(lora_adapter_path, use_shm=self.model_config.use_shm)
+
+            module.load_lora_adapter(local_adapter_path)
+        else:
+            # Convert config to regular Python types before creating PEFT model
+            lora_config = {
+                "r": self.model_config.lora_rank,
+                "lora_alpha": self.model_config.lora_alpha,
+                "init_lora_weights": self.model_config.lora_init_weights,
+                "target_modules": convert_to_regular_types(self.model_config.target_modules),
+                "target_parameters": convert_to_regular_types(self.model_config.target_parameters),
+                "exclude_modules": convert_to_regular_types(self.model_config.exclude_modules),
+                "bias": "none",
+            }
+            module.add_adapter(LoraConfig(**lora_config))
+
+        # Optionally convert LoRA parameters to a target dtype (e.g., fp32).
+        lora_dtype = getattr(self.model_config, "lora_dtype", None)
+        if lora_dtype is not None:
+            from verl.utils.torch_dtypes import PrecisionType
+
+            target_dtype = PrecisionType.to_dtype(lora_dtype)
+            for name, param in module.named_parameters():
+                if param.requires_grad:
+                    orig_dtype = param.dtype
+                    param.data = param.data.to(target_dtype)
+                    logger.debug("LoRA param %s: %s -> %s", name, orig_dtype, param.dtype)
+
+            for submodule in module.modules():
+                if isinstance(submodule, BaseTunerLayer):
+                    submodule.cast_input_dtype_enabled = False
 
         return module
 
@@ -697,9 +688,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(self.optimizer)
 
-    def get_per_tensor_param(
-        self, layered_summon=False, base_sync_done=False, adapter_name: str | None = None, **kwargs
-    ):
+    def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
 
         load_fsdp_model_to_gpu(self.module)
@@ -711,16 +700,12 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
         if hasattr(peft_model, "peft_config"):  # LoRA
             peft_config = peft_model.peft_config.get("default", None)
-            adapter_ctx = self.use_adapter(adapter_name) if adapter_name is not None else nullcontext()
-            with adapter_ctx:
-                params = collect_lora_params(
-                    module=self.module,
-                    layered_summon=layered_summon,
-                    base_sync_done=base_sync_done,
-                    is_diffusers=True,
-                    adapter_name=adapter_name or "default",
-                    layer_prefixes=self.model_config.fsdp_layer_prefixes,
-                )
+            params = collect_lora_params(
+                module=self.module,
+                layered_summon=layered_summon,
+                base_sync_done=base_sync_done,
+                is_diffusers=True,
+            )
             if not base_sync_done:
                 params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
         else:
@@ -753,15 +738,32 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         peft_config_dict = peft_config.to_dict() if peft_config is not None else None
         return per_tensor_param, peft_config_dict
 
-    def _run_forward_backward_batch(
-        self,
-        data: TensorDict,
-        loss_function: Callable,
-        forward_only: bool,
-        *,
-        timesteps_key: str,
-    ) -> dict:
-        num_timesteps = data[timesteps_key].shape[1]
+    @contextmanager
+    def disable_adapter(self):
+        try:
+            self.module.disable_adapters()
+            yield
+        finally:
+            self.module.enable_adapters()
+
+
+@EngineRegistry.register(model_type="diffusion_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
+class PPODiffusersFSDPEngine(DiffusersFSDPEngine):
+    """Diffusers FSDP engine with PPO forward/backward and I/O preparation.
+
+    Supports both policy-gradient (FlowGRPO) and direct-preference (NFT) training
+    modes. NFT mode is detected via ``nft_mode=True`` in the batch's non-tensor data.
+    """
+
+    def forward_backward_batch(
+        self, data: TensorDict, loss_function: Callable, forward_only: bool = False
+    ) -> list[TensorDict]:
+        # Detect NFT mode from non-tensor metadata
+        nft_mode = tu.get_non_tensor_data(data, "nft_mode", default=False)
+        if nft_mode:
+            return self._forward_backward_batch_nft(data, loss_function, forward_only)
+
+        num_timesteps = data["all_timesteps"].shape[1]
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
         tu.assign_non_tensor(data, use_dynamic_bsz=False)
 
@@ -770,7 +772,9 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         )
 
         gradient_accumulation_steps = len(micro_batches) * num_timesteps
+
         output_lst = []
+
         ctx = torch.no_grad() if forward_only else nullcontext()
 
         for micro_batch in micro_batches:
@@ -783,24 +787,250 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
                     loss, meta_info = self.forward_step(
                         micro_batch, loss_function=loss_function, forward_only=forward_only, step=step
                     )
+
                     if not forward_only:
                         loss.backward()
+
                     for key, val in meta_info.items():
                         meta_info_lst[key].append(val)
+
             output_lst.append(meta_info_lst)
 
         # postprocess and return
         return self.postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
-
-@EngineRegistry.register(model_type="diffusion_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
-class PPODiffusersFSDPEngine(DiffusersFSDPEngine):
-    """Diffusers FSDP engine with PPO forward/backward and I/O preparation."""
-
-    def forward_backward_batch(
+    def _forward_backward_batch_nft(
         self, data: TensorDict, loss_function: Callable, forward_only: bool = False
     ) -> list[TensorDict]:
-        return self._run_forward_backward_batch(data, loss_function, forward_only, timesteps_key="all_timesteps")
+        """NFT-specific forward/backward: independently sample timesteps and noise clean latents.
+
+        Instead of iterating over rollout timesteps (as FlowGRPO does), NFT:
+        1. Extracts the final clean latent from the rollout trajectory.
+        2. Samples new timesteps using the configured strategy.
+        3. Noises the clean latents at each sampled timestep.
+        4. Runs the model forward to get noise_pred.
+        5. Computes the NFT loss (positive/negative weighted MSE).
+
+        Two optional behaviours mirror flow-factory's NFT trainer:
+
+        - ``nft_off_policy`` (config flag): when ``True``, ``old_noise_pred``
+          is produced by the *reference* (LoRA-disabled) model rather than
+          a no-grad pass through the current policy. This makes the
+          positive/negative interpolation truly off-policy — flow-factory
+          uses an EMA wrapper for the same purpose; in our LoRA-only
+          training setup ``disable_adapter`` is the analogous switch
+          because the base weights are frozen.
+        - ``nft_kl_beta`` (config float): when ``> 0``, an extra v-space
+          MSE-KL term ``kl_beta * mean((new_v - ref_v)**2)`` is added to
+          the policy loss. ``ref_v`` comes from the same reference forward
+          and anchors the current policy to the base model. When
+          ``nft_off_policy`` is ``True`` we re-use the off-policy reference
+          forward to avoid a third pass.
+        """
+        from verl_omni.trainer.diffusion.nft_utils import TimeSampler, flow_match_sigma, to_broadcast_tensor
+
+        nft_num_train_timesteps = tu.get_non_tensor_data(data, "nft_num_train_timesteps", default=5)
+        nft_time_sampling_strategy = tu.get_non_tensor_data(data, "nft_time_sampling_strategy", default="discrete")
+        nft_timestep_range = tu.get_non_tensor_data(data, "nft_timestep_range", default=[0.0, 0.9])
+        nft_off_policy = tu.get_non_tensor_data(data, "nft_off_policy", default=False)
+        nft_kl_beta = float(tu.get_non_tensor_data(data, "nft_kl_beta", default=0.0))
+        kl_anchor_enabled = nft_kl_beta > 0.0
+
+        tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
+        tu.assign_non_tensor(data, use_dynamic_bsz=False)
+
+        micro_batches, indices = prepare_micro_batches(
+            data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
+        )
+
+        gradient_accumulation_steps = len(micro_batches) * nft_num_train_timesteps
+
+        output_lst = []
+        ctx = torch.no_grad() if forward_only else nullcontext()
+
+        # Get scheduler timesteps for discrete sampling
+        scheduler_timesteps = (
+            self.scheduler.timesteps if hasattr(self, "scheduler") and self.scheduler is not None else None
+        )
+
+        for micro_batch in micro_batches:
+            micro_batch = micro_batch.to(get_device_id())
+            tu.assign_non_tensor(micro_batch, gradient_accumulation_steps=gradient_accumulation_steps)
+            meta_info_lst = {"model_output": [], "loss": [], "metrics": []}
+
+            # Extract clean latents (final denoised latent from rollout)
+            all_latents = micro_batch["all_latents"]
+            clean_latents = all_latents[:, -1]  # (B, seq_len, dim)
+            batch_size = clean_latents.shape[0]
+
+            with ctx:
+                for step in range(nft_num_train_timesteps):
+                    # Sample timestep. Each TimeSampler method returns shape
+                    # (num_timesteps, batch_size); we draw one row per training
+                    # step and squeeze it down to (batch_size,) so it lines up
+                    # with ``micro_batch["all_timesteps"][:, 0]`` below.
+                    #
+                    # ``discrete`` family resolves three different
+                    # initial-step behaviours, mirroring flow-factory's
+                    # _sample_timesteps:
+                    #   discrete            → include_init=True, force_init=False
+                    #     (one row in the batch may land on the grid head)
+                    #   discrete_with_init  → include_init=True, force_init=True
+                    #     (every row uses the grid head — useful when the
+                    #     scheduler's first step is the most informative)
+                    #   discrete_wo_init    → include_init=False, force_init=False
+                    #     (avoid the grid head entirely)
+                    if (
+                        nft_time_sampling_strategy in ("discrete", "discrete_with_init", "discrete_wo_init")
+                        and scheduler_timesteps is not None
+                    ):
+                        _DISCRETE_INIT = {
+                            "discrete": (True, False),
+                            "discrete_with_init": (True, True),
+                            "discrete_wo_init": (False, False),
+                        }
+                        include_init, force_init = _DISCRETE_INIT[nft_time_sampling_strategy]
+                        t = TimeSampler.discrete(
+                            batch_size=batch_size,
+                            num_train_timesteps=1,
+                            scheduler_timesteps=scheduler_timesteps,
+                            timestep_range=nft_timestep_range,
+                            include_init=include_init,
+                            force_init=force_init,
+                        )[0].to(clean_latents.device)
+                    elif nft_time_sampling_strategy == "logit_normal":
+                        nft_time_shift = tu.get_non_tensor_data(micro_batch, "nft_time_shift", default=3.0)
+                        t = TimeSampler.logit_normal_shifted(
+                            batch_size=batch_size,
+                            num_timesteps=1,
+                            timestep_range=nft_timestep_range,
+                            time_shift=nft_time_shift,
+                            device=clean_latents.device,
+                        )[0]
+                    else:
+                        t = TimeSampler.uniform(
+                            batch_size=batch_size,
+                            num_timesteps=1,
+                            timestep_range=nft_timestep_range,
+                            device=clean_latents.device,
+                        )[0]
+
+                    # Compute sigma and noise the clean latent
+                    sigma = flow_match_sigma(t)
+                    sigma_broadcast = to_broadcast_tensor(sigma, clean_latents)
+
+                    noise = torch.randn_like(clean_latents)
+                    noised_latents = (1.0 - sigma_broadcast) * clean_latents + sigma_broadcast * noise
+
+                    # Build model inputs with noised_latents at the "current step"
+                    # We temporarily replace all_latents[:, 0] with noised_latents
+                    # and all_timesteps[:, 0] with t for prepare_model_inputs.
+                    orig_latents_step = micro_batch["all_latents"][:, 0].clone()
+                    orig_timesteps_step = micro_batch["all_timesteps"][:, 0].clone()
+
+                    micro_batch["all_latents"][:, 0] = noised_latents
+                    micro_batch["all_timesteps"][:, 0] = t
+
+                    model_inputs, negative_model_inputs = self.prepare_model_inputs(micro_batch=micro_batch, step=0)
+
+                    # ── Reference forward (only when needed) ─────────────────
+                    # ``ref_noise_pred`` is the LoRA-disabled forward. It is
+                    # used in two distinct roles, so we compute it at most
+                    # once per training step:
+                    #   1. ``nft_off_policy=True`` — replaces ``old_noise_pred``
+                    #      so the positive/negative interpolation is truly
+                    #      off-policy.
+                    #   2. ``nft_kl_beta>0`` — anchors the current policy
+                    #      via ``kl_beta * mean((new_v - ref_v)**2)``.
+                    #
+                    # IMPORTANT: ``disable_adapter()`` only produces a
+                    # *useful* reference when LoRA is actually active —
+                    # otherwise turning off the adapter is a no-op and
+                    # ``ref_noise_pred == new_noise_pred``, which silently
+                    # zeros out the off-policy and KL effects. Raise here
+                    # so the user fixes the config (set ``model.lora_rank > 0``
+                    # or use a stand-alone reference worker — the latter is
+                    # tracked as TODO and matches verl-omni's pattern for
+                    # FlowGRPO via ``_compute_ref_log_prob``).
+                    need_ref = nft_off_policy or kl_anchor_enabled
+                    ref_noise_pred = None
+                    if need_ref:
+                        if not self._is_lora:
+                            raise RuntimeError(
+                                "DiffusionNFT off-policy / KL-anchor paths require LoRA "
+                                "training (so disable_adapter() yields a real reference "
+                                "forward). Got nft_off_policy="
+                                f"{nft_off_policy}, nft_kl_beta={nft_kl_beta}, but "
+                                "self._is_lora is False (model.lora_rank == 0). Either "
+                                "(a) enable LoRA, or (b) disable both nft_off_policy "
+                                "and set nft_kl_beta=0.0."
+                            )
+                        with torch.no_grad(), self.disable_adapter():
+                            ref_noise_pred = self.module(**model_inputs)[0]
+                            if ref_noise_pred.shape[1] > clean_latents.shape[1]:
+                                ref_noise_pred = ref_noise_pred[:, : clean_latents.shape[1]]
+
+                    # ── old_noise_pred ───────────────────────────────────────
+                    if nft_off_policy:
+                        # Off-policy: sampling policy is the LoRA-off (ref)
+                        # model, exactly the same tensor we just produced.
+                        old_noise_pred = ref_noise_pred
+                    else:
+                        # On-policy: sampling policy is the current model
+                        # (no_grad detaches it from the new forward below).
+                        with torch.no_grad():
+                            old_noise_pred = self.module(**model_inputs)[0]
+                            if old_noise_pred.shape[1] > clean_latents.shape[1]:
+                                old_noise_pred = old_noise_pred[:, : clean_latents.shape[1]]
+
+                    # Compute new noise_pred (with grad for training)
+                    new_noise_pred = self.module(**model_inputs)[0]
+                    if new_noise_pred.shape[1] > clean_latents.shape[1]:
+                        new_noise_pred = new_noise_pred[:, : clean_latents.shape[1]]
+
+                    # Restore original data
+                    micro_batch["all_latents"][:, 0] = orig_latents_step
+                    micro_batch["all_timesteps"][:, 0] = orig_timesteps_step
+
+                    # Prepare model output and data for loss function
+                    model_output = {"noise_pred": new_noise_pred}
+
+                    loss_data_dict = {
+                        "old_noise_pred": old_noise_pred,
+                        "advantages": micro_batch["advantages"][:, 0]
+                        if micro_batch["advantages"].dim() > 1
+                        else micro_batch["advantages"],
+                        "clean_latents": clean_latents,
+                        "noised_latents": noised_latents,
+                        "sigma_broadcast": sigma_broadcast,
+                    }
+                    if kl_anchor_enabled:
+                        # Loss reads ``ref_noise_pred`` only when nft_kl_beta>0
+                        # (see DiffusionNFTLoss.compute_loss).
+                        loss_data_dict["ref_noise_pred"] = ref_noise_pred
+                    loss_data = tu.get_tensordict(loss_data_dict)
+                    tu.assign_non_tensor(
+                        loss_data,
+                        gradient_accumulation_steps=gradient_accumulation_steps,
+                        sp_size=tu.get_non_tensor_data(micro_batch, "sp_size", default=None),
+                        nft_kl_beta=nft_kl_beta,
+                    )
+
+                    loss, metrics = loss_function(
+                        model_output=model_output, data=loss_data, dp_group=self.get_data_parallel_group()
+                    )
+
+                    if not forward_only:
+                        loss.backward()
+
+                    meta_info_lst["model_output"].append({"noise_pred": new_noise_pred.detach()})
+                    meta_info_lst["loss"].append(loss.detach().item())
+                    meta_info_lst["metrics"].append(metrics)
+
+            output_lst.append(meta_info_lst)
+
+        # postprocess and return
+        return self.postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
     def prepare_model_inputs(self, micro_batch: TensorDict, step: int):
         """
@@ -812,16 +1042,16 @@ class PPODiffusersFSDPEngine(DiffusersFSDPEngine):
         """
         latents = micro_batch["all_latents"]
         timesteps = micro_batch["all_timesteps"]
-        prompt_embeds = micro_batch.get("prompt_embeds", None)
-        prompt_embeds_mask = micro_batch.get("prompt_embeds_mask", None)
-        negative_prompt_embeds = micro_batch.get("negative_prompt_embeds", None)
-        negative_prompt_embeds_mask = micro_batch.get("negative_prompt_embeds_mask", None)
+        prompt_embeds = micro_batch["prompt_embeds"]
+        prompt_embeds_mask = micro_batch["prompt_embeds_mask"]
+        negative_prompt_embeds = micro_batch["negative_prompt_embeds"]
+        negative_prompt_embeds_mask = micro_batch["negative_prompt_embeds_mask"]
         sp_size = self.ulysses_sequence_parallel_size if self.use_ulysses_sp else 1
 
-        if isinstance(prompt_embeds, torch.Tensor) and prompt_embeds.is_nested:
+        if prompt_embeds.is_nested:
             prompt_embeds, prompt_embeds_mask = self._unpad_nested_embeds(prompt_embeds, prompt_embeds_mask)
 
-        if isinstance(prompt_embeds, torch.Tensor) and sp_size > 1:
+        if sp_size > 1:
             prompt_embeds, prompt_embeds_mask = self._pad_embeds_for_sp(prompt_embeds, prompt_embeds_mask, sp_size)
 
         if isinstance(negative_prompt_embeds, torch.Tensor) and negative_prompt_embeds.is_nested:
@@ -912,7 +1142,7 @@ class PPODiffusersFSDPEngine(DiffusersFSDPEngine):
         return loss, output
 
 
-@EngineRegistry.register(model_type="diffusion_dpo_model", backend=["fsdp", "fsdp2"], device=["cuda"])
+@EngineRegistry.register(model_type="diffusion_dp_model", backend=["fsdp", "fsdp2"], device=["cuda"])
 class DPODiffusersFSDPEngine(DiffusersFSDPEngine):
     """Diffusers FSDP engine variant for diffusion DPO."""
 
@@ -1053,11 +1283,14 @@ class DPODiffusersFSDPEngine(DiffusersFSDPEngine):
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only, step):
         model_inputs, negative_model_inputs, dpo_context = self.prepare_model_inputs(micro_batch=micro_batch, step=step)
-        noise_pred = forward(
+        noise_pred = forward_and_sample_previous_step(
             module=self.module,
+            scheduler=self.scheduler,
             model_config=self.model_config,
             model_inputs=model_inputs,
             negative_model_inputs=negative_model_inputs,
+            scheduler_inputs=micro_batch,
+            step=step,
         )
         model_output = self.prepare_model_outputs(output=(noise_pred, dpo_context), micro_batch=micro_batch)
 
@@ -1090,133 +1323,6 @@ class DPODiffusersFSDPEngine(DiffusersFSDPEngine):
             "metrics": metrics,
         }
 
-        return loss, output
-
-
-@EngineRegistry.register(model_type="diffusion_nft_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
-class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
-    """Diffusers FSDP engine for direct-preference / forward-process objectives (e.g. DiffusionNFT)."""
-
-    def forward_backward_batch(
-        self, data: TensorDict, loss_function: Callable, forward_only: bool = False
-    ) -> list[TensorDict]:
-        return self._run_forward_backward_batch(data, loss_function, forward_only, timesteps_key="train_timesteps")
-
-    def prepare_model_inputs(self, micro_batch: TensorDict, step: int):
-        x0 = micro_batch["latents_clean"]
-        timestep = micro_batch["train_timesteps"][:, step]
-        t = timestep.float() / 1000.0
-        t_expanded = t.view(-1, *([1] * (x0.ndim - 1)))
-
-        if micro_batch.get("forward_noise", None) is not None:
-            forward_noise = micro_batch["forward_noise"]
-            noise = forward_noise[:, step] if forward_noise.ndim == x0.ndim + 1 else forward_noise
-        else:
-            noise = torch.randn_like(x0.float())
-        xt = (1.0 - t_expanded) * x0 + t_expanded * noise
-
-        prompt_embeds = micro_batch["prompt_embeds"]
-        prompt_embeds_mask = micro_batch["prompt_embeds_mask"]
-        negative_prompt_embeds = micro_batch.get("negative_prompt_embeds", None)
-        negative_prompt_embeds_mask = micro_batch.get("negative_prompt_embeds_mask", None)
-        sp_size = self.ulysses_sequence_parallel_size if self.use_ulysses_sp else 1
-
-        if prompt_embeds.is_nested:
-            prompt_embeds, prompt_embeds_mask = self._unpad_nested_embeds(prompt_embeds, prompt_embeds_mask)
-
-        if sp_size > 1:
-            prompt_embeds, prompt_embeds_mask = self._pad_embeds_for_sp(prompt_embeds, prompt_embeds_mask, sp_size)
-
-        if isinstance(negative_prompt_embeds, torch.Tensor) and negative_prompt_embeds.is_nested:
-            negative_prompt_embeds, negative_prompt_embeds_mask = self._unpad_nested_embeds(
-                negative_prompt_embeds, negative_prompt_embeds_mask
-            )
-
-        if isinstance(negative_prompt_embeds, torch.Tensor) and sp_size > 1:
-            negative_prompt_embeds, negative_prompt_embeds_mask = self._pad_embeds_for_sp(
-                negative_prompt_embeds, negative_prompt_embeds_mask, sp_size
-            )
-
-        model_inputs, negative_model_inputs = prepare_model_inputs(
-            module=self.module,
-            model_config=self.model_config,
-            latents=xt,
-            timesteps=timestep,
-            prompt_embeds=prompt_embeds,
-            prompt_embeds_mask=prompt_embeds_mask,
-            negative_prompt_embeds=negative_prompt_embeds,
-            negative_prompt_embeds_mask=negative_prompt_embeds_mask,
-            micro_batch=micro_batch,
-            step=step,
-        )
-        return model_inputs, negative_model_inputs, x0, xt, t_expanded
-
-    def prepare_model_outputs(self, output, micro_batch: TensorDict):
-        old_prediction, forward_prediction, ref_forward_prediction, x0, xt, t_expanded = output
-        return {
-            "old_prediction": old_prediction,
-            "forward_prediction": forward_prediction,
-            "ref_forward_prediction": ref_forward_prediction,
-            "x0": x0,
-            "xt": xt,
-            "t_expanded": t_expanded,
-        }
-
-    def forward_step(self, micro_batch: TensorDict, loss_function, forward_only, step):
-        model_inputs, negative_model_inputs, x0, xt, t_expanded = self.prepare_model_inputs(
-            micro_batch=micro_batch, step=step
-        )
-
-        with self.use_adapter("old"), torch.no_grad():
-            old_prediction = forward(
-                module=self.module,
-                model_config=self.model_config,
-                model_inputs=model_inputs,
-                negative_model_inputs=negative_model_inputs,
-            ).detach()
-
-        forward_prediction = forward(
-            module=self.module,
-            model_config=self.model_config,
-            model_inputs=model_inputs,
-            negative_model_inputs=negative_model_inputs,
-        )
-
-        with torch.no_grad():
-            with self.disable_adapter():
-                ref_forward_prediction = forward(
-                    module=self.module,
-                    model_config=self.model_config,
-                    model_inputs=model_inputs,
-                    negative_model_inputs=negative_model_inputs,
-                ).detach()
-        self._set_adapter("default")
-
-        model_output = self.prepare_model_outputs(
-            output=(old_prediction, forward_prediction, ref_forward_prediction, x0, xt, t_expanded),
-            micro_batch=micro_batch,
-        )
-
-        if loss_function is not None:
-            data = tu.get_tensordict({"reward_prob": micro_batch["reward_prob"][:, step]})
-            tu.assign_non_tensor(
-                data,
-                gradient_accumulation_steps=tu.get_non_tensor_data(
-                    micro_batch, "gradient_accumulation_steps", default=None
-                ),
-                sp_size=tu.get_non_tensor_data(micro_batch, "sp_size", default=None),
-            )
-            loss, metrics = loss_function(model_output=model_output, data=data, dp_group=self.get_data_parallel_group())
-        else:
-            assert forward_only, "forward_only must be True when loss_function is None"
-            loss = torch.tensor(1.0, device=x0.device)
-            metrics = {}
-
-        output = {
-            "model_output": model_output,
-            "loss": loss.detach().item(),
-            "metrics": metrics,
-        }
         return loss, output
 
 
