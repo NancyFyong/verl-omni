@@ -5,7 +5,8 @@ set -x
 export RAY_DEDUP_LOGS=0
 
 model_name=${MODEL_PATH:-Qwen/Qwen-Image-Edit-2511}
-reward_function_path=${REWARD_FUNCTION_PATH:-verl_omni/utils/reward_score/pickscore.py}
+reward_function_path=${REWARD_FUNCTION_PATH:-pkg://verl_omni.utils.reward_score.pickscore_http_client}
+reward_server_urls=${PICKSCORE_SERVER_URLS:-http://127.0.0.1:19084,http://127.0.0.1:19085,http://127.0.0.1:19086,http://127.0.0.1:19087}
 
 NUM_GPUS_ACTOR_ROLLOUT_REWARD=${NUM_GPUS_ACTOR_ROLLOUT_REWARD:-4}
 ACTOR_SP=${ACTOR_SP:-1}
@@ -104,7 +105,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.rollout.load_format=safetensors \
     actor_rollout_ref.rollout.layered_summon=True \
     actor_rollout_ref.rollout.prompt_length=$MAX_PROMPT_LENGTH \
-    actor_rollout_ref.rollout.pipeline.num_inference_steps=10 \
+    actor_rollout_ref.rollout.pipeline.num_inference_steps=28 \
     actor_rollout_ref.rollout.pipeline.true_cfg_scale=4.0 \
     actor_rollout_ref.rollout.pipeline.height=$IMAGE_RESOLUTION \
     actor_rollout_ref.rollout.pipeline.width=$IMAGE_RESOLUTION \
@@ -116,10 +117,11 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.rollout.val_kwargs.pipeline.num_inference_steps=28 \
     actor_rollout_ref.rollout.val_kwargs.algo.noise_level=0.0 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=32 \
-    reward.num_workers=1 \
+    reward.num_workers=4 \
     reward.reward_model.enable=False \
     reward.custom_reward_function.path=$reward_function_path \
     reward.custom_reward_function.name=compute_score \
+    "+reward.custom_reward_function.reward_kwargs.server_urls='$reward_server_urls'" \
     trainer.logger='["console", "tensorboard"]' \
     trainer.project_name=flow_grpo \
     trainer.experiment_name=qwen_image_edit_sharegpt4o_image_mini_lora_pickscore \

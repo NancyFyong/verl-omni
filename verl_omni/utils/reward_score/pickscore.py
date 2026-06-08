@@ -12,17 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""PickScore reward function for verl-omni.
+"""PickScore reward function for image generation/editing."""
 
-PickScore is a text-to-image human-preference scoring model built on top of
-CLIP-ViT-H-14. It computes a cosine similarity between text and image embeddings,
-scaled by a learned logit-scale parameter.
-
-Reference: https://github.com/yuvalkirstain/PickScore
-"""
-
+import asyncio
+import io
 import logging
-from typing import Any, Optional
+import threading
+from typing import Any
 
 import numpy as np
 import torch
@@ -30,108 +26,104 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-# ---- lazy-loaded singleton ----
+PROCESSOR_NAME = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
+MODEL_NAME = "yuvalkirstain/PickScore_v1"
+SCORE_SCALE = 26.0
 
+_lock: threading.Lock = threading.Lock()
 _processor: Any = None
 _model: Any = None
 _device: str = "cuda"
 
-PROCESSOR_NAME = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
-MODEL_NAME = "yuvalkirstain/PickScore_v1"
 
-
-def _ensure_model(device: Optional[str] = None) -> None:
-    """Lazily load the PickScore model and CLIP processor."""
-    global _processor, _model
+def _load_model() -> None:
+    """Thread-safe lazy loading of PickScore model and processor."""
+    global _device, _model, _processor
 
     if _model is not None:
         return
 
-    from transformers import AutoModel, AutoProcessor
+    with _lock:
+        if _model is not None:
+            return
 
-    if device is None:
-        dev = "cuda" if torch.cuda.is_available() else "cpu"
-    else:
-        dev = device
+        from transformers import CLIPModel, CLIPProcessor
 
-    logger.info("Loading PickScore processor: %s", PROCESSOR_NAME)
-    _processor = AutoProcessor.from_pretrained(PROCESSOR_NAME)
-
-    logger.info("Loading PickScore model: %s", MODEL_NAME)
-    _model = AutoModel.from_pretrained(MODEL_NAME).eval().to(dev)
-
-
-# ---- tensor helpers ----
+        _device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info("Loading PickScore processor: %s", PROCESSOR_NAME)
+        _processor = CLIPProcessor.from_pretrained(PROCESSOR_NAME)
+        logger.info("Loading PickScore model: %s", MODEL_NAME)
+        _model = CLIPModel.from_pretrained(MODEL_NAME).eval().to(_device)
 
 
-def _tensor_to_pil(image: torch.Tensor) -> Image.Image:
-    """Convert a CHW float tensor in [0, 1] to an RGB PIL image."""
-    if image.ndim == 4:
-        image = image[0]  # (N, C, H, W) -> (C, H, W)
-    image = image.float().permute(1, 2, 0).cpu().numpy()
-    image = (image * 255).round().clip(0, 255).astype(np.uint8)
-    return Image.fromarray(image)
+def _extract_feature_tensor(output: Any) -> torch.Tensor:
+    """Extract feature tensor from transformers outputs across versions."""
+    if isinstance(output, torch.Tensor):
+        return output
+    if hasattr(output, "pooler_output") and output.pooler_output is not None:
+        return output.pooler_output
+    raise TypeError(f"Unsupported PickScore feature output type: {type(output)}")
 
 
 def _to_pil(image: Any) -> Image.Image:
-    """Normalize various image representations to a PIL Image."""
+    """Convert tensor / ndarray / PIL / parquet image dict to RGB PIL image."""
     if isinstance(image, dict):
-        import io as _io
-
         if image.get("bytes") is not None:
-            image = Image.open(_io.BytesIO(image["bytes"]))
+            image = Image.open(io.BytesIO(image["bytes"]))
         elif image.get("path") is not None:
             image = Image.open(image["path"])
+
+    if isinstance(image, torch.Tensor):
+        if image.ndim == 4:
+            image = image[0]
+        image = image.float().permute(1, 2, 0).cpu().numpy()
+
     if isinstance(image, np.ndarray):
-        if image.ndim == 3 and image.shape[-1] == 3:
+        if image.ndim == 4:
+            image = image[0]
+        assert image.shape[-1] == 3, "PickScore expects RGB images in HWC format"
+        if image.dtype != np.uint8:
             image = (image * 255).round().clip(0, 255).astype(np.uint8)
         image = Image.fromarray(image)
-    if isinstance(image, torch.Tensor):
-        image = _tensor_to_pil(image)
-    if not isinstance(image, Image.Image):
-        raise TypeError(f"Unsupported image type: {type(image)}")
+
+    assert isinstance(image, Image.Image)
     return image.convert("RGB")
 
 
-# ---- public API ----
-
-
-def compute_score(
+async def compute_score(
     data_source: str,
-    solution_image: torch.Tensor,
+    solution_image: torch.Tensor | np.ndarray | Image.Image | dict,
     ground_truth: str,
     extra_info: dict,
-    device: Optional[str] = None,
-    **kwargs,
 ) -> dict[str, float]:
-    """Compute PickScore between a text prompt and generated image.
+    """Compute PickScore reward.
+
+    This function is async-compatible: VisualRewardManager calls it via ``await``
+    inside the main event loop rather than ``run_in_executor``, so the PickScore
+    model stays loaded on the reward worker's GPU across samples.
 
     Args:
-        data_source: Dataset identifier (unused, kept for interface compatibility).
-        solution_image: Generated image tensor (C, H, W) or (N, C, H, W) in [0, 1].
-        ground_truth: Text prompt used to generate the image.
-        extra_info: Additional metadata (unused here, kept for interface compatibility).
-        device: Torch device string (``"cuda"``, ``"cpu"``). Defaults to ``"cuda"`` if
-            available, otherwise ``"cpu"``.
+        data_source: Dataset name, kept for verl-omni reward interface compatibility.
+        solution_image: Generated image in CHW / NCHW tensor, HWC / NHWC ndarray,
+            PIL image, or parquet image dict format.
+        ground_truth: Text prompt or edit instruction.
+        extra_info: Extra sample metadata, kept for interface compatibility.
 
     Returns:
-        ``{"score": float}`` where score is the cosine similarity in ``[0, 1]``
-        between the prompt and image embeddings.
+        A dict containing normalized ``score`` and unnormalized ``pickscore_raw``.
     """
-    _ensure_model(device=device)
+    _load_model()
+    loop = asyncio.get_event_loop()
 
-    # Convert the output image tensor to PIL
-    pil_image = _to_pil(solution_image)
+    image = await loop.run_in_executor(None, _to_pil, solution_image)
 
-    # Preprocess
     image_inputs = _processor(
-        images=[pil_image],
+        images=[image],
         padding=True,
         truncation=True,
         max_length=77,
         return_tensors="pt",
     ).to(_device)
-
     text_inputs = _processor(
         text=[ground_truth],
         padding=True,
@@ -141,20 +133,14 @@ def compute_score(
     ).to(_device)
 
     with torch.no_grad():
-        image_embs = _model.get_image_features(**image_inputs).pooler_output
-        image_embs = image_embs / torch.norm(image_embs, dim=-1, keepdim=True)
+        image_embs = _extract_feature_tensor(_model.get_image_features(**image_inputs))
+        image_embs = image_embs / image_embs.norm(p=2, dim=-1, keepdim=True)
 
-        text_embs = _model.get_text_features(**text_inputs).pooler_output
-        text_embs = text_embs / torch.norm(text_embs, dim=-1, keepdim=True)
+        text_embs = _extract_feature_tensor(_model.get_text_features(**text_inputs))
+        text_embs = text_embs / text_embs.norm(p=2, dim=-1, keepdim=True)
 
-        # Cosine similarity between text and image embeddings.
-        # PickScore's ``logit_scale`` is designed for softmax-based
-        # contrastive comparison across multiple images; using it on a
-        # single pair would saturate sigmoid to ~1.0 and kill reward
-        # variance.  We use the raw cosine similarity rescaled to [0, 1]
-        # instead, which is interpretable and preserves the ranking
-        # needed for GRPO advantage computation.
-        cos_sim = (text_embs @ image_embs.T)[0, 0]  # in [-1, 1]
-        score = (cos_sim + 1.0) / 2.0
+        raw_score = _model.logit_scale.exp() * (text_embs * image_embs).sum(dim=-1)
+        raw_score = raw_score[0]
+        score = raw_score / SCORE_SCALE
 
-    return {"score": float(score.cpu())}
+    return {"score": float(score.cpu()), "pickscore_raw": float(raw_score.cpu())}

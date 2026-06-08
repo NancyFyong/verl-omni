@@ -81,6 +81,17 @@ def _pick_condition_images(custom_prompt: dict) -> list | None:
     raw_images = multi_modal_data.get("image")
     if isinstance(raw_images, list) and len(raw_images) > 0:
         return raw_images
+
+    # Current verl/vLLM-Omni server code forwards image_data through
+    # custom_prompt["extra_args"]["multi_modal_data"] instead of top-level
+    # custom_prompt["multi_modal_data"]. Handle both layouts so Qwen-Image-Edit
+    # always receives the original condition image for prompt encoding.
+    extra_args = custom_prompt.get("extra_args") or {}
+    extra_multi_modal_data = extra_args.get("multi_modal_data") or {}
+    raw_images = extra_multi_modal_data.get("image")
+    if isinstance(raw_images, list) and len(raw_images) > 0:
+        return raw_images
+
     additional_information = custom_prompt.get("additional_information") or {}
     return additional_information.get("condition_images")
 
