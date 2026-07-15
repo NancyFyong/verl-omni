@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from . import diffusion, omni
-from .diffusion import *  # noqa: F401,F403
-from .omni import *  # noqa: F401,F403
+from .diffusers_training_adapter import QwenImageEditPlusFlowGRPO
+from .vllm_omni_rollout_adapter import QwenImageEditPlusPipelineWithLogProb
 
-__all__ = list(diffusion.__all__) + list(omni.__all__)
+__all__ = ["QwenImageEditPlusFlowGRPO", "QwenImageEditPlusPipelineWithLogProb"]
