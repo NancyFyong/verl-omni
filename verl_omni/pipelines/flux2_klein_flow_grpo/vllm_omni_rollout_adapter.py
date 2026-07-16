@@ -148,6 +148,20 @@ def _normalize_sde_window_args(
     return sde_window_size, (int(sde_window_range[0]), int(sde_window_range[1]))
 
 
+def _build_request_scheduler(
+    base_scheduler: FlowMatchSDEDiscreteScheduler,
+    num_inference_steps: int,
+    device,
+    sigmas,
+    mu: float,
+) -> FlowMatchSDEDiscreteScheduler:
+    """Clone mutable scheduler state for one concurrent rollout request."""
+    scheduler = FlowMatchSDEDiscreteScheduler.from_config(base_scheduler.config)
+    scheduler.set_timesteps(num_inference_steps, device=device, sigmas=sigmas, mu=mu)
+    scheduler.set_begin_index(0)
+    return scheduler
+
+
 @VllmOmniPipelineBase.register("Flux2KleinPipeline", algorithm="flow_grpo")
 class Flux2KleinPipelineWithLogProb(VllmOmniPipelineBase, Flux2KleinPipeline):
     """Rollout pipeline for FLUX.2-Klein that captures per-step log-probabilities.
@@ -234,6 +248,7 @@ class Flux2KleinPipelineWithLogProb(VllmOmniPipelineBase, Flux2KleinPipeline):
 
     def diffuse(
         self,
+        scheduler: FlowMatchSDEDiscreteScheduler,
         prompt_embeds: torch.Tensor,
         prompt_embeds_mask: torch.Tensor | None,
         negative_prompt_embeds: torch.Tensor | None,
@@ -323,7 +338,7 @@ class Flux2KleinPipelineWithLogProb(VllmOmniPipelineBase, Flux2KleinPipeline):
                 noise_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
 
             # Scheduler step (operates on packed [B, N, 128] latents).
-            latents, log_prob, _, _ = self.scheduler.step(
+            latents, log_prob, _, _ = scheduler.step(
                 noise_pred.float(),
                 timestep_value,
                 latents,
@@ -513,8 +528,19 @@ class Flux2KleinPipelineWithLogProb(VllmOmniPipelineBase, Flux2KleinPipeline):
         # small-sigma tail. Training recomputes log-probs against the same grid.
         request_sigmas = sampling_params.sigmas if sampling_params.sigmas is not None else sigmas
         sigmas_schedule = resolve_flux2_klein_sigmas(request_sigmas, num_inference_steps)
-        self.scheduler.set_timesteps(num_inference_steps, device=self.device, sigmas=sigmas_schedule, mu=mu)
-        timesteps_tensor = self.scheduler.timesteps
+        # ``FlowMatchSDEDiscreteScheduler.step`` mutates ``step_index``. The
+        # vLLM-Omni server can execute multiple requests concurrently, so using
+        # the pipeline-level scheduler here lets one request advance another
+        # request's sigma index and corrupts both denoising trajectories.
+        # Clone request-local state while retaining the loaded model config.
+        request_scheduler = _build_request_scheduler(
+            self.scheduler,
+            num_inference_steps,
+            self.device,
+            sigmas_schedule,
+            mu,
+        )
+        timesteps_tensor = request_scheduler.timesteps
 
         if sde_window_size is not None:
             start = torch.randint(
@@ -529,6 +555,7 @@ class Flux2KleinPipelineWithLogProb(VllmOmniPipelineBase, Flux2KleinPipeline):
             sde_window = (0, len(timesteps_tensor) - 1)
 
         latents, all_latents, all_log_probs, all_timesteps = self.diffuse(
+            request_scheduler,
             prompt_embeds,
             prompt_embeds_mask,
             negative_prompt_embeds,

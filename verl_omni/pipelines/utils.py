@@ -15,11 +15,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from io import BytesIO
 from typing import Any, Mapping, Optional
 
 import torch
 from diffusers import ModelMixin, SchedulerMixin
 from diffusers.training_utils import compute_density_for_timestep_sampling
+from PIL import Image
 from tensordict import TensorDict
 from verl.utils.device import get_device_name
 
@@ -27,9 +29,24 @@ from verl_omni.workers.config import DiffusionModelConfig
 
 from .model_base import DiffusionI2IModelBase, DiffusionModelBase
 
+
+def decode_images(raw_images: list | None) -> list[Image.Image] | None:
+    """Decode parquet image payloads for text-only diffusion pipelines."""
+    if not raw_images:
+        return None
+    images = []
+    for image in raw_images:
+        if isinstance(image, dict) and "bytes" in image:
+            images.append(Image.open(BytesIO(image["bytes"])).convert("RGB"))
+        elif isinstance(image, Image.Image):
+            images.append(image)
+    return images or None
+
+
 __all__ = [
     "ImageGenerationRequest",
     "build_scheduler",
+    "decode_images",
     "forward",
     "forward_and_sample_previous_step",
     "get_sigmas",

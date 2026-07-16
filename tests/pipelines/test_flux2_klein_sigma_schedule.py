@@ -35,6 +35,7 @@ from verl_omni.pipelines.flux2_klein_flow_grpo.diffusers_training_adapter import
     compute_empirical_mu,
     resolve_flux2_klein_sigmas,
 )
+from verl_omni.pipelines.flux2_klein_flow_grpo.vllm_omni_rollout_adapter import _build_request_scheduler
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 
 # Matches the published black-forest-labs/FLUX.2-klein-base-4B scheduler config.
@@ -189,3 +190,26 @@ def test_schedule_guard_rejects_off_grid_timesteps():
 def test_schedule_guard_skips_scheduler_without_grid():
     # Scheduler doubles used elsewhere lack a ``timesteps`` grid; skip, don't crash.
     Flux2KleinFlowGRPO._assert_rollout_schedule_matches(object(), torch.ones(1, 1))
+
+
+def test_request_schedulers_do_not_share_step_index():
+    base = FlowMatchSDEDiscreteScheduler(**_KLEIN_SCHEDULER_CONFIG)
+    sigmas = build_flux2_klein_sigmas(10)
+    mu = compute_empirical_mu(1024, 10)
+    first = _build_request_scheduler(base, 10, "cpu", sigmas, mu)
+    second = _build_request_scheduler(base, 10, "cpu", sigmas, mu)
+
+    sample = torch.zeros(1, 2, 3, dtype=torch.float32)
+    model_output = torch.ones_like(sample)
+    first.step(
+        model_output,
+        first.timesteps[0],
+        sample,
+        noise_level=0.0,
+        sde_type="dance_sde",
+        return_logprobs=False,
+    )
+
+    assert first.step_index == 1
+    assert second.step_index is None
+    assert base.step_index is None

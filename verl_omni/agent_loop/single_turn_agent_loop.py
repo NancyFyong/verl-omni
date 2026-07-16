@@ -20,6 +20,7 @@ from verl.experimental.agent_loop.agent_loop import AgentLoopBase, register
 from verl.utils.profiler import simple_timer
 
 from verl_omni.agent_loop.diffusion_agent_loop import DiffusionAgentLoopOutput
+from verl_omni.pipelines.utils import decode_images
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -44,9 +45,13 @@ class DiffusionSingleTurnAgentLoop(AgentLoopBase):
         raw_prompt = kwargs["raw_prompt"]
         raw_negative_prompt = kwargs.get("raw_negative_prompt")
 
-        # 1. extract images and videos from messages
+        # 1. Extract images from VLM messages, or directly from the dataset for
+        # text-only image-conditioned pipelines such as FLUX.2-Klein.
         multi_modal_data = await self.process_vision_info(raw_prompt)
         images = multi_modal_data.get("images")
+        if not images:
+            raw_images = kwargs.get("images")
+            images = decode_images(raw_images) if raw_images else None
         videos = multi_modal_data.get("videos")
 
         # 2. apply chat template and tokenize
