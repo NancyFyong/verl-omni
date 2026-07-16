@@ -31,8 +31,16 @@ external_lib: null
 # whether to enable gradient checkpointing.
 enable_gradient_checkpointing: True
 
-# Diffusers attention backend. Supported: "native"
-attn_backend: native
+# Optional model config path. If null, backends use <path>/<transformer_subfolder>.
+config_path: null
+
+# Subfolder containing the diffusion transformer weights/config.
+transformer_subfolder: transformer
+
+# Diffusers attention backend.
+# Supported: "native", "_native_npu", "_flash_3_varlen_hub"
+# GPU default; NPU recipes override with _native_npu. Falls back to native when FA3 deps are missing.
+attn_backend: _flash_3_varlen_hub
 
 # Set to positive value to enable LoRA (e.g., 32)
 lora_rank: 0
@@ -61,6 +69,9 @@ policy_state_adapters: ["default"]
 # Convert LoRA parameters to a target dtype for numerical stability (e.g., "fp32", "bf16").
 # Default null means no conversion.
 lora_dtype: null
+
+# FSDP layer name prefixes for LoRA parameter layered summon.
+fsdp_layer_prefixes: ["transformer_blocks."]
 
 # MTP
 mtp: 
@@ -94,6 +105,9 @@ pipeline:
 
   # Distilled guidance scale
   guidance_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.guidance_scale,null}
+
+  # Wan2.2 video number of frames
+  num_frames: ${oc.select:actor_rollout_ref.rollout.pipeline.num_frames,1}
 
 # Rollout Algorithm configuration
 algo:

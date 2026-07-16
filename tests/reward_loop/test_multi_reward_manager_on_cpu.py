@@ -14,12 +14,12 @@
 """CPU tests for MultiVisualRewardManager."""
 
 import os
+from unittest.mock import MagicMock
 
 import pytest
 import torch
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
-from transformers import AutoTokenizer
 from verl import DataProto
 
 from verl_omni.reward_loop.reward_manager.multi import MultiVisualRewardManager, _filter_kwargs
@@ -82,7 +82,7 @@ def _make_single_data() -> DataProto:
 
 def _build_manager(reward_functions: dict) -> MultiVisualRewardManager:
     config = _make_config(reward_functions)
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    tokenizer = MagicMock()
     return MultiVisualRewardManager(config, tokenizer, compute_score=None)
 
 
@@ -135,6 +135,7 @@ class TestMultiVisualRewardManagerRunSingle:
         assert result["reward_extra_info"]["reward/fixed"] == pytest.approx(0.5)
         assert result["reward_extra_info"]["reward/dict_result"] == pytest.approx(1.0)
         assert result["reward_extra_info"]["reward/dict_result/detail"] == "perfect"
+        assert "reward/dict_result/score" not in result["reward_extra_info"]
         assert result["reward_extra_info"]["reward/combined"] == pytest.approx(2.0)
 
     def test_exception_contributes_zero(self):
@@ -163,6 +164,30 @@ class TestMultiVisualRewardManagerRunSingle:
         result = manager.loop.run_until_complete(manager.run_single(data))
 
         assert result["reward_score"] == pytest.approx(0.8)
+
+    def test_jpeg_reward_via_file_path(self):
+        """JPEG reward loaded via file path must not fail on relative imports."""
+        reward_fns = {
+            "jpeg": {
+                "path": "verl_omni/utils/reward_score/jpeg_compressibility.py",
+                "name": "compute_score",
+                "weight": 1.0,
+            },
+        }
+        manager = _build_manager(reward_fns)
+        data = DataProto.from_dict(
+            tensors={"responses": torch.randn(1, 3, 64, 64)},
+            non_tensors={
+                "data_source": ["jpeg_compressibility"],
+                "reward_model": [{"ground_truth": "hello"}],
+                "extra_info": [{}],
+            },
+        )
+
+        result = manager.loop.run_until_complete(manager.run_single(data))
+
+        assert result["reward_score"] != pytest.approx(0.0)
+        assert "reward/jpeg" in result["reward_extra_info"]
 
 
 class TestMultiVisualRewardManagerInit:

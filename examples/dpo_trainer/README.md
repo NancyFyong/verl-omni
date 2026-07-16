@@ -1,12 +1,97 @@
-# SD3.5 Offline DPO
+# DPO Training
 
-This example trains Stable Diffusion 3.5 with offline DPO. The data preparation
+This directory contains examples for **direct-preference** diffusion training
+(DPO and related losses). Two workflows are supported:
+
+1. **Qwen-Image online DPO** — rollout and reward run each training step;
+   preference pairs are formed from live samples.
+2. **SD3.5 offline DPO** — win/lose pairs and precomputed tensors are prepared
+   ahead of time; training reads them from parquet without rollout or reward
+   workers.
+
+For implementation details on adding or extending direct-preference algorithms,
+see
+[`docs/contributing/integrating_a_new_direct_preference_algorithm_for_diffusion_model.md`](../../docs/contributing/integrating_a_new_direct_preference_algorithm_for_diffusion_model.md).
+
+## Qwen-Image Online DPO
+
+Online DPO does not consume pre-ranked win/lose rows from parquet. At each
+training step it:
+
+- samples multiple candidate images per prompt with vLLM-Omni rollout;
+- scores images through the configured reward function;
+- forms one adjacent `[chosen, rejected]` pair per prompt from the highest-
+  and lowest-scoring candidates;
+- runs the diffusion DPO loss on those pairs.
+
+### Dataset
+
+Use the same OCR prompt parquet as FlowGRPO Qwen-Image training. Prepare the
+data following [Prepare the dataset](../flowgrpo_trainer/README.md#prepare-the-dataset)
+in `examples/flowgrpo_trainer/README.md` (raw OCR from
+[flow_grpo/dataset/ocr](https://github.com/yifan123/flow_grpo/tree/main/dataset/ocr),
+then `examples/flowgrpo_trainer/data_process/qwenimage_ocr.py` to write
+`$WORKSPACE/data/ocr/qwen_image/train.parquet` and `test.parquet`).
+
+### Run
+
+#### NVIDIA GPU
+
+```bash
+bash examples/dpo_trainer/qwen_image/run_qwen_image_online_dpo_lora.sh \
+  data.train_files=$WORKSPACE/data/ocr/qwen_image/train.parquet \
+  data.val_files=$WORKSPACE/data/ocr/qwen_image/test.parquet
+```
+
+#### NPU
+
+For Huawei Ascend NPUs, use the NPU-optimized script:
+
+```bash
+bash examples/dpo_trainer/qwen_image/run_qwen_image_online_dpo_lora_npu.sh \
+  data.train_files=$WORKSPACE/data/ocr/qwen_image/train.parquet \
+  data.val_files=$WORKSPACE/data/ocr/qwen_image/test.parquet
+```
+
+This script uses a 16-NPU global distribution strategy with:
+- `actor_rollout_ref.model.attn_backend='_native_npu'`
+- `actor_rollout_ref.rollout.tensor_model_parallel_size=2`
+- `reward.reward_model.rollout.tensor_model_parallel_size=4`
+- `trainer.n_gpus_per_node=16`
+
+### Notes
+
+- Pairing is fixed to top-vs-bottom reward per prompt. Set
+  `actor_rollout_ref.rollout.n` to at least `2` so each prompt has enough
+  candidates. Recommend to set it to `8` or `16` for better performance.
+- The example sets `true_cfg_scale=1.0`, so CFG is no applied.
+
+
+### Performance
+
+> All experiments were conducted on *NVIDIA H800* GPUs; NPU experiments use *16× Ascend NPUs*. The OCR reward was used for all experiments.
+
+| Script | Model | Algorithm | Hybrid Engine | # Cards | Reward Fn | # Cards for Actor | # Cards for Rollout | # Cards for Async Reward | Batch Size | `rollout.n` | lr   | # Val Samples | Training Samples per Step | `ppo_micro_batch_size_per_gpu` | Throughput (Samples / Card / Seconds) | Time per Step (Seconds) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `qwen_image/run_qwen_image_online_dpo_lora.sh` | Qwen-Image | Online DPO | True | 4 (NVIDIA) | qwenvl-ocr-vllm | 4 | 4 | 0 (sync) | 32 | 16 | 3e-4 | 1k (full set) | 32×2=64 | 8 | 0.040 | 408 |
+| `qwen_image/run_qwen_image_online_dpo_lora_npu.sh` | Qwen-Image | Online DPO | True | 16 (NPU) | qwenvl-ocr-vllm | 16 | 16 | 0 (sync) | 32 | 16 | 3e-4 | 1k (full set) | 32×2=64 | 4 | 0.003 | 1188 |
+
+- Colocated actor, vLLM-Omni rollout, and sync OCR reward on 4 NVIDIA GPUs (or 16 NPUs for NPU script); `rollout.n=16` samples candidates, then top/bottom pairing keeps 64 actor-update images per step.
+- Validation uses the full OCR test parquet.
+- Unlike policy-gradient trainers (e.g. FlowGRPO), where actor updates use `train_batch_size × rollout.n` images per step, online DPO keeps one `[chosen, rejected]` pair per prompt (`train_batch_size × 2`), so throughput numbers are not directly comparable—use the **Training Samples per Step** column.
+
+> **Note:** Reward curves may differ between runs because online DPO depends on stochastic diffusion rollouts and the example scripts do not fix the data seed.
+
+
+## SD3.5 Offline DPO
+
+This workflow trains Stable Diffusion 3.5 with offline DPO. The data preparation
 step first generates several candidate images per prompt with a frozen reference
 pipeline, scores the candidates, and writes one pre-ranked win/lose pair per
 prompt. Training consumes those pairs directly and does not run online rollout,
 training-time reward scoring, or online pair selection.
 
-## Pair Data
+### Pair data
 
 The resulting parquet rows contain:
 
@@ -73,28 +158,31 @@ This writes:
 - `data/offline_dpo/test.parquet`
 - generated images under the requested `--image_dir`
 
-## Training
+### Training
 
-Train on the offline triples with:
+Train on the offline pairs with:
 
 ```bash
-bash examples/dpo_trainer/run_sd35_medium_offline_dpo_lora.sh \
+bash examples/dpo_trainer/sd35/run_sd35_medium_offline_dpo_lora.sh \
   data.train_files=data/offline_dpo/train.parquet \
   data.val_files=data/offline_dpo/test.parquet
 ```
 
-During training, `run_sd35_medium_offline_dpo_lora.sh` sets `algorithm.sample_source=offline`
-and loads `OfflineDPODataset` via `data.custom_cls`. The dataset expands each row into adjacent
-`[win, lose]` samples with a shared `uid`. Collate stacks the precomputed
-`image_latents` plus SD3 prompt embeddings from parquet before calling the DPO
-loss, so training does not load the SD3 VAE or text encoders during
-actor updates. Offline DPO also disables rollout and reward workers, so
-validation generation is disabled by default.
+During training, `run_sd35_medium_offline_dpo_lora.sh` sets
+`algorithm.sample_source=offline` and loads `OfflineDPODataset` via
+`data.custom_cls`. The dataset expands each row into adjacent `[win, lose]`
+samples with a shared `uid`. Collate stacks the precomputed latents (from
+`img_win_latents` / `img_lose_latents` in parquet, exposed as `latents_clean` in
+the actor batch) plus SD3 prompt embeddings before calling the DPO loss, so
+training does not load the SD3 VAE or text encoders during actor updates. Offline
+DPO also disables rollout and reward workers, so validation generation is
+disabled by default.
 
-## Reward Template
+### Reward template
 
-`prepare_offline_dpo.py` can call any reward function with the standard
-VeRL-Omni custom reward signature. The example command above uses
+`prepare_offline_dpo.py` can call any reward function with the standard VeRL-Omni
+custom reward signature. The example commands above use
 `verl_omni/utils/reward_score/unified_reward.py` and can either launch a local
 OpenAI-compatible vLLM reward server or connect to an existing one through
 `--reward_router_address`.
+

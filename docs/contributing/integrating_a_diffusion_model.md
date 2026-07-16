@@ -1,14 +1,22 @@
 # How to Integrate a New Diffusion Model for FlowGRPO Training
 
-Last updated: 05/21/2026.
+Last updated: 06/02/2026.
 
 This guide walks you through everything required to integrate a new diffusion
 model into VeRL-Omni so it can be trained end-to-end with the **FlowGRPO**
 algorithm. The contracts described below (registry hooks, adapter
 classmethods, scheduler choice, custom-output field names) are specific to
-the FlowGRPO trainer; other RL algorithms may impose different requirements
-(see [`integrating_a_new_algorithm_for_diffusion_model.md`](integrating_a_new_algorithm_for_diffusion_model.md) for
-how algorithm dispatch is layered on top of model dispatch).
+the FlowGRPO trainer; other RL algorithms may impose different requirements.
+Use
+[`integrating_a_new_policy_gradient_algorithm_for_diffusion_model.md`](integrating_a_new_policy_gradient_algorithm_for_diffusion_model.md)
+for PPO-like policy-gradient algorithms, and
+[`integrating_a_new_direct_preference_algorithm_for_diffusion_model.md`](integrating_a_new_direct_preference_algorithm_for_diffusion_model.md)
+for direct-preference algorithms.
+
+**If diffusers cannot load your model**, use
+[`integrating_a_non_diffusers_model.md`](integrating_a_non_diffusers_model.md)
+instead. That guide covers the `NonDiffusersModelBase` path using BAGEL-7B-MoT as the
+worked example.
 
 We use the **Qwen-Image** integration
 ([`verl_omni/pipelines/qwen_image_flow_grpo/`](../../verl_omni/pipelines/qwen_image_flow_grpo/__init__.py))
@@ -20,7 +28,8 @@ code is the canonical reference.
 ## TL;DR
 
 A new model needs **three files in one new package** plus **two registry
-hooks**:
+hooks**. The same adapters work with both the default diffusers + FSDP2
+backend and the optional [VeOmni backend](#53-use-the-veomni-backend-optional) — backend selection is purely a configuration concern.
 
 ```
 verl_omni/pipelines/<model>_flow_grpo/
@@ -49,6 +58,8 @@ algorithm** (FlowGRPO) but use **different runtimes**:
 | **Rollout** (sampling trajectories) | vllm-omni | `VllmOmniPipelineBase` subclass — runs the SDE loop and returns latents, log-probs, and prompt embeddings. |
 | **Training** (per-step forward + loss) | FSDP + diffusers | `DiffusionModelBase` subclass — re-runs one denoising step per micro-batch slot to compute fresh log-probs for the policy gradient. |
 
+The trainer runtime can also be VeOmni's FSDP2-based DiT trainer; see [§ 5.3](#53-use-the-veomni-backend-optional). The training-adapter contract (`prepare_model_inputs` / `forward_and_sample_previous_step`) is identical on both backends.
+
 ```text
   ┌─────────────────────────┐                ┌──────────────────────────┐
   │ Rollout worker          │   trajectory   │ Trainer worker           │
@@ -67,8 +78,8 @@ The two adapters must agree on:
   `"QwenImagePipeline"`.
 - **Algorithm string** (the `algorithm=` keyword on `@register(...)`).
   For this guide the value is always `"flow_grpo"`. When integrating a
-  different RL algorithm use the appropriate algorithm name — see
-  [`integrating_a_new_algorithm_for_diffusion_model.md`](integrating_a_new_algorithm_for_diffusion_model.md).
+  different RL algorithm use the appropriate algorithm name and the matching
+  algorithm-family guide.
 - **Prompt-encoding format** of the embeddings shipped through the agent
   loop. The rollout always returns padded `(B, L, D)` + `(B, L)` mask;
   the training adapter is free to convert to whatever the transformer
@@ -190,7 +201,15 @@ class MyModel(DiffusionModelBase):
                                          scheduler_inputs, step): ...
 ```
 
-### 3.1 `build_scheduler` and `set_timesteps`
+### 3.1 (Optional) `configure_trainable_params`
+
+Override this hook to selectively set ``requires_grad`` for non-LoRA
+full-weight training.  The engine calls it after module build, before
+FSDP wrapping, when ``lora_rank=0``.  When LoRA is enabled this hook
+is **not** called — ``requires_grad`` is managed by the LoRA adapter
+instead.  The default is a no-op (all params trainable).
+
+### 3.2 `build_scheduler` and `set_timesteps`
 
 Reuse
 [`FlowMatchSDEDiscreteScheduler`](../../verl_omni/pipelines/schedulers/flow_match_sde.py)
@@ -201,7 +220,7 @@ Compute `image_seq_len` and `mu` exactly as the upstream diffusers
 pipeline does. If they drift, the training-time noise schedule will not
 match deployment.
 
-### 3.2 `prepare_model_inputs`
+### 3.3 `prepare_model_inputs`
 
 This method receives the **full** batched tensors for the entire
 denoising trajectory (`latents` of shape `(B, T, ...)`, `timesteps` of
@@ -222,7 +241,7 @@ inputs. The typical steps are:
 The dict keys must match the kwargs of the diffusers transformer
 class verbatim — the FSDP engine calls `module(**model_inputs)`.
 
-### 3.3 `forward_and_sample_previous_step`
+### 3.4 `forward_and_sample_previous_step`
 
 Call the transformer once for the positive prompt; if CFG is active,
 call it again for the negative prompt and combine them. Always finish with
@@ -318,7 +337,7 @@ RL exploration starts from a known-good operating point.
 
 Ship a runnable example so users can launch training without trial and
 error. Use
-[`examples/flowgrpo_trainer/run_qwen_image_ocr_lora.sh`](../../examples/flowgrpo_trainer/run_qwen_image_ocr_lora.sh)
+[`examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_lora.sh`](../../examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_lora.sh)
 and
 [`examples/flowgrpo_trainer/data_process/qwenimage_ocr.py`](../../examples/flowgrpo_trainer/data_process/qwenimage_ocr.py)
 as templates.
@@ -327,6 +346,42 @@ The data preprocessor's tokenisation **must match the upstream
 `_encode_prompt` exactly** — same chat template, same special tokens,
 same `enable_thinking` flag, etc. Mismatches here cause silent reward
 collapse.
+
+(53-use-the-veomni-backend-optional)=
+### 5.3 Use the VeOmni Backend
+
+Backend selection is **orthogonal** to model integration: the adapters you wrote in Steps 3–4 work unchanged regardless of whether the actor runs on the default diffusers + FSDP2 engine or on [VeOmni](https://github.com/ByteDance-Seed/VeOmni). Switching is a configuration concern handled by a few Hydra overrides at launch time.
+
+#### What VeOmni reuses from your model adapter
+
+- `DiffusionModelBase` subclass (Step 3) — used verbatim. The VeOmni engine calls the same `prepare_model_inputs` / `forward_and_sample_previous_step` contract.
+- `VllmOmniPipelineBase` subclass (Step 4) — used verbatim. Rollout always runs in vllm-omni, independent of the actor backend.
+- `FlowMatchSDEDiscreteScheduler` (Step 3.1) — used verbatim.
+
+#### What VeOmni requires that diffusers does not
+
+1. **Upstream support in VeOmni.** Just as diffusers must provide your `<Name>Transformer2DModel`, VeOmni must be able to load your model via its `DiTTrainer` path. If VeOmni does not yet support the architecture, upstream it there first (the diffusers prerequisite from Step 1 still applies for rollout — both upstreams are required).
+2. **`config_path` / `transformer_subfolder`.** The VeOmni engine loads the transformer from `<local_path>/<transformer_subfolder>` and the config from `config_path` (falling back to the weights path). These fields are already on `DiffusionModelConfig` and are shared with the diffusers backend, so no new model-specific fields are needed.
+
+#### Launching with the VeOmni backend
+
+`diffusion/model_engine=veomni_diffusion` switches the entire actor / reference Hydra schema; the other actor-engine fields then live under `actor_rollout_ref.actor.veomni_config.*` and `actor_rollout_ref.ref.veomni_config.*`:
+
+```bash
+python3 -m verl_omni.trainer.main_diffusion \
+    diffusion/model_engine=veomni_diffusion \
+    actor_rollout_ref.actor.strategy=veomni \
+    actor_rollout_ref.actor.veomni_config.strategy=veomni \
+    actor_rollout_ref.ref.veomni_config.strategy=veomni \
+    ...  # everything else identical to your diffusers/FSDP2 recipe
+```
+
+See [`examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_veomni.sh`](../../examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_veomni.sh) for a complete VeOmni recipe that mirrors [`run_qwen_image_ocr.sh`](../../examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr.sh) line-for-line — the diff is only the engine-selection fields. Install instructions for VeOmni alongside vLLM 0.20.2 are in [`docs/start/install.md`](../start/install.md#optional-engine-backends).
+
+
+#### Mixing override schemas — don't
+
+`diffusion/model_engine=veomni_diffusion` selects the Hydra schema as a whole. Do **not** mix `actor.fsdp_config.*` and `actor.veomni_config.*` overrides in the same run — the fields for the other engine will be rejected as unknown keys at config-resolution time.
 
 ---
 

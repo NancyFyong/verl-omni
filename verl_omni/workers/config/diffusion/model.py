@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -29,21 +31,27 @@ from .rollout import DiffusionPipelineConfig, DiffusionRolloutAlgoConfig
 
 __all__ = ["DiffusionModelConfig"]
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class DiffusionModelConfig(BaseConfig):
     _mutable_fields = {
         "model_type",
+        "algorithm",
         "tokenizer_path",
         "tokenizer",
         "processor",
         "local_path",
         "local_tokenizer_path",
         "architecture",
+        "transformer_config",
     }
 
     path: str = MISSING
     architecture: Optional[str] = None
+    # diffusers ``transformer/config.json``; used by DiffusionFlopsCounter for MFU.
+    transformer_config: Optional[dict[str, Any]] = None
     algorithm: str = MISSING
     local_path: Optional[str] = None
     tokenizer_path: Optional[str] = None
@@ -67,7 +75,7 @@ class DiffusionModelConfig(BaseConfig):
     external_lib: Optional[str] = None
 
     enable_gradient_checkpointing: bool = True
-    attn_backend: str = "native"
+    attn_backend: str = "_flash_3_varlen_hub"
 
     lora_rank: int = 0
     lora_alpha: int = 64
@@ -95,12 +103,27 @@ class DiffusionModelConfig(BaseConfig):
 
     algo: Optional[DiffusionRolloutAlgoConfig] = field(default_factory=DiffusionRolloutAlgoConfig)
 
+    fsdp_layer_prefixes: list[str] = field(default_factory=lambda: ["transformer_blocks."])
+
+    # Optional model config path. If unset, the backend uses
+    # ``<local_path>/<transformer_subfolder>``.
+    config_path: Optional[str] = None
+
+    # Subfolder containing the diffusion transformer weights/config.
+    transformer_subfolder: str = "transformer"
+
     def __post_init__(self):
         import_external_libs(self.external_lib)
 
-        valid_backends = {"native", "_native_npu"}
+        valid_backends = {"native", "_native_npu", "_flash_3_varlen_hub"}
         if self.attn_backend not in valid_backends:
             raise ValueError(f"Invalid attn_backend: {self.attn_backend}. Must be one of {sorted(valid_backends)}")
+
+        if self.attn_backend == "_flash_3_varlen_hub":
+            try:
+                import kernels  # noqa: F401
+            except ImportError as e:
+                raise ImportError("attn_backend '_flash_3_varlen_hub' requires `kernels` package. ") from e
 
         self.local_path = resolve_model_local_dir(self.path, use_shm=self.use_shm)
         if self.tokenizer_path is None:
@@ -108,11 +131,24 @@ class DiffusionModelConfig(BaseConfig):
             self.tokenizer_path = tokenizer_path if os.path.exists(tokenizer_path) else self.local_path
 
         if self.architecture is None:
-            import json
-
             model_index_path = os.path.join(self.local_path, "model_index.json")
             with open(model_index_path) as f:
                 self.architecture = json.load(f)["_class_name"]
+
+        if self.transformer_config is None:
+            config_path = os.path.join(self.local_path, "transformer", "config.json")
+            if os.path.isfile(config_path):
+                try:
+                    with open(config_path) as f:
+                        self.transformer_config = json.load(f)
+                except (OSError, json.JSONDecodeError) as exc:
+                    logger.warning("Diffusion MFU disabled: failed to read %s: %s", config_path, exc)
+            else:
+                logger.warning(
+                    "Diffusion MFU disabled: transformer config not found at %s. "
+                    "Expected the diffusers pipeline layout `<local_path>/transformer/config.json`.",
+                    config_path,
+                )
 
         # construct tokenizer
         if self.load_tokenizer:
@@ -120,10 +156,9 @@ class DiffusionModelConfig(BaseConfig):
             self.tokenizer = hf_tokenizer(
                 self.local_tokenizer_path, trust_remote_code=self.trust_remote_code, use_fast=True
             )
-            if os.path.exists(os.path.join(self.local_path, "processor")):
-                self.processor = hf_processor(
-                    os.path.join(self.local_path, "processor"), trust_remote_code=self.trust_remote_code
-                )
+            processor_path = os.path.join(self.local_path, "processor")
+            if os.path.exists(processor_path):
+                self.processor = hf_processor(processor_path, trust_remote_code=self.trust_remote_code)
             else:
                 self.processor = None
 

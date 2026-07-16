@@ -54,14 +54,10 @@ If possible, please add CI test(s) for your new feature:
 ## Building the Docs
 
 ```bash
-# Ensure verl-omni is on your PYTHONPATH, e.g.:
 pip install -e .
+pip install -r docs/requirements-docs.txt
 
-# Install documentation dependencies
 cd docs
-pip install -r requirements-docs.txt
-
-# Generate HTML docs
 make clean
 make html
 
@@ -71,6 +67,8 @@ python -m http.server -d _build/html/
 
 Open your browser at http://localhost:8000 to explore the docs.
 
+If autodoc fails on missing `vllm` / `vllm_omni` imports, install the runtime stack from [docs/start/install.md](docs/start/install.md) first.
+
 ## Model & Algorithm Integrations
 
 To integrate a new diffusion model for an existing PPO-like algorithm (new
@@ -78,10 +76,15 @@ To integrate a new diffusion model for an existing PPO-like algorithm (new
 
 - [How to Integrate a New Diffusion Model for FlowGRPO Training](docs/contributing/integrating_a_diffusion_model.md)
 
-To integrate a new PPO-like RL algorithm (new advantage estimator, loss, and
-SDE step scheduler), follow:
+To integrate a new policy-gradient diffusion algorithm (new advantage
+estimator, loss, and SDE step scheduler), follow:
 
-- [How to Integrate a New PPO-like Algorithm for Diffusion Model](docs/contributing/integrating_a_new_algorithm_for_diffusion_model.md)
+- [How to Integrate a New Policy-Gradient Algorithm for Diffusion Model](docs/contributing/integrating_a_new_policy_gradient_algorithm_for_diffusion_model.md)
+
+To integrate a new direct-preference diffusion algorithm (offline DPO-style
+pairs or online DiffusionNFT-style forward-process training), follow:
+
+- [How to Integrate a New Direct-Preference Algorithm for Diffusion Model](docs/contributing/integrating_a_new_direct_preference_algorithm_for_diffusion_model.md)
 
 ## Pull Requests & Code Reviews
 

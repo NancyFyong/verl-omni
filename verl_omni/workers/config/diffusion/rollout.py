@@ -65,6 +65,9 @@ class DiffusionPipelineConfig(BaseConfig):
     max_sequence_length: int = 512
     guidance_scale: Optional[float] = None
 
+    # Wan2.2 video generation: number of frames (81 = ~3s at 24fps)
+    num_frames: int = 1
+
 
 @dataclass
 class DiffusionSamplingConfig(BaseConfig):
@@ -95,6 +98,10 @@ class DiffusionRolloutConfig(BaseConfig):
     gpu_memory_utilization: float = 0.5
     enforce_eager: bool = False
     cudagraph_capture_sizes: Optional[list] = None
+
+    # vLLM-omni diffusion attention backend.
+    # Allow custom select of attention backend for rollout.
+    rollout_attn_backend: str = "FLASH_ATTN"
     free_cache_engine: bool = True
     data_parallel_size: int = 1
     expert_parallel_size: int = 1
@@ -108,6 +115,10 @@ class DiffusionRolloutConfig(BaseConfig):
 
     max_model_len: Optional[int] = None
     max_num_seqs: int = 1024
+
+    # When True, the vLLM-Omni engine runs in step-execution mode and selects
+    # the *_stepwise variant of the pipeline (e.g. flow_grpo_stepwise).
+    step_execution: bool = False
 
     # note that the logprob computation should belong to the actor
     log_prob_micro_batch_size_per_gpu: Optional[int] = None
@@ -174,3 +185,17 @@ class DiffusionRolloutConfig(BaseConfig):
                 raise NotImplementedError(
                     f"Current rollout {self.name=} not implemented pipeline_model_parallel_size > 1 yet."
                 )
+
+    def resolve_algorithm(self, model_config) -> None:
+        """Update model_config.algorithm to the _stepwise variant when step_execution is enabled.
+
+        When ``step_execution=True`` and a ``<algorithm>_stepwise`` pipeline class is registered
+        for the given architecture, model_config.algorithm is updated in-place so that the engine
+        uses the experimental prepare_encode / step_scheduler / post_decode overrides.
+        """
+        if self.step_execution:
+            from verl_omni.pipelines.model_base import VllmOmniPipelineBase
+
+            stepwise = f"{model_config.algorithm}_stepwise"
+            if VllmOmniPipelineBase.get_class(model_config.architecture, stepwise):
+                model_config.algorithm = stepwise

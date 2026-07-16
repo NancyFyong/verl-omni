@@ -44,8 +44,12 @@ This produces:
 Launch the example from the repository root:
 
 ```bash
-bash examples/flowgrpo_trainer/run_qwen_image_ocr_lora.sh
+bash examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_lora.sh
 ```
+
+GPU training defaults to matched FA3 in config (`attn_backend: _flash_3_varlen_hub`; rollout
+`DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN` is set by `main_diffusion` when FA3 is available).
+Training falls back to native/SDPA if FA3 deps are unavailable.
 
 Optional KL loss tuning:
 
@@ -86,24 +90,60 @@ See the [Metrics Documentation](../../docs/start/metrics.md) for a full descript
 
 ## Variants
 
-For reward models that are expensive to evaluate (e.g., a VLM judge), the reward model can be allocated its own dedicated GPU resource pool and run asynchronously alongside the policy. This avoids blocking policy training on reward computation.
+All example scripts in this directory:
+
+### Qwen-Image
+
+| Variant | Script | GPUs | Notes |
+|---------|--------|------|-------|
+| LoRA (baseline) | `qwen_image/run_qwen_image_ocr_lora.sh` | 4×GPU | Standard LoRA FlowGRPO + OCR reward |
+| LoRA + async reward | `qwen_image/run_qwen_image_ocr_lora_async_reward.sh` | 5×GPU | Dedicated GPU pool for reward model |
+| LoRA + SP=2 | `qwen_image/run_qwen_image_ocr_lora_sp2.sh` | 4×GPU | Ulysses sequence parallelism |
+| LoRA + FA3 | `qwen_image/run_qwen_image_ocr_lora_fsdp2_fa3.sh` | 4×GPU | FSDP2 with FlashAttention 3 |
+| LoRA + rollout corr | `qwen_image/run_qwen_image_ocr_lora_rollout_corr.sh` | 4×GPU | Bypass old-log-prob recompute |
+| LoRA + multi-node | `qwen_image/run_qwen_image_ocr_lora_multi_node.sh` | 2×4 GPU | Horizontal scaling across nodes |
+| LoRA + NPU | `qwen_image/run_qwen_image_ocr_lora_npu.sh` | 8×NPU | Ascend NPU LoRA training |
+| Full model | `qwen_image/run_qwen_image_ocr.sh` | 4×H200 | Non-CFG full-weight training |
+| Full + FSDP2 64-card | `qwen_image/run_qwen_image_ocr_fsdp2_64cards.sh` | 64×GPU | Large-scale FSDP2 |
+| Full + VeOmni | `qwen_image/run_qwen_image_ocr_veomni.sh` | 64×H100 | VeOmni engine backend |
+| Full + VeOmni 64-card | `qwen_image/run_qwen_image_ocr_veomni_64cards.sh` | 64×GPU | VeOmni at scale |
+| Full + H200 MFU opt | `qwen_image/run_qwen_image_ocr_h200_mfu_optimized.sh` | H200 | MFU-optimized config |
+| Full + NPU | `qwen_image/run_qwen_image_ocr_npu.sh` | 16×NPU | Ascend NPU full model |
+| HTTP reward server | `qwen_image/run_qwen_image_ocr_reward_server.sh` | 4×GPU | External HTTP OCR reward service |
+| Multi-reward | `qwen_image/run_qwen_image_ocr_multi_reward.sh` | 4×GPU | Multiple reward functions combined |
+
+### Stable Diffusion 3.5 Medium
+
+| Variant | Script | GPUs | Notes |
+|---------|--------|------|-------|
+| LoRA | `sd35/run_sd35_medium_ocr_lora.sh` | 3×GPU | 2 actor+rollout, 1 reward pool |
+
+### BAGEL
+
+| Variant | Script | GPUs | Notes |
+|---------|--------|------|-------|
+| LoRA (OCR) | `bagel/run_bagel_ocr_lora.sh` | 4×GPU | OCR reward (Qwen3-VL) |
+| LoRA (PickScore) | `bagel/run_bagel_pickscore_lora.sh` | 4×GPU | CLIP-based image-text alignment |
+
+### Engine backends
+
+The diffusion trainer defaults to **FSDP2**. To use [VeOmni](https://github.com/ByteDance-Seed/VeOmni) instead, follow the [VeOmni install instructions](../../docs/start/install.md#optional-engine-backends), then run the VeOmni counterpart:
 
 ```bash
-bash examples/flowgrpo_trainer/run_qwen_image_ocr_lora_async_reward.sh
+bash examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_veomni.sh
 ```
 
-Ulysses sequence parallelism shards the sequence dimension across GPUs to reduce per-GPU memory. A ready-to-use 4-GPU SP=2 LoRA example is provided:
+`run_qwen_image_ocr_veomni.sh` mirrors `run_qwen_image_ocr.sh` and differs only in engine-selection overrides:
 
-```bash
-bash examples/flowgrpo_trainer/run_qwen_image_ocr_lora_sp2.sh
-```
+| Override | FSDP2 (default) | VeOmni |
+|---|---|---|
+| `diffusion/model_engine=` | _(unset; uses `dp_diffusion`)_ | `veomni_diffusion` |
+| `actor_rollout_ref.actor.strategy=` | `fsdp2` | `veomni` |
+| Actor engine config block | `actor.fsdp_config.*` | `actor.veomni_config.*` |
+| Sequence-parallel field | `fsdp_config.ulysses_sequence_parallel_size` | `veomni_config.ulysses_parallel_size` |
+| Ref engine config block | `ref.fsdp_config.*` | `ref.veomni_config.*` |
 
-We have provided a script to enable non-cfg full-weight Qwen-Image OCR training. The example is runnable on 4 NVIDIA H200 GPUs; enabling CFG requires more GPU resources.
-
-```bash
-bash examples/flowgrpo_trainer/run_qwen_image_ocr.sh
-```
-
+Do not mix `fsdp_config` and `veomni_config` overrides — `diffusion/model_engine=...` selects the schema, and overrides for the other engine are rejected.
 
 ## Performance
 
@@ -113,17 +153,17 @@ The experiment settings and throughputs are shown in the table below.
 
 | Script | Model | Algorithm | Hybrid Engine | # Cards | Reward Fn | # GPUs for Actor | # GPUs for Rollout | # GPUs for Async Reward | Batch Size | `rollout.n` | lr   | # Val Samples | Training Samples per Step | `ppo_micro_batch_size_per_gpu` | Throughput (Samples / GPU / Seconds) | Time per Step (Seconds) |
 | --- | --- | --- | --- | --- | --- | --- | --- |-------------------------| --- | --- |------| --- | --- | --- |------------------------------| --------------------------------|
-| `run_qwen_image_ocr_lora.sh` | Qwen-Image | Flow-GRPO | True | 4 | qwenvl-ocr-vllm | 4 | 4 | 0 (sync)                | 32 | 16 | 3e-4 | 1k (full set) | 32×16=512 | 16 | 0.305                        | 420 |
-| `run_qwen_image_ocr_lora_async_reward.sh` | Qwen-Image | Flow-GRPO | True | 5 | qwenvl-ocr-vllm | 4 | 4 | 1                       | 32 | 16 | 3e-4 | 1k (full set) | 32×16=512 | 16 | 0.280                        | 360 |
+| `qwen_image/run_qwen_image_ocr_lora.sh` | Qwen-Image | Flow-GRPO | True | 4 | qwenvl-ocr-vllm | 4 | 4 | 0 (sync)                | 32 | 16 | 3e-4 | 1k (full set) | 32×16=512 | 16 | 0.305                        | 420 |
+| `qwen_image/run_qwen_image_ocr_lora_async_reward.sh` | Qwen-Image | Flow-GRPO | True | 5 | qwenvl-ocr-vllm | 4 | 4 | 1                       | 32 | 16 | 3e-4 | 1k (full set) | 32×16=512 | 16 | 0.280                        | 360 |
 
 - Validation reward curve (evaluated with `trainer.val_before_train=True`):
 
 <div align="center">
 <img width="600" alt="2p_comparison" src="https://github.com/user-attachments/assets/1094beaf-fed9-4661-8a6a-1c3983150648" />
 <br>
-qwen_image_ocr_lora: corresponding with the script `run_qwen_image_ocr_lora.sh`; 
+qwen_image_ocr_lora: corresponding with the script `qwen_image/run_qwen_image_ocr_lora.sh`; 
 <br>
-qwen_image_ocr_lora_async_reward: corresponding with the script `run_qwen_image_ocr_lora_async_reward.sh`.
+qwen_image_ocr_lora_async_reward: corresponding with the script `qwen_image/run_qwen_image_ocr_lora_async_reward.sh`.
 </div>
 
 > **Note:** Reward curves may differ from the references above mainly due to rollout-side stochasticity: diffusion rollouts sample random latents/noise, and the example scripts do not fix the data seed, so prompt ordering can vary between runs.

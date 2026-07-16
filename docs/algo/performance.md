@@ -1,7 +1,7 @@
 (performance)=
 # Performance Reference
 
-Last updated: 05/13/2026
+Last updated: 06/17/2026
 
 Below are reference benchmark results for VeRL-Omni training runs.
 
@@ -50,6 +50,8 @@ Evaluated with `trainer.val_before_train=True`:
 |--------|--------|------------------|--------------------|-------------------------|------------|-------------------|----|-----------------------|-------------------|
 | `run_qwen_image_ocr.sh` | 4 | 4 | 4 | 0 (sync) | 32 | 16 | 3e-5 | 0.510 | 250 |
 
+Reference wandb curve [here](https://wandb.ai/andyzhou/VeRL-Omni-demo/runs/8p8y9olb).
+
 ### Full-Model Training - Zero Standard Deviation Ratio and Reward Curve
 
 <div align="center">
@@ -66,4 +68,72 @@ Evaluated with `trainer.val_before_train=True`:
 
 <div align="center">
 <img width="600" alt="Full Model FlowGRPO OCR validation reward curve" src="https://github.com/user-attachments/assets/5ed8fd76-6f1b-4c80-aa43-af905e58d722" />
+</div>
+
+## FlowGRPO non-CFG Full Model: VeOmni vs FSDP1 Backend (same config)
+
+> Apples-to-apples comparison: the **VeOmni** and **FSDP1** actor engines run the *same* FlowGRPO recipe — same algorithm, data, and hyper-parameters — on the *same* hardware (64 × NVIDIA H100), differing only in the training engine. lr 3e-5, clip_ratio 1e-5, optimizer state fp32; other parameters match the LoRA setting.
+
+- **FSDP1** — `run_qwen_image_ocr.sh`
+- **VeOmni** — `run_qwen_image_ocr_veomni.sh` (see the [install guide](../start/install.md) "Optional engine backends")
+
+### Settings and Throughput
+
+| Backend | Script | GPU name | # GPUs | # GPUs for Actor | # GPUs for Rollout | # GPUs for Async Reward | Batch Size | Images per Prompt | LR | Throughput (images/GPU/s) | Time per Step (s) |
+|---------|--------|--------|--------|------------------|--------------------|-------------------------|------------|-------------------|----|-----------------------|-------------------|
+| VeOmni | `run_qwen_image_ocr_veomni.sh` | H100 | 64 | 64 | 64 | 0 (sync) | 32 | 16 | 3e-5 | 0.079 | 100 |
+| FSDP1 | `run_qwen_image_ocr.sh` | H100 | 64 | 64 | 64 | 0 (sync) | 32 | 16 | 3e-5 | 0.077 | 105 |
+
+> **Note**: VeOmni and FSDP1 run with `actor_rollout_ref.actor.veomni_config.param_offload=False`, `actor_rollout_ref.actor.veomni_config.optimizer_offload=True`, and `SP=1`.
+
+### Full-Model Training - Zero Standard Deviation Ratio and Reward Curve
+
+<img width="1221" height="465" alt="zero_std_ratio" src="https://github.com/user-attachments/assets/3ba4db3e-ea26-4528-893f-8fb00feb7fad" />
+
+<img width="1221" height="465" alt="reward_mean" src="https://github.com/user-attachments/assets/ac828e51-a99d-4b8a-92fb-2c5d3dcbf08a" />
+
+### Training - Clip Fraction
+
+<img width="1221" height="465" alt="pg_clip" src="https://github.com/user-attachments/assets/467819cf-f7f5-45b4-bf11-1af359900b0d" />
+
+### Full-Model Validation Reward Curve
+
+<img width="1221" height="465" alt="mean" src="https://github.com/user-attachments/assets/2a85d8d8-703e-4975-9b6e-cc6ad3fcda63" />
+
+## FlowDPPO: LoRA Training on Qwen-Image OCR
+
+> All experiments used NVIDIA H200 GPUs, LoRA rank 64, `ppo_micro_batch_size_per_gpu` 16, and the full 1k validation set. Training images per step = batch size × images per prompt = 32 × 16 = 512.
+
+| Script | # GPUs | # GPUs for Actor | # GPUs for Rollout | # GPUs for Async Reward | Batch Size | Images per Prompt | LR | Throughput (images/GPU/s) | Time per Step (s) |
+|--------|--------|------------------|--------------------|-------------------------|------------|-------------------|----|-----------------------|-------------------|
+| `run_qwen_image_ocr_lora.sh` | 4 | 4 | 4 | 0 (sync) | 32 | 16 | 3e-4 | 0.240 | 540 |
+
+<div align="center">
+<img width="600" alt="FlowDPPO LoRA OCR training zero standard deviation ratio and reward curve" src="https://github.com/user-attachments/assets/7e3405bb-d609-42b0-b563-58e81d428c48" />
+</div>
+
+### LoRA Validation Reward Curve
+
+<div align="center">
+<img width="600" alt="FlowDPPO LoRA OCR training validation curve" src="https://github.com/user-attachments/assets/bd44e0f6-c0f1-4d0d-b5ea-8bade1e9a1c5" />
+</div>
+
+## DiffusionNFT: non-CFG LoRA Training on Qwen-Image OCR
+
+> All experiments used NVIDIA H200 GPUs, LoRA rank 64, `ppo_micro_batch_size_per_gpu` 16, and the full 1k validation set. Training images per step = batch size × images per prompt = 32 × 16 = 512.
+
+| Script | # GPUs | # GPUs for Actor | # GPUs for Rollout | # GPUs for Async Reward | Batch Size | Images per Prompt | LR | Throughput (images/GPU/s) | Time per Step (s) |
+|--------|--------|------------------|--------------------|-------------------------|------------|-------------------|----|-----------------------|-------------------|
+| `run_qwen_image_ocr_lora.sh` | 4 | 4 | 4 | 0 (sync) | 24 | 12 | 3e-4 | 0.175 | 550 |
+
+Reference wandb curve [here](https://wandb.ai/andyzhou/VeRL-Omni-demo/runs/djrzzibt). 
+
+<div align="center">
+<img width="600" alt="DiffusionNFT LoRA OCR training zero standard deviation ratio and reward curve" src="https://github.com/user-attachments/assets/afed8370-c37e-4f7b-9bba-83ef4b28b6c7" />
+</div>
+
+### LoRA Validation Reward Curve
+
+<div align="center">
+<img width="600" alt="DiffusionNFT LoRA OCR training validation curve" src="https://github.com/user-attachments/assets/9cc0e639-58c7-4ef7-ab8a-ee8e8aef2d53" />
 </div>

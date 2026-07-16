@@ -1,6 +1,6 @@
 # Welcome to VeRL-Omni's documentation!
 
-Last updated: 05/29/2026
+Last updated: 06/05/2026
 
 [VeRL-Omni](https://github.com/verl-project/verl-omni) is a general RL training framework focused on multimodal generative models, built on top of [verl](https://github.com/verl-project/verl). It originated from the multi-modal generation RL effort in `verl`, and now has a dedicated home so it can evolve in a more focused way.
 
@@ -20,12 +20,16 @@ VeRL-Omni targets RL post-training for three families of generative models:
 - **End-to-end examples and benchmarks** validating co-located sync and fully-async RL on the model families above.
 - **High training throughput** — on our reference Qwen-Image FlowGRPO setup, VeRL-Omni achieves **up to ~25% higher end-to-end throughput** than the diffusers-based [`flow_grpo`](https://github.com/yifan123/flow_grpo) reference implementation, driven by vLLM-Omni rollout, FSDP/USP training, and asynchronous reward computation on a dedicated GPU pool.
 
+See {doc}`start/models` for the full model catalogue and which algorithms run on each model.
+
 ```{toctree}
 :maxdepth: 2
 :caption: Getting Started
 
 start/install.md
+start/models.md
 start/flowgrpo_quickstart.md
+start/multi_node_training.md
 start/metrics.md
 ```
 
@@ -33,6 +37,7 @@ start/metrics.md
 :maxdepth: 1
 :caption: Advanced Features
 
+algo/async_reward.md
 algo/rollout_correction.md
 start/http_scorer.md
 ```
@@ -42,6 +47,9 @@ start/http_scorer.md
 :caption: Algorithms
 
 algo/flowgrpo.md
+algo/flowdppo.md
+algo/diffusion_dpo.md
+algo/diffusionnft.md
 algo/grpo_guard.md
 algo/mixgrpo.md
 algo/performance.md
@@ -51,6 +59,7 @@ algo/performance.md
 :maxdepth: 1
 :caption: Performance Tuning Guide
 
+perf/diffusion_mfu.md
 perf/profiler.md
 ```
 
@@ -79,7 +88,11 @@ api/utils.rst
 
 contributing/editing-agent-instructions.md
 contributing/integrating_a_diffusion_model.md
-contributing/integrating_a_new_algorithm_for_diffusion_model.md
+contributing/integrating_an_i2i_diffusion_model.md
+contributing/integrating_a_non_diffusers_model.md
+contributing/integrating_a_stepwise_continuous_batching_model.md
+contributing/integrating_a_new_policy_gradient_algorithm_for_diffusion_model.md
+contributing/integrating_a_new_direct_preference_algorithm_for_diffusion_model.md
 contributing/common_pitfalls.md
 ```
 
