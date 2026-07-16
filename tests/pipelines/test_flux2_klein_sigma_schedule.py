@@ -26,6 +26,8 @@ import numpy as np
 import pytest
 import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
+from tensordict import TensorDict
+from tensordict.tensorclass import NonTensorData, NonTensorStack
 
 from verl_omni.pipelines.flux2_klein_flow_grpo.diffusers_training_adapter import (
     Flux2KleinFlowGRPO,
@@ -47,6 +49,10 @@ _KLEIN_SCHEDULER_CONFIG = dict(
     max_shift=1.15,
     shift_terminal=None,
 )
+
+
+def _non_tensor_stack(values):
+    return NonTensorStack.from_list([NonTensorData(value) for value in values])
 
 
 def _model_config(height=512, width=512, num_inference_steps=10):
@@ -114,3 +120,72 @@ def test_resolve_sigmas_drops_terminal_zero_for_t_plus_one():
 def test_resolve_sigmas_rejects_incompatible_length():
     with pytest.raises(ValueError, match="incompatible with num_inference_steps"):
         resolve_flux2_klein_sigmas([1.0, 0.5, 0.25, 0.1], 2)
+
+
+def _steps_micro_batch(rollout_steps):
+    return TensorDict(
+        {
+            "latent_h": _non_tensor_stack([2, 2]),
+            "latent_w": _non_tensor_stack([3, 3]),
+            "num_inference_steps": _non_tensor_stack([rollout_steps, rollout_steps]),
+        },
+        batch_size=[2],
+    )
+
+
+def _prepare_model_inputs(micro_batch, num_inference_steps):
+    return Flux2KleinFlowGRPO.prepare_model_inputs(
+        module=None,
+        model_config=_model_config(num_inference_steps=num_inference_steps),
+        latents=torch.zeros(2, 1, 6, 128),
+        timesteps=torch.ones(2, 1),
+        prompt_embeds=torch.zeros(2, 5, 4),
+        prompt_embeds_mask=torch.ones(2, 5, dtype=torch.bool),
+        negative_prompt_embeds=None,
+        negative_prompt_embeds_mask=None,
+        micro_batch=micro_batch,
+        step=0,
+    )
+
+
+def test_prepare_model_inputs_accepts_matching_rollout_steps():
+    _prepare_model_inputs(_steps_micro_batch(10), num_inference_steps=10)
+
+
+def test_prepare_model_inputs_rejects_step_count_mismatch():
+    with pytest.raises(ValueError, match="rollout num_inference_steps"):
+        _prepare_model_inputs(_steps_micro_batch(10), num_inference_steps=28)
+
+
+def test_prepare_model_inputs_skips_guard_without_transported_steps():
+    micro_batch = TensorDict(
+        {"latent_h": _non_tensor_stack([2, 2]), "latent_w": _non_tensor_stack([3, 3])},
+        batch_size=[2],
+    )
+    # Legacy trajectories without num_inference_steps must not trip the guard.
+    _prepare_model_inputs(micro_batch, num_inference_steps=28)
+
+
+def _scheduler_with_grid(num_inference_steps=10):
+    scheduler = FlowMatchSDEDiscreteScheduler(**_KLEIN_SCHEDULER_CONFIG)
+    Flux2KleinFlowGRPO.set_timesteps(scheduler, _model_config(num_inference_steps=num_inference_steps), "cpu")
+    return scheduler
+
+
+def test_schedule_guard_accepts_on_grid_timesteps():
+    scheduler = _scheduler_with_grid()
+    grid = scheduler.timesteps
+    all_timesteps = torch.stack([grid[0], grid[3]]).reshape(1, 2)
+    Flux2KleinFlowGRPO._assert_rollout_schedule_matches(scheduler, all_timesteps)
+
+
+def test_schedule_guard_rejects_off_grid_timesteps():
+    scheduler = _scheduler_with_grid()
+    off_grid = torch.tensor(12345.0).reshape(1, 1)
+    with pytest.raises(ValueError, match="absent from the training scheduler grid"):
+        Flux2KleinFlowGRPO._assert_rollout_schedule_matches(scheduler, off_grid)
+
+
+def test_schedule_guard_skips_scheduler_without_grid():
+    # Scheduler doubles used elsewhere lack a ``timesteps`` grid; skip, don't crash.
+    Flux2KleinFlowGRPO._assert_rollout_schedule_matches(object(), torch.ones(1, 1))

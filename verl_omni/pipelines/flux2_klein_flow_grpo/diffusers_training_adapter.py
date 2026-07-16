@@ -210,6 +210,60 @@ class Flux2KleinFlowGRPO(DiffusionI2IModelBase):
         sigmas = build_flux2_klein_sigmas(model_config.pipeline.num_inference_steps)
         scheduler.set_timesteps(model_config.pipeline.num_inference_steps, device=device, sigmas=sigmas, mu=mu)
 
+    @staticmethod
+    def _assert_rollout_steps_match(micro_batch: TensorDict, model_config: DiffusionModelConfig) -> None:
+        """Fail closed when rollout and training disagree on ``num_inference_steps``.
+
+        Training rebuilds ``scheduler.sigmas`` from
+        ``model_config.pipeline.num_inference_steps`` and indexes it by the
+        transported rollout timesteps. A step-count mismatch means the two
+        FlowMatch schedules differ and the log-prob ratio would be computed on
+        the wrong transition. Older trajectories without the field are skipped.
+        """
+        if "num_inference_steps" not in micro_batch:
+            return
+        rollout_steps = _get_constant_batch_value(micro_batch, "num_inference_steps")
+        if rollout_steps is None:
+            return
+        training_steps = int(model_config.pipeline.num_inference_steps)
+        if int(rollout_steps) != training_steps:
+            raise ValueError(
+                "Flux2KleinFlowGRPO: rollout num_inference_steps "
+                f"({int(rollout_steps)}) != training pipeline.num_inference_steps "
+                f"({training_steps}); the FlowMatch sigma schedule would diverge "
+                "between rollout and training."
+            )
+
+    @staticmethod
+    def _assert_rollout_schedule_matches(scheduler: FlowMatchSDEDiscreteScheduler, all_timesteps) -> None:
+        """Fail closed when rollout timesteps are absent from the training grid.
+
+        Complements :meth:`_assert_rollout_steps_match` by catching schedule
+        drift that keeps the step count but changes the values (e.g. a different
+        resolution -> ``mu``, scheduler config, or diffusers shift formula):
+        every rollout-collected timestep must land on the training scheduler
+        grid so the sigma lookup reproduces the sampled transition.
+        """
+        if all_timesteps is None:
+            return
+        grid = getattr(scheduler, "timesteps", None)
+        if grid is None:
+            return
+        rollout_timesteps = all_timesteps[0] if all_timesteps.dim() > 1 else all_timesteps
+        rollout_timesteps = rollout_timesteps.reshape(-1).to(torch.float32)
+        if rollout_timesteps.numel() == 0:
+            return
+        grid = grid.reshape(-1).to(device=rollout_timesteps.device, dtype=torch.float32)
+        max_gap = float((rollout_timesteps.view(-1, 1) - grid.view(1, -1)).abs().min(dim=1).values.max())
+        if max_gap > 1e-3:
+            raise ValueError(
+                "Flux2KleinFlowGRPO: rollout timesteps are absent from the training "
+                f"scheduler grid (max gap {max_gap:.4f}, training "
+                f"num_inference_steps={grid.numel()}). Rollout sampling and training "
+                "must share num_inference_steps and resolution so the FlowMatch "
+                "sigma schedule matches."
+            )
+
     @classmethod
     def prepare_model_inputs(
         cls,
@@ -224,6 +278,8 @@ class Flux2KleinFlowGRPO(DiffusionI2IModelBase):
         micro_batch: TensorDict,
         step: int,
     ) -> tuple[dict, Optional[dict]]:
+        if step == 0:
+            cls._assert_rollout_steps_match(micro_batch, model_config)
         selected_latents = latents[:, step]  # [B, N, 128] (packed)
         batch_size, num_tokens, _ = selected_latents.shape
         latent_h = _get_constant_batch_value(micro_batch, "latent_h")
@@ -287,6 +343,9 @@ class Flux2KleinFlowGRPO(DiffusionI2IModelBase):
         assert scheduler_inputs is not None
         all_latents = scheduler_inputs["all_latents"]
         all_timesteps = scheduler_inputs["all_timesteps"]
+
+        if step == 0:
+            cls._assert_rollout_schedule_matches(scheduler, all_timesteps)
 
         noise_pred = cls.forward(module, model_config, model_inputs)
         true_cfg_scale = _true_cfg_scale(model_config)

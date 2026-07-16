@@ -580,5 +580,8 @@ class Flux2KleinPipelineWithLogProb(VllmOmniPipelineBase, Flux2KleinPipeline):
                 "condition_image_latent_ids": _maybe_to_cpu(condition_image_latent_ids),
                 "latent_h": latent_h,
                 "latent_w": latent_w,
+                # Transport the resolved step count so training can fail closed
+                # when its FlowMatch schedule would diverge from this rollout.
+                "num_inference_steps": num_inference_steps,
             },
         )
