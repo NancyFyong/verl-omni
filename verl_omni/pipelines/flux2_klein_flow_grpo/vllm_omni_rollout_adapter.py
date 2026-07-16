@@ -50,6 +50,7 @@ from .diffusers_training_adapter import (
     compute_empirical_mu,
     prepare_latent_ids,
     prepare_text_ids,
+    resolve_flux2_klein_sigmas,
     unpack_latents,
 )
 
@@ -506,7 +507,13 @@ class Flux2KleinPipelineWithLogProb(VllmOmniPipelineBase, Flux2KleinPipeline):
         # Prepare timesteps with Klein empirical-mu shifting.
         image_seq_len = latents.shape[1]
         mu = compute_empirical_mu(image_seq_len, num_inference_steps)
-        self.scheduler.set_timesteps(num_inference_steps, device=self.device, mu=mu)
+        # Forward the official ``linspace(1, 1/N, N)`` base grid (or a caller/
+        # request-pinned schedule) so the dynamic-shift scheduler matches the
+        # pretrained FLUX.2-Klein inference trajectory instead of collapsing its
+        # small-sigma tail. Training recomputes log-probs against the same grid.
+        request_sigmas = sampling_params.sigmas if sampling_params.sigmas is not None else sigmas
+        sigmas_schedule = resolve_flux2_klein_sigmas(request_sigmas, num_inference_steps)
+        self.scheduler.set_timesteps(num_inference_steps, device=self.device, sigmas=sigmas_schedule, mu=mu)
         timesteps_tensor = self.scheduler.timesteps
 
         if sde_window_size is not None:

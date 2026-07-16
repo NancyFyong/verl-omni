@@ -24,6 +24,7 @@ image tokens are distinguished from noise tokens by a time-axis offset
 
 from typing import Optional
 
+import numpy as np
 import torch
 from diffusers import ModelMixin
 from tensordict import TensorDict
@@ -58,6 +59,46 @@ def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
     a = (m_200 - m_10) / 190.0
     b = m_200 - 200.0 * a
     return float(a * num_steps + b)
+
+
+def build_flux2_klein_sigmas(num_inference_steps: int) -> np.ndarray:
+    """Official FLUX.2-Klein base sigma grid ``linspace(1, 1/N, N)``.
+
+    Mirrors ``Flux2KleinPipeline.__call__`` in diffusers and UniRL's
+    ``get_sigma_schedule``. This explicit grid must be forwarded into
+    ``set_timesteps(sigmas=..., mu=mu)``: omitting ``sigmas`` lets the
+    dynamic-shift scheduler collapse its small-sigma tail toward
+    ``~1 / num_train_timesteps``, which diverges from the pretrained
+    inference trajectory the policy is initialized from.
+    """
+    if num_inference_steps < 1:
+        raise ValueError(f"num_inference_steps must be >= 1, got {num_inference_steps}.")
+    return np.linspace(1.0, 1.0 / num_inference_steps, num_inference_steps, dtype=np.float32)
+
+
+def resolve_flux2_klein_sigmas(request_sigmas, num_inference_steps: int) -> np.ndarray:
+    """Resolve the sigma grid used by ``set_timesteps(sigmas=..., mu=mu)``.
+
+    Falls back to :func:`build_flux2_klein_sigmas` when the caller/request does
+    not pin a schedule. ``diffusers`` ``set_timesteps(sigmas=...)`` expects
+    exactly ``num_inference_steps`` entries and appends the terminal ``0``
+    itself, so a canonical ``T + 1`` schedule (terminal ``0`` included) is
+    accepted by dropping the final entry, matching UniRL's request convention.
+    """
+    if request_sigmas is None:
+        return build_flux2_klein_sigmas(num_inference_steps)
+    sigmas = np.asarray(list(request_sigmas), dtype=np.float32)
+    if sigmas.ndim != 1:
+        raise ValueError(f"FLUX.2-Klein sigmas must be 1-D, got shape {sigmas.shape}.")
+    if sigmas.shape[0] == num_inference_steps + 1:
+        sigmas = sigmas[:-1]
+    if sigmas.shape[0] != num_inference_steps:
+        raise ValueError(
+            f"FLUX.2-Klein sigmas length {sigmas.shape[0]} is incompatible with "
+            f"num_inference_steps {num_inference_steps} (expected {num_inference_steps} "
+            f"or {num_inference_steps + 1})."
+        )
+    return sigmas
 
 
 def unpack_latents(tokens: torch.Tensor, height: int, width: int) -> torch.Tensor:
@@ -166,7 +207,8 @@ class Flux2KleinFlowGRPO(DiffusionI2IModelBase):
     ):
         image_seq_len = _flux_image_seq_len(model_config.pipeline.height, model_config.pipeline.width)
         mu = compute_empirical_mu(image_seq_len, model_config.pipeline.num_inference_steps)
-        scheduler.set_timesteps(model_config.pipeline.num_inference_steps, device=device, mu=mu)
+        sigmas = build_flux2_klein_sigmas(model_config.pipeline.num_inference_steps)
+        scheduler.set_timesteps(model_config.pipeline.num_inference_steps, device=device, sigmas=sigmas, mu=mu)
 
     @classmethod
     def prepare_model_inputs(
