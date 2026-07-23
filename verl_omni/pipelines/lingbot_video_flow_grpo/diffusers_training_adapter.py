@@ -58,11 +58,12 @@ class LingBotVideoDenseFlowGRPO(DiffusionModelBase):
                 "Install `verl-omni[lingbot-video]` before starting training."
             ) from exc
 
-        module = LingBotVideoTransformer3DModel.from_pretrained(
+        module = cls._peft_capable_transformer_cls(LingBotVideoTransformer3DModel).from_pretrained(
             model_config.local_path,
             subfolder=model_config.transformer_subfolder,
             torch_dtype=torch_dtype,
         )
+        cls._patch_time_embedder_input_dtype(module)
         num_experts = int(getattr(module.config, "num_experts", 0))
         if num_experts != 0:
             raise ValueError(
@@ -70,6 +71,67 @@ class LingBotVideoDenseFlowGRPO(DiffusionModelBase):
                 f"(transformer.config.num_experts == 0), got {num_experts}."
             )
         return module
+
+    @staticmethod
+    def _peft_capable_transformer_cls(base_cls: type) -> type:
+        """Return ``base_cls`` extended with diffusers' ``PeftAdapterMixin``.
+
+        Every diffusers transformer the training engine drives inherits
+        ``PeftAdapterMixin`` (which supplies ``add_adapter``/``set_adapter``/
+        ``disable_adapters``/``load_lora_adapter``), and the shared
+        ``LoRAAdapterMixin`` engine is written against that API.  The optional
+        ``lingbot-video`` package predates PEFT and ships a bare ``ModelMixin``
+        subclass, so we re-add the mixin here rather than teaching the shared
+        engine a second, LingBot-only adapter dialect.  ``base_cls`` stays first
+        in the MRO so its ``forward`` and config loading are untouched, and the
+        module tree keeps its ``blocks.*`` names (no ``base_model.model.``
+        wrapper prefix), so FSDP wrapping and LoRA weight export behave exactly
+        as they do for the other transformers.
+        """
+        from diffusers.loaders import PeftAdapterMixin
+
+        if issubclass(base_cls, PeftAdapterMixin):
+            return base_cls
+        return type(f"{base_cls.__name__}WithPeft", (base_cls, PeftAdapterMixin), {})
+
+    @staticmethod
+    def _patch_time_embedder_input_dtype(module: torch.nn.Module) -> None:
+        """Keep LingBot timestep embeddings compatible with FSDP mixed precision.
+
+        The upstream LingBot forward computes ``timestep.float()`` before calling
+        ``time_embedder``.  Diffusers' ``TimestepEmbedding`` does not cast that
+        projection to its linear weight dtype, so FSDP mixed precision can expose
+        a Float input / BFloat16 weight mismatch.  Casting at the module boundary
+        is a no-op for fp32 training and follows the dtype used by the active
+        linear/LoRA wrapper during mixed-precision forward.
+
+        A narrow pre-hook is used rather than a broader remedy on purpose: the
+        fp32 re-promotion happens *inside* the forward (past the top-level
+        inputs), so FSDP2's ``cast_forward_inputs`` cannot reach it, and a global
+        ``torch.autocast`` over the transformer would also lower the FlowGRPO
+        log-prob/SDE math we intend to keep in fp32.
+        """
+        time_embedder = getattr(module, "time_embedder", None)
+        if time_embedder is None or getattr(time_embedder, "_verl_omni_dtype_hook_installed", False):
+            return
+
+        def _weight_dtype(embedder: torch.nn.Module) -> torch.dtype | None:
+            linear_1 = getattr(embedder, "linear_1", None)
+            weight = getattr(linear_1, "weight", None)
+            if weight is None and hasattr(linear_1, "base_layer"):
+                weight = getattr(linear_1.base_layer, "weight", None)
+            return None if weight is None else weight.dtype
+
+        def _cast_sample_to_weight_dtype(embedder: torch.nn.Module, args: tuple):
+            if not args or not isinstance(args[0], torch.Tensor):
+                return args
+            dtype = _weight_dtype(embedder)
+            if dtype is None or args[0].dtype == dtype:
+                return args
+            return (args[0].to(dtype=dtype), *args[1:])
+
+        time_embedder.register_forward_pre_hook(_cast_sample_to_weight_dtype)
+        time_embedder._verl_omni_dtype_hook_installed = True
 
     @classmethod
     def configure_train_mode(cls, module: torch.nn.Module) -> None:
