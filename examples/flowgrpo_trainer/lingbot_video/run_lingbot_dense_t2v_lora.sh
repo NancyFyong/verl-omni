@@ -24,7 +24,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     'actor_rollout_ref.model.fsdp_layer_prefixes=["blocks."]' \
     actor_rollout_ref.model.lora_rank=32 \
     actor_rollout_ref.model.lora_alpha=32 \
-    actor_rollout_ref.model.target_modules=all-linear \
+    actor_rollout_ref.model.target_modules="['to_q','to_k','to_v','to_out','gate_proj','up_proj','down_proj']" \
     actor_rollout_ref.actor.optim.lr=1e-5 \
     actor_rollout_ref.actor.ppo_mini_batch_size=4 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \

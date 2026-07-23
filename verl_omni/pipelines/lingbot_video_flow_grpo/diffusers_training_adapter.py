@@ -39,6 +39,13 @@ def _pipeline_value(pipeline, name: str, default):
     return default if value is None else value
 
 
+# Derived PEFT-capable classes, memoized per base class.  Reusing one derived
+# class per base keeps ``isinstance`` checks stable across calls, and binding it
+# at module scope makes instances picklable (a bare ``type(...)`` class has no
+# importable qualified name).
+_PEFT_CAPABLE_CLS_CACHE: dict[type, type] = {}
+
+
 @DiffusionModelBase.register("LingBotVideoPipeline", algorithm="flow_grpo")
 class LingBotVideoDenseFlowGRPO(DiffusionModelBase):
     """FlowGRPO integration for the non-MoE LingBot Video transformer.
@@ -86,13 +93,19 @@ class LingBotVideoDenseFlowGRPO(DiffusionModelBase):
         in the MRO so its ``forward`` and config loading are untouched, and the
         module tree keeps its ``blocks.*`` names (no ``base_model.model.``
         wrapper prefix), so FSDP wrapping and LoRA weight export behave exactly
-        as they do for the other transformers.
+        as they do for the other transformers.  The derived class is memoized and
+        bound at module scope so instances stay picklable.
         """
         from diffusers.loaders import PeftAdapterMixin
 
         if issubclass(base_cls, PeftAdapterMixin):
             return base_cls
-        return type(f"{base_cls.__name__}WithPeft", (base_cls, PeftAdapterMixin), {})
+        derived = _PEFT_CAPABLE_CLS_CACHE.get(base_cls)
+        if derived is None:
+            derived = type(f"{base_cls.__name__}WithPeft", (base_cls, PeftAdapterMixin), {"__module__": __name__})
+            globals()[derived.__name__] = derived  # make the dynamic class importable for pickling
+            _PEFT_CAPABLE_CLS_CACHE[base_cls] = derived
+        return derived
 
     @staticmethod
     def _patch_time_embedder_input_dtype(module: torch.nn.Module) -> None:
