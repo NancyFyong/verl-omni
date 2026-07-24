@@ -100,6 +100,14 @@ class VeOmniDiffusionEngineConfig(EngineConfig):
             raise ValueError(f"VeOmni diffusion engine requires strategy='veomni', got {self.strategy!r}")
         if self.ulysses_parallel_size != 1:
             raise NotImplementedError("VeOmni Qwen-Image diffusion backend does not support Ulysses SP yet.")
+        if self.expert_parallel_size > 1 and self.moe_implementation == "eager":
+            # The eager expert paths index EP-sharded [E/ep, ...] grouped
+            # tensors with global expert ids; only the fused kernels carry
+            # the EP token all-to-all.
+            raise ValueError(
+                "expert_parallel_size > 1 requires a fused MoE kernel "
+                "(e.g. moe_implementation='fused_triton'); 'eager' cannot dispatch across EP ranks."
+            )
 
 
 @dataclass

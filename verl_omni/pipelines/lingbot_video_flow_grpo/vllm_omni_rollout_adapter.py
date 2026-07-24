@@ -66,13 +66,14 @@ def _autocast(device: torch.device, dtype: torch.dtype):
 
 @VllmOmniPipelineBase.register("LingBotVideoPipeline", algorithm="flow_grpo")
 class LingBotVideoPipelineWithLogProb(torch.nn.Module):
-    """Single-request LingBot Dense rollout with an SDE trajectory.
+    """Single-request LingBot rollout (Dense and MoE) with an SDE trajectory.
 
     The native in-tree ``LingBotVideoPipeline`` drives a deterministic UniPC
     solver and returns no replay trajectory, so this adapter reuses vLLM-Omni's
     in-tree LingBot transformer (#5035) but owns the SDE denoising loop, which
-    lets it return old-policy log-probabilities to FlowGRPO.  MoE, TI2V and the
-    refiner are deliberately rejected by this adapter's dense-only model check.
+    lets it return old-policy log-probabilities to FlowGRPO.  The in-tree
+    transformer natively supports both Dense (``num_experts == 0``) and MoE
+    checkpoints; TI2V and the refiner remain out of scope.
     """
 
     supports_request_batch = False
@@ -109,12 +110,10 @@ class LingBotVideoPipelineWithLogProb(torch.nn.Module):
             torch_dtype=dtype,
             local_files_only=local_files_only,
         ).to(self.device)
-        num_experts = int(getattr(self.transformer.config, "num_experts", 0))
-        if num_experts != 0:
-            raise ValueError(
-                "LingBotVideoPipelineWithLogProb supports only the Dense checkpoint "
-                f"(transformer.config.num_experts == 0), got {num_experts}."
-            )
+        # Both Dense (num_experts == 0) and MoE checkpoints are served by the
+        # in-tree transformer (#5035); its MoE path uses the fused grouped_mm
+        # expert backend with deterministic sort/scatter sub-ops.
+        self.num_experts = int(getattr(self.transformer.config, "num_experts", 0))
 
         self.vae = AutoencoderKLWan.from_pretrained(
             model_path,

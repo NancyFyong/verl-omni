@@ -22,7 +22,7 @@ from typing import Callable, Optional
 import torch
 import torch.distributed
 from tensordict import TensorDict
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate
 from veomni.distributed.offloading import (
     load_model_to_gpu,
     load_optimizer,
@@ -254,6 +254,14 @@ class VeOmniDiffusionEngine(BaseEngine):
 
     def _build_model_optimizer(self):
         from veomni.trainer.base import BaseTrainer
+
+        from verl_omni.models.veomni import register_veomni_models
+
+        # Make verl-omni's VeOmni-native architectures (e.g. LingBot-Video)
+        # resolvable by VeOmni's MODELING_REGISTRY before the foundation model
+        # is built.  Stock VeOmni architectures pass through untouched.
+        transformer_config = self.model_config.transformer_config or {}
+        register_veomni_models(transformer_config.get("_class_name"))
 
         self.veomni_trainer = self._build_veomni_dit_trainer()
         veomni_base = self.veomni_trainer.base
@@ -595,11 +603,47 @@ class VeOmniDiffusionEngine(BaseEngine):
         device = get_device_id()
         export_dtype = PrecisionType.to_dtype(self.engine_config.model_dtype)
 
+        # Params the model declares as fp32-sensitive (e.g. LingBot's MoE
+        # router weight / e_score_correction_bias, norms, time embedder) must
+        # not be truncated to the bf16 export dtype: the rollout transformer
+        # holds them in fp32, and a bf16 round-trip can flip borderline
+        # router top-k picks, silently biasing the FlowGRPO importance ratio.
+        module = getattr(self.module, "_fsdp_wrapped_module", self.module)
+        fp32_fragments = frozenset(
+            list(getattr(module, "_keep_in_fp32_modules", None) or [])
+            + list(getattr(module, "_keep_in_fp32_modules_strict", None) or [])
+        )
+
+        def _keep_source_dtype(name: str) -> bool:
+            return any(fragment in name.split(".") for fragment in fp32_fragments)
+
+        # Expert-parallel params need special handling: ``ParallelPlan.apply``
+        # slices them to a plain local ``[E/ep, ...]`` chunk (the EP dim is
+        # NOT a DTensor dim), and FSDP then shards only the remaining dims.
+        # A bare ``full_tensor()`` therefore gathers FSDP but not EP and
+        # yields a wrong-shaped tensor that rollout's shape check would
+        # silently skip.  Rebuild the 2-D ``[Shard(0), Shard(1)]`` DTensor on
+        # the ``[ep, ep_fsdp]`` mesh first — the same restore VeOmni's own
+        # checkpointer performs before saving.
+        fqn2spec_info = getattr(module, "_fqn2spec_info", None) or {}
+
+        def _materialize_full_tensor(name: str, param):
+            spec_info = fqn2spec_info.get(name)
+            if spec_info is not None and not isinstance(spec_info.placement, Replicate):
+                from veomni.checkpoint.dcp_checkpointer import restore_extra_parallel_dim
+
+                param = restore_extra_parallel_dim(
+                    param,
+                    spec_info.para_fsdp_mesh,
+                    spec_info.para_fsdp_mesh[f"{spec_info.para_name}_fsdp"],
+                )
+            return param.full_tensor() if isinstance(param, DTensor) else param
+
         def param_generator():
             for name, param in params.items():
-                tensor = param.full_tensor() if isinstance(param, DTensor) else param
+                tensor = _materialize_full_tensor(name, param)
                 tensor = tensor.to(device, non_blocking=True)
-                if tensor.is_floating_point() and tensor.dtype != export_dtype:
+                if tensor.is_floating_point() and tensor.dtype != export_dtype and not _keep_source_dtype(name):
                     tensor = tensor.to(export_dtype, non_blocking=True)
                 yield f"transformer.{name}", tensor
 

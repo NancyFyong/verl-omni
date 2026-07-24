@@ -73,9 +73,15 @@ class LingBotVideoDenseFlowGRPO(DiffusionModelBase):
         cls._patch_time_embedder_input_dtype(module)
         num_experts = int(getattr(module.config, "num_experts", 0))
         if num_experts != 0:
+            # ``build_module`` is only reached by the FSDP engine.  The MoE
+            # checkpoint trains through the VeOmni engine (strategy=veomni),
+            # which builds the model via VeOmni's registry with expert
+            # parallelism and full fine-tuning instead.
             raise ValueError(
-                "LingBotVideoDenseFlowGRPO supports only robbyant/lingbot-video-dense-1.3b "
-                f"(transformer.config.num_experts == 0), got {num_experts}."
+                "The FSDP LingBot path supports only the Dense checkpoint "
+                f"(transformer.config.num_experts == 0), got {num_experts}. "
+                "Train the MoE checkpoint with the VeOmni engine: "
+                "actor_rollout_ref.actor.strategy=veomni."
             )
         return module
 
