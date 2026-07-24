@@ -71,6 +71,7 @@ from verl_omni.trainer.diffusion.rollout_correction import (
     compute_rollout_corr_metrics_from_logprobs,
     rollout_correction_enabled,
 )
+from verl_omni.utils.media import video_tensor_to_pil_frames
 from verl_omni.workers.utils.padding import embeds_padding_2_no_padding
 
 sys_logger = logging.getLogger(__name__)
@@ -275,35 +276,56 @@ class BaseRayDiffusionTrainer(ABC):
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
-        """Dump rollout/validation samples as JSONL."""
+    def _dump_generations(
+        self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, max_samples=None, fps=24
+    ):
+        """Dump rollout/validation samples to disk as media files plus a JSONL index.
+
+        ``outputs`` is a batch of either images ``[N, C, H, W]`` or videos
+        ``[N, T, C, H, W]``. Images are written as ``{i}.jpg`` and videos as ``{i}.mp4``
+        (at ``fps`` frames per second). ``max_samples`` caps how many samples are written
+        (``None`` = all); this bounds disk usage and the per-step ffmpeg encode cost that
+        would otherwise be prohibitive for video runs.
+        """
         os.makedirs(dump_path, exist_ok=True)
 
         visual_folder = os.path.join(dump_path, f"{self.global_steps}")
         os.makedirs(visual_folder, exist_ok=True)
 
+        n_full = outputs.shape[0]
+        n = n_full if max_samples is None else min(max_samples, n_full)
+        is_video = outputs.ndim == 5  # [N, T, C, H, W] vs image [N, C, H, W]
+
         output_paths = []
-        images_pil = outputs.cpu().float().permute(0, 2, 3, 1).numpy()
-        images_pil = (images_pil * 255).round().clip(0, 255).astype("uint8")
-        for i, image in enumerate(images_pil):
-            image_path = os.path.join(visual_folder, f"{i}.jpg")
-            Image.fromarray(image).save(image_path)
-            output_paths.append(image_path)
+        if is_video:
+            from diffusers.utils import export_to_video
+
+            for i in range(n):
+                frames = video_tensor_to_pil_frames(outputs[i])
+                video_path = os.path.join(visual_folder, f"{i}.mp4")
+                export_to_video(frames, video_path, fps=fps)
+                output_paths.append(video_path)
+        else:
+            images_pil = outputs[:n].cpu().float().permute(0, 2, 3, 1).numpy()
+            images_pil = (images_pil * 255).round().clip(0, 255).astype("uint8")
+            for i, image in enumerate(images_pil):
+                image_path = os.path.join(visual_folder, f"{i}.jpg")
+                Image.fromarray(image).save(image_path)
+                output_paths.append(image_path)
 
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
 
-        n = len(inputs)
         base_data = {
-            "input": inputs,
+            "input": list(inputs)[:n],
             "output": output_paths,
-            "gts": gts,
-            "score": scores,
+            "gts": list(gts)[:n],
+            "score": list(scores)[:n],
             "step": [self.global_steps] * n,
         }
 
         for k, v in reward_extra_infos_dict.items():
-            if len(v) == n:
-                base_data[k] = v
+            if len(v) == n_full:
+                base_data[k] = list(v)[:n]
 
         lines = []
         for i in range(n):
@@ -347,6 +369,8 @@ class BaseRayDiffusionTrainer(ABC):
                 scores=scores,
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
+                max_samples=self.config.trainer.get("rollout_data_max_samples", None),
+                fps=int(self.config.trainer.get("video_fps", 24)),
             )
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
@@ -357,25 +381,56 @@ class BaseRayDiffusionTrainer(ABC):
         if generations_to_log == 0:
             return
 
+        import os
+        import shutil
+        import tempfile
+
         import numpy as np
 
-        # Create tuples of (input, output, score) and sort by input text
+        # Pair (input, output, score), sort by input text, then deterministically shuffle
+        # and truncate BEFORE wrapping media so video runs do not encode every sample just
+        # to keep a handful. Sorting keys on the input string only, so raw output tensors
+        # are never compared.
+        samples = list(zip(inputs, list(outputs), scores, strict=True))
+        samples.sort(key=lambda x: x[0])  # Sort by input text
+        rng = np.random.RandomState(42)  # Fixed seed for deterministic shuffling
+        rng.shuffle(samples)
+        samples = samples[:generations_to_log]
+
+        # Wrap the retained media for wandb: videos [T, C, H, W] -> wandb.Video, images
+        # [C, H, W] -> wandb.Image. Other backends receive the raw tensors as before.
+        video_tmp_dir = None
         if "wandb" in self.config.trainer.logger:
             import wandb
 
-            outputs = [wandb.Image(image.float(), file_type="jpg") for image in outputs]
-        samples = list(zip(inputs, outputs, scores, strict=True))
-        samples.sort(key=lambda x: x[0])  # Sort by input text
+            fps = int(self.config.trainer.get("video_fps", 24))
+            wrapped = []
+            for inp, out, score in samples:
+                if hasattr(out, "ndim") and out.ndim == 4:  # video [T, C, H, W]
+                    # Passing raw frames to wandb.Video pulls in the heavy ``moviepy``
+                    # dependency. Encode to a temp mp4 with diffusers' ffmpeg backend
+                    # (already used for the on-disk dump) and hand wandb the file path,
+                    # which needs no moviepy.
+                    from diffusers.utils import export_to_video
 
-        # Use fixed random seed for deterministic shuffling
-        rng = np.random.RandomState(42)
-        rng.shuffle(samples)
-
-        # Take first N samples after shuffling
-        samples = samples[:generations_to_log]
+                    if video_tmp_dir is None:
+                        video_tmp_dir = tempfile.mkdtemp(prefix="val_video_")
+                    frames = video_tensor_to_pil_frames(out)
+                    video_path = os.path.join(video_tmp_dir, f"{len(wrapped)}.mp4")
+                    export_to_video(frames, video_path, fps=fps)
+                    media = wandb.Video(video_path, fps=fps, format="mp4")
+                else:
+                    media = wandb.Image(out.float(), file_type="jpg")
+                wrapped.append((inp, media, score))
+            samples = wrapped
 
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+
+        # wandb copies each Video's file into the run directory during log(); the
+        # temp encodes are no longer needed afterward.
+        if video_tmp_dir is not None:
+            shutil.rmtree(video_tmp_dir, ignore_errors=True)
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
@@ -506,6 +561,8 @@ class BaseRayDiffusionTrainer(ABC):
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
+                max_samples=self.config.trainer.get("validation_data_max_samples", None),
+                fps=int(self.config.trainer.get("video_fps", 24)),
             )
 
         for key_info, lst in reward_extra_infos_dict.items():
@@ -1120,9 +1177,12 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_output_metrics)
 
-                    # Log rollout generations if enabled
+                    # Log rollout generations if enabled. rollout_data_save_freq bounds how
+                    # often we dump (default 1 = every step); this matters for video runs
+                    # where per-step encoding is expensive.
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir:
+                    save_freq = self.config.trainer.get("rollout_data_save_freq", 1)
+                    if rollout_data_dir and (save_freq <= 0 or self.global_steps % save_freq == 0):
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                 # validate
@@ -1522,9 +1582,16 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_output_metrics)
 
-                    # Log rollout generations if enabled
+                    # Log rollout generations if enabled. rollout_data_save_freq bounds how
+                    # often we dump (default 1 = every step); this matters for video runs
+                    # where per-step encoding is expensive.
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir and not self.is_offline:
+                    save_freq = self.config.trainer.get("rollout_data_save_freq", 1)
+                    if (
+                        rollout_data_dir
+                        and not self.is_offline
+                        and (save_freq <= 0 or self.global_steps % save_freq == 0)
+                    ):
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                 # validate
