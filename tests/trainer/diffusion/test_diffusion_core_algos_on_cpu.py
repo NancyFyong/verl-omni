@@ -520,3 +520,175 @@ def test_dance_grpo_advantage_return(norm_adv_by_std_in_grpo: bool, global_std: 
     )
 
     assert advantages.shape == returns.shape == (batch_size, steps)
+
+
+# --------------------------------------------------------------------------- #
+# Flash-GRPO: compute_timestep_weight (coe) + FlashGRPOLoss.
+# coe = 1 / (sqrt(-dt)/std_dev_t + std_dev_t*sqrt(-dt)*(1-sigma)/(2*sigma)),
+# the policy-independent temporal-gradient-rectification weight (see
+# flow_match_sde.compute_timestep_weight). FlashGRPOLoss reuses the FlowGRPO
+# clipped objective and multiplies each per-element loss by normalized coe.
+# --------------------------------------------------------------------------- #
+
+
+def _make_fsdp_actor_config():
+    from hydra import compose, initialize_config_dir
+    from verl.utils.config import omega_conf_to_dataclass
+
+    with initialize_config_dir(
+        config_dir=os.path.abspath("verl_omni/trainer/config/diffusion/actor"), version_base=None
+    ):
+        cfg = compose(
+            config_name="dp_diffusion_actor",
+            overrides=[
+                "strategy=fsdp",
+                "diffusion_loss.clip_ratio=0.0001",
+                "diffusion_loss.adv_clip_max=5.0",
+                "ppo_micro_batch_size_per_gpu=8",
+            ],
+        )
+    return omega_conf_to_dataclass(cfg)
+
+
+def _reference_flow_grpo_per_elem(old_log_prob, log_prob, advantages, clip_ratio, adv_clip_max):
+    """Per-element FlowGRPO loss (before mean), matching FlowGRPOLoss.compute_loss."""
+    advantages = torch.clamp(advantages, -adv_clip_max, adv_clip_max)
+    ratio = torch.exp(log_prob - old_log_prob)
+    unclipped = -advantages * ratio
+    clipped = -advantages * torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio)
+    return torch.maximum(unclipped, clipped)
+
+
+def test_compute_timestep_weight_formula() -> None:
+    """coe matches the closed-form Flash-GRPO definition on hand-checked values."""
+    from verl_omni.pipelines.schedulers.flow_match_sde import compute_timestep_weight
+
+    sigma = torch.tensor([0.9])
+    dt = torch.tensor([-0.05])  # sigma_prev - sigma, negative
+    std_dev_t = torch.tensor([0.4])
+
+    sqrt_neg_dt = torch.sqrt(-1.0 * dt)
+    expected = 1.0 / (sqrt_neg_dt / std_dev_t + std_dev_t * sqrt_neg_dt * (1.0 - sigma) / (2.0 * sigma))
+    coe = compute_timestep_weight(sigma, dt, std_dev_t)
+    assert torch.allclose(coe, expected, atol=1e-6)
+
+
+def test_compute_timestep_weight_numerics() -> None:
+    """coe is finite/positive across the schedule and -> 0 as sigma -> 0."""
+    from verl_omni.pipelines.schedulers.flow_match_sde import compute_timestep_weight
+
+    # Decreasing sigma (high -> low noise), dt<0, std_dev_t shrinks with sigma.
+    sigma = torch.linspace(0.99, 0.05, 20)
+    dt = -0.05 * torch.ones_like(sigma)
+    std_dev_t = torch.sqrt(sigma) * 0.5
+    coe = compute_timestep_weight(sigma, dt, std_dev_t)
+    assert torch.isfinite(coe).all()
+    assert (coe > 0).all()
+    # Low-noise (small sigma, small std_dev_t) -> denominator blows up -> coe -> 0.
+    assert coe[-1] < coe[0]
+    assert coe[-1].item() < 0.5
+
+
+def test_flash_grpo_loss_registered_and_callable() -> None:
+    actor_config = _make_fsdp_actor_config()
+    flash_loss = diffusion_algos.get_diffusion_loss_fn("flash_grpo")
+    assert type(flash_loss).__name__ == "FlashGRPOLoss"
+
+    bsz = 8
+    old_log_prob = torch.randn(bsz, dtype=torch.float32)
+    log_prob = torch.randn(bsz, dtype=torch.float32)
+    advantages = torch.randn(bsz, dtype=torch.float32)
+    coe = torch.rand(bsz, dtype=torch.float32) + 0.1
+
+    pg_loss, pg_metrics = flash_loss.compute_loss(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        config=actor_config,
+        coe=coe,
+    )
+    assert pg_loss.shape == ()
+    assert isinstance(pg_loss.item(), float)
+    for key in (
+        "actor/ppo_kl",
+        "actor/pg_clipfrac",
+        "actor/pg_clipfrac_higher",
+        "actor/pg_clipfrac_lower",
+        "actor/ratio_mean",
+        "actor/ratio_std",
+        "actor/timestep_weight_mean",
+        "actor/timestep_weight_std",
+    ):
+        assert key in pg_metrics, key
+
+
+def test_flash_grpo_loss_degenerates_to_flow_grpo_without_coe() -> None:
+    """Without coe, FlashGRPOLoss is identical to FlowGRPOLoss (uniform weighting)."""
+    actor_config = _make_fsdp_actor_config()
+    flow_loss = diffusion_algos.get_diffusion_loss_fn("flow_grpo")
+    flash_loss = diffusion_algos.get_diffusion_loss_fn("flash_grpo")
+
+    torch.manual_seed(0)
+    bsz = 16
+    old_log_prob = torch.randn(bsz, dtype=torch.float32)
+    log_prob = torch.randn(bsz, dtype=torch.float32)
+    advantages = torch.randn(bsz, dtype=torch.float32)
+
+    flow_pg, _ = flow_loss.compute_loss(
+        old_log_prob=old_log_prob, log_prob=log_prob, advantages=advantages, config=actor_config
+    )
+    flash_pg, _ = flash_loss.compute_loss(
+        old_log_prob=old_log_prob, log_prob=log_prob, advantages=advantages, config=actor_config, coe=None
+    )
+    assert torch.allclose(flow_pg, flash_pg, atol=1e-7)
+
+
+def test_flash_grpo_loss_uniform_coe_equals_flow_grpo() -> None:
+    """A uniform coe normalizes to 1, so FlashGRPOLoss still equals FlowGRPOLoss."""
+    actor_config = _make_fsdp_actor_config()
+    flow_loss = diffusion_algos.get_diffusion_loss_fn("flow_grpo")
+    flash_loss = diffusion_algos.get_diffusion_loss_fn("flash_grpo")
+
+    torch.manual_seed(1)
+    bsz = 16
+    old_log_prob = torch.randn(bsz, dtype=torch.float32)
+    log_prob = torch.randn(bsz, dtype=torch.float32)
+    advantages = torch.randn(bsz, dtype=torch.float32)
+    coe = torch.ones(bsz, dtype=torch.float32) * 3.7  # constant -> normalized to 1
+
+    flow_pg, _ = flow_loss.compute_loss(
+        old_log_prob=old_log_prob, log_prob=log_prob, advantages=advantages, config=actor_config
+    )
+    flash_pg, _ = flash_loss.compute_loss(
+        old_log_prob=old_log_prob, log_prob=log_prob, advantages=advantages, config=actor_config, coe=coe
+    )
+    assert torch.allclose(flow_pg, flash_pg, atol=1e-6)
+
+
+def test_flash_grpo_loss_applies_nonuniform_timestep_weight() -> None:
+    """Non-uniform coe reweights per-element losses by coe/mean(coe) before the mean."""
+    actor_config = _make_fsdp_actor_config()
+    flash_loss = diffusion_algos.get_diffusion_loss_fn("flash_grpo")
+
+    torch.manual_seed(2)
+    bsz = 16
+    old_log_prob = torch.randn(bsz, dtype=torch.float32)
+    log_prob = torch.randn(bsz, dtype=torch.float32)
+    advantages = torch.randn(bsz, dtype=torch.float32)
+    coe = torch.rand(bsz, dtype=torch.float32) + 0.1  # non-uniform
+
+    clip_ratio = actor_config.diffusion_loss.clip_ratio
+    adv_clip_max = actor_config.diffusion_loss.adv_clip_max
+    per_elem = _reference_flow_grpo_per_elem(old_log_prob, log_prob, advantages, clip_ratio, adv_clip_max)
+    expected = (per_elem * (coe / (coe.mean() + 1e-8))).mean()
+
+    flash_pg, _ = flash_loss.compute_loss(
+        old_log_prob=old_log_prob, log_prob=log_prob, advantages=advantages, config=actor_config, coe=coe
+    )
+    assert torch.allclose(flash_pg, expected, atol=1e-6)
+
+    # And it must differ from the unweighted (FlowGRPO) loss on this non-uniform case.
+    flow_pg, _ = diffusion_algos.get_diffusion_loss_fn("flow_grpo").compute_loss(
+        old_log_prob=old_log_prob, log_prob=log_prob, advantages=advantages, config=actor_config
+    )
+    assert not torch.allclose(flash_pg, flow_pg, atol=1e-4)

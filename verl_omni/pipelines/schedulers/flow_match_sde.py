@@ -45,6 +45,46 @@ class FlowMatchSDEDiscreteSchedulerOutput(BaseOutput):
     std_dev_t: torch.FloatTensor
 
 
+def compute_timestep_weight(
+    sigma: torch.Tensor,
+    dt: torch.Tensor,
+    std_dev_t: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Flash-GRPO temporal-gradient-rectification weight (``coe``).
+
+    Matches the 6th return value of Flash-GRPO's ``sde_step_with_logprob``
+    (https://github.com/Shredded-Pork/Flash-GRPO), whose hardcoded ``value_dict``
+    is this coefficient precomputed for the first 10 high-noise timesteps.
+
+    ``coe = 1 / ( sqrt(-dt)/std_dev_t + std_dev_t * sqrt(-dt) * (1 - sigma) / (2 * sigma) )``
+
+    The weight is **policy-independent**: it depends only on the scheduler's
+    ``sigma``, ``dt`` and the SDE ``std_dev_t``, none of which involve the model
+    output. It is used to balance gradient magnitude across denoising timesteps
+    (high-noise and low-noise steps produce gradients of very different scales).
+
+    Numerically safe across the schedule: at ``sigma == 1`` ``std_dev_t`` is
+    already guarded upstream (``torch.where(sigma == 1, sigma_max, sigma)``) and
+    the ``(1 - sigma) / (2 * sigma)`` term vanishes; as ``sigma -> 0``
+    ``std_dev_t -> 0`` so ``coe -> 0`` (low-noise steps are down-weighted, which
+    is the intended behaviour). ``eps`` only guards the final division.
+
+    Args:
+        sigma (`torch.Tensor`): current sigma, broadcastable with ``std_dev_t``.
+        dt (`torch.Tensor`): ``sigma_prev - sigma`` (negative on a decreasing
+            flow-matching schedule, so ``sqrt(-dt)`` is real).
+        std_dev_t (`torch.Tensor`): the SDE step's noise standard deviation.
+        eps (`float`): guard for the final reciprocal.
+
+    Returns:
+        `torch.Tensor`: ``coe`` with the broadcast shape of the inputs.
+    """
+    sqrt_neg_dt = torch.sqrt(-1.0 * dt)
+    denom = sqrt_neg_dt / std_dev_t + std_dev_t * sqrt_neg_dt * (1.0 - sigma) / (2.0 * sigma)
+    return 1.0 / (denom + eps)
+
+
 class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
     """SDE version of the FlowMatchEulerDiscreteScheduler.
     The implementation is based on FlowGRPO paper (https://arxiv.org/abs/2505.05470)
@@ -158,6 +198,7 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         return_logprobs: bool = True,
         return_sqrt_dt: bool = False,
         include_logprob_normalizer: bool = True,
+        return_coe: bool = False,
     ):
         """
         Run a single SDE / CPS reverse step.
@@ -189,6 +230,12 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
                 (see `GRPOGuardLoss`).
             include_logprob_normalizer (`bool`, *optional*, defaults to True):
                 Whether to include Gaussian normalizer constants in log probabilities.
+            return_coe (`bool`, *optional*, defaults to False):
+                Whether to additionally return the Flash-GRPO temporal-gradient-
+                rectification weight ``coe`` (see ``compute_timestep_weight``) as a
+                tensor of shape ``(batch_size,)``. Only supported for ``sde`` (and
+                ``flash`` once added); ``dance_sde`` and ``cps`` use a different
+                log-prob density form for which the coe formula does not apply.
         """
         assert sde_type in ["sde", "cps", "dance_sde"]
         assert sample.dtype == torch.float32
@@ -311,11 +358,34 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
 
         # mean along all but batch dimension
         log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim))) if log_prob is not None else None
+
+        if return_coe:
+            # coe is derived for the Gaussian transition with ``sigma_noise =
+            # std_dev_t * sqrt(-dt)`` (the ``sde`` branch's density form, also
+            # shared by Flash-GRPO and the future ``flash`` variant). ``dance_sde``
+            # uses ``sigma_noise = std_dev_t`` (no ``sqrt(-dt)`` factor) and
+            # ``cps`` uses an unnormalized density, so the coe formula does not
+            # match their log-prob form and is not offered for them.
+            assert sde_type in ("sde", "flash"), (
+                f"return_coe is only supported for sde_type in ('sde', 'flash'), got {sde_type!r}."
+            )
+            # coe is policy-independent (sigma/dt/std_dev_t only); reduce it to
+            # (batch_size,) the same way ``sqrt_dt`` is reduced below.
+            coe = compute_timestep_weight(sigma, dt, std_dev_t)
+            if coe.ndim == 0:
+                coe = coe.expand(sample.shape[0]).clone()
+            else:
+                coe = coe.reshape(coe.shape[0])
+
         if return_sqrt_dt:
             sqrt_dt = torch.sqrt(-1 * dt)
             if sqrt_dt.ndim == 0:
                 sqrt_dt = sqrt_dt.expand(sample.shape[0]).clone()
             else:
                 sqrt_dt = sqrt_dt.reshape(sqrt_dt.shape[0])
+            if return_coe:
+                return prev_sample, log_prob, prev_sample_mean, std_dev_t, sqrt_dt, coe
             return prev_sample, log_prob, prev_sample_mean, std_dev_t, sqrt_dt
+        if return_coe:
+            return prev_sample, log_prob, prev_sample_mean, std_dev_t, coe
         return prev_sample, log_prob, prev_sample_mean, std_dev_t
