@@ -394,15 +394,13 @@ def _extract_frames(solution_image, frame_interval: int = 1) -> list[Image.Image
 
     elif solution_image.ndim == 4:
         if is_channels_last:
-            solution_image = solution_image.permute(3, 0, 1, 2)
-        solution_image = solution_image[:, ::frame_interval]
-        solution_image = solution_image.permute(1, 0, 2, 3)
+            solution_image = solution_image.permute(0, 3, 1, 2)
+        solution_image = solution_image[::frame_interval]
 
     elif solution_image.ndim == 5:
         if is_channels_last:
-            solution_image = solution_image.permute(0, 4, 1, 2, 3)
-        solution_image = solution_image[:, :, ::frame_interval]
-        solution_image = solution_image.permute(0, 2, 1, 3, 4)
+            solution_image = solution_image.permute(0, 1, 4, 2, 3)
+        solution_image = solution_image[:, ::frame_interval]
         solution_image = solution_image.reshape(-1, *solution_image.shape[2:])
 
     return [_to_pil_hwc(frame) for frame in solution_image]
