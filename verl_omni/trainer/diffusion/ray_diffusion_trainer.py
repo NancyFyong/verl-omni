@@ -418,7 +418,10 @@ class BaseRayDiffusionTrainer(ABC):
                     frames = video_tensor_to_pil_frames(out)
                     video_path = os.path.join(video_tmp_dir, f"{len(wrapped)}.mp4")
                     export_to_video(frames, video_path, fps=fps)
-                    media = wandb.Video(video_path, fps=fps, format="mp4")
+                    # fps is baked into the mp4 by export_to_video; wandb.Video
+                    # ignores (and warns about) fps for file-path inputs, so it is
+                    # deliberately omitted here.
+                    media = wandb.Video(video_path, format="mp4")
                 else:
                     media = wandb.Image(out.float(), file_type="jpg")
                 wrapped.append((inp, media, score))
