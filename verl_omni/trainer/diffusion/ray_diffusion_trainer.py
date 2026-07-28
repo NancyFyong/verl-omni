@@ -427,13 +427,15 @@ class BaseRayDiffusionTrainer(ABC):
                 wrapped.append((inp, media, score))
             samples = wrapped
 
-        # Log to each configured logger
-        self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
-
-        # wandb copies each Video's file into the run directory during log(); the
-        # temp encodes are no longer needed afterward.
-        if video_tmp_dir is not None:
-            shutil.rmtree(video_tmp_dir, ignore_errors=True)
+        # Log to each configured logger. wandb copies each Video's file into the run
+        # directory during log(); the temp encodes are removed afterwards -- in a
+        # ``finally`` so a logging failure (network/wandb error) cannot leak the temp
+        # dir and let it accumulate over long runs.
+        try:
+            self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+        finally:
+            if video_tmp_dir is not None:
+                shutil.rmtree(video_tmp_dir, ignore_errors=True)
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
@@ -1185,7 +1187,7 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                     # where per-step encoding is expensive.
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     save_freq = self.config.trainer.get("rollout_data_save_freq", 1)
-                    if rollout_data_dir and (save_freq <= 0 or self.global_steps % save_freq == 0):
+                    if rollout_data_dir and save_freq > 0 and self.global_steps % save_freq == 0:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                 # validate
@@ -1593,7 +1595,8 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
                     if (
                         rollout_data_dir
                         and not self.is_offline
-                        and (save_freq <= 0 or self.global_steps % save_freq == 0)
+                        and save_freq > 0
+                        and self.global_steps % save_freq == 0
                     ):
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 

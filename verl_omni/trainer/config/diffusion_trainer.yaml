@@ -148,8 +148,8 @@ trainer:
   # to wandb (image runs ignore this)
   video_fps: 24
 
-  # Dump train rollout data every N steps (1 = every step). Larger values bound disk usage
-  # and per-step ffmpeg encode cost for video rollouts.
+  # Dump train rollout data every N steps (1 = every step, <=0 = never). Larger values
+  # bound disk usage and per-step ffmpeg encode cost for video rollouts.
   rollout_data_save_freq: 1
 
   # Cap on the number of samples dumped per train rollout step (null = all)

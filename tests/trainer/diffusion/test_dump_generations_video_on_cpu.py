@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests for ``BaseBaseRayDiffusionTrainer._dump_generations`` media handling.
+"""CPU tests for ``BaseRayDiffusionTrainer._dump_generations`` media handling.
 
 The dump branches on tensor rank: 5-D video batches ``[N, T, C, H, W]`` are
 written as ``{i}.mp4`` and 4-D image batches ``[N, C, H, W]`` as ``{i}.jpg``,
