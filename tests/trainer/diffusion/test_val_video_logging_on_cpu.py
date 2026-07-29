@@ -143,7 +143,7 @@ class TestMaybeLogValGenerationsWandb:
         CPU-only evidence the video is viewable in wandb (short of a live run)."""
         from diffusers.utils import export_to_video
 
-        from verl_omni.utils.media import video_tensor_to_pil_frames
+        from verl_omni.utils.reward_score.reward_utils import video_tensor_to_pil_frames
 
         clip = _warm_clips(1)[0]  # [T, C, H, W]
         path = str(tmp_path / "clip.mp4")

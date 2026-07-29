@@ -12,22 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU tests for media conversion helpers."""
+"""CPU tests for image/video conversion helpers in reward_score.reward_utils."""
 
+import base64
 import importlib.util
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
+from PIL import Image
 
-_MEDIA_PATH = Path(__file__).resolve().parents[2] / "verl_omni" / "utils" / "media.py"
-_MEDIA_SPEC = importlib.util.spec_from_file_location("media_under_test", _MEDIA_PATH)
-assert _MEDIA_SPEC is not None
-assert _MEDIA_SPEC.loader is not None
-_MEDIA_MODULE = importlib.util.module_from_spec(_MEDIA_SPEC)
-_MEDIA_SPEC.loader.exec_module(_MEDIA_MODULE)
-video_tensor_to_pil_frames = _MEDIA_MODULE.video_tensor_to_pil_frames
+_SRC = Path(__file__).resolve().parents[3] / "verl_omni" / "utils" / "reward_score" / "reward_utils.py"
+_SPEC = importlib.util.spec_from_file_location("reward_utils_under_test", _SRC)
+assert _SPEC is not None
+assert _SPEC.loader is not None
+_MODULE = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(_MODULE)
+video_tensor_to_pil_frames = _MODULE.video_tensor_to_pil_frames
+pil_image_to_base64 = _MODULE.pil_image_to_base64
 
 
 def test_video_tensor_to_pil_frames_clips_before_uint8_quantization():
@@ -54,3 +58,14 @@ def test_video_tensor_to_pil_frames_clips_before_uint8_quantization():
 def test_video_tensor_to_pil_frames_rejects_non_tchw_rgb(shape):
     with pytest.raises(ValueError, match="Expected an RGB video tensor"):
         video_tensor_to_pil_frames(torch.zeros(shape))
+
+
+def test_pil_image_to_base64_roundtrips_to_the_same_image():
+    image = Image.fromarray(np.arange(48, dtype=np.uint8).reshape(4, 4, 3))
+
+    uri = pil_image_to_base64(image)
+
+    assert uri.startswith("data:image/png;base64,")
+    decoded = Image.open(BytesIO(base64.b64decode(uri.split(",", 1)[1])))
+    assert decoded.format == "PNG"
+    assert np.array_equal(np.asarray(decoded), np.asarray(image))

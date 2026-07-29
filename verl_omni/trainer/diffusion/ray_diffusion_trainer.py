@@ -71,7 +71,8 @@ from verl_omni.trainer.diffusion.rollout_correction import (
     compute_rollout_corr_metrics_from_logprobs,
     rollout_correction_enabled,
 )
-from verl_omni.utils.media import video_tensor_to_pil_frames
+from verl_omni.utils.reward_score.reward_utils import video_tensor_to_pil_frames
+from verl_omni.utils.tracking import wrap_val_samples_for_wandb
 from verl_omni.workers.utils.padding import embeds_padding_2_no_padding
 
 sys_logger = logging.getLogger(__name__)
@@ -379,9 +380,7 @@ class BaseRayDiffusionTrainer(ABC):
         if generations_to_log == 0:
             return
 
-        import os
         import shutil
-        import tempfile
 
         import numpy as np
 
@@ -399,25 +398,9 @@ class BaseRayDiffusionTrainer(ABC):
         # Wrap retained media for wandb (after truncation, so videos are not all encoded)
         video_tmp_dir = None
         if "wandb" in self.config.trainer.logger:
-            import wandb
-
-            fps = int(self.config.trainer.get("video_fps", 24))
-            wrapped = []
-            for inp, out, score in samples:
-                if hasattr(out, "ndim") and out.ndim == 4:
-                    # Encode video to a temp mp4 and pass the path so wandb.Video skips moviepy
-                    from diffusers.utils import export_to_video
-
-                    if video_tmp_dir is None:
-                        video_tmp_dir = tempfile.mkdtemp(prefix="val_video_")
-                    frames = video_tensor_to_pil_frames(out)
-                    video_path = os.path.join(video_tmp_dir, f"{len(wrapped)}.mp4")
-                    export_to_video(frames, video_path, fps=fps)
-                    media = wandb.Video(video_path, format="mp4")
-                else:
-                    media = wandb.Image(out.float(), file_type="jpg")
-                wrapped.append((inp, media, score))
-            samples = wrapped
+            samples, video_tmp_dir = wrap_val_samples_for_wandb(
+                samples, fps=int(self.config.trainer.get("video_fps", 24))
+            )
 
         # Log to each configured logger
         try:
