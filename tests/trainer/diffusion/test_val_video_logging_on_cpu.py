@@ -11,23 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests for the wandb branch of ``BaseRayDiffusionTrainer._maybe_log_val_generations``.
-
-Validation logging pre-encodes each per-sample video tensor ``[T, C, H, W]`` to a
-temp ``.mp4`` (via diffusers' ffmpeg backend) and hands ``wandb.Video`` the file
-path -- avoiding the heavy ``moviepy`` dependency that raw-frame ``wandb.Video``
-pulls in -- then removes the temp dir after ``log()``.
-
-Two things are pinned here without a live wandb run:
-
-1. With ``wandb.Video`` monkeypatched, assert our code hands it a real, existing,
-   imageio-decodable mp4 (and that colors are not inverted), then that the temp
-   dir is cleaned up afterwards.
-2. With the REAL ``wandb.Video``, assert it ingests our production-encoded mp4 from
-   disk (reading its byte size + sha256) with no moviepy -- that ingested file is
-   exactly what wandb uploads to a run and renders as a playable video in the UI,
-   which is as far as a CPU-only test can verify "viewable in wandb".
-"""
+"""CPU tests for the wandb branch of ``BaseRayDiffusionTrainer._maybe_log_val_generations``."""
 
 import os
 from types import SimpleNamespace
@@ -44,8 +28,7 @@ from verl_omni.trainer.diffusion.ray_diffusion_trainer import BaseRayDiffusionTr
 
 
 class _RecordingValLogger:
-    """Stands in for ValidationGenerationsLogger: records the wrapped samples
-    instead of calling into a live wandb run."""
+    """Records wrapped samples in place of a live wandb run."""
 
     def __init__(self):
         self.calls = []
@@ -78,8 +61,7 @@ def _run_val_logging(outputs, *, log_val_generations, video_fps=8, global_steps=
 
 
 def _warm_clips(n, t=8, h=32, w=32):
-    """``n`` solid warm clips ``[N, T, C, H, W]`` with R > G > B, so an inverted
-    (uint8-overflow) encode is detectable after decode."""
+    """``n`` solid warm clips ``[N, T, C, H, W]`` with R > G > B, so an inverted encode is detectable."""
     clips = torch.zeros(n, t, 3, h, w)
     clips[:, :, 0] = 0.75  # R
     clips[:, :, 1] = 0.35  # G
@@ -89,19 +71,15 @@ def _warm_clips(n, t=8, h=32, w=32):
 
 class TestMaybeLogValGenerationsWandb:
     def test_wandb_video_gets_real_decodable_mp4_and_temp_dir_is_cleaned(self, monkeypatch):
-        """monkeypatch ``wandb.Video`` and assert it is called with a path to a real,
-        existing, imageio-decodable mp4 (correct colors), and that the temp dir is
-        removed after ``log()``."""
+        """wandb.Video gets a real, decodable, correctly-colored mp4, and the temp dir is removed after log()."""
         captured = []
 
         class _FakeVideo:
             def __init__(self, data_or_path, *args, **kwargs):
-                # Called during media wrapping, BEFORE the temp dir is cleaned up:
-                # the encoded mp4 must be a real, decodable file on disk right now.
                 assert isinstance(data_or_path, str), f"expected a file path, got {type(data_or_path)}"
                 assert os.path.isfile(data_or_path), f"wandb.Video got a non-existent path: {data_or_path}"
-                reader = imageio.get_reader(data_or_path)  # ffmpeg backend -> proves it decodes
-                frame = reader.get_data(4)  # a mid frame, [H, W, C] uint8 RGB
+                reader = imageio.get_reader(data_or_path)
+                frame = reader.get_data(4)
                 reader.close()
                 rgb = tuple(float(frame[..., c].mean()) for c in range(3))
                 captured.append(SimpleNamespace(path=data_or_path, kwargs=dict(kwargs), rgb=rgb))
@@ -136,11 +114,7 @@ class TestMaybeLogValGenerationsWandb:
         assert all(isinstance(media, _FakeVideo) for _inp, media, _score in samples)
 
     def test_real_wandb_video_ingests_our_production_mp4(self, tmp_path):
-        """Whether wandb can actually save/show the video: hand the REAL ``wandb.Video``
-        an mp4 built through the exact production path. Construction reads the file
-        from disk -- byte size + sha256 -- which is the content wandb uploads to the
-        run and renders in the UI. A successful, moviepy-free ingest is the strongest
-        CPU-only evidence the video is viewable in wandb (short of a live run)."""
+        """The REAL wandb.Video ingests a production-path mp4 from disk (size + sha256) with no moviepy."""
         from diffusers.utils import export_to_video
 
         from verl_omni.utils.reward_score.reward_utils import video_tensor_to_pil_frames
