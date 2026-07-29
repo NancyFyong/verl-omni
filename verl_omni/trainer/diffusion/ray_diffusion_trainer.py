@@ -279,13 +279,11 @@ class BaseRayDiffusionTrainer(ABC):
     def _dump_generations(
         self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, max_samples=None, fps=24
     ):
-        """Dump rollout/validation samples to disk as media files plus a JSONL index.
+        """Dump samples to disk as media files plus a JSONL index.
 
-        ``outputs`` is a batch of either images ``[N, C, H, W]`` or videos
-        ``[N, T, C, H, W]``. Images are written as ``{i}.jpg`` and videos as ``{i}.mp4``
-        (at ``fps`` frames per second). ``max_samples`` caps how many samples are written
-        (``None`` = all); this bounds disk usage and the per-step ffmpeg encode cost that
-        would otherwise be prohibitive for video runs.
+        ``outputs`` is a batch of images ``[N, C, H, W]`` (-> ``{i}.jpg``) or videos
+        ``[N, T, C, H, W]`` (-> ``{i}.mp4`` at ``fps``). ``max_samples`` caps how many
+        are written (``None`` = all).
         """
         os.makedirs(dump_path, exist_ok=True)
 
@@ -387,18 +385,18 @@ class BaseRayDiffusionTrainer(ABC):
 
         import numpy as np
 
-        # Pair (input, output, score), sort by input text, then deterministically shuffle
-        # and truncate BEFORE wrapping media so video runs do not encode every sample just
-        # to keep a handful. Sorting keys on the input string only, so raw output tensors
-        # are never compared.
+        # Create tuples of (input, output, score) and sort by input text
         samples = list(zip(inputs, list(outputs), scores, strict=True))
         samples.sort(key=lambda x: x[0])  # Sort by input text
-        rng = np.random.RandomState(42)  # Fixed seed for deterministic shuffling
+
+        # Use fixed random seed for deterministic shuffling
+        rng = np.random.RandomState(42)
         rng.shuffle(samples)
+
+        # Take first N samples after shuffling
         samples = samples[:generations_to_log]
 
-        # Wrap the retained media for wandb: videos [T, C, H, W] -> wandb.Video, images
-        # [C, H, W] -> wandb.Image. Other backends receive the raw tensors as before.
+        # Wrap retained media for wandb (after truncation, so videos are not all encoded)
         video_tmp_dir = None
         if "wandb" in self.config.trainer.logger:
             import wandb
@@ -406,11 +404,8 @@ class BaseRayDiffusionTrainer(ABC):
             fps = int(self.config.trainer.get("video_fps", 24))
             wrapped = []
             for inp, out, score in samples:
-                if hasattr(out, "ndim") and out.ndim == 4:  # video [T, C, H, W]
-                    # Passing raw frames to wandb.Video pulls in the heavy ``moviepy``
-                    # dependency. Encode to a temp mp4 with diffusers' ffmpeg backend
-                    # (already used for the on-disk dump) and hand wandb the file path,
-                    # which needs no moviepy.
+                if hasattr(out, "ndim") and out.ndim == 4:
+                    # Encode video to a temp mp4 and pass the path so wandb.Video skips moviepy
                     from diffusers.utils import export_to_video
 
                     if video_tmp_dir is None:
@@ -418,19 +413,13 @@ class BaseRayDiffusionTrainer(ABC):
                     frames = video_tensor_to_pil_frames(out)
                     video_path = os.path.join(video_tmp_dir, f"{len(wrapped)}.mp4")
                     export_to_video(frames, video_path, fps=fps)
-                    # fps is baked into the mp4 by export_to_video; wandb.Video
-                    # ignores (and warns about) fps for file-path inputs, so it is
-                    # deliberately omitted here.
                     media = wandb.Video(video_path, format="mp4")
                 else:
                     media = wandb.Image(out.float(), file_type="jpg")
                 wrapped.append((inp, media, score))
             samples = wrapped
 
-        # Log to each configured logger. wandb copies each Video's file into the run
-        # directory during log(); the temp encodes are removed afterwards -- in a
-        # ``finally`` so a logging failure (network/wandb error) cannot leak the temp
-        # dir and let it accumulate over long runs.
+        # Log to each configured logger
         try:
             self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
         finally:
@@ -1182,9 +1171,7 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_output_metrics)
 
-                    # Log rollout generations if enabled. rollout_data_save_freq bounds how
-                    # often we dump (default 1 = every step); this matters for video runs
-                    # where per-step encoding is expensive.
+                    # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     save_freq = self.config.trainer.get("rollout_data_save_freq", 1)
                     if rollout_data_dir and save_freq > 0 and self.global_steps % save_freq == 0:
@@ -1587,9 +1574,7 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_output_metrics)
 
-                    # Log rollout generations if enabled. rollout_data_save_freq bounds how
-                    # often we dump (default 1 = every step); this matters for video runs
-                    # where per-step encoding is expensive.
+                    # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     save_freq = self.config.trainer.get("rollout_data_save_freq", 1)
                     if (

@@ -21,19 +21,13 @@ from PIL import Image
 def video_tensor_to_pil_frames(video: torch.Tensor) -> list[Image.Image]:
     """Convert an RGB ``[T, C, H, W]`` tensor in ``[0, 1]`` to PIL frames.
 
-    PIL frames are intentional here. ``diffusers.utils.export_to_video`` scales
-    NumPy inputs by 255 even when they are already ``uint8``; passing PIL images
-    prevents that second scaling and the resulting modulo-256 color inversion.
-    Values outside the display range, including non-finite decoder output, are
-    sanitized before quantization.
+    PIL (not NumPy) frames avoid ``export_to_video`` rescaling already-uint8 input
+    by 255, which would invert colors modulo 256.
     """
     if video.ndim != 4 or video.shape[1] != 3:
         raise ValueError(f"Expected an RGB video tensor with shape [T, 3, H, W], got {tuple(video.shape)}")
 
-    frames = []
-    for frame in video:
-        frame = frame.detach().permute(1, 2, 0).to(dtype=torch.float32)
-        frame = torch.nan_to_num(frame, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0, 1)
-        frame = frame.mul_(255).round_().to(dtype=torch.uint8, device="cpu").contiguous().numpy()
-        frames.append(Image.fromarray(frame))
-    return frames
+    video = video.detach().permute(0, 2, 3, 1).to(dtype=torch.float32)
+    video = torch.nan_to_num(video, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0, 1)
+    frames = video.mul_(255).round_().to(dtype=torch.uint8, device="cpu").contiguous().numpy()
+    return [Image.fromarray(frame) for frame in frames]
