@@ -45,6 +45,20 @@ thing, the guide wins and the file links to it.
 `commit-and-pr` holds the authoritative module list; other files link to it rather
 than duplicating it.
 
+## Other agent tools
+
+`.agents/` and `.codex/` are symlinks into this directory, so a tool that looks for
+its own conventional path finds the same files:
+
+```
+.agents/skills -> ../.claude/skills      .codex/skills -> ../.claude/skills
+.agents/rules  -> ../.claude/rules       .codex/rules  -> ../.claude/rules
+```
+
+Whole directories, not per-file links — a skill added under `.claude/` shows up in
+both without anyone remembering to link it. Add content only under `.claude/`;
+`CLAUDE.md` → `AGENTS.md` is the same arrangement one level up.
+
 ## Maintaining these files
 
 - Verify before you edit. Read the enforcement script, count the occurrences, read
