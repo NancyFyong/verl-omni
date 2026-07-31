@@ -15,11 +15,12 @@
 from dataclasses import dataclass, field
 
 from verl.base_config import BaseConfig
-from verl.workers.config import FSDPActorConfig
+from verl.workers.config import ActorConfig, AutomodelEngineConfig, AutomodelOptimizerConfig, FSDPActorConfig
 
 __all__ = [
     "OmniLossConfig",
     "OmniActorConfig",
+    "OmniAutomodelActorConfig",
 ]
 
 
@@ -97,3 +98,35 @@ class OmniActorConfig(FSDPActorConfig):
             )
         if self.trainer_type == "direct_preference" and self.omni_loss is None:
             raise ValueError("OmniActorConfig.omni_loss is required for direct_preference training.")
+
+
+@dataclass
+class OmniAutomodelActorConfig(ActorConfig):
+    """Automodel (``nemo_automodel``) actor config for omni model training.
+
+    Mirrors verl's per-strategy actor configs (``FSDPActorConfig`` / ``VeOmniActorConfig``)
+    for the ``automodel`` backend: it subclasses the base ``ActorConfig`` (not
+    ``OmniActorConfig``, whose FSDP parent asserts an FSDP strategy) and points
+    ``engine`` at an ``AutomodelEngineConfig``. The ``trainer_type`` / ``omni_loss``
+    fields duplicate ``OmniActorConfig``'s two omni-specific fields; a shared mixin is
+    avoided in v1 because dataclass field ordering across a mixin and two bases is
+    error-prone. Select it from YAML with
+    ``actor._target_: verl_omni.workers.config.omni.OmniAutomodelActorConfig``.
+    """
+
+    strategy: str = "automodel"
+    automodel: AutomodelEngineConfig = field(default_factory=AutomodelEngineConfig)
+    optim: AutomodelOptimizerConfig = field(default_factory=AutomodelOptimizerConfig)
+    trainer_type: str = "direct_preference"  # "direct_preference" or "policy_gradient"
+    omni_loss: OmniLossConfig = field(default_factory=OmniLossConfig)
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.engine = self.automodel
+        object.__setattr__(self.engine, "strategy", self.strategy)
+        if self.trainer_type not in ["direct_preference", "policy_gradient"]:
+            raise ValueError(
+                f"Invalid omni trainer_type={self.trainer_type}; expected ['direct_preference', 'policy_gradient']."
+            )
+        if self.trainer_type == "direct_preference" and self.omni_loss is None:
+            raise ValueError("OmniAutomodelActorConfig.omni_loss is required for direct_preference training.")
