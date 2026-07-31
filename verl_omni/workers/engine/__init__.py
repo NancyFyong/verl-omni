@@ -24,6 +24,13 @@ try:
 except ImportError:
     VeOmniDiffusionEngine = None
 
+# nemo_automodel is an optional dependency; register the automodel omni engine only
+# when it (and verl's automodel engine) are importable.
+try:
+    from .automodel import OmniAutomodelEngine  # noqa: F401
+except ImportError:
+    OmniAutomodelEngine = None
+
 __all__ = [
     "PPODiffusersFSDPEngine",
     "DPODiffusersFSDPEngine",
@@ -31,4 +38,5 @@ __all__ = [
     "DiffusersFSDPEngine",
     "VeOmniDiffusionEngine",
     "OmniFSDPEngine",
+    "OmniAutomodelEngine",
 ]

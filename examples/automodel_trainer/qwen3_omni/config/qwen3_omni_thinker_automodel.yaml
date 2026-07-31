@@ -1,0 +1,55 @@
+# Qwen3-Omni Thinker offline DPO training on the Automodel (nemo_automodel) engine.
+#
+# Demonstrates selecting the automodel backend for an omni model: the actor
+# group override below replaces the default FSDP actor with the automodel one
+# (verl_omni.workers.config.omni.OmniAutomodelActorConfig, strategy=automodel),
+# which routes to OmniAutomodelEngine at runtime.
+#
+# Scope: image+text inputs (inherits the LM-head forward path). This is an
+# opt-in example -- it does NOT change omni_trainer.yaml's default composition,
+# so _generated_omni_trainer.yaml is unaffected.
+#
+# Offline DPO is used deliberately: it exercises the engine's build, forward,
+# loss and optimizer path without requiring rollout weight sync
+# (engine.get_per_tensor_param), which is validated separately for the online RL
+# path. omni_trainer.yaml already defaults to direct_preference / offline / dpo,
+# so no algorithm overrides are needed here.
+#
+# Requires the optional nemo_automodel dependency and is validated on GPU.
+#
+# Launch:
+#   bash examples/automodel_trainer/qwen3_omni/run_qwen3_omni_thinker_automodel.sh
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+    - pkg://verl_omni.trainer.config
+
+defaults:
+  - omni_trainer
+  - override /actor@actor_rollout_ref.actor: qwen3_omni_automodel_actor
+  - _self_
+
+data:
+  train_batch_size: 32
+  max_prompt_length: 4096
+  max_response_length: 2048
+  truncation: error
+  filter_overlong_prompts: true
+
+actor_rollout_ref:
+
+  model:
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+
+trainer:
+  val_before_train: false
+  balance_batch: true
+  critic_warmup: 0
+  logger: ["console", "wandb"]
+  project_name: qwen3_omni_automodel
+  experiment_name: qwen3_omni_thinker_offline_dpo_automodel
+  save_freq: 50
+  test_freq: 10
+  total_epochs: 3

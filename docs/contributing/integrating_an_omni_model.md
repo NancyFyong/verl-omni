@@ -1,6 +1,6 @@
 # How to Add a New Omni Model
 
-Last updated: 07/28/2026.
+Last updated: 07/31/2026.
 
 This guide walks through adding a new omni (multimodal autoregressive) model to
 the verl-omni training framework. It uses the Qwen3-Omni Thinker adapter as a
@@ -176,3 +176,29 @@ model-specific — verify each against your own model's architecture.
   in `configure_tokenizer` and assign it to `tokenizer.chat_template`.
   verl's dataset loader calls `tokenizer.apply_chat_template()` and will
   fail without a template.
+
+## 7. Engine backend selection
+
+The training adapter above is engine-agnostic; the engine that wraps the model
+is chosen by `actor_rollout_ref.actor.strategy`:
+
+- **`fsdp` / `fsdp2` (default)**: `OmniFSDPEngine`. This is the fully supported
+  path used by every example recipe. `actor._target_` defaults to
+  `OmniActorConfig`.
+- **`automodel` (optional, image+text)**: `OmniAutomodelEngine`, which delegates
+  model build, parallelism, optimizer, LR schedule, grad-clip, and checkpointing
+  to NVIDIA's `nemo_automodel` while keeping verl-omni's training loop, data, and
+  loss. It reuses the same `configure_model` adapter as the FSDP path, so no
+  adapter changes are needed.
+
+The `automodel` backend is an **opt-in** dependency: the engine is only
+registered when `nemo_automodel` is importable, and it is selected via a Hydra
+group override (not by changing `omni_trainer.yaml`'s defaults), so the
+generated trainer config is unaffected. Select it with
+`actor._target_: verl_omni.workers.config.omni.OmniAutomodelActorConfig` and
+`actor.strategy=automodel`.
+
+Current scope is **image+text** inputs (it inherits the LM-head forward path).
+LoRA / rollout weight-sync parity with `OmniFSDPEngine`, audio/video modalities,
+and Megatron sharding are deferred. See the example recipe:
+[`examples/automodel_trainer/qwen3_omni/`](../../examples/automodel_trainer/qwen3_omni/).

@@ -1,0 +1,109 @@
+# Automodel (nemo_automodel) actor group for Qwen3-Omni Thinker offline DPO.
+#
+# Selected by qwen3_omni_thinker_automodel.yaml via a group override so it
+# fully replaces the default FSDP `dp_actor` node (whose fsdp_config / strategy
+# keys are not accepted by OmniAutomodelActorConfig). Instantiated through
+# verl.utils.omega_conf_to_dataclass -> hydra.instantiate, so every node needs
+# a `_target_`. backend_config / moe_config are omitted here and fall back to
+# nemo_automodel's own defaults.
+
+_target_: verl_omni.workers.config.omni.OmniAutomodelActorConfig
+
+# Backend strategy; routes to OmniAutomodelEngine (model_type=omni_model, backend=automodel).
+strategy: automodel
+
+# Mirrors algorithm.trainer_type; direct_preference for offline DPO.
+trainer_type: ${algorithm.trainer_type}
+
+# Freeze the vision tower during DPO (image inputs are encoded, not trained).
+freeze_vision_tower: true
+
+# Minibatch size for the DPO update.
+ppo_mini_batch_size: 8
+
+# Dynamic batching by token length.
+use_dynamic_bsz: true
+
+# Max tokens per GPU micro-batch when use_dynamic_bsz is true.
+ppo_max_token_len_per_gpu: 16384
+
+# Loss aggregation mode.
+loss_agg_mode: seq-mean-token-mean
+
+# Omni DPO loss config; consumed by OmniDPOLoss via OmniDirectPreferenceRayTrainer.
+omni_loss:
+
+  # Target dataclass for the omni loss config.
+  _target_: verl_omni.workers.config.omni.OmniLossConfig
+
+  # Preference loss registry key.
+  loss_mode: dpo
+
+  # DPO inverse temperature.
+  beta: 0.1
+
+  # DPO label smoothing (0.0 disables cDPO smoothing).
+  label_smoothing: 0.0
+
+  # Bradley-Terry sigmoid DPO loss.
+  loss_type: sigmoid
+
+  # Sum token log-probs rather than averaging them (TRL default).
+  average_log_prob: false
+
+  # Parameter dtype for the frozen reference policy.
+  refer_model_precision: bfloat16
+
+# Automodel engine config (nemo_automodel); lands at OmniAutomodelActorConfig.automodel.
+automodel:
+
+  # Target dataclass for the automodel engine config.
+  _target_: verl.workers.config.AutomodelEngineConfig
+
+  # Backend strategy identifier.
+  strategy: automodel
+
+  # Distributed training strategy: "fsdp2", "megatron_fsdp", or "ddp".
+  distributed_strategy: fsdp2
+
+  # Tensor parallel size.
+  tp_size: 1
+
+  # Context parallel size.
+  cp_size: 1
+
+  # Expert parallel size (MoE); Qwen3-Omni-MoE can use ep_size > 1 on multi-GPU.
+  ep_size: 1
+
+  # Offload parameters to CPU between steps.
+  param_offload: true
+
+  # Offload optimizer state to CPU between steps.
+  optimizer_offload: true
+
+  # Model weight dtype ("fp32", "bf16", "fp16").
+  model_dtype: bf16
+
+  # Attention implementation.
+  attn_implementation: flash_attention_2
+
+  # Activation checkpointing to reduce memory.
+  activation_checkpointing: true
+
+# Automodel optimizer config; lands at OmniAutomodelActorConfig.optim.
+optim:
+
+  # Target dataclass for the automodel optimizer config.
+  _target_: verl.workers.config.AutomodelOptimizerConfig
+
+  # Learning rate (maps to max_lr in nemo's OptimizerParamScheduler).
+  lr: 5e-7
+
+  # Weight decay.
+  weight_decay: 0.01
+
+  # Gradient clipping norm (consumed as max_grad_norm during the optimizer step).
+  clip_grad: 1.0
+
+  # LR decay style.
+  lr_scheduler_type: cosine

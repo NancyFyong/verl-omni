@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from . import model
-from .actor import OmniActorConfig, OmniAutomodelActorConfig, OmniLossConfig
-from .model import *  # noqa: F401
+from .omni_impl import OmniAutomodelEngine  # noqa: F401
 
-__all__ = list(model.__all__) + ["OmniLossConfig", "OmniActorConfig", "OmniAutomodelActorConfig"]
+__all__ = ["OmniAutomodelEngine"]
