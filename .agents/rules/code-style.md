@@ -1,3 +1,8 @@
+---
+paths:
+  - "**/*"
+---
+
 # Code Style Rules
 
 Rules beyond the automated pre-commit hooks (`ruff --fix`, `ruff-format`, `mypy`).
@@ -13,7 +18,7 @@ Formatting is handled by the tools below; this file covers conventions they do
 | -------------------------- | -------------------------------------------------------------------------- |
 | `ruff` / `ruff-format`     | Lint + format, `line-length = 120` (scope below)                           |
 | `mypy`                     | Static typing                                                              |
-| `check-license`            | Apache header on every git-tracked `.py`; accepts `Copyright 2024/2025/2026 Bytedance …` or `2026 Amazon.com Inc …` |
+| `check-license`            | Apache header on every git-tracked `.py`; accepts `Copyright 2024/2025/2026 Bytedance …` |
 | `autogen-trainer-cfg`      | `verl_omni/trainer/config/_generated_*.yaml` matches the dataclasses       |
 | `check-docstrings`         | Presence (not style) of docstrings, in a hardcoded file list — see below     |
 | `check-naming-conventions` | **Spelling only** — two project names, see below                          |

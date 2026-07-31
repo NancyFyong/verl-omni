@@ -37,16 +37,21 @@ gh pr list --repo verl-project/verl-omni --state open --search "<short area keyw
 [{modules}] {type}: {description}
 ```
 
-- **modules** (comma-separated if several): `vllm_omni`, `diffusion`, `omni`,
-  `rollout`, `trainer`, `reward`, `model`, `algo`, `fsdp`, `ray`, `worker`,
-  `data`, `cfg`, `ckpt`, `doc`, `ci`, `tests`, `docker`, `misc` (the official
-  list in `AGENTS.md`). Real history also uses `recipe` (for `examples/` /
-  recipe work) and occasionally `perf` — prefer the official list, but `recipe`
-  is established for example/recipe changes.
+- **modules** (comma-separated if several). The gate is
+  `tests/special_sanity/check_pr_title.py`, not `AGENTS.md` — it accepts the official
+  `AGENTS.md` set (`vllm_omni`, `diffusion`, `omni`, `rollout`, `trainer`, `reward`,
+  `model`, `algo`, `fsdp`, `ray`, `worker`, `data`, `cfg`, `ckpt`, `doc`, `ci`,
+  `tests`, `docker`, `misc`) **plus** `training_utils`, `single_controller`,
+  `recipe`, `perf`, `env`, `tool`. Prefer the official set; the extras are real
+  (`recipe` for `examples/` work, `perf` for perf changes). Anything outside the
+  validator's list fails the check.
 - **type**: `feat`, `fix`, `refactor`, `chore`, `test`.
-- Prefix `[BREAKING]` if it breaks any API (CLI args, config, signatures).
-- For a stacked/multi-part PR series, prefix `[N/N]`, e.g.
-  `[1/N][omni] feat: ...` (common in this repo).
+- `[BREAKING]` if it breaks any API (CLI args, config, signatures) — placed
+  **immediately before the module bracket**: `[BREAKING][cfg] refactor: ...`, *not*
+  `[cfg] [BREAKING] ...` (the validator only strips a leading `[BREAKING]`).
+- For a stacked/multi-part PR series, prefix `[N/N]` (single digits only), e.g.
+  `[1/N][omni] feat: ...`. Combined with `[BREAKING]` the order is
+  `[N/N][BREAKING][module]`.
 
 ### Module inference from changed paths
 
@@ -73,7 +78,7 @@ gh pr list --repo verl-project/verl-omni --state open --search "<short area keyw
 [diffusion, cfg] feat: add teacher-anchored distillation losses for OPD
 [omni] fix: correct attention mask for Qwen3-Omni text+image inputs
 [tests] test: cover qwen-image DPO adapter guidance branching on CPU
-[cfg] [BREAKING] refactor: rename guidance_scale to cfg_scale
+[BREAKING][cfg] refactor: rename guidance_scale to cfg_scale
 ```
 
 Real history to match style: `[trainer, algo, cfg] feat: ...`,
@@ -119,8 +124,8 @@ regenerated `_generated_*.yaml` (see [config rule](../../rules/config.md)).
 
 ## Common Mistakes
 
-- ❌ Title without `[{modules}]` or with an invalid module/type.
-- ❌ Missing `[BREAKING]` on a config/CLI/signature change.
+- ❌ Title with a module not in `check_pr_title.py`, or an invalid type.
+- ❌ `[BREAKING]` after the module bracket (`[cfg] [BREAKING]`) instead of before it.
 - ❌ Opening a PR without the duplicate-work checks.
 - ❌ Omitting the AI-assistance disclosure or trailers.
 - ❌ Committing a stale `_generated_*.yaml`.

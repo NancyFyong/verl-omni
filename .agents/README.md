@@ -1,4 +1,4 @@
-# `.claude/` — Agent rules & skills for verl-omni
+# `.agents/` — Agent rules & skills for verl-omni
 
 Repo-local guidance for AI-assisted contributions, complementing the mandatory
 contribution policy in [`AGENTS.md`](../AGENTS.md) / [`CLAUDE.md`](../CLAUDE.md).
@@ -47,17 +47,18 @@ than duplicating it.
 
 ## Other agent tools
 
-`.agents/` and `.codex/` are symlinks into this directory, so a tool that looks for
-its own conventional path finds the same files:
+The files live here. `.claude/` and `.codex/` are symlinks to the `skills/` and
+`rules/` directories in this one, so each tool finds the same content at the path it
+looks for:
 
 ```
-.agents/skills -> ../.claude/skills      .codex/skills -> ../.claude/skills
-.agents/rules  -> ../.claude/rules       .codex/rules  -> ../.claude/rules
+.claude/skills -> ../.agents/skills      .codex/skills -> ../.agents/skills
+.claude/rules  -> ../.agents/rules       .codex/rules  -> ../.agents/rules
 ```
 
-Whole directories, not per-file links — a skill added under `.claude/` shows up in
-both without anyone remembering to link it. Add content only under `.claude/`;
-`CLAUDE.md` → `AGENTS.md` is the same arrangement one level up.
+Whole directories, not per-file links — a skill added under `.agents/` shows up in
+both without anyone remembering to link it. Add content only here; `CLAUDE.md` →
+`AGENTS.md` is the same arrangement one level up.
 
 ## Maintaining these files
 
