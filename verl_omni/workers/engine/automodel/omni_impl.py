@@ -43,6 +43,68 @@ from verl.workers.engine.base import EngineRegistry
 logger = logging.getLogger(__name__)
 
 
+def build_omni_distributed_config(engine_config, world_size):
+    """Build ``(distributed_config, device_mesh, moe_mesh)`` against nemo's current mesh API.
+
+    Replaces verl's ``build_distributed_config_from_engine_config``, which imports
+    ``create_device_mesh`` from ``nemo_automodel.components.distributed.mesh_utils``.
+    That helper was made private (``_create_device_meshes``) in nemo PR #2266, so the
+    import raises ``ImportError`` on every released nemo 0.5.0 — the PyPI wheel and the
+    ``v0.5.0`` tag both post-date the rename. The public entry point is now
+    ``MeshContext.build``, used here; the strategy-config half is unchanged from verl's
+    version, and the meshes are returned bare so the inherited engine code (grad-norm
+    scaling, dp group, checkpoint ranks) keeps working against them.
+
+    Args:
+        engine_config: ``AutomodelEngineConfig``; supplies ``distributed_strategy``,
+            the ``mp_*`` dtypes and the parallelism sizes.
+        world_size: Total number of processes in the job.
+
+    Returns:
+        Tuple of ``(distributed_config, device_mesh, moe_mesh)``, matching the shape
+        verl's helper returned.
+    """
+    from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config, MegatronFSDPConfig
+    from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
+
+    strategy = engine_config.distributed_strategy
+    if strategy == "fsdp2":
+        from torch.distributed.fsdp import MixedPrecisionPolicy
+
+        from verl.utils.torch_dtypes import PrecisionType
+
+        distributed_config = FSDP2Config(
+            sequence_parallel=engine_config.sequence_parallel,
+            mp_policy=MixedPrecisionPolicy(
+                param_dtype=PrecisionType.to_dtype(engine_config.mp_param_dtype),
+                reduce_dtype=PrecisionType.to_dtype(engine_config.mp_reduce_dtype),
+                output_dtype=PrecisionType.to_dtype(engine_config.mp_output_dtype),
+                cast_forward_inputs=True,
+            ),
+            activation_checkpointing=engine_config.activation_checkpointing,
+            defer_fsdp_grad_sync=engine_config.defer_fsdp_grad_sync,
+        )
+    elif strategy == "megatron_fsdp":
+        distributed_config = MegatronFSDPConfig(activation_checkpointing=engine_config.activation_checkpointing)
+    elif strategy == "ddp":
+        distributed_config = DDPConfig(activation_checkpointing=engine_config.activation_checkpointing)
+    else:
+        raise ValueError(f"Unsupported distributed_strategy: {strategy}")
+
+    mesh_context = MeshContext.build(
+        distributed_config,
+        ParallelismSizes(
+            dp_replicate_size=engine_config.dp_replicate_size,
+            tp_size=engine_config.tp_size,
+            pp_size=engine_config.pp_size,
+            cp_size=engine_config.cp_size,
+            ep_size=engine_config.ep_size,
+        ),
+        world_size=world_size,
+    )
+    return distributed_config, mesh_context.device_mesh, mesh_context.moe_mesh
+
+
 def build_omni_distributed_setup(engine_config, distributed_config, device_mesh, moe_mesh):
     """Wrap verl's separate distributed arguments into nemo's ``DistributedSetup``.
 
@@ -155,6 +217,70 @@ def build_automodel_omni_model(model_config, engine_config, distributed_config, 
 @EngineRegistry.register(model_type="omni_model", backend=["automodel"], device=["cuda"])
 class OmniAutomodelEngine(AutomodelEngineWithLMHead):
     """Automodel engine for omni models (image+text)."""
+
+    def __init__(self, model_config, engine_config, optimizer_config, checkpoint_config, **kwargs):
+        """Initialize like the parent, but build the meshes via nemo's current API.
+
+        The parent's ``__init__`` calls verl's ``build_distributed_config_from_engine_config``,
+        which raises ``ImportError`` against every released nemo 0.5.0 (see
+        :func:`build_omni_distributed_config`). That helper is patched out for the
+        duration of the ``super().__init__`` call rather than after it, because the
+        parent would otherwise fail before returning.
+        """
+        import verl.workers.engine.automodel.transformer_impl as _verl_automodel
+
+        original = _verl_automodel.build_distributed_config_from_engine_config
+        _verl_automodel.build_distributed_config_from_engine_config = build_omni_distributed_config
+        try:
+            super().__init__(model_config, engine_config, optimizer_config, checkpoint_config, **kwargs)
+        finally:
+            _verl_automodel.build_distributed_config_from_engine_config = original
+
+    def _build_optimizer(self, module):
+        """Build the optimizer against nemo's current ``build_optimizer`` location and signature.
+
+        The parent imports ``build_optimizer`` from ``nemo_automodel.recipes.llm.train_ft``
+        and calls it as ``(module, cfg, distributed_config, device_mesh)``. nemo PR #2190
+        moved the function to ``components.optim.optimizer`` and changed the signature to
+        ``(model, config, *, device_mesh=None)`` — ``distributed_config`` is gone and
+        ``device_mesh`` is keyword-only — so the inherited version raises ``ImportError``
+        on every released nemo 0.5.0.
+
+        The same PR also dropped ``ConfigNode`` support: the config now has to be an
+        ``OptimizerConfig`` or a ``(import_path, kwargs)`` tuple. The tuple form is nemo's
+        documented escape hatch for external integrations, so ``_target_`` becomes the
+        path element and the remaining keys the kwargs. Which keys are collected is
+        unchanged from the parent.
+        """
+        from nemo_automodel.components.optim.optimizer import build_optimizer
+
+        config = self.optimizer_config
+        opt_dict = {
+            "_target_": f"{config.optimizer_impl}.{config.optimizer}",
+            "lr": config.lr,
+            "weight_decay": config.weight_decay,
+            "eps": config.eps,
+            "betas": list(config.betas),
+        }
+
+        if config.master_weights:
+            opt_dict["master_weights"] = config.master_weights
+        if config.store_param_remainders:
+            opt_dict["store_param_remainders"] = config.store_param_remainders
+
+        _short_to_torch = {"bf16": "torch.bfloat16", "fp32": "torch.float32", "fp16": "torch.float16"}
+        for attr in ("exp_avg_dtype", "exp_avg_sq_dtype", "master_weight_dtype"):
+            val = getattr(config, attr, None)
+            if val is not None:
+                opt_dict[attr] = _short_to_torch.get(val, val)
+
+        if config.override_optimizer_config:
+            opt_dict.update(config.override_optimizer_config)
+
+        optimizer_path = opt_dict.pop("_target_")
+        optimizers = build_optimizer(module, (optimizer_path, opt_dict), device_mesh=self.device_mesh)
+        assert len(optimizers) == 1, f"Expected 1 optimizer, got {len(optimizers)}"
+        return optimizers[0]
 
     def initialize(self):
         """Build the multimodal model, then reuse verl's optimizer/LR/checkpoint setup."""
