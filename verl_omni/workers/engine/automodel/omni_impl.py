@@ -70,7 +70,6 @@ def build_omni_distributed_config(engine_config, world_size):
     strategy = engine_config.distributed_strategy
     if strategy == "fsdp2":
         from torch.distributed.fsdp import MixedPrecisionPolicy
-
         from verl.utils.torch_dtypes import PrecisionType
 
         distributed_config = FSDP2Config(

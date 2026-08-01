@@ -72,6 +72,7 @@ This installs `vllm-omni`, then `verl` and `verl-omni`.
 | Multimodal training   | `pip install qwen-vl-utils math-verify`                   | Vision-language training (e.g. MMK12)   |
 | Dev tools             | `uv pip install -e ".[dev]"`                              | Linting and unit tests                  |
 | VeOmni engine backend | See [Optional engine backends](#optional-engine-backends) | VeOmni instead of default FSDP2         |
+| nemo_automodel engine backend | See [Optional engine backends](#optional-engine-backends) | Omni policy on `nemo_automodel` instead of default FSDP2 |
 
 ### Flash Attention 3
 
@@ -111,6 +112,28 @@ python -c "from veomni.distributed.offloading import load_model_to_gpu, load_opt
 ```
 
 If you want VeOmni's full `[gpu,dit]` extras (flash-attn variants, liger-kernel, cuda-python, etc.), install them in a separate environment not pinned to vllm 0.24.0; verl-omni does not need them.
+
+### Installing nemo_automodel alongside vLLM 0.24.0
+
+`nemo_automodel==0.5.0` selects the `(omni_model, automodel)` engine (`actor.strategy=automodel`) — an alternative to the default FSDP2 path for omni models. Resolving its dependencies against the current stack downgrades `transformers` (5.14.1 → 5.8.1), `pandas` (3.0.5 → 2.3.3) and `protobuf` (7.35.1 → 6.33.6), all three of which the rest of the verl-omni stack (vllm-omni, verl, dataset loaders) requires at the higher versions. Install without dependency resolution and let the existing stack satisfy the runtime imports:
+
+```bash
+uv pip install nemo_automodel==0.5.0 --no-deps
+```
+
+Verify the engine is registered:
+
+```bash
+python -c "import nemo_automodel; print('nemo_automodel', nemo_automodel.__version__)"
+python -c "
+from verl.workers.engine.base import EngineRegistry
+import verl_omni.workers.engine.automodel  # registers the engine
+cls = EngineRegistry.get_engine_cls('omni_model', 'automodel')
+print('registered:', cls.__name__)
+"
+```
+
+An end-to-end recipe lives at [`examples/automodel_trainer/qwen3_omni/run_qwen3_omni_thinker_automodel.sh`](https://github.com/verl-project/verl-omni/blob/main/examples/automodel_trainer/qwen3_omni/run_qwen3_omni_thinker_automodel.sh) (Qwen3-Omni Thinker offline DPO).
 
 ## Post-Installation Verification
 

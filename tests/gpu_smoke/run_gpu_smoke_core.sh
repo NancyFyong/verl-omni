@@ -33,4 +33,9 @@ run_test 5 "visual reward manager" \
     env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" \
     pytest -s tests/reward_loop/test_visual_reward_manager.py
 
+# Skips itself if the optional `nemo_automodel` backend is not installed (importorskip).
+run_test 6 "omni automodel engine" \
+    env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" \
+    pytest -s tests/workers/test_omni_automodel_engine.py
+
 gpu_smoke_summary
