@@ -22,6 +22,7 @@ from contextlib import nullcontext
 
 import torch
 from diffusers import AutoencoderKLWan
+from verl.utils.device import get_device_name
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -59,8 +60,9 @@ def _module_device(module: torch.nn.Module) -> torch.device:
 
 
 def _autocast(device: torch.device, dtype: torch.dtype):
-    if device.type == "cuda" and dtype in {torch.float16, torch.bfloat16}:
-        return torch.autocast("cuda", dtype=dtype)
+    device_type = get_device_name()
+    if device.type == device_type and dtype in {torch.float16, torch.bfloat16}:
+        return torch.autocast(device_type, dtype=dtype)
     return nullcontext()
 
 
@@ -331,7 +333,7 @@ class LingBotVideoPipelineWithLogProb(torch.nn.Module):
         negative_prompt_mask: torch.Tensor | None = None,
         height: int = 480,
         width: int = 832,
-        num_frames: int = 121,
+        num_frames: int = 81,
         num_inference_steps: int = 40,
         guidance_scale: float = 3.0,
         shift: float = 3.0,

@@ -46,6 +46,8 @@ python examples/flowgrpo_trainer/lingbot_video/prepare_structured_captions.py \
 
 Set a video reward function already available in this repository/environment,
 then launch `run_lingbot_dense_t2v_lora.sh`. The recipe uses the official
-480×832, 121-frame, 40-step, guidance-3, shift-3 baseline. For inexpensive
-training experiments lower `num_inference_steps` explicitly, while retaining
-the 40-step validation setting until quality is measured.
+480×832, 81-frame, guidance-3, shift-3 baseline. Training uses a lighter
+10-step rollout by default and keeps 40-step validation for quality checks.
+`trainer.validation_data_max_samples` only caps how many validation samples are
+saved/logged; use a smaller validation parquet if you want to generate fewer
+validation videos.

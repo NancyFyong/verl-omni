@@ -58,8 +58,8 @@ def test_caption_serialization_and_template_are_officially_compact():
         caption_to_json("a plain text prompt")
 
 
-@pytest.mark.parametrize("height,width,num_frames", [(480, 832, 121), (16, 16, 1), (512, 512, 81)])
-def test_t2v_dimensions_accept_official_shapes(height, width, num_frames):
+@pytest.mark.parametrize("height,width,num_frames", [(480, 832, 81), (480, 832, 121), (16, 16, 1)])
+def test_t2v_dimensions_accept_valid_shapes(height, width, num_frames):
     validate_t2v_dimensions(height, width, num_frames)
 
 
