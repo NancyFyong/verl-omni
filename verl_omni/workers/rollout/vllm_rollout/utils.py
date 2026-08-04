@@ -114,7 +114,13 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
             return model, model_config
         return None
 
-    def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
+    def update_weights_from_ipc(
+        self,
+        peft_config: dict = None,
+        base_sync_done=False,
+        use_shm: bool = False,
+        zmq_handle: str | None = None,
+    ):
         """Update the weights of the rollout model.
 
         For LoRA updates, all LoRA tensors are accumulated across buckets and loaded
@@ -127,7 +133,7 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
 
         assert self.device is not None
         receiver = BucketedWeightReceiver(
-            zmq_handle=self._get_zmq_handle(),
+            zmq_handle=zmq_handle or self._get_zmq_handle(),
             device=self.device,
             use_shm=use_shm,
         )
@@ -195,6 +201,13 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
                 # model.load_weights (no per-bucket finalize), then run the single
                 # post-load processing pass once all buckets are received.
                 model, model_config = standard
+                # Re-attach weight_loader on Ascend FusedMoE params via verl's
+                # built-in patch (handles ACLGraph unwrap + SUPPORTED_MOE_MODELS
+                # whitelist, which Qwen3-Omni is registered into via
+                # patch_register_vllm_moe_model_weight_loader).
+                from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+
+                patch_vllm_moe_model_weight_loader(model)
                 receiver.receive_weights(on_bucket_received=lambda weights: model.load_weights(weights))
                 from vllm.model_executor.model_loader.utils import process_weights_after_loading
 

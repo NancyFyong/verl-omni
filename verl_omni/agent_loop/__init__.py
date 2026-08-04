@@ -13,12 +13,18 @@
 # limitations under the License.
 
 from .diffusion_agent_loop import DiffusionAgentLoopOutput, DiffusionAgentLoopWorker
+from .diffusion_agent_loop_tq import (
+    DiffusionAgentLoopWorkerTQ,
+    create_diffusion_agent_loop_manager,
+)
 from .lingbot_dense_t2v_agent_loop import LingBotDenseT2VAgentLoop
 from .single_turn_agent_loop import DiffusionSingleTurnAgentLoop
 
 __all__ = [
     "DiffusionAgentLoopOutput",
     "DiffusionAgentLoopWorker",
+    "DiffusionAgentLoopWorkerTQ",
     "LingBotDenseT2VAgentLoop",
     "DiffusionSingleTurnAgentLoop",
+    "create_diffusion_agent_loop_manager",
 ]

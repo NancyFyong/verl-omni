@@ -22,6 +22,7 @@ from contextlib import nullcontext
 
 import torch
 from diffusers import AutoencoderKLWan
+from verl.utils.device import get_device_name
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -59,8 +60,8 @@ def _module_device(module: torch.nn.Module) -> torch.device:
 
 
 def _autocast(device: torch.device, dtype: torch.dtype):
-    if device.type == "cuda" and dtype in {torch.float16, torch.bfloat16}:
-        return torch.autocast("cuda", dtype=dtype)
+    if device.type == get_device_name() and dtype in {torch.float16, torch.bfloat16}:
+        return torch.autocast(device.type, dtype=dtype)
     return nullcontext()
 
 
