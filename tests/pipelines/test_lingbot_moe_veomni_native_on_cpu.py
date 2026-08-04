@@ -318,11 +318,11 @@ def test_backward_reaches_experts_router_and_shared_experts():
     for layer in range(model.config.depth):
         ffn = model.blocks[layer].ffn
         for name, grad in (
-            (f"blocks.{layer}.experts.w1", ffn.experts.w1.grad),
-            (f"blocks.{layer}.experts.w2", ffn.experts.w2.grad),
-            (f"blocks.{layer}.experts.w3", ffn.experts.w3.grad),
-            (f"blocks.{layer}.router.weight", ffn.router.weight.grad),
-            (f"blocks.{layer}.shared_experts.gate", ffn.shared_experts.gate_proj.weight.grad),
+            (f"blocks.{layer}.ffn.experts.w1", ffn.experts.w1.grad),
+            (f"blocks.{layer}.ffn.experts.w2", ffn.experts.w2.grad),
+            (f"blocks.{layer}.ffn.experts.w3", ffn.experts.w3.grad),
+            (f"blocks.{layer}.ffn.router.weight", ffn.router.weight.grad),
+            (f"blocks.{layer}.ffn.shared_experts.gate_proj.weight", ffn.shared_experts.gate_proj.weight.grad),
         ):
             assert grad is not None, f"{name} got no grad"
             assert torch.isfinite(grad).all(), f"{name} grad not finite"

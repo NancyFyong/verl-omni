@@ -150,11 +150,14 @@ class _LingBotVideoInitShim(_LingBotVideoTransformer3DModel):
 
 class LingBotVideoTransformer3DModel(PreTrainedModel, _LingBotVideoInitShim):
     config_class = LingBotVideoTransformer3DModelConfig
-    # The pip implementation deliberately does not implement gradient
-    # checkpointing (`_supports_gradient_checkpointing = False`); keep the
-    # transformers-side flag consistent so `gradient_checkpointing_enable`
-    # fails loudly instead of silently doing nothing.
+    # The pip implementation does not implement gradient checkpointing.  Both
+    # flags must agree: `supports_gradient_checkpointing` gates the
+    # transformers-side `gradient_checkpointing_enable`, and
+    # `_supports_gradient_checkpointing` is what VeOmni's
+    # GradientCheckpointingConfig(enable=True) probes via the diffusers-side
+    # class; leaving the diffusers flag True would silently no-op.
     supports_gradient_checkpointing = False
+    _supports_gradient_checkpointing = False
     _no_split_modules = ["LingBotVideoBlock"]
     _keep_in_fp32_modules = list(LINGBOT_VIDEO_FP32_MODULES)
     _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
