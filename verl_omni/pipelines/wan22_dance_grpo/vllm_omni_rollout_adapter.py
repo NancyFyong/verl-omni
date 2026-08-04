@@ -49,6 +49,7 @@ def _coalesce_not_none(value, default):
 
 
 @VllmOmniPipelineBase.register("WanPipeline", algorithm="dance_grpo")
+@VllmOmniPipelineBase.register("WanPipeline", algorithm="flash_grpo")
 class Wan22DanceGRPOPipelineWithLogProb(Wan22Pipeline):
     """Rollout pipeline for Wan2.2 that captures per-step log-probabilities.
 

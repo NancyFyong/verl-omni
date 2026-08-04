@@ -67,6 +67,7 @@ def _configure_wan_scheduler(
 
 
 @DiffusionModelBase.register("WanPipeline", algorithm="dance_grpo")
+@DiffusionModelBase.register("WanPipeline", algorithm="flash_grpo")
 class Wan22DanceGRPO(DiffusionModelBase):
     """Training adapter for the Wan2.2 diffusion model with DanceGRPO.
 
@@ -211,7 +212,13 @@ class Wan22DanceGRPO(DiffusionModelBase):
             step: Current denoising step index.
 
         Returns:
-            tuple: ``(log_prob, prev_sample_mean, std_dev_t, sqrt_dt)``.
+            tuple: ``(log_prob, prev_sample_mean, std_dev_t, sqrt_dt)``, or
+                ``(log_prob, prev_sample_mean, std_dev_t, sqrt_dt, coe)`` when
+                ``sde_type`` is ``sde``/``flash`` (the density form the Flash-GRPO
+                coe is derived for). ``coe`` is the temporal-gradient-rectification
+                weight consumed only by ``FlashGRPOLoss``; the default 4-tuple is
+                unchanged for ``dance_sde``/``cps``, so the DanceGRPO path and any
+                existing 4-tuple caller are unaffected.
         """
         assert scheduler_inputs is not None
         latents = scheduler_inputs["all_latents"]
@@ -228,8 +235,14 @@ class Wan22DanceGRPO(DiffusionModelBase):
             neg_noise_pred = module(**negative_model_inputs)[0]
             noise_pred = apply_cfg(noise_pred, neg_noise_pred, true_cfg_scale)
 
+        # ``coe`` is only defined for the ``sde``/``flash`` log-prob density form
+        # (see ``compute_timestep_weight``). Only then extend the return with a
+        # 5th value; ``dance_sde`` / ``cps`` keep the original 4-tuple so the
+        # DanceGRPO path is byte-for-byte unaffected.
+        want_coe = model_config.algo.sde_type in ("sde", "flash")
+
         # Sample previous step via SDE scheduler
-        _, log_prob, prev_sample_mean, std_dev_t, sqrt_dt = scheduler.sample_previous_step(
+        result = scheduler.sample_previous_step(
             sample=latents[:, step].float(),
             model_output=noise_pred.float(),
             timestep=timesteps[:, step],
@@ -238,6 +251,11 @@ class Wan22DanceGRPO(DiffusionModelBase):
             sde_type=model_config.algo.sde_type,
             return_logprobs=True,
             return_sqrt_dt=True,
+            return_coe=want_coe,
         )
+        if want_coe:
+            _, log_prob, prev_sample_mean, std_dev_t, sqrt_dt, coe = result
+            return log_prob, prev_sample_mean, std_dev_t, sqrt_dt, coe
 
+        _, log_prob, prev_sample_mean, std_dev_t, sqrt_dt = result
         return log_prob, prev_sample_mean, std_dev_t, sqrt_dt

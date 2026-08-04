@@ -150,6 +150,7 @@ class DiffusionAdvantageEstimator(str, Enum):
 
     FLOW_GRPO = "flow_grpo"
     DANCE_GRPO = "dance_grpo"
+    FLASH_GRPO = "flash_grpo"
 
 
 DIFFUSION_ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -189,6 +190,7 @@ def get_diffusion_adv_estimator_fn(name_or_enum):
 
 @register_diffusion_adv_est(DiffusionAdvantageEstimator.FLOW_GRPO)
 @register_diffusion_adv_est(DiffusionAdvantageEstimator.DANCE_GRPO)
+@register_diffusion_adv_est(DiffusionAdvantageEstimator.FLASH_GRPO)
 def compute_flow_grpo_outcome_advantage(
     sample_level_rewards: torch.Tensor,
     index: np.ndarray,
