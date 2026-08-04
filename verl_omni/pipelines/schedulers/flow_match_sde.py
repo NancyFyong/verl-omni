@@ -50,6 +50,7 @@ def compute_timestep_weight(
     dt: torch.Tensor,
     std_dev_t: torch.Tensor,
     eps: float = 1e-8,
+    sqrt_neg_dt: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Flash-GRPO temporal-gradient-rectification weight (``coe``).
 
@@ -80,7 +81,8 @@ def compute_timestep_weight(
     Returns:
         `torch.Tensor`: ``coe`` with the broadcast shape of the inputs.
     """
-    sqrt_neg_dt = torch.sqrt(-1.0 * dt)
+    if sqrt_neg_dt is None:
+        sqrt_neg_dt = torch.sqrt(-1.0 * dt)
     denom = sqrt_neg_dt / std_dev_t + std_dev_t * sqrt_neg_dt * (1.0 - sigma) / (2.0 * sigma)
     return 1.0 / (denom + eps)
 
@@ -237,7 +239,13 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
                 ``flash`` once added); ``dance_sde`` and ``cps`` use a different
                 log-prob density form for which the coe formula does not apply.
         """
-        assert sde_type in ["sde", "cps", "dance_sde"]
+        if sde_type == "flash":
+            raise NotImplementedError(
+                "sde_type='flash' (Flash-GRPO's linear std_dev_t = sigma_min + (sigma_max - sigma_min) * sigma) "
+                "is not yet implemented. Use sde_type='sde' with return_coe=True for temporal gradient "
+                "rectification via the existing FlowGRPO SDE formulation."
+            )
+        assert sde_type in ["sde", "cps", "dance_sde"], f"Unknown sde_type: {sde_type!r}"
         assert sample.dtype == torch.float32
         if prev_sample is not None:
             assert prev_sample.dtype == torch.float32
@@ -260,6 +268,8 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
 
         if sde_type == "sde":
             std_dev_t = torch.sqrt(sigma / (1 - torch.where(sigma == 1, sigma_max, sigma))) * noise_level
+            sqrt_neg_dt = torch.sqrt(-1.0 * dt)
+            sigma_noise = std_dev_t * sqrt_neg_dt
 
             prev_sample_mean = (
                 sample * (1 + std_dev_t**2 / (2 * sigma) * dt)
@@ -273,18 +283,12 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
                     device=model_output.device,
                     dtype=model_output.dtype,
                 )
-                prev_sample = prev_sample_mean + std_dev_t * torch.sqrt(-1 * dt) * variance_noise
+                prev_sample = prev_sample_mean + sigma_noise * variance_noise
 
             if return_logprobs:
-                log_prob = -((prev_sample.detach() - prev_sample_mean) ** 2) / (
-                    2 * ((std_dev_t * torch.sqrt(-1 * dt)) ** 2)
-                )
+                log_prob = -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * (sigma_noise**2))
                 if include_logprob_normalizer:
-                    log_prob = (
-                        log_prob
-                        - torch.log(std_dev_t * torch.sqrt(-1 * dt))
-                        - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
-                    )
+                    log_prob = log_prob - torch.log(sigma_noise) - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
             else:
                 log_prob = None
 
@@ -371,14 +375,17 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             )
             # coe is policy-independent (sigma/dt/std_dev_t only); reduce it to
             # (batch_size,) the same way ``sqrt_dt`` is reduced below.
-            coe = compute_timestep_weight(sigma, dt, std_dev_t)
+            # Reuse ``sqrt_neg_dt`` from the ``sde`` branch if available.
+            _sqrt_neg_dt = sqrt_neg_dt if sde_type == "sde" else None
+            coe = compute_timestep_weight(sigma, dt, std_dev_t, sqrt_neg_dt=_sqrt_neg_dt)
             if coe.ndim == 0:
                 coe = coe.expand(sample.shape[0]).clone()
             else:
                 coe = coe.reshape(coe.shape[0])
 
         if return_sqrt_dt:
-            sqrt_dt = torch.sqrt(-1 * dt)
+            # Reuse sqrt_neg_dt from the sde branch when available.
+            sqrt_dt = sqrt_neg_dt if sde_type == "sde" else torch.sqrt(-1 * dt)
             if sqrt_dt.ndim == 0:
                 sqrt_dt = sqrt_dt.expand(sample.shape[0]).clone()
             else:

@@ -377,13 +377,19 @@ class VeOmniDiffusionEngine(BaseEngine):
         )
 
     def prepare_model_outputs(self, output, micro_batch: TensorDict):
-        log_prob, prev_sample_mean, std_dev_t, sqrt_dt = output
-        return {
+        # Variable-length unpack: pipelines that support Flash-GRPO append a 5th
+        # value ``coe`` (temporal-gradient-rectification weight); pipelines that
+        # do not still return the 4-tuple, so ``rest`` is empty.
+        log_prob, prev_sample_mean, std_dev_t, sqrt_dt, *rest = output
+        model_output = {
             "log_probs": log_prob,
             "prev_sample_mean": prev_sample_mean,
             "std_dev_t": std_dev_t,
             "sqrt_dt": sqrt_dt,
         }
+        if rest and rest[0] is not None:
+            model_output["coe"] = rest[0]
+        return model_output
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only, step):
         model_inputs, negative_model_inputs = self.prepare_model_inputs(micro_batch=micro_batch, step=step)

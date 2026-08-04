@@ -13,6 +13,7 @@
 # limitations under the License.
 """Diffusion-specific loss functions and KL penalties."""
 
+import warnings
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass
@@ -267,6 +268,46 @@ def compute_flow_grpo_outcome_advantage(
     return scores, scores
 
 
+def _compute_clipped_per_elem_loss(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    clip_ratio: float,
+    adv_clip_max: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Shared PPO-clip per-element loss used by FlowGRPO and FlashGRPO.
+
+    Returns:
+        (per_elem_loss, log_ratio, ratio) — all shape ``(B,)``.
+    """
+    advantages = torch.clamp(advantages, -adv_clip_max, adv_clip_max)
+    log_ratio = log_prob - old_log_prob
+    ratio = torch.exp(log_ratio)
+    unclipped_loss = -advantages * ratio
+    clipped_loss = -advantages * torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio)
+    per_elem_loss = torch.maximum(unclipped_loss, clipped_loss)
+    return per_elem_loss, log_ratio, ratio
+
+
+def _compute_ppo_clip_metrics(log_ratio: torch.Tensor, ratio: torch.Tensor, clip_ratio: float) -> dict[str, Any]:
+    """Shared PPO-clip metrics dict used by FlowGRPO and FlashGRPO."""
+    with torch.no_grad():
+        ppo_kl = torch.mean(-log_ratio)
+        pg_clipfrac = torch.mean((torch.abs(ratio - 1.0) > clip_ratio).float())
+        pg_clipfrac_higher = torch.mean((ratio - 1.0 > clip_ratio).float())
+        pg_clipfrac_lower = torch.mean((1.0 - ratio > clip_ratio).float())
+        ratio_mean = ratio.mean()
+        ratio_std = ratio.std()
+    return {
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/pg_clipfrac_higher": pg_clipfrac_higher.detach().item(),
+        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+        "actor/ratio_mean": ratio_mean.detach().item(),
+        "actor/ratio_std": ratio_std.detach().item(),
+    }
+
+
 @register_diffusion_loss("flow_grpo")
 @register_diffusion_loss("dance_grpo")
 class FlowGRPOLoss(DiffusionLossFn):
@@ -289,58 +330,16 @@ class FlowGRPOLoss(DiffusionLossFn):
 
         Adapted from
         https://github.com/yifan123/flow_grpo/blob/main/scripts/train_sd3_fast.py#L885
-
-        Args:
-            old_log_prob (torch.Tensor):
-                Log-probabilities of actions under the old policy, shape (batch_size,).
-            log_prob (torch.Tensor):
-                Log-probabilities of actions under the current policy, shape (batch_size,).
-            advantages (torch.Tensor):
-                Advantage estimates for each action, shape (batch_size,).
-            config (verl_omni.workers.config.DiffusionActorConfig):
-                Config for the actor.
-            rollout_is_weights (Optional[torch.Tensor]):
-                Optional Rollout Correction multiplier (same shape as ``log_prob``) combining
-                IS weights and RS rejection (rejected samples have weight 0). When provided,
-                the per-element policy loss is multiplied by these (detached) weights before
-                the mean reduction.
         """
         assert config is not None, "config is required for FlowGRPOLoss!"
         loss_cfg = config.diffusion_loss
-        advantages = torch.clamp(
-            advantages,
-            -loss_cfg.adv_clip_max,
-            loss_cfg.adv_clip_max,
+        per_elem_loss, log_ratio, ratio = _compute_clipped_per_elem_loss(
+            old_log_prob, log_prob, advantages, loss_cfg.clip_ratio, loss_cfg.adv_clip_max
         )
-        log_ratio = log_prob - old_log_prob
-        ratio = torch.exp(log_ratio)
-        unclipped_loss = -advantages * ratio
-        clipped_loss = -advantages * torch.clamp(
-            ratio,
-            1.0 - loss_cfg.clip_ratio,
-            1.0 + loss_cfg.clip_ratio,
-        )
-        per_elem_loss = torch.maximum(unclipped_loss, clipped_loss)
         if rollout_is_weights is not None:
             per_elem_loss = per_elem_loss * rollout_is_weights.detach()
         pg_loss = torch.mean(per_elem_loss)
-
-        with torch.no_grad():
-            ppo_kl = torch.mean(-log_ratio)
-            pg_clipfrac = torch.mean((torch.abs(ratio - 1.0) > loss_cfg.clip_ratio).float())
-            pg_clipfrac_higher = torch.mean((ratio - 1.0 > loss_cfg.clip_ratio).float())
-            pg_clipfrac_lower = torch.mean((1.0 - ratio > loss_cfg.clip_ratio).float())
-            ratio_mean = ratio.mean()
-            ratio_std = ratio.std()
-
-        pg_metrics = {
-            "actor/ppo_kl": ppo_kl.detach().item(),
-            "actor/pg_clipfrac": pg_clipfrac.detach().item(),
-            "actor/pg_clipfrac_higher": pg_clipfrac_higher.detach().item(),
-            "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
-            "actor/ratio_mean": ratio_mean.detach().item(),
-            "actor/ratio_std": ratio_std.detach().item(),
-        }
+        pg_metrics = _compute_ppo_clip_metrics(log_ratio, ratio, loss_cfg.clip_ratio)
         return pg_loss, pg_metrics
 
     def __call__(
@@ -362,10 +361,12 @@ class FlowGRPOLoss(DiffusionLossFn):
 
 @register_diffusion_loss("flash_grpo")
 class FlashGRPOLoss(DiffusionLossFn):
-    """Flash-GRPO single-step policy objective with temporal gradient rectification.
+    """Flash-GRPO temporal gradient rectification (coe weighting).
 
-    Reuses the FlowGRPO clipped policy objective and multiplies each per-element
-    loss by a policy-independent timestep weight ``coe`` (see
+    This is the **loss component** of Flash-GRPO
+    (https://github.com/Shredded-Pork/Flash-GRPO). It reuses the FlowGRPO clipped
+    policy objective and multiplies each per-element loss by a policy-independent
+    timestep weight ``coe`` (see
     ``verl_omni.pipelines.schedulers.flow_match_sde.compute_timestep_weight``) so
     that gradient magnitude is balanced across denoising timesteps — the
     "temporal gradient rectification" of Flash-GRPO
@@ -383,6 +384,16 @@ class FlashGRPOLoss(DiffusionLossFn):
     distinction; the final loss is still cross-rank averaged by the existing
     post-loss ``all_reduce(AVG)``. The relative cross-timestep weighting — the
     part that matters for rectification — is preserved exactly.
+
+    Note:
+        Flash-GRPO's other two innovations — **single-step training** (gradient on
+        only one timestep per prompt) and **iso-temporal grouping** (same prompt →
+        same timestep across rollouts) — are NOT implemented here. They belong to
+        the rollout/trainer scheduling layer and are planned as Phase 2. Without
+        them, the loss operates on the full ``sde_window`` (same as FlowGRPO) but
+        with per-timestep reweighting. The coe weighting is still beneficial
+        (gradient magnitudes are balanced), but the paper's training-speed gain
+        (10-40x fewer forward passes) is not realized until Phase 2.
     """
 
     required_model_output_keys = ("log_probs",)
@@ -390,16 +401,14 @@ class FlashGRPOLoss(DiffusionLossFn):
 
     @classmethod
     def _normalize_coe(cls, coe: torch.Tensor, per_elem_loss: torch.Tensor) -> torch.Tensor:
-        """Reshape ``coe`` to ``per_elem_loss`` and normalize to mean 1."""
+        """Reshape ``coe`` to match ``per_elem_loss`` shape and normalize to mean 1."""
         coe = coe.detach().to(dtype=per_elem_loss.dtype, device=per_elem_loss.device)
-        if coe.numel() == per_elem_loss.numel():
-            coe = coe.reshape_as(per_elem_loss)
-        elif coe.numel() == 1:
-            coe = coe.expand_as(per_elem_loss)
-        else:
+        if coe.numel() != per_elem_loss.numel():
             raise ValueError(
-                f"`coe` (numel={coe.numel()}) is not broadcastable to `per_elem_loss` (numel={per_elem_loss.numel()})."
+                f"`coe` (numel={coe.numel()}) does not match `per_elem_loss` (numel={per_elem_loss.numel()}). "
+                "coe must be shape (B,) matching the batch dimension of the loss."
             )
+        coe = coe.reshape_as(per_elem_loss)
         return coe / (coe.mean() + 1e-8)
 
     @classmethod
@@ -430,20 +439,9 @@ class FlashGRPOLoss(DiffusionLossFn):
         """
         assert config is not None, "config is required for FlashGRPOLoss!"
         loss_cfg = config.diffusion_loss
-        advantages = torch.clamp(
-            advantages,
-            -loss_cfg.adv_clip_max,
-            loss_cfg.adv_clip_max,
+        per_elem_loss, log_ratio, ratio = _compute_clipped_per_elem_loss(
+            old_log_prob, log_prob, advantages, loss_cfg.clip_ratio, loss_cfg.adv_clip_max
         )
-        log_ratio = log_prob - old_log_prob
-        ratio = torch.exp(log_ratio)
-        unclipped_loss = -advantages * ratio
-        clipped_loss = -advantages * torch.clamp(
-            ratio,
-            1.0 - loss_cfg.clip_ratio,
-            1.0 + loss_cfg.clip_ratio,
-        )
-        per_elem_loss = torch.maximum(unclipped_loss, clipped_loss)
 
         timestep_weights = None
         if coe is not None:
@@ -454,22 +452,7 @@ class FlashGRPOLoss(DiffusionLossFn):
             per_elem_loss = per_elem_loss * rollout_is_weights.detach()
         pg_loss = torch.mean(per_elem_loss)
 
-        with torch.no_grad():
-            ppo_kl = torch.mean(-log_ratio)
-            pg_clipfrac = torch.mean((torch.abs(ratio - 1.0) > loss_cfg.clip_ratio).float())
-            pg_clipfrac_higher = torch.mean((ratio - 1.0 > loss_cfg.clip_ratio).float())
-            pg_clipfrac_lower = torch.mean((1.0 - ratio > loss_cfg.clip_ratio).float())
-            ratio_mean = ratio.mean()
-            ratio_std = ratio.std()
-
-        pg_metrics = {
-            "actor/ppo_kl": ppo_kl.detach().item(),
-            "actor/pg_clipfrac": pg_clipfrac.detach().item(),
-            "actor/pg_clipfrac_higher": pg_clipfrac_higher.detach().item(),
-            "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
-            "actor/ratio_mean": ratio_mean.detach().item(),
-            "actor/ratio_std": ratio_std.detach().item(),
-        }
+        pg_metrics = _compute_ppo_clip_metrics(log_ratio, ratio, loss_cfg.clip_ratio)
         if timestep_weights is not None:
             pg_metrics["actor/timestep_weight_mean"] = timestep_weights.mean().detach().item()
             pg_metrics["actor/timestep_weight_std"] = timestep_weights.std().detach().item()
@@ -482,12 +465,22 @@ class FlashGRPOLoss(DiffusionLossFn):
         model_output: dict[str, Any],
         data: TensorDict,
     ) -> DiffusionLossResult:
+        coe = model_output.get("coe", None)
+        if coe is None:
+            warnings.warn(
+                "FlashGRPOLoss received coe=None — temporal gradient rectification is disabled "
+                "and the loss degenerates to FlowGRPO. This usually means sde_type is not 'sde' "
+                "(or 'flash'). Set actor_rollout_ref.rollout.algo.sde_type='sde' to enable "
+                "Flash-GRPO's timestep weighting.",
+                UserWarning,
+                stacklevel=2,
+            )
         loss, metrics = self.compute_loss(
             old_log_prob=data["old_log_probs"],
             log_prob=model_output["log_probs"],
             advantages=data["advantages"],
             config=config,
-            coe=model_output.get("coe", None),
+            coe=coe,
             rollout_is_weights=data.get("rollout_is_weights", None),
         )
         return DiffusionLossResult(loss=loss, metrics=metrics)
