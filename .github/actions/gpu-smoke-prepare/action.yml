@@ -21,7 +21,7 @@ runs:
         pip3 install veomni==0.1.11 --no-deps
         pip3 install torchcodec librosa soundfile av
         pip3 install "transformers[mistral-common]"
-        # nemo_automodel's PyPI deps would downgrade transformers / pandas / protobuf
-        # below what the rest of the verl-omni stack requires.
-        # See docs/start/install.md "Installing nemo_automodel alongside vLLM 0.24.0".
-        pip3 install nemo_automodel==0.5.0 --no-deps
+        # nemo_automodel's dep tree may conflict with the vLLM stack; --no-deps
+        # like VeOmni. See docs/start/install.md "Optional engine backends".
+        pip3 install "nemo_automodel @ git+https://github.com/NVIDIA-NeMo/Automodel.git" --no-deps
+        pip3 install megatron_core nvidia-modelopt
