@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .flow_match_dual_sde import FlowMatchDualSDEDiscreteScheduler, minimax_h3_time_shift_sigmas
 from .flow_match_sde import FlowMatchSDEDiscreteScheduler
 
-__all__ = ["FlowMatchSDEDiscreteScheduler"]
+__all__ = [
+    "FlowMatchDualSDEDiscreteScheduler",
+    "FlowMatchSDEDiscreteScheduler",
+    "minimax_h3_time_shift_sigmas",
+]

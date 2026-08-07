@@ -40,7 +40,11 @@ from typing import Any
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
-from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+
+try:  # vllm-omni 0.26 renamed this class StepRequestState
+    from vllm_omni.diffusion.worker.utils import StepRequestState as DiffusionRequestState
+except ImportError:  # vllm-omni < 0.26
+    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.qwen_image_flow_grpo.vllm_omni_rollout_adapter import QwenImagePipelineWithLogProb

@@ -126,6 +126,14 @@ contributing/gpu_smoke_tests.md
 contributing/common_pitfalls.md
 ```
 
+```{toctree}
+:maxdepth: 1
+:caption: Design RFCs
+
+rfcs/rfc-0001-minimax-h3-fl2va.md
+rfcs/rfc-0002-minimax-h3-ref2va.md
+```
+
 ## Contribution
 
 VeRL-Omni is free software; you can redistribute it and/or modify it under the terms

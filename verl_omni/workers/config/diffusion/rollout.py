@@ -73,6 +73,18 @@ class DiffusionPipelineConfig(BaseConfig):
     # Audio-video generation frame rate.
     frame_rate: float = 24.0
 
+    # MiniMax H3: sigma-schedule shift for the video stream (maps to vllm-omni's flow_shift)
+    video_flow_shift: float = 12.0
+
+    # MiniMax H3: sigma-schedule shift for the audio stream (maps to vllm-omni's audio_flow_shift)
+    audio_flow_shift: float = 3.0
+
+    # MiniMax H3 flow_grpo: weight on the video stream's per-step log-prob in the combined log-prob
+    av_logprob_video_weight: float = 1.0
+
+    # MiniMax H3 flow_grpo: weight on the audio stream's per-step log-prob in the combined log-prob
+    av_logprob_audio_weight: float = 1.0
+
 
 @dataclass
 class DiffusionSamplingConfig(BaseConfig):

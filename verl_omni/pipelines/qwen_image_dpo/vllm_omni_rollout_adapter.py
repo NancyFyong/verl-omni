@@ -23,7 +23,11 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.qwen_image import QwenImagePipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+
+try:  # vllm-omni 0.26 renamed this class StepRequestState
+    from vllm_omni.diffusion.worker.utils import StepRequestState as DiffusionRequestState
+except ImportError:  # vllm-omni < 0.26
+    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.qwen_image_flow_grpo.common import apply_true_cfg, build_img_shapes
