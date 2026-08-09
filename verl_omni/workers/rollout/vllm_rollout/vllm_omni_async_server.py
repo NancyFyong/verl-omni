@@ -609,7 +609,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
 
         # Extract replay data from legacy custom_output or the newer
         # multimodal trajectory payload used by vLLM-Omni custom pipelines.
-        custom_output = final_res.custom_output or {}
+        custom_output = getattr(final_res, "custom_output", None) or {}
         if not custom_output:
             multimodal_output = getattr(final_res, "multimodal_output", None) or {}
             trajectory_output = multimodal_output.get("trajectory") if isinstance(multimodal_output, dict) else None

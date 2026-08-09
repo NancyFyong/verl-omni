@@ -244,7 +244,6 @@ def test_async_server_reads_trajectory_payload_from_multimodal_output():
     }
     final_res = SimpleNamespace(
         images=[video],
-        custom_output={},
         multimodal_output={"trajectory": trajectory, "metadata": {"trajectory": {"type": "denoising"}}},
         request_output=None,
     )
