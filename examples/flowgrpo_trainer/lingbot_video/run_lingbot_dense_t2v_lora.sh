@@ -1,125 +1,61 @@
-#!/usr/bin/env bash
-# Dense LingBot T2V FlowGRPO LoRA recipe.
-# Requires structured-caption parquet from prepare_structured_captions.py.
-set -euo pipefail
+# LingBot Dense T2V LoRA RL with HPSv3 reward.
+set -x
 
-WORKSPACE=${WORKSPACE:-$HOME}
-MODEL_PATH=${MODEL_PATH:-$WORKSPACE/models/lingbot-video-dense-1.3b}
-TOKENIZER_PATH=${TOKENIZER_PATH:-$MODEL_PATH/processor}
-TRAIN_PATH=${TRAIN_PATH:-$WORKSPACE/data/lingbot_video/train.parquet}
-VAL_PATH=${VAL_PATH:-$WORKSPACE/data/lingbot_video/val.parquet}
-REWARD_FUNCTION_PATH=${REWARD_FUNCTION_PATH:?Set an existing video reward function path.}
-REWARD_FUNCTION_NAME=${REWARD_FUNCTION_NAME:?Set its callable name.}
+export RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
 
-HPSV3_MODEL_PATH=${HPSV3_MODEL_PATH:-$WORKSPACE/models/HPSv3/HPSv3.safetensors}
-HPSV3_REWARD_DEVICE=${HPSV3_REWARD_DEVICE:-cuda}
-export custom_reward_model_path=${custom_reward_model_path:-$HPSV3_MODEL_PATH}
-export custom_reward_device=${custom_reward_device:-$HPSV3_REWARD_DEVICE}
+WORKSPACE=${WORKSPACE:-$(cd "$(dirname "$0")/../../.." && pwd)}
+model_name=${MODEL_PATH:-$WORKSPACE/models/lingbot-video-dense-1.3b}
+tokenizer_path=${TOKENIZER_PATH:-$model_name/processor}
+reward_function_path=${REWARD_FUNCTION_PATH:-pkg://verl_omni.utils.reward_score.hpsv3_reward}
 
-NUM_GPUS=${NUM_GPUS:-8}
+export custom_reward_model_path=${custom_reward_model_path:-$WORKSPACE/models/HPSv3/HPSv3.safetensors}
+export custom_reward_device=${custom_reward_device:-cuda}
+
+NUM_GPUS_ACTOR_ROLLOUT_REWARD=${NUM_GPUS_ACTOR_ROLLOUT_REWARD:-8}
 ROLLOUT_TP=${ROLLOUT_TP:-1}
+REWARD_WORKERS=${REWARD_WORKERS:-1}
 NUM_CPUS=${NUM_CPUS:-64}
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-37698}
+IMAGE_HEIGHT=${IMAGE_HEIGHT:-480}
+IMAGE_WIDTH=${IMAGE_WIDTH:-832}
+NUM_FRAMES=${NUM_FRAMES:-81}
 
-PROJECT_NAME=${PROJECT_NAME:-flow_grpo}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-lingbot_dense_t2v_lora}
-CKPT_DIR=${CKPT_DIR:-checkpoints/$PROJECT_NAME/$EXPERIMENT_NAME}
-RUN_DIR=${RUN_DIR:-$CKPT_DIR}
-ROLLOUT_DATA_DIR=${ROLLOUT_DATA_DIR:-$RUN_DIR/rollout}
-VALIDATION_DATA_DIR=${VALIDATION_DATA_DIR:-$RUN_DIR/val}
-LOG_FILE=${LOG_FILE:-$RUN_DIR/run.log}
-WANDB_DIR=${WANDB_DIR:-$RUN_DIR/wandb}
-export WANDB_DIR
-ROLLOUT_DATA_SAVE_FREQ=${ROLLOUT_DATA_SAVE_FREQ:-5}
-VALIDATION_DATA_MAX_SAMPLES=${VALIDATION_DATA_MAX_SAMPLES:-32}
-
-# Defaults target 16 prompts x 8 rollouts on 8 GPUs for 81-frame videos.
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-16}
 VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-16}
 ROLLOUT_GROUP_SIZE=${ROLLOUT_GROUP_SIZE:-8}
-LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-2}
-REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=${REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-$LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-8}
 PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-2}
+LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-2}
+REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=${REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-$LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}
 ENABLE_GRADIENT_CHECKPOINTING=${ENABLE_GRADIENT_CHECKPOINTING:-True}
-NUM_FRAMES=${NUM_FRAMES:-81}
 ROLLOUT_NOISE_LEVEL=${ROLLOUT_NOISE_LEVEL:-0.7}
 ROLLOUT_SDE_TYPE=${ROLLOUT_SDE_TYPE:-dance_sde}
-CHECK_CONFIG_ONLY=${CHECK_CONFIG_ONLY:-False}
-MODEL_DTYPE=${MODEL_DTYPE:-fp32}
-PYTHON_BIN=${PYTHON_BIN:-python3}
 
-die() {
-    echo "[config error] $*" >&2
-    exit 2
-}
+ENGINE=vllm_omni
 
-must_divide() {
-    local lhs_name=$1 lhs=$2 rhs_name=$3 rhs=$4
-    ((lhs % rhs == 0)) || die "$lhs_name=$lhs must be divisible by $rhs_name=$rhs"
-}
+train_path=${TRAIN_FILES:-$WORKSPACE/data/lingbot_video/train.parquet}
+test_path=${VAL_FILES:-$WORKSPACE/data/lingbot_video/val.parquet}
 
-for name in \
-    NUM_GPUS \
-    ROLLOUT_TP \
-    TRAIN_BATCH_SIZE \
-    VAL_BATCH_SIZE \
-    ROLLOUT_GROUP_SIZE \
-    PPO_MINI_BATCH_SIZE \
-    PPO_MICRO_BATCH_SIZE_PER_GPU \
-    LOG_PROB_MICRO_BATCH_SIZE_PER_GPU \
-    REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU; do
-    value=${!name}
-    [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "$name must be a positive integer, got: $value"
-done
+output_dir=$WORKSPACE/outputs/lingbot_dense_t2v_lora
+checkpoint_dir=$output_dir/checkpoints
+run_timestamp=$(date +"%Y%m%d_%H%M")
+log_file=$output_dir/logs/$run_timestamp/${NODE_RANK:-0}.log
+rollout_data_dir=$output_dir/logs/$run_timestamp/rollout_videos
+val_data_dir=$output_dir/logs/$run_timestamp/val_videos
+mkdir -p "$checkpoint_dir" "$(dirname "$log_file")"
+exec > >(tee -a "$log_file") 2>&1
+echo "Logging to $log_file"
 
-must_divide NUM_GPUS "$NUM_GPUS" ROLLOUT_TP "$ROLLOUT_TP"
-
-GLOBAL_ROLLOUT_BATCH=$((TRAIN_BATCH_SIZE * ROLLOUT_GROUP_SIZE))
-ACTOR_UPDATE_GLOBAL_MINI_BATCH=$((PPO_MINI_BATCH_SIZE * ROLLOUT_GROUP_SIZE))
-
-must_divide GLOBAL_ROLLOUT_BATCH "$GLOBAL_ROLLOUT_BATCH" NUM_GPUS "$NUM_GPUS"
-must_divide ACTOR_UPDATE_GLOBAL_MINI_BATCH "$ACTOR_UPDATE_GLOBAL_MINI_BATCH" NUM_GPUS "$NUM_GPUS"
-
-ROLLOUT_BATCH_PER_GPU=$((GLOBAL_ROLLOUT_BATCH / NUM_GPUS))
-ACTOR_UPDATE_MINI_BATCH_PER_GPU=$((ACTOR_UPDATE_GLOBAL_MINI_BATCH / NUM_GPUS))
-
-must_divide ROLLOUT_BATCH_PER_GPU "$ROLLOUT_BATCH_PER_GPU" \
-    ACTOR_UPDATE_MINI_BATCH_PER_GPU "$ACTOR_UPDATE_MINI_BATCH_PER_GPU"
-must_divide ACTOR_UPDATE_MINI_BATCH_PER_GPU "$ACTOR_UPDATE_MINI_BATCH_PER_GPU" \
-    PPO_MICRO_BATCH_SIZE_PER_GPU "$PPO_MICRO_BATCH_SIZE_PER_GPU"
-must_divide ROLLOUT_BATCH_PER_GPU "$ROLLOUT_BATCH_PER_GPU" \
-    LOG_PROB_MICRO_BATCH_SIZE_PER_GPU "$LOG_PROB_MICRO_BATCH_SIZE_PER_GPU"
-must_divide ROLLOUT_BATCH_PER_GPU "$ROLLOUT_BATCH_PER_GPU" \
-    REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU "$REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU"
-
-{
-    echo "[config check] batch settings are self-consistent:"
-    echo "  global_rollout_batch=$GLOBAL_ROLLOUT_BATCH, rollout_batch_per_gpu=$ROLLOUT_BATCH_PER_GPU"
-    echo "  actor_update_global_mini_batch=$ACTOR_UPDATE_GLOBAL_MINI_BATCH"
-    echo "  actor_update_mini_batch_per_gpu=$ACTOR_UPDATE_MINI_BATCH_PER_GPU"
-    echo "  ppo_micro_batch_size_per_gpu=$PPO_MICRO_BATCH_SIZE_PER_GPU"
-    echo "  log_prob_micro_batch_size_per_gpu=$LOG_PROB_MICRO_BATCH_SIZE_PER_GPU"
-    echo "  ref_log_prob_micro_batch_size_per_gpu=$REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU"
-    echo "  enable_gradient_checkpointing=$ENABLE_GRADIENT_CHECKPOINTING"
-    echo "  rollout_noise_level=$ROLLOUT_NOISE_LEVEL, rollout_sde_type=$ROLLOUT_SDE_TYPE"
-} >&2
-
-if [[ "${CHECK_CONFIG_ONLY,,}" == "1" || "${CHECK_CONFIG_ONLY,,}" == "true" ]]; then
-    exit 0
-fi
-
-mkdir -p "$RUN_DIR" "$WANDB_DIR"
-
-"$PYTHON_BIN" -m verl_omni.trainer.main_diffusion \
+python3 -m verl_omni.trainer.main_diffusion \
     algorithm.adv_estimator=flow_grpo \
-    data.train_files=$TRAIN_PATH \
-    data.val_files=$VAL_PATH \
+    data.train_files=$train_path \
+    data.val_files=$test_path \
     data.train_batch_size=$TRAIN_BATCH_SIZE \
     data.val_batch_size=$VAL_BATCH_SIZE \
-    data.max_prompt_length=37698 \
+    data.max_prompt_length=$MAX_PROMPT_LENGTH \
     data.seed=42 \
-    actor_rollout_ref.model.path=$MODEL_PATH \
-    actor_rollout_ref.model.tokenizer_path=$TOKENIZER_PATH \
+    actor_rollout_ref.model.path=$model_name \
+    actor_rollout_ref.model.tokenizer_path=$tokenizer_path \
     actor_rollout_ref.model.algorithm=flow_grpo \
     actor_rollout_ref.model.enable_gradient_checkpointing=$ENABLE_GRADIENT_CHECKPOINTING \
     'actor_rollout_ref.model.fsdp_layer_prefixes=["blocks."]' \
@@ -132,54 +68,54 @@ mkdir -p "$RUN_DIR" "$WANDB_DIR"
     actor_rollout_ref.actor.ppo_mini_batch_size=$PPO_MINI_BATCH_SIZE \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$PPO_MICRO_BATCH_SIZE_PER_GPU \
     actor_rollout_ref.actor.diffusion_loss.loss_mode=flow_grpo \
-    actor_rollout_ref.actor.fsdp_config.model_dtype=$MODEL_DTYPE \
+    actor_rollout_ref.actor.fsdp_config.model_dtype=fp32 \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
-    actor_rollout_ref.rollout.name=vllm_omni \
+    actor_rollout_ref.rollout.name=$ENGINE \
     actor_rollout_ref.rollout.load_format=safetensors \
     actor_rollout_ref.rollout.layered_summon=True \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP \
     actor_rollout_ref.rollout.n=$ROLLOUT_GROUP_SIZE \
     actor_rollout_ref.rollout.seed=42 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$LOG_PROB_MICRO_BATCH_SIZE_PER_GPU \
-    actor_rollout_ref.rollout.agent.num_workers=$((NUM_GPUS / ROLLOUT_TP)) \
+    actor_rollout_ref.rollout.agent.num_workers=$((NUM_GPUS_ACTOR_ROLLOUT_REWARD / ROLLOUT_TP)) \
     actor_rollout_ref.rollout.agent.default_agent_loop=lingbot_dense_t2v_agent \
-    actor_rollout_ref.rollout.prompt_length=37698 \
-    actor_rollout_ref.rollout.pipeline.height=480 \
-    actor_rollout_ref.rollout.pipeline.width=832 \
+    actor_rollout_ref.rollout.prompt_length=$MAX_PROMPT_LENGTH \
+    actor_rollout_ref.rollout.pipeline.height=$IMAGE_HEIGHT \
+    actor_rollout_ref.rollout.pipeline.width=$IMAGE_WIDTH \
     actor_rollout_ref.rollout.pipeline.num_frames=$NUM_FRAMES \
     actor_rollout_ref.rollout.pipeline.num_inference_steps=10 \
     actor_rollout_ref.rollout.pipeline.guidance_scale=3.0 \
     actor_rollout_ref.rollout.pipeline.shift=3.0 \
-    actor_rollout_ref.rollout.pipeline.max_sequence_length=37698 \
+    actor_rollout_ref.rollout.pipeline.max_sequence_length=$MAX_PROMPT_LENGTH \
     actor_rollout_ref.rollout.algo.noise_level=$ROLLOUT_NOISE_LEVEL \
     actor_rollout_ref.rollout.algo.sde_type=$ROLLOUT_SDE_TYPE \
     actor_rollout_ref.rollout.algo.sde_window_size=2 \
-    'actor_rollout_ref.rollout.algo.sde_window_range=[0,5]' \
+    actor_rollout_ref.rollout.algo.sde_window_range="[0,5]" \
     actor_rollout_ref.rollout.val_kwargs.pipeline.num_inference_steps=40 \
     actor_rollout_ref.rollout.val_kwargs.algo.noise_level=0.0 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU \
-    reward.num_workers=1 \
+    reward.num_workers=$REWARD_WORKERS \
     reward.reward_model.enable=False \
-    reward.custom_reward_function.path=$REWARD_FUNCTION_PATH \
-    reward.custom_reward_function.name=$REWARD_FUNCTION_NAME \
-    trainer.logger='["console","wandb"]' \
-    trainer.project_name=$PROJECT_NAME \
-    trainer.experiment_name=$EXPERIMENT_NAME \
+    reward.custom_reward_function.path=$reward_function_path \
+    reward.custom_reward_function.name=compute_score_hpsv3 \
+    trainer.logger='["console", "tensorboard", "wandb"]' \
+    trainer.project_name=flow_grpo \
+    trainer.experiment_name=lingbot_dense_t2v_lora \
+    trainer.default_local_dir=$checkpoint_dir \
+    trainer.rollout_data_dir=$rollout_data_dir \
+    trainer.validation_data_dir=$val_data_dir \
+    trainer.rollout_data_save_freq=5 \
+    trainer.validation_data_max_samples=32 \
     trainer.log_val_generations=8 \
     trainer.val_before_train=False \
-    trainer.n_gpus_per_node=$NUM_GPUS \
+    trainer.n_gpus_per_node=$NUM_GPUS_ACTOR_ROLLOUT_REWARD \
     trainer.nnodes=1 \
     ray_kwargs.ray_init.num_cpus=$NUM_CPUS \
     +ray_kwargs.ray_init.runtime_env.env_vars.custom_reward_model_path=$custom_reward_model_path \
     +ray_kwargs.ray_init.runtime_env.env_vars.custom_reward_device=$custom_reward_device \
-    trainer.default_local_dir=$CKPT_DIR \
-    trainer.rollout_data_dir=$ROLLOUT_DATA_DIR \
-    trainer.validation_data_dir=$VALIDATION_DATA_DIR \
-    trainer.rollout_data_save_freq=$ROLLOUT_DATA_SAVE_FREQ \
-    trainer.validation_data_max_samples=$VALIDATION_DATA_MAX_SAMPLES \
     trainer.save_freq=30 \
     trainer.max_actor_ckpt_to_keep=2 \
     trainer.test_freq=30 \
-    trainer.total_epochs=1 "$@" \
-    2>&1 | tee "$LOG_FILE"
+    trainer.total_epochs=1 \
+    trainer.resume_mode=auto "$@"

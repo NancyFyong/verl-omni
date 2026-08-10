@@ -12,10 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU checks for LingBot Dense T2V example script configuration guards."""
+"""CPU checks for LingBot Dense T2V example script launchers."""
 
-import os
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -24,58 +22,73 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SCRIPT_DIR = _REPO_ROOT / "examples" / "flowgrpo_trainer" / "lingbot_video"
 
 
-def _script_env(**overrides):
-    env = os.environ.copy()
-    env.update(
-        {
-            "CHECK_CONFIG_ONLY": "True",
-            "WORKSPACE": str(_REPO_ROOT),
-            "REWARD_FUNCTION_PATH": "verl_omni/utils/reward_score/hpsv3_reward.py",
-            "REWARD_FUNCTION_NAME": "compute_score_hpsv3",
-        }
-    )
-    env.update(overrides)
-    return env
+def _read_script(script: str) -> str:
+    return (_SCRIPT_DIR / script).read_text(encoding="utf-8")
 
 
-def _run_script_config_check(script, **env_overrides):
-    return subprocess.run(
-        ["bash", str(_SCRIPT_DIR / script)],
-        cwd=_REPO_ROOT,
-        env=_script_env(**env_overrides),
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+@pytest.mark.parametrize(
+    "script, experiment_name",
+    [
+        ("run_lingbot_dense_t2v_lora.sh", "lingbot_dense_t2v_lora"),
+        ("run_lingbot_dense_t2v_lora_fsdp2.sh", "lingbot_dense_t2v_lora_fsdp2"),
+    ],
+)
+def test_lingbot_training_scripts_use_simple_example_launcher_shape(script, experiment_name):
+    text = _read_script(script)
+
+    assert "set -x" in text
+    assert "CHECK_CONFIG_ONLY" not in text
+    assert "must_divide" not in text
+    assert "python3 -m verl_omni.trainer.main_diffusion" in text
+    assert f"output_dir=$WORKSPACE/outputs/{experiment_name}" in text
+    assert "checkpoint_dir=$output_dir/checkpoints" in text
+    assert 'exec > >(tee -a "$log_file") 2>&1' in text
+    assert 'echo "Logging to $log_file"' in text
 
 
 @pytest.mark.parametrize(
     "script",
     ["run_lingbot_dense_t2v_lora.sh", "run_lingbot_dense_t2v_lora_fsdp2.sh"],
 )
-def test_lingbot_scripts_default_batch_config_is_self_consistent(script):
-    result = _run_script_config_check(script)
+def test_lingbot_training_scripts_keep_validated_defaults(script):
+    text = _read_script(script)
 
-    assert result.returncode == 0, result.stderr + result.stdout
-    assert "batch settings are self-consistent" in result.stderr
-    assert "global_rollout_batch=128" in result.stderr
-    assert "rollout_batch_per_gpu=16" in result.stderr
-    assert "actor_update_global_mini_batch=64" in result.stderr
-    assert "actor_update_mini_batch_per_gpu=8" in result.stderr
-    assert "ppo_micro_batch_size_per_gpu=2" in result.stderr
-    assert "log_prob_micro_batch_size_per_gpu=2" in result.stderr
-    assert "ref_log_prob_micro_batch_size_per_gpu=2" in result.stderr
-    assert "enable_gradient_checkpointing=True" in result.stderr
-    assert "rollout_noise_level=0.7, rollout_sde_type=dance_sde" in result.stderr
+    expected_snippets = [
+        "TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-16}",
+        "VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-16}",
+        "ROLLOUT_GROUP_SIZE=${ROLLOUT_GROUP_SIZE:-8}",
+        "PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-8}",
+        "PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-2}",
+        "LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-2}",
+        "ENABLE_GRADIENT_CHECKPOINTING=${ENABLE_GRADIENT_CHECKPOINTING:-True}",
+        "NUM_FRAMES=${NUM_FRAMES:-81}",
+        "ROLLOUT_NOISE_LEVEL=${ROLLOUT_NOISE_LEVEL:-0.7}",
+        "ROLLOUT_SDE_TYPE=${ROLLOUT_SDE_TYPE:-dance_sde}",
+        "actor_rollout_ref.rollout.pipeline.shift=3.0",
+        "actor_rollout_ref.rollout.algo.sde_type=$ROLLOUT_SDE_TYPE",
+        "reward.custom_reward_function.name=compute_score_hpsv3",
+        "trainer.rollout_data_dir=$rollout_data_dir",
+        "trainer.validation_data_dir=$val_data_dir",
+        "trainer.resume_mode=auto",
+    ]
+    for snippet in expected_snippets:
+        assert snippet in text
 
 
-@pytest.mark.parametrize(
-    "script",
-    ["run_lingbot_dense_t2v_lora.sh", "run_lingbot_dense_t2v_lora_fsdp2.sh"],
-)
-def test_lingbot_scripts_reject_non_divisible_ppo_micro_batch(script):
-    result = _run_script_config_check(script, PPO_MICRO_BATCH_SIZE_PER_GPU="3")
+def test_lingbot_fsdp2_script_sets_fsdp2_specific_knobs():
+    text = _read_script("run_lingbot_dense_t2v_lora_fsdp2.sh")
 
-    assert result.returncode == 2
-    assert "ACTOR_UPDATE_MINI_BATCH_PER_GPU=8" in result.stderr
-    assert "PPO_MICRO_BATCH_SIZE_PER_GPU=3" in result.stderr
+    assert "ROLLOUT_TP=${ROLLOUT_TP:-2}" in text
+    assert "ACTOR_SP=${ACTOR_SP:-1}" in text
+    assert "ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.4}" in text
+    assert "actor_rollout_ref.actor.strategy=fsdp2" in text
+    assert "actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=$ACTOR_SP" in text
+
+
+def test_lingbot_non_fsdp2_script_keeps_fp32_actor_init():
+    text = _read_script("run_lingbot_dense_t2v_lora.sh")
+
+    assert "ROLLOUT_TP=${ROLLOUT_TP:-1}" in text
+    assert "actor_rollout_ref.actor.strategy=fsdp2" not in text
+    assert "actor_rollout_ref.actor.fsdp_config.model_dtype=fp32" in text
+    assert "actor_rollout_ref.model.lora_dtype=bf16" in text
