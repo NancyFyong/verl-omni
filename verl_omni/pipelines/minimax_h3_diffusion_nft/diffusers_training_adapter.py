@@ -39,6 +39,8 @@ from verl_omni.workers.config import DiffusionModelConfig
 
 from .common import (
     build_layout_from_meta,
+    h3_dit_timestep,
+    h3_velocity_to_flow_match,
     pack_video_audio_rows,
     split_dual_velocity,
     unpack_video_audio_rows,
@@ -133,7 +135,7 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
             "audio_rows": audio_rows,
             "encoder_hidden_states": prompt_embeds,
             "encoder_mask": prompt_embeds_mask,
-            "timestep": timesteps.float() / 1000.0,
+            "timestep": h3_dit_timestep(timesteps.float()),
             "latent_meta": meta,
         }
         return model_inputs, None
@@ -161,7 +163,8 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
 
         Returns:
             torch.Tensor: Packed-flat velocity of shape ``(B, Nv * 96 + Na * 32)``, matching ``xt`` so
-                the shared elementwise loss applies directly.
+                the shared elementwise loss applies directly. Sign-converted to the diffusers
+                flow-match convention the NFT loss expects (see :func:`.common.h3_velocity_to_flow_match`).
         """
         del negative_model_inputs
         video_rows = model_inputs["video_rows"]
@@ -206,7 +209,9 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
                 return_dict=False,
             )
             v_video, v_audio = split_dual_velocity(result)
-            packed_velocities.append(pack_video_audio_rows(v_video, v_audio))
+            packed_velocities.append(
+                pack_video_audio_rows(h3_velocity_to_flow_match(v_video), h3_velocity_to_flow_match(v_audio))
+            )
         return torch.cat(packed_velocities, dim=0)
 
     @classmethod

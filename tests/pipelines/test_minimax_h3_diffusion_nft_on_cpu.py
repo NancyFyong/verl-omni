@@ -35,6 +35,8 @@ from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     VIDEO_ROW_WIDTH,
     VIDEO_TAG,
     build_layout_from_meta,
+    h3_dit_timestep,
+    h3_velocity_to_flow_match,
     pack_video_audio_rows,
     unpack_video_audio_rows,
 )
@@ -120,6 +122,33 @@ class TestMiniMaxH3PackUnpack:
         assert torch.equal(out_audio, audio_rows.unsqueeze(0))
 
 
+class TestMiniMaxH3Conventions:
+    """Both MiniMax H3 conventions, shared by every H3 algorithm (see ``common.py``)."""
+
+    def test_dit_timestep_mirrors_the_sigma_schedule(self):
+        # sigma 1.0 (pure noise) -> t 0.0, sigma 0.0 (clean data) -> t 1.0.
+        torch.testing.assert_close(h3_dit_timestep(torch.tensor([1000.0, 750.0, 0.0])), torch.tensor([0.0, 0.25, 1.0]))
+
+    def test_dit_timestep_is_its_own_inverse(self):
+        sigmas = torch.tensor([1000.0, 600.0, 120.0, 0.0])
+        torch.testing.assert_close(h3_dit_timestep(h3_dit_timestep(sigmas) * 1000.0), sigmas / 1000.0)
+
+    def test_velocity_conversion_flips_the_sign(self):
+        velocity = torch.randn(3, VIDEO_ROW_WIDTH)
+        torch.testing.assert_close(h3_velocity_to_flow_match(velocity), -velocity)
+        torch.testing.assert_close(h3_velocity_to_flow_match(h3_velocity_to_flow_match(velocity)), velocity)
+
+    def test_converted_velocity_recovers_x0_under_the_flow_match_rule(self):
+        # H3: x0 = xt + sigma * v. Flow-match consumers: x0 = xt - sigma * model_output.
+        # The two agree only for model_output = -v, which is what the helper produces.
+        sigma = 0.4
+        x0 = torch.randn(2, VIDEO_ROW_WIDTH)
+        noise = torch.randn(2, VIDEO_ROW_WIDTH)
+        xt = (1.0 - sigma) * x0 + sigma * noise
+        velocity = x0 - noise
+        torch.testing.assert_close(xt - sigma * h3_velocity_to_flow_match(velocity), x0)
+
+
 class TestMiniMaxH3BuildLayoutFromMeta:
     def test_row_counts_and_tags_match_meta(self):
         position_ids, token_tags, video_indices, audio_indices, text_indices, num_cond_video, num_cond_audio = (
@@ -154,10 +183,11 @@ class TestMiniMaxH3PrepareModelInputs:
         assert torch.equal(model_inputs["audio_rows"], audio_rows)
         assert model_inputs["latent_meta"] == _META
 
-    def test_timestep_is_scaled_to_unit_interval(self):
+    def test_timestep_is_mirrored_into_the_dit_data_fraction(self):
         video_rows, audio_rows = _rows()
         model_inputs, _ = _prepared_inputs(video_rows, audio_rows, timesteps=torch.tensor([500.0, 250.0]))
-        torch.testing.assert_close(model_inputs["timestep"], torch.tensor([0.5, 0.25]))
+        # sigma 0.5 -> t 0.5, sigma 0.25 -> t 0.75: the DiT reads t as a data fraction, not a noise level.
+        torch.testing.assert_close(model_inputs["timestep"], torch.tensor([0.5, 0.75]))
 
 
 class TestMiniMaxH3Forward:
@@ -166,12 +196,13 @@ class TestMiniMaxH3Forward:
         packed = pack_video_audio_rows(video_rows, audio_rows)
         model_inputs, _ = _prepared_inputs(video_rows, audio_rows, timesteps=torch.tensor([500.0, 250.0]))
 
-        # Echoing the per-sample rows back and re-packing must reproduce the flat ``xt`` exactly.
+        # Echoing the per-sample rows back and re-packing must reproduce the flat ``xt`` layout exactly,
+        # negated: H3's velocity is ``x0 - noise`` and the loss expects the opposite convention.
         out = MiniMaxH3DiffusionNFT.forward(
             module=_module(_identity), model_config=MagicMock(), model_inputs=model_inputs, negative_model_inputs=None
         )
         assert out.shape == packed.shape
-        torch.testing.assert_close(out, packed)
+        torch.testing.assert_close(out, -packed)
 
     def test_per_sample_loop_stacks_scaled_velocity_video_then_audio(self):
         video_rows, audio_rows = _rows()
@@ -182,7 +213,7 @@ class TestMiniMaxH3Forward:
             module=module, model_config=MagicMock(), model_inputs=model_inputs, negative_model_inputs=None
         )
         assert module.call_count == _BATCH
-        torch.testing.assert_close(out, pack_video_audio_rows(video_rows * 2.0, audio_rows * 3.0))
+        torch.testing.assert_close(out, pack_video_audio_rows(video_rows * -2.0, audio_rows * -3.0))
 
     def test_forward_calls_module_with_real_packed_sequence_kwargs(self):
         video_rows, audio_rows = _rows()

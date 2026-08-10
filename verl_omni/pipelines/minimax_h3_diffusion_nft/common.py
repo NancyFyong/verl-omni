@@ -64,10 +64,50 @@ __all__ = [
     "pack_video_audio_rows",
     "unpack_video_audio_rows",
     "split_dual_velocity",
+    "h3_dit_timestep",
+    "h3_velocity_to_flow_match",
     "build_packed_sequence",
     "build_layout_from_meta",
     "build_row_timesteps",
 ]
+
+
+def h3_dit_timestep(timesteps: torch.Tensor) -> torch.Tensor:
+    """Convert diffusers-style timesteps (``sigma * 1000``) to the DiT's own convention.
+
+    MiniMax H3's DiT consumes ``t`` in ``[0, 1]`` as a *data* fraction, not a noise
+    fraction: vllm-omni feeds it ``t = 1 - sigma`` (``denoise_loop.py``, and
+    ``scheduling_minimax_h3_euler_ancestral._validate_unit_timestep`` rejects any pair
+    where ``sigma_curr != 1 - timestep``). Sigmas descend ``1.0 -> 0.0``, so the noisiest
+    step is ``sigma=1`` / ``t=0``. Passing ``sigma`` straight through tells the model it is
+    looking at clean data when it is looking at pure noise.
+
+    Args:
+        timesteps: Timesteps on the diffusers ``[0, 1000]`` scale.
+
+    Returns:
+        The same tensor as DiT timesteps in ``[0, 1]``.
+    """
+    return 1.0 - timesteps / 1000.0
+
+
+def h3_velocity_to_flow_match(velocity: torch.Tensor) -> torch.Tensor:
+    """Flip a MiniMax H3 velocity into the diffusers flow-match sign convention.
+
+    vllm-omni defines ``x0 = x_t + sigma * v`` (``minimax_h3_rf_v_to_x0``), so H3's
+    velocity is ``x0 - noise``. Every consumer in this tree assumes the opposite
+    ``noise - x0``: the SDE scheduler recovers ``x0 = sample - sigma * model_output``
+    (``schedulers/flow_match_sde.py``) and the DiffusionNFT loss uses
+    ``x0_prediction = xt - t * prediction`` (``trainer/diffusion/diffusion_algos.py``).
+    Feeding the raw velocity therefore steps *away* from the data.
+
+    Args:
+        velocity: A raw DiT velocity row tensor.
+
+    Returns:
+        The negated velocity.
+    """
+    return -velocity
 
 
 def pack_video_audio_rows(video_rows: torch.Tensor, audio_rows: torch.Tensor) -> torch.Tensor:
