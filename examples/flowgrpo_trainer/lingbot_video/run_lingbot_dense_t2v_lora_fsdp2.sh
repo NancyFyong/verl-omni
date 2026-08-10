@@ -1,51 +1,27 @@
 #!/usr/bin/env bash
-# Dense LingBot T2V FlowGRPO LoRA FSDP2 starter recipe.  Preprocess structured captions
-# first; the rollout agent rejects plain-text prompts by design.
-#
-# Hyperparameter provenance:
-#   * Sampling/denoising params (resolution, frames, steps, guidance, shift)
-#     follow the official LingBot-Video Dense T2V recipe
-#     (lingbot-video/scripts/single-gpu/run_dense_t2v.sh + pipeline defaults):
-#     480x832, 81 frames (duration 3.4s x 24fps -> 4n+1), 40 steps,
-#     guidance_scale=3, flow shift=3.
-#   * Training/tooling params (save/test freq, offload, logger, loss/adv,
-#     total steps) follow the Wan2.2 DanceGRPO recipe and the FlowGRPO
-#     examples in this repo.
+# Dense LingBot T2V FlowGRPO LoRA FSDP2 recipe.
+# Requires structured-caption parquet from prepare_structured_captions.py.
 set -euo pipefail
 
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=common.sh
-source "$SCRIPT_DIR/common.sh"
-
-# Paths and reward configuration.
 WORKSPACE=${WORKSPACE:-$HOME}
 MODEL_PATH=${MODEL_PATH:-$WORKSPACE/models/lingbot-video-dense-1.3b}
-# The Qwen tokenizer/processor lives in the checkpoint's ``processor``
-# subfolder; the trainer needs it explicitly (otherwise tokenizer
-# instantiation fails).  Override for a non-standard layout.
 TOKENIZER_PATH=${TOKENIZER_PATH:-$MODEL_PATH/processor}
 TRAIN_PATH=${TRAIN_PATH:-$WORKSPACE/data/lingbot_video/train.parquet}
 VAL_PATH=${VAL_PATH:-$WORKSPACE/data/lingbot_video/val.parquet}
 REWARD_FUNCTION_PATH=${REWARD_FUNCTION_PATH:?Set an existing video reward function path.}
 REWARD_FUNCTION_NAME=${REWARD_FUNCTION_NAME:?Set its callable name.}
-# HPSv3's local reward implementation reads the checkpoint path from
-# custom_reward_model_path. Keep this default overridable for non-standard
-# layouts and harmless for other reward functions.
+
 HPSV3_MODEL_PATH=${HPSV3_MODEL_PATH:-$WORKSPACE/models/HPSv3/HPSv3.safetensors}
 HPSV3_REWARD_DEVICE=${HPSV3_REWARD_DEVICE:-cuda}
 export custom_reward_model_path=${custom_reward_model_path:-$HPSV3_MODEL_PATH}
 export custom_reward_device=${custom_reward_device:-$HPSV3_REWARD_DEVICE}
 
-# Runtime resources.
 NUM_GPUS=${NUM_GPUS:-8}
-# Use rollout TP=2 by default so colocated vLLM weights are sharded
-# and actor update has enough headroom on large-memory GPUs.
 ROLLOUT_TP=${ROLLOUT_TP:-2}
 ACTOR_SP=${ACTOR_SP:-1}
 NUM_CPUS=${NUM_CPUS:-64}
 ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.4}
 
-# Output and logging.
 PROJECT_NAME=${PROJECT_NAME:-flow_grpo}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-lingbot_dense_t2v_lora_fsdp2}
 CKPT_DIR=${CKPT_DIR:-checkpoints/$PROJECT_NAME/$EXPERIMENT_NAME}
@@ -58,11 +34,8 @@ export WANDB_DIR
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 ROLLOUT_DATA_SAVE_FREQ=${ROLLOUT_DATA_SAVE_FREQ:-5}
 VALIDATION_DATA_MAX_SAMPLES=${VALIDATION_DATA_MAX_SAMPLES:-8}
-# Batch, rollout, and memory defaults.
-# Formal LingBot video FSDP2 defaults.  On 8 GPUs this produces
-# 16 prompts x 8 rollouts = 128 videos/step, i.e. 16 rollout samples/GPU.
-# Keep logprob/ref/PPO micro conservative by default for 81-frame
-# videos. Increase them only after a stable memory check.
+
+# Defaults target 16 prompts x 8 rollouts on 8 GPUs for 81-frame videos.
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-16}
 VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-16}
 ROLLOUT_GROUP_SIZE=${ROLLOUT_GROUP_SIZE:-8}
@@ -70,32 +43,107 @@ LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-2}
 REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=${REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-$LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-8}
 PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-2}
-# Enable block-level gradient checkpointing by default for 81-frame
-# training; override for debugging/performance experiments.
 ENABLE_GRADIENT_CHECKPOINTING=${ENABLE_GRADIENT_CHECKPOINTING:-True}
 NUM_FRAMES=${NUM_FRAMES:-81}
 ROLLOUT_NOISE_LEVEL=${ROLLOUT_NOISE_LEVEL:-0.7}
 ROLLOUT_SDE_TYPE=${ROLLOUT_SDE_TYPE:-dance_sde}
 CHECK_CONFIG_ONLY=${CHECK_CONFIG_ONLY:-False}
+MODEL_DTYPE=${MODEL_DTYPE:-bfloat16}
+PYTHON_BIN=${PYTHON_BIN:-python3}
 
-validate_lingbot_batch_config
-print_lingbot_batch_config
+is_truthy() {
+    [[ "${1:-}" == "1" || "${1:-}" == "true" || "${1:-}" == "True" ]]
+}
+
+require_positive_int() {
+    local name=$1
+    local value=$2
+
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || ((value <= 0)); then
+        echo "[config error] $name must be a positive integer, got: $value" >&2
+        exit 2
+    fi
+}
+
+require_divisible() {
+    local dividend_name=$1
+    local dividend=$2
+    local divisor_name=$3
+    local divisor=$4
+    local reason=$5
+
+    if ((divisor <= 0)); then
+        echo "[config error] $divisor_name must be > 0 for $reason, got: $divisor" >&2
+        exit 2
+    fi
+    if ((dividend % divisor != 0)); then
+        echo "[config error] $dividend_name=$dividend must be divisible by $divisor_name=$divisor ($reason)" >&2
+        exit 2
+    fi
+}
+
+validate_batch_config() {
+    require_positive_int NUM_GPUS "$NUM_GPUS"
+    require_positive_int ROLLOUT_TP "$ROLLOUT_TP"
+    require_positive_int TRAIN_BATCH_SIZE "$TRAIN_BATCH_SIZE"
+    require_positive_int VAL_BATCH_SIZE "$VAL_BATCH_SIZE"
+    require_positive_int ROLLOUT_GROUP_SIZE "$ROLLOUT_GROUP_SIZE"
+    require_positive_int PPO_MINI_BATCH_SIZE "$PPO_MINI_BATCH_SIZE"
+    require_positive_int PPO_MICRO_BATCH_SIZE_PER_GPU "$PPO_MICRO_BATCH_SIZE_PER_GPU"
+    require_positive_int LOG_PROB_MICRO_BATCH_SIZE_PER_GPU "$LOG_PROB_MICRO_BATCH_SIZE_PER_GPU"
+    require_positive_int REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU "$REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU"
+
+    require_divisible NUM_GPUS "$NUM_GPUS" ROLLOUT_TP "$ROLLOUT_TP" "rollout worker sharding"
+
+    GLOBAL_ROLLOUT_BATCH=$((TRAIN_BATCH_SIZE * ROLLOUT_GROUP_SIZE))
+    ACTOR_UPDATE_GLOBAL_MINI_BATCH=$((PPO_MINI_BATCH_SIZE * ROLLOUT_GROUP_SIZE))
+
+    require_divisible GLOBAL_ROLLOUT_BATCH "$GLOBAL_ROLLOUT_BATCH" NUM_GPUS "$NUM_GPUS" "rollout DP sharding"
+    require_divisible \
+        ACTOR_UPDATE_GLOBAL_MINI_BATCH "$ACTOR_UPDATE_GLOBAL_MINI_BATCH" \
+        NUM_GPUS "$NUM_GPUS" \
+        "actor mini-batch sharding"
+
+    ROLLOUT_BATCH_PER_GPU=$((GLOBAL_ROLLOUT_BATCH / NUM_GPUS))
+    ACTOR_UPDATE_MINI_BATCH_PER_GPU=$((ACTOR_UPDATE_GLOBAL_MINI_BATCH / NUM_GPUS))
+
+    require_divisible \
+        ROLLOUT_BATCH_PER_GPU "$ROLLOUT_BATCH_PER_GPU" \
+        ACTOR_UPDATE_MINI_BATCH_PER_GPU "$ACTOR_UPDATE_MINI_BATCH_PER_GPU" \
+        "local rollout/train mini-batches"
+    require_divisible \
+        ACTOR_UPDATE_MINI_BATCH_PER_GPU "$ACTOR_UPDATE_MINI_BATCH_PER_GPU" \
+        PPO_MICRO_BATCH_SIZE_PER_GPU "$PPO_MICRO_BATCH_SIZE_PER_GPU" \
+        "actor micro-batches"
+    require_divisible \
+        ROLLOUT_BATCH_PER_GPU "$ROLLOUT_BATCH_PER_GPU" \
+        LOG_PROB_MICRO_BATCH_SIZE_PER_GPU "$LOG_PROB_MICRO_BATCH_SIZE_PER_GPU" \
+        "old-logprob micro-batches"
+    require_divisible \
+        ROLLOUT_BATCH_PER_GPU "$ROLLOUT_BATCH_PER_GPU" \
+        REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU "$REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU" \
+        "ref-logprob micro-batches"
+}
+
+print_batch_config() {
+    echo "[config check] batch settings are self-consistent:" >&2
+    echo "  global_rollout_batch=$GLOBAL_ROLLOUT_BATCH, rollout_batch_per_gpu=$ROLLOUT_BATCH_PER_GPU" >&2
+    printf '  actor_update_global_mini_batch=%s, actor_update_mini_batch_per_gpu=%s\n' \
+        "$ACTOR_UPDATE_GLOBAL_MINI_BATCH" "$ACTOR_UPDATE_MINI_BATCH_PER_GPU" >&2
+    echo "  ppo_micro_batch_size_per_gpu=$PPO_MICRO_BATCH_SIZE_PER_GPU" >&2
+    echo "  log_prob_micro_batch_size_per_gpu=$LOG_PROB_MICRO_BATCH_SIZE_PER_GPU" >&2
+    echo "  ref_log_prob_micro_batch_size_per_gpu=$REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU" >&2
+    echo "  enable_gradient_checkpointing=$ENABLE_GRADIENT_CHECKPOINTING" >&2
+    echo "  rollout_noise_level=$ROLLOUT_NOISE_LEVEL, rollout_sde_type=$ROLLOUT_SDE_TYPE" >&2
+}
+
+validate_batch_config
+print_batch_config
 if is_truthy "$CHECK_CONFIG_ONLY"; then
     exit 0
 fi
 
 mkdir -p "$RUN_DIR" "$WANDB_DIR"
-
-# Launch configuration.
-# Match the existing FSDP2 examples: keep model weights in bf16 before sharding
-# and let FSDP2 mixed precision cast forward inputs at shard boundaries. Override
-# to fp32 only when debugging dtype-specific model init issues.
-MODEL_DTYPE=${MODEL_DTYPE:-bfloat16}
-
-# Interpreter to launch with.  Defaults to ``python3`` on PATH; override with an
-# absolute path (e.g. a project venv) when the shell auto-activates a different
-# environment via BASH_ENV/.bashrc and PATH ordering can't be trusted.
-PYTHON_BIN=${PYTHON_BIN:-python3}
 
 "$PYTHON_BIN" -m verl_omni.trainer.main_diffusion \
     algorithm.adv_estimator=flow_grpo \
