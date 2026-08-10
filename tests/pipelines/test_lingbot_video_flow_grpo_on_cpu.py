@@ -269,6 +269,8 @@ def test_async_server_reads_trajectory_payload_from_multimodal_output():
     assert extra["global_steps"] == 3
     # The formatter-facing duplicate keys must not leak into training data.
     assert "latents" not in extra and "log_probs" not in extra and "timesteps" not in extra
+    assert "trajectory" not in extra
+    assert extra["metadata"] == {"trajectory": {"type": "denoising"}}
 
 
 # --------------------------------------------------------------------------- #

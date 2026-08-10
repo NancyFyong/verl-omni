@@ -82,7 +82,6 @@ def test_video_samples_without_output_dir_return_cleanup_temp_dir(monkeypatch):
             assert os.path.isfile(path), f"wandb.Video got a non-existent path: {path}"
             captured.append(SimpleNamespace(path=path, kwargs=dict(kwargs)))
             self.data_or_path = path
-            self.data_or_path = path
 
     monkeypatch.setattr(wandb, "Video", _FakeVideo)
 
