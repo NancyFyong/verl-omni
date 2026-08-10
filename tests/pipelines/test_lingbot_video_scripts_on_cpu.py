@@ -40,8 +40,8 @@ def test_lingbot_training_scripts_use_simple_example_launcher_shape(script, expe
     assert "CHECK_CONFIG_ONLY" not in text
     assert "must_divide" not in text
     assert "python3 -m verl_omni.trainer.main_diffusion" in text
-    assert f"EXPERIMENT_NAME=${{EXPERIMENT_NAME:-{experiment_name}}}" in text
-    assert "output_dir=${OUTPUT_DIR:-$WORKSPACE/outputs/$EXPERIMENT_NAME}" in text
+    assert f"experiment_name=${{EXPERIMENT_NAME:-{experiment_name}}}" in text
+    assert "output_dir=${OUTPUT_DIR:-$WORKSPACE/outputs/$experiment_name}" in text
     assert "checkpoint_dir=${CHECKPOINT_DIR:-$output_dir/checkpoints}" in text
     assert 'exec > >(tee -a "$log_file") 2>&1' in text
     assert 'echo "Logging to $log_file"' in text
@@ -55,31 +55,29 @@ def test_lingbot_training_scripts_keep_validated_defaults(script):
     text = _read_script(script)
 
     expected_snippets = [
-        "TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-16}",
-        "VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-16}",
-        "ROLLOUT_GROUP_SIZE=${ROLLOUT_GROUP_SIZE:-8}",
-        "PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-8}",
-        "PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-2}",
-        "LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-2}",
-        "ENABLE_GRADIENT_CHECKPOINTING=${ENABLE_GRADIENT_CHECKPOINTING:-True}",
-        "NUM_FRAMES=${NUM_FRAMES:-81}",
-        "ROLLOUT_NOISE_LEVEL=${ROLLOUT_NOISE_LEVEL:-0.7}",
-        "ROLLOUT_SDE_TYPE=${ROLLOUT_SDE_TYPE:-dance_sde}",
-        "FLOW_SHIFT=${FLOW_SHIFT:-3.0}",
-        "GUIDANCE_SCALE=${GUIDANCE_SCALE:-3.0}",
-        "NUM_INFERENCE_STEPS=${NUM_INFERENCE_STEPS:-10}",
-        "VAL_NUM_INFERENCE_STEPS=${VAL_NUM_INFERENCE_STEPS:-40}",
-        "LR=${LR:-1e-5}",
-        "LORA_RANK=${LORA_RANK:-64}",
-        "LORA_ALPHA=${LORA_ALPHA:-128}",
-        "TRAINER_LOGGER=${TRAINER_LOGGER:-",
-        "actor_rollout_ref.rollout.pipeline.shift=$FLOW_SHIFT",
-        "actor_rollout_ref.rollout.algo.sde_type=$ROLLOUT_SDE_TYPE",
-        'actor_rollout_ref.rollout.algo.sde_window_range="$SDE_WINDOW_RANGE"',
-        "reward.custom_reward_function.name=$REWARD_FUNCTION_NAME",
+        "data.train_batch_size=${TRAIN_BATCH_SIZE:-16}",
+        "data.val_batch_size=${VAL_BATCH_SIZE:-16}",
+        "actor_rollout_ref.rollout.n=${ROLLOUT_GROUP_SIZE:-8}",
+        "actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-8}",
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${PPO_MICRO_BATCH_SIZE_PER_GPU:-2}",
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-2}",
+        "actor_rollout_ref.model.enable_gradient_checkpointing=${ENABLE_GRADIENT_CHECKPOINTING:-True}",
+        "actor_rollout_ref.rollout.pipeline.num_frames=${NUM_FRAMES:-81}",
+        "actor_rollout_ref.rollout.algo.noise_level=${ROLLOUT_NOISE_LEVEL:-0.7}",
+        "actor_rollout_ref.rollout.algo.sde_type=${ROLLOUT_SDE_TYPE:-dance_sde}",
+        "actor_rollout_ref.rollout.pipeline.shift=${FLOW_SHIFT:-3.0}",
+        "actor_rollout_ref.rollout.pipeline.guidance_scale=${GUIDANCE_SCALE:-3.0}",
+        "actor_rollout_ref.rollout.pipeline.num_inference_steps=${NUM_INFERENCE_STEPS:-10}",
+        "actor_rollout_ref.rollout.val_kwargs.pipeline.num_inference_steps=${VAL_NUM_INFERENCE_STEPS:-40}",
+        "actor_rollout_ref.actor.optim.lr=${LR:-1e-5}",
+        "actor_rollout_ref.model.lora_rank=${LORA_RANK:-64}",
+        "actor_rollout_ref.model.lora_alpha=${LORA_ALPHA:-128}",
+        'trainer.logger="${TRAINER_LOGGER:-',
+        'actor_rollout_ref.rollout.algo.sde_window_range="${SDE_WINDOW_RANGE:-[0,5]}"',
+        "reward.custom_reward_function.name=${REWARD_FUNCTION_NAME:-compute_score_hpsv3}",
         "trainer.rollout_data_dir=$rollout_data_dir",
         "trainer.validation_data_dir=$val_data_dir",
-        "trainer.resume_mode=$RESUME_MODE",
+        "trainer.resume_mode=${RESUME_MODE:-auto}",
     ]
     for snippet in expected_snippets:
         assert snippet in text
@@ -88,20 +86,16 @@ def test_lingbot_training_scripts_keep_validated_defaults(script):
 def test_lingbot_fsdp2_script_sets_fsdp2_specific_knobs():
     text = _read_script("run_lingbot_dense_t2v_lora_fsdp2.sh")
 
-    assert "ROLLOUT_TP=${ROLLOUT_TP:-2}" in text
-    assert "ACTOR_SP=${ACTOR_SP:-1}" in text
-    assert "ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.4}" in text
-    assert "ACTOR_STRATEGY=${ACTOR_STRATEGY:-fsdp2}" in text
-    assert "actor_rollout_ref.actor.strategy=$ACTOR_STRATEGY" in text
-    assert "actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=$ACTOR_SP" in text
+    assert "actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP:-2}" in text
+    assert "actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=${ACTOR_SP:-1}" in text
+    assert "actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.4}" in text
+    assert "actor_rollout_ref.actor.strategy=${ACTOR_STRATEGY:-fsdp2}" in text
 
 
 def test_lingbot_non_fsdp2_script_keeps_fp32_actor_init():
     text = _read_script("run_lingbot_dense_t2v_lora.sh")
 
-    assert "ROLLOUT_TP=${ROLLOUT_TP:-1}" in text
+    assert "actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP:-1}" in text
     assert "actor_rollout_ref.actor.strategy=fsdp2" not in text
-    assert "MODEL_DTYPE=${MODEL_DTYPE:-fp32}" in text
-    assert "actor_rollout_ref.actor.fsdp_config.model_dtype=$MODEL_DTYPE" in text
-    assert "LORA_DTYPE=${LORA_DTYPE:-bf16}" in text
-    assert "actor_rollout_ref.model.lora_dtype=$LORA_DTYPE" in text
+    assert "actor_rollout_ref.actor.fsdp_config.model_dtype=${MODEL_DTYPE:-fp32}" in text
+    assert "actor_rollout_ref.model.lora_dtype=${LORA_DTYPE:-bf16}" in text
