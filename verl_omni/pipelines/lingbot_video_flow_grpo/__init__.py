@@ -16,6 +16,7 @@
 
 import logging
 
+from .agent_loop import LingBotDenseT2VAgentLoop
 from .diffusers_training_adapter import LingBotVideoDenseFlowGRPO
 
 logger = logging.getLogger(__name__)
@@ -34,4 +35,8 @@ except (ImportError, RuntimeError, AttributeError) as exc:
 
     LingBotVideoPipelineWithLogProb = _UnavailableModule()
 
-__all__ = ["LingBotVideoDenseFlowGRPO", "LingBotVideoPipelineWithLogProb"]
+__all__ = [
+    "LingBotDenseT2VAgentLoop",
+    "LingBotVideoDenseFlowGRPO",
+    "LingBotVideoPipelineWithLogProb",
+]

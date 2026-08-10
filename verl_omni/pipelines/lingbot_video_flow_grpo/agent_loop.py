@@ -25,11 +25,8 @@ from verl.experimental.agent_loop.agent_loop import AgentLoopBase, register
 from verl.utils.profiler import simple_timer
 
 from verl_omni.agent_loop.diffusion_agent_loop import DiffusionAgentLoopOutput
-from verl_omni.pipelines.lingbot_video_flow_grpo.common import (
-    DEFAULT_NEGATIVE_PROMPT,
-    apply_prompt_template,
-    caption_to_json,
-)
+
+from .common import DEFAULT_NEGATIVE_PROMPT, apply_prompt_template, caption_to_json
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))

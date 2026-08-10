@@ -88,6 +88,18 @@ def test_dense_adapter_is_registered_without_optional_lingbot_package():
     assert DiffusionModelBase.get_class(cfg) is LingBotVideoDenseFlowGRPO
 
 
+def test_lingbot_agent_loop_is_pipeline_registered_not_shared_base():
+    from verl.experimental.agent_loop.agent_loop import _agent_loop_registry
+
+    import verl_omni.agent_loop as shared_agent_loop
+
+    assert _agent_loop_registry["lingbot_dense_t2v_agent"] == {
+        "_target_": "verl_omni.pipelines.lingbot_video_flow_grpo.agent_loop.LingBotDenseT2VAgentLoop"
+    }
+    assert "LingBotDenseT2VAgentLoop" not in shared_agent_loop.__all__
+    assert not hasattr(shared_agent_loop, "LingBotDenseT2VAgentLoop")
+
+
 def test_adapter_builds_lingbot_transformer_inputs_and_cfg_pair():
     model_config = SimpleNamespace(pipeline=SimpleNamespace(guidance_scale=3.0, true_cfg_scale=1.0))
     latents = torch.randn(2, 3, 16, 2, 4, 4)
