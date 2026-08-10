@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# Rewrite plain prompts into LingBot structured JSON captions.
-# BACKEND=vllm expects serve_rewriter.sh to be running. BACKEND=transformers
-# shards local inference across GPUS. Existing prompt_raw records are skipped.
+# LingBot prompt rewrite launcher.
 set -euo pipefail
 
 ROOT=${ROOT:-${HOME}}
@@ -26,7 +24,6 @@ OUTDIR=${OUTDIR:-$(dirname "$OUTPUT")}
 
 mkdir -p "$(dirname "$OUTPUT")" "$LOGDIR"
 
-# Deduplicate JSONL shards by prompt_raw before resuming or merging.
 merge_into_output() {
     "$PY" - "$OUTPUT" "$@" <<'PY'
 import json
@@ -71,7 +68,6 @@ print(
 PY
 }
 
-# Carry over legacy transformer shards when present.
 CARRY=${CARRY:-$ROOT/data/lingbot_video/rewritten}
 if [ -d "$CARRY" ] && ls "$CARRY"/shard_*.jsonl >/dev/null 2>&1; then
     merge_into_output "$CARRY"/shard_*.jsonl
@@ -110,7 +106,6 @@ elif [ "$BACKEND" = "transformers" ]; then
         echo "  shard $i on GPU $g -> PID ${pids[-1]}  (log: $LOGDIR/shard_${i}.log)"
     done
     echo "Launched ${#pids[@]} shards; waiting..."
-    # Wait per PID so failed shards do not produce a partial merge.
     failed=0
     for i in "${!pids[@]}"; do
         if ! wait "${pids[$i]}"; then

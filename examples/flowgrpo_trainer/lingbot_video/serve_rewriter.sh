@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Serve the LingBot prompt rewriter through the vLLM OpenAI API.
-# Step 1 uses the base model id; step 2 uses the "rewriter" LoRA id.
+# LingBot prompt rewriter server.
 set -euo pipefail
 
 ROOT=${ROOT:-${HOME}}
@@ -14,7 +13,6 @@ TP=${TP:-8}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-262144}
 GPU_UTIL=${GPU_UTIL:-0.92}
 
-# Keep cudagraph on; disable RMS all-reduce fusion for this TP path.
 COMPILE_CONFIG=${COMPILE_CONFIG:-'{"pass_config": {"fuse_allreduce_rms": false}}'}
 
 EXTRA=()

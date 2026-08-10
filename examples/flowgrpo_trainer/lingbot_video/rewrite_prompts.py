@@ -12,32 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Rewrite plain-text video prompts into LingBot structured JSON captions.
-
-LingBot-Video DiT consumes structured JSON captions, not casual natural-language
-prompts (see the model card).  This driver streams a list of plain prompts
-through the official LingBot two-stage rewriter (step1 EXPAND = base VLM; step2
-MAP = base VLM + rewriter LoRA) and writes one JSONL record per prompt in the
-schema expected by ``prepare_structured_captions.py``.
-
-Two interchangeable backends select how the 27B VLM is served:
-
-* ``--backend vllm`` (default, high throughput): talk to a standalone vLLM
-  OpenAI-compatible server (see ``serve_rewriter.sh``), picking the LoRA adapter
-  per request via the ``model`` field.  Many prompts run concurrently through a
-  producer/consumer worker pool so vLLM continuous-batches them; a tqdm bar shows
-  progress.  This is the recommended production path.
-* ``--backend transformers`` (reference/fallback, low throughput): load the base
-  VLM + LoRA in-process via the bundled ``rewriter/inference.py`` and stream one
-  prompt at a time.  Shard across GPUs with ``--num-shards N --shard i`` and
-  ``CUDA_VISIBLE_DEVICES=i`` (see ``run_rewrite.sh`` with ``BACKEND=transformers``).
-
-Both backends share one output schema and are resumable: prompts already present
-in ``--output`` are skipped, so a killed run can be relaunched with the same
-arguments.  The reward ground truth is the ORIGINAL plain prompt (HPSv3 scores
-video/text alignment against the human intent), while ``caption`` carries the
-structured rewrite fed to the DiT.
-"""
+"""Rewrite plain prompts into LingBot structured-caption JSONL."""
 
 from __future__ import annotations
 
@@ -64,9 +39,6 @@ def _load_prompts(path: str, num_shards: int, shard: int) -> list[str]:
     with open(path, encoding="utf-8") as f:
         for line in f:
             s = line.strip()
-            # The official rewriter explicitly supports Chinese prompts, including
-            # the Chinese duration suffix in its step-1 instruction.  Do not drop
-            # them during dataset preparation.
             if not s or s in seen:
                 continue
             seen.add(s)
@@ -86,9 +58,6 @@ def _already_done(path: str) -> set[str]:
             try:
                 done.add(json.loads(line)["prompt_raw"])
             except (json.JSONDecodeError, KeyError, TypeError):
-                # TypeError: a line that is valid JSON but not an object (a bare
-                # scalar/array) is not subscriptable; skip it like a malformed line
-                # instead of aborting the whole resumable run.
                 continue
     return done
 
@@ -105,13 +74,7 @@ def build_record(prompt: str, caption: dict, args: argparse.Namespace) -> dict:
 
 
 class VLLMBackend:
-    """OpenAI-chat backend mirroring the reference ``TransformersBackend``.
-
-    ``generate(text, image, use_lora)`` posts one chat completion.  ``use_lora``
-    picks the served model id: the LoRA adapter (step2 MAP) or the base VLM
-    (step1 EXPAND).  A thread-local ``requests.Session`` keeps this safe under a
-    thread pool.
-    """
+    """OpenAI-compatible rewriter backend."""
 
     def __init__(
         self,
@@ -143,7 +106,6 @@ class VLLMBackend:
             "messages": [{"role": "user", "content": [{"type": "text", "text": text}]}],
             "max_tokens": self.max_new_tokens,
             "temperature": 0.0,
-            # Mirror the reference backend's apply_chat_template(enable_thinking=False).
             "chat_template_kwargs": {"enable_thinking": False},
         }
         resp = self._session().post(self.url, json=payload, timeout=self.timeout)
@@ -152,8 +114,7 @@ class VLLMBackend:
 
 
 def _process_one(rewriter, prompt: str, args: argparse.Namespace, neg_editor=None) -> dict | None:
-    """Run both rewrite stages; return the JSONL record, or None if step2 output
-    is not a structured JSON object (counted as ``empty``)."""
+    """Run both rewrite stages and build one output record."""
     result = rewriter.rewrite(prompt, mode=args.mode, duration=args.duration)
     caption = result["json"]
     if not isinstance(caption, dict):
@@ -165,11 +126,7 @@ def _process_one(rewriter, prompt: str, args: argparse.Namespace, neg_editor=Non
 
 
 def run_vllm(rewriter, todo: list[str], out_path: str, args: argparse.Namespace, neg_editor=None) -> dict:
-    """Producer/consumer over a bounded queue: one producer feeds prompts, a fixed
-    pool of ``--concurrency`` consumers each pull the next prompt the instant they
-    are free.  Exactly ``concurrency`` prompts are in flight at steady state (the
-    server continuous-batches them), the queue never starves while work remains,
-    and memory stays bounded — no 45k-future cold-start burst."""
+    """Rewrite prompts with a bounded worker pool."""
     concurrency = args.concurrency
     q: queue.Queue = queue.Queue(maxsize=args.queue_size or concurrency * 2)
     write_lock = threading.Lock()
@@ -284,8 +241,6 @@ def main() -> None:
     if args.backend == "vllm" and args.concurrency <= 0:
         ap.error("--concurrency must be positive")
     if args.queue_size < 0:
-        # queue.Queue treats maxsize <= 0 as unbounded, which would defeat the
-        # producer/consumer backpressure; only 0 (== "2*concurrency") is allowed.
         ap.error("--queue-size must be >= 0 (0 selects the default 2*concurrency)")
 
     sys.path.insert(0, args.rewriter_dir)

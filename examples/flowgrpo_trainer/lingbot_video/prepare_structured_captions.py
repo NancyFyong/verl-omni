@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Convert pre-generated LingBot structured captions from JSONL to parquet.
-
-Each JSONL record requires a ``caption`` field containing a JSON object (or a
-JSON string).  Optional ``negative_caption`` and ``reward_model`` fields are
-preserved.  The 27B prompt rewriter is intentionally not invoked here: run it
-offline before this script, not in rollout workers.
-"""
+"""Convert LingBot caption JSONL files to train/val parquet."""
 
 from __future__ import annotations
 
