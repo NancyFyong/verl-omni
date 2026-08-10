@@ -1,4 +1,11 @@
-# RFC-0003: Unified multi-input / multi-output interface for diffusion rollout
+# [RFC] Unified multi-input / multi-output interface for diffusion rollout
+
+> Structured against `.github/ISSUE_TEMPLATE/feature-request.yml` — the repo has no dedicated
+> RFC template — following the two `nemo_automodel` design drafts that set the precedent
+> (`.agents/RFC_ISSUE.md`, `.agents/RFC_ISSUE_DIFFUSION.md`; they live on their own branch).
+> §0 TL;DR is the template's *Feature request* field, §2 is *Motivation*, and a *Your
+> contribution* answer would be scoped from §6 Milestones. §1 and §3-§10 are the technical
+> body.
 
 - **Status:** Draft
 - **Scope:** the request and output objects crossing the agent-loop → rollout-server →
