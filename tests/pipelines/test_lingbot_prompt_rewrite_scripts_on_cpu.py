@@ -12,12 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Regression coverage for the unified LingBot offline prompt-rewrite driver.
-
-``rewrite_prompts.py`` merges the former vLLM and transformers drivers behind a
-single ``--backend`` switch, so these tests exercise the shared IO/record layer
-and the vLLM HTTP backend without importing the optional 27B model stack.
-"""
+"""Tests for the LingBot offline prompt-rewrite driver."""
 
 from __future__ import annotations
 

@@ -11,15 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Create a small synthetic parquet dataset for LingBot Dense T2V e2e testing.
-
-LingBot-Video's DiT consumes structured JSON captions rather than chat
-messages, so the ``prompt`` column holds a caption dict (matching
-``prepare_structured_captions.py``); the ``lingbot_dense_t2v_agent`` loop reads
-it back from ``raw_prompt`` and does its own tokenization.  There is no images
-column (this is text-to-video).  ``jpeg_compressibility`` is used as a
-self-contained rule reward so no external reward model server is needed.
-"""
+"""Create dummy LingBot Dense T2V parquet data for e2e tests."""
 
 from __future__ import annotations
 
@@ -28,10 +20,6 @@ import os
 
 import pandas as pd
 
-# Tiny structured captions in the official LingBot shape (a mapping keyed by
-# ``comprehensive_description`` plus a couple of auxiliary fields).  Content is
-# irrelevant to the smoke test -- only the schema and the denoise/decode/reward
-# path are exercised -- so these stay short.
 _CAPTIONS = [
     {
         "comprehensive_description": "a red cube slowly rotating on a wooden table",
@@ -55,8 +43,6 @@ _CAPTIONS = [
     },
 ]
 
-# A structured negative caption (same shape as the prompt) so the CFG path is
-# exercised without relying on the built-in default negative prompt.
 _NEGATIVE_CAPTION = {
     "universal_negative": {
         "visual_quality": ["low quality", "blurry", "jpeg artifacts"],
@@ -82,7 +68,7 @@ def build_rows(split: str, n: int) -> list[dict]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate dummy LingBot Dense T2V parquet data for e2e testing")
+    parser = argparse.ArgumentParser(description="Generate dummy LingBot Dense T2V parquet data")
     parser.add_argument(
         "--local_save_dir",
         default=os.path.expanduser("~/data/dummy_lingbot_video"),

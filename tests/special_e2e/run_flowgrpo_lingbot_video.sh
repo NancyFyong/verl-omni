@@ -1,20 +1,7 @@
 #!/usr/bin/env bash
-# LingBot-Video Dense T2V FlowGRPO e2e smoke test (minimal runtime), vllm_omni rollout.
-#
-# Single pass covering:
-#   parquet load (structured JSON captions) -> lingbot_dense_t2v_agent rollout
-#   (vllm_omni) -> jpeg_compressibility rule reward (self-contained, no reward
-#   server) -> flow_grpo -> FSDP LoRA on the `blocks.*` transformer -> weight sync.
-#
-# Requires: vllm-omni, diffusers>=0.37, the optional `lingbot-video` package, and
-#   a tiny LingBot-Video Dense checkpoint at ~/models/tiny-random/lingbot-video-dense.
-#   If that checkpoint is absent it is built here from LINGBOT_SOURCE_MODEL (a real
-#   Dense checkpoint, used offline only for its processor/scheduler configs -- the
-#   multi-GB weight shards are never loaded).
+# LingBot Dense T2V FlowGRPO e2e smoke test.
 set -euo pipefail
 
-# Override via env: NUM_GPUS, ROLLOUT_TP, MODEL_PATH, LINGBOT_SOURCE_MODEL, DATA_DIR,
-#                   TOTAL_TRAIN_STEPS, TRAIN_FILES, VAL_FILES
 NUM_GPUS=${NUM_GPUS:-4}
 ROLLOUT_TP=${ROLLOUT_TP:-1}
 MODEL_PATH=${MODEL_PATH:-${HOME}/models/tiny-random/lingbot-video-dense}
@@ -25,22 +12,15 @@ dummy_test_path=${VAL_FILES:-${DATA_DIR}/test.parquet}
 TOTAL_TRAIN_STEPS=${TOTAL_TRAIN_STEPS:-1}
 
 ENGINE=vllm_omni
-# LingBot captions expand to the ~150-token rewrite template plus a short caption
-# dict, so the tiny smoke prompts stay well under this budget.
 max_prompt_length=512
 
-# Build the tiny checkpoint on demand.  LingBot has no shared tiny-model provisioning
-# step (unlike the Qwen-Image smoke tests), so the e2e self-provisions and is a no-op
-# once the checkpoint exists.
 if [[ ! -f "${MODEL_PATH}/model_index.json" ]]; then
-    echo "Tiny LingBot-Video Dense checkpoint not found at ${MODEL_PATH}; building it..."
+    echo "Building tiny LingBot-Video Dense checkpoint at ${MODEL_PATH}"
     python3 tests/special_e2e/build_lingbot_video_dense_tiny_random.py \
         --output-dir "${MODEL_PATH}" \
         --source-model "${LINGBOT_SOURCE_MODEL}"
 fi
 
-# This helper runs nvidia-smi in a background loop during training and
-# fails if any vLLMOmniHttpServer process is left resident on GPU-0.
 _LEAK_FILE=$(mktemp)
 _LEAK_PID=""
 cleanup_leak_monitor() {
@@ -64,8 +44,7 @@ check_leak_monitor() {
     kill "${_LEAK_PID}" 2>/dev/null || true
     _LEAK_PID=""
     if grep -q "LEAK" "${_LEAK_FILE}" 2>/dev/null; then
-        echo ""
-        echo "FAIL: unexpected vLLMOmniHttpServer process(es) detected on GPU-0 —"
+        echo "FAIL: unexpected vLLMOmniHttpServer process on GPU-0"
         ray stop --force 2>/dev/null || true
         exit 1
     fi
@@ -144,4 +123,4 @@ python3 -m verl_omni.trainer.main_diffusion \
     "$@"
 check_leak_monitor
 
-echo "FlowGRPO LingBot-Video Dense T2V e2e test passed (training completed successfully)."
+echo "FlowGRPO LingBot Dense T2V e2e test passed."

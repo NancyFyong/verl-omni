@@ -36,9 +36,7 @@ from verl_omni.pipelines.lingbot_video_flow_grpo.common import (
 from verl_omni.pipelines.lingbot_video_flow_grpo.diffusers_training_adapter import LingBotVideoDenseFlowGRPO
 from verl_omni.pipelines.model_base import DiffusionModelBase
 
-# The rollout adapter pulls in vLLM-Omni / diffusers video pieces at import time.
-# Its pure helpers (_sample_sde_window, dtype/device coalescing) are CPU-testable,
-# so import it defensively and skip only those tests when the stack is absent.
+# Skip rollout-helper tests when optional vLLM-Omni video pieces are absent.
 try:
     from verl_omni.pipelines.lingbot_video_flow_grpo import vllm_omni_rollout_adapter as rollout_adapter
 except Exception:  # noqa: BLE001 - optional rollout stack (vllm-omni) may be missing
@@ -229,14 +227,7 @@ def test_custom_pipeline_lora_proxy_routes_worker_lifecycle_calls():
 
 
 def test_async_server_reads_trajectory_payload_from_multimodal_output():
-    """The consumer must read payload["trajectory"] via multimodal_output.
-
-    vLLM-Omni main removed ``DiffusionOutput.custom_output`` (#4922); the engine
-    copies ``output["payload"]["trajectory"]`` into
-    ``OmniRequestOutput.multimodal_output["trajectory"]`` and the formatter never
-    repopulates ``custom_output``. This test drives ``_process_output`` with the
-    post-#4922 shape and asserts the training-facing keys survive.
-    """
+    """Read trajectory payloads from ``multimodal_output``."""
 
     from verl_omni.workers.rollout.vllm_rollout.vllm_omni_async_server import vLLMOmniHttpServer
 

@@ -50,12 +50,7 @@ _PEFT_CAPABLE_CLS_CACHE: dict[type, type] = {}
 
 @DiffusionModelBase.register("LingBotVideoPipeline", algorithm="flow_grpo")
 class LingBotVideoDenseFlowGRPO(DiffusionModelBase):
-    """FlowGRPO integration for the non-MoE LingBot Video transformer.
-
-    LingBot's transformer is supplied by the optional, pinned
-    ``lingbot-video`` package rather than the installed diffusers package.  It
-    is loaded as a bare module so FSDP/PEFT see ``blocks.*`` directly.
-    """
+    """FlowGRPO integration for the non-MoE LingBot Video transformer."""
 
     @classmethod
     def build_module(cls, model_config: DiffusionModelConfig, torch_dtype: torch.dtype) -> Optional[torch.nn.Module]:
@@ -85,21 +80,7 @@ class LingBotVideoDenseFlowGRPO(DiffusionModelBase):
 
     @staticmethod
     def _peft_capable_transformer_cls(base_cls: type) -> type:
-        """Return ``base_cls`` extended with diffusers' ``PeftAdapterMixin``.
-
-        Every diffusers transformer the training engine drives inherits
-        ``PeftAdapterMixin`` (which supplies ``add_adapter``/``set_adapter``/
-        ``disable_adapters``/``load_lora_adapter``), and the shared
-        ``LoRAAdapterMixin`` engine is written against that API.  The optional
-        ``lingbot-video`` package predates PEFT and ships a bare ``ModelMixin``
-        subclass, so we re-add the mixin here rather than teaching the shared
-        engine a second, LingBot-only adapter dialect.  ``base_cls`` stays first
-        in the MRO so its ``forward`` and config loading are untouched, and the
-        module tree keeps its ``blocks.*`` names (no ``base_model.model.``
-        wrapper prefix), so FSDP wrapping and LoRA weight export behave exactly
-        as they do for the other transformers.  The derived class is memoized and
-        bound at module scope so instances stay picklable.
-        """
+        """Return ``base_cls`` extended with diffusers' ``PeftAdapterMixin``."""
         from diffusers.loaders import PeftAdapterMixin
 
         if issubclass(base_cls, PeftAdapterMixin):
@@ -129,21 +110,7 @@ class LingBotVideoDenseFlowGRPO(DiffusionModelBase):
 
     @staticmethod
     def _patch_time_embedder_input_dtype(module: torch.nn.Module) -> None:
-        """Keep LingBot timestep embeddings compatible with FSDP mixed precision.
-
-        The upstream LingBot forward computes ``timestep.float()`` before calling
-        ``time_embedder``.  Diffusers' ``TimestepEmbedding`` does not cast that
-        projection to its linear weight dtype, so FSDP mixed precision can expose
-        a Float input / BFloat16 weight mismatch.  Casting at the module boundary
-        is a no-op for fp32 training and follows the dtype used by the active
-        linear/LoRA wrapper during mixed-precision forward.
-
-        A narrow pre-hook is used rather than a broader remedy on purpose: the
-        fp32 re-promotion happens *inside* the forward (past the top-level
-        inputs), so FSDP2's ``cast_forward_inputs`` cannot reach it, and a global
-        ``torch.autocast`` over the transformer would also lower the FlowGRPO
-        log-prob/SDE math we intend to keep in fp32.
-        """
+        """Cast timestep embeddings to their active linear weight dtype."""
         time_embedder = getattr(module, "time_embedder", None)
         if time_embedder is None or getattr(time_embedder, "_verl_omni_dtype_hook_installed", False):
             return

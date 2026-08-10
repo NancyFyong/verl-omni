@@ -28,10 +28,7 @@ def _read_script(script: str) -> str:
 
 @pytest.mark.parametrize(
     "script, experiment_name",
-    [
-        ("run_lingbot_dense_t2v_lora.sh", "lingbot_dense_t2v_lora"),
-        ("run_lingbot_dense_t2v_lora_fsdp2.sh", "lingbot_dense_t2v_lora_fsdp2"),
-    ],
+    [("run_lingbot_dense_t2v_lora_fsdp2.sh", "lingbot_dense_t2v_lora_fsdp2")],
 )
 def test_lingbot_training_scripts_use_simple_example_launcher_shape(script, experiment_name):
     text = _read_script(script)
@@ -47,10 +44,7 @@ def test_lingbot_training_scripts_use_simple_example_launcher_shape(script, expe
     assert 'echo "Logging to $log_file"' in text
 
 
-@pytest.mark.parametrize(
-    "script",
-    ["run_lingbot_dense_t2v_lora.sh", "run_lingbot_dense_t2v_lora_fsdp2.sh"],
-)
+@pytest.mark.parametrize("script", ["run_lingbot_dense_t2v_lora_fsdp2.sh"])
 def test_lingbot_training_scripts_keep_validated_defaults(script):
     text = _read_script(script)
 
@@ -90,12 +84,3 @@ def test_lingbot_fsdp2_script_sets_fsdp2_specific_knobs():
     assert "actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=${ACTOR_SP:-1}" in text
     assert "actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.4}" in text
     assert "actor_rollout_ref.actor.strategy=${ACTOR_STRATEGY:-fsdp2}" in text
-
-
-def test_lingbot_non_fsdp2_script_keeps_fp32_actor_init():
-    text = _read_script("run_lingbot_dense_t2v_lora.sh")
-
-    assert "actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP:-1}" in text
-    assert "actor_rollout_ref.actor.strategy=fsdp2" not in text
-    assert "actor_rollout_ref.actor.fsdp_config.model_dtype=${MODEL_DTYPE:-fp32}" in text
-    assert "actor_rollout_ref.model.lora_dtype=${LORA_DTYPE:-bf16}" in text

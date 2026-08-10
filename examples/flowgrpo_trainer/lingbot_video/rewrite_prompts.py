@@ -183,8 +183,7 @@ def run_vllm(rewriter, todo: list[str], out_path: str, args: argparse.Namespace,
 
 
 def run_transformers(rewriter, todo: list[str], out_path: str, args: argparse.Namespace, neg_editor=None) -> dict:
-    """Single-threaded loop: the in-process 27B model serves one request at a time,
-    so concurrency comes from multiple sharded processes, not threads."""
+    """Rewrite prompts with the in-process transformers backend."""
     counters = {"ok": 0, "empty": 0, "err": 0}
     with open(out_path, "a", encoding="utf-8") as out:
         for prompt in tqdm(

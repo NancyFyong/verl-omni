@@ -67,21 +67,7 @@ DEFAULT_NEGATIVE_PROMPT = (
 
 
 def install_flash_attn_interface_compat(*, prefer_fa3: bool = True) -> bool:
-    """Expose LingBot's expected varlen attention entrypoint.
-
-    Upstream ``lingbot-video`` imports
-    ``flash_attn_interface.flash_attn_varlen_func`` for packed-batch attention
-    (used when diffusion micro-batch size is greater than 1).  Some
-    environments provide the compatible symbol from ``fa3_fwd_interface`` rather
-    than the legacy module, and the FA3 wheel can import successfully while its
-    first CUDA call fails because the wheel bundles a newer CUDA runtime than the
-    host driver supports.
-
-    Install an in-process shim so the optional LingBot dependency stays
-    unmodified.  The shim tries the real FA3 implementation when requested, but
-    falls back to a differentiable PyTorch SDPA varlen implementation if FA3 is
-    absent or hits the known CUDA runtime/driver mismatch at execution time.
-    """
+    """Expose LingBot's expected varlen attention entrypoint."""
 
     backend_func = None
     backend_file = None
@@ -159,15 +145,7 @@ def _is_known_fa3_runtime_mismatch(exc: RuntimeError) -> bool:
 
 
 def _torch_flash_attn_varlen_fallback(*args, **kwargs) -> torch.Tensor:
-    """Small SDPA fallback for LingBot's packed self-attention path.
-
-    It implements the subset of ``flash_attn_varlen_func`` used by
-    ``lingbot_video.transformer_lingbot_video``: flattened ``(tokens, heads,
-    head_dim)`` q/k/v tensors with cumulative sequence lengths and no attention
-    windowing.  The implementation is slower than FA3 but differentiable and
-    keeps ``micro_batch_size > 1`` functional when the FA3 wheel is ABI/runtime
-    incompatible with the host.
-    """
+    """SDPA fallback for LingBot's packed self-attention path."""
 
     names = (
         "q",
@@ -240,12 +218,7 @@ def _preload_bundled_cuda13_runtime() -> None:
 
 
 def caption_to_json(caption: Any) -> str:
-    """Serialize a structured LingBot caption with the official compact JSON form.
-
-    The model is trained on structured captions.  Rejecting plain text here is
-    intentional: silently accepting it would make an incorrectly preprocessed
-    dataset look like a valid LingBot rollout.
-    """
+    """Serialize a structured LingBot caption as compact JSON."""
 
     if isinstance(caption, str):
         try:

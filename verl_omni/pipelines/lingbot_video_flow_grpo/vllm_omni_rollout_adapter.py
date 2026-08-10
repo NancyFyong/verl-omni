@@ -68,14 +68,7 @@ def _autocast(device: torch.device, dtype: torch.dtype):
 
 @VllmOmniPipelineBase.register("LingBotVideoPipeline", algorithm="flow_grpo")
 class LingBotVideoPipelineWithLogProb(torch.nn.Module):
-    """Single-request LingBot Dense rollout with an SDE trajectory.
-
-    The native in-tree ``LingBotVideoPipeline`` drives a deterministic UniPC
-    solver and returns no replay trajectory, so this adapter reuses vLLM-Omni's
-    in-tree LingBot transformer (#5035) but owns the SDE denoising loop, which
-    lets it return old-policy log-probabilities to FlowGRPO.  MoE, TI2V and the
-    refiner are deliberately rejected by this adapter's dense-only model check.
-    """
+    """Single-request LingBot Dense rollout with an SDE trajectory."""
 
     supports_request_batch = False
 
@@ -483,14 +476,7 @@ class LingBotVideoPipelineWithLogProb(torch.nn.Module):
         self._manual_lora.set_active_adapter(lora_request, lora_scale)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        """Accept trainer LoRA/full-state updates after eager initial loading.
-
-        The initial vLLM-Omni loader sees ``weights_sources=()`` and calls this
-        with no tensors.  Returning ``None`` intentionally disables its strict
-        initial-load check because the official package has already loaded all
-        components.  Later trainer updates are copied by bare-transformer or
-        ``transformer.``-prefixed name.
-        """
+        """Accept trainer LoRA/full-state updates after eager initial loading."""
 
         parameters = dict(self.named_parameters())
         buffers = dict(self.named_buffers())

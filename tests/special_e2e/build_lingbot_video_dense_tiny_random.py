@@ -11,13 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Build a tiny LingBot-Video Dense T2V checkpoint for smoke tests.
-
-Usage:
-    python tests/special_e2e/build_lingbot_video_dense_tiny_random.py \
-        --output-dir ~/models/tiny-random/lingbot-video-dense \
-        --source-model ~/models/lingbot-video-dense-1.3b
-"""
+"""Build a tiny random LingBot-Video Dense checkpoint for smoke tests."""
 
 from __future__ import annotations
 
@@ -34,9 +28,7 @@ from transformers import AutoProcessor, Qwen3VLConfig, Qwen3VLForConditionalGene
 DEFAULT_OUTPUT_DIR = os.path.expanduser("~/models/tiny-random/lingbot-video-dense")
 DEFAULT_SOURCE_MODEL = os.path.expanduser("~/models/lingbot-video-dense-1.3b")
 
-# Wan VAE latent statistics (16 channels).  Copied verbatim from the real Dense
-# checkpoint so the latent normalization in the rollout adapter stays
-# self-consistent (transformer in_channels == vae z_dim == 16).
+# Wan VAE latent statistics copied from the Dense checkpoint config.
 _LATENTS_MEAN = [
     -0.7571,
     -0.7089,
@@ -74,34 +66,24 @@ _LATENTS_STD = [
     1.916,
 ]
 
-# Qwen3VL text-encoder special-token ids (must match the copied processor).
+# Qwen3VL special-token ids must match the copied processor.
 _IMAGE_TOKEN_ID = 151655
 _VIDEO_TOKEN_ID = 151656
 _VISION_START_TOKEN_ID = 151652
 _VISION_END_TOKEN_ID = 151653
-_BOS_TOKEN_ID = 151643
-_EOS_TOKEN_ID = 151645
-# The full vocab is kept (only the hidden size shrinks) so every id the copied
-# tokenizer can emit -- including the ~151k special tokens -- stays in range.
 _VOCAB_SIZE = 151936
 
-# Tiny transformer geometry.  head_dim == hidden_size // num_attention_heads ==
-# sum(axes_dims) == 32; every axis dim is even for the rotary embedding.
+# Tiny transformer geometry.
 _DIT_HIDDEN_SIZE = 64
 _DIT_NUM_HEADS = 2
 _DIT_DEPTH = 2
 _DIT_INTERMEDIATE_SIZE = 128
 _DIT_AXES_DIMS = (8, 12, 12)
-# RoPE position tables only need to cover the tiny latent grid (a few tokens per
-# axis after patchifying), but we keep comfortable headroom.
 _DIT_AXES_LENS = (256, 128, 128)
 
 
 def _mrope_section(head_dim: int) -> list[int]:
-    """Split ``head_dim // 2`` into a 3-way (temporal, height, width) M-RoPE section.
-
-    The M-RoPE rotary embedding requires ``sum(mrope_section) == head_dim // 2``.
-    """
+    """Return a 3-way M-RoPE section summing to ``head_dim // 2``."""
     half = head_dim // 2
     if half < 3:
         raise ValueError(f"head_dim // 2 must be >= 3 for a 3-way M-RoPE split, got {half}")
@@ -112,12 +94,7 @@ def _mrope_section(head_dim: int) -> list[int]:
 
 
 def get_dummy_components(*, text_dim: int = 32, seed: int = 42) -> dict[str, Any]:
-    """Instantiate tiny LingBot Dense components with random weights.
-
-    ``text_dim`` is the cross-model contract: the Qwen3VL last-hidden dimension
-    is fed to the transformer as ``encoder_hidden_states`` with no projection,
-    so the text-encoder hidden size and the transformer ``text_dim`` must match.
-    """
+    """Instantiate tiny LingBot Dense components with random weights."""
     from lingbot_video.transformer_lingbot_video import LingBotVideoTransformer3DModel
 
     torch.manual_seed(seed)
@@ -139,7 +116,7 @@ def get_dummy_components(*, text_dim: int = 32, seed: int = 42) -> dict[str, Any
         out_bias=True,
         patch_embed_bias=True,
         timestep_mlp_bias=True,
-        num_experts=0,  # dense-only: the FlowGRPO adapters reject num_experts != 0
+        num_experts=0,
     )
 
     torch.manual_seed(seed + 1)
@@ -184,12 +161,12 @@ def get_dummy_components(*, text_dim: int = 32, seed: int = 42) -> dict[str, Any
             hidden_size=32,
             intermediate_size=64,
             num_heads=2,
-            out_hidden_size=text_dim,  # projector target: must match the text hidden size
+            out_hidden_size=text_dim,
             patch_size=16,
             spatial_merge_size=2,
             temporal_patch_size=2,
             num_position_embeddings=256,
-            deepstack_visual_indexes=[1, 2, 3],  # must be < depth
+            deepstack_visual_indexes=[1, 2, 3],
         ),
     )
     text_encoder = Qwen3VLForConditionalGeneration(text_encoder_config)
@@ -198,7 +175,7 @@ def get_dummy_components(*, text_dim: int = 32, seed: int = 42) -> dict[str, Any
 
 
 def _resolve_source_dir(source_model: str) -> str:
-    """Resolve ``source_model`` to a local directory (offline; never downloads weights)."""
+    """Resolve ``source_model`` from a local path or HF cache."""
     local = os.path.expanduser(source_model)
     if os.path.isdir(local):
         return local
@@ -212,13 +189,7 @@ def _resolve_source_dir(source_model: str) -> str:
 
 
 def _copy_pretrained_assets(source_model: str, output_dir: str) -> None:
-    """Re-serialize the processor and scheduler from a cached source checkpoint.
-
-    Both are loaded from the local filesystem / HF cache (no Hub access).  The
-    processor bundles the tokenizer for LingBot (there is no separate tokenizer
-    subfolder), and the scheduler is re-serialized with the class the FlowGRPO
-    adapters actually load it as, so the tiny config stays self-consistent.
-    """
+    """Copy processor and scheduler config from the cached source checkpoint."""
     from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 
     src = _resolve_source_dir(source_model)
@@ -231,13 +202,7 @@ def _copy_pretrained_assets(source_model: str, output_dir: str) -> None:
 
 
 def _write_model_index(output_dir: str) -> None:
-    """Write the diffusers ``model_index.json`` describing every pipeline component.
-
-    ``_class_name`` is what ``DiffusionModelConfig`` reads to auto-detect the
-    architecture and dispatch to the LingBot FlowGRPO adapters; the component
-    entries mirror the real Dense checkpoint.  The adapters load each component
-    by subfolder directly, so the custom module references are never imported.
-    """
+    """Write the diffusers ``model_index.json`` component map."""
     model_index = {
         "_class_name": "LingBotVideoPipeline",
         "_diffusers_version": "0.37.1",
@@ -265,7 +230,6 @@ def build(
 
     components = get_dummy_components(text_dim=text_dim, seed=seed)
     components["transformer"].to(dtype).save_pretrained(os.path.join(output_dir, "transformer"))
-    # The Wan VAE runs in fp32 in the rollout adapter; keep its saved weights fp32.
     components["vae"].to(torch.float32).save_pretrained(os.path.join(output_dir, "vae"))
     components["text_encoder"].to(dtype).save_pretrained(os.path.join(output_dir, "text_encoder"))
 
@@ -298,13 +262,13 @@ def main() -> None:
     parser.add_argument(
         "--source-model",
         default=DEFAULT_SOURCE_MODEL,
-        help="Cached Dense checkpoint to copy processor/scheduler from (local_files_only).",
+        help="Cached Dense checkpoint used for processor/scheduler config.",
     )
     parser.add_argument(
         "--text-dim",
         type=int,
         default=32,
-        help="Shared Qwen3VL hidden size == transformer text_dim (cross-attention context).",
+        help="Shared Qwen3VL hidden size and transformer text_dim.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="bfloat16")

@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Manual LoRA application for LingBot's standard ``torch.nn.Linear`` layers.
-
-vLLM-Omni's diffusion LoRA manager patches vLLM ``LinearBase`` layers.  The
-upstream LingBot transformer uses ordinary PyTorch ``nn.Linear`` modules, so
-rollout-side in-memory LoRA sync needs a small local hook path instead of the
-vLLM layer replacement path.
-"""
+"""Manual LoRA hooks for LingBot ``torch.nn.Linear`` layers."""
 
 from __future__ import annotations
 
