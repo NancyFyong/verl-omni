@@ -421,7 +421,7 @@ def compute_score_hpsv3(
 ) -> dict:
     checkpoint_path = os.getenv("custom_reward_model_path", model_name)
     assert checkpoint_path is not None, "HPSv3 checkpoint path must be provided via reward.reward_model.model_path"
-    device = os.getenv("custom_reward_device", device or get_device_name())
+    device = device or get_device_name()
     inferencer = _get_inferencer(checkpoint_path, device)
 
     frame_interval = extra_info.get("frame_interval", 4)

@@ -9,7 +9,6 @@ tokenizer_path=${TOKENIZER_PATH:-$model_name/processor}
 reward_function_path=${REWARD_FUNCTION_PATH:-pkg://verl_omni.utils.reward_score.hpsv3_reward}
 
 export custom_reward_model_path=${custom_reward_model_path:-$WORKSPACE/models/HPSv3/HPSv3.safetensors}
-export custom_reward_device=${custom_reward_device:-cuda}
 
 experiment_name=${EXPERIMENT_NAME:-lingbot_dense_t2v_lora}
 train_path=${TRAIN_FILES:-$WORKSPACE/data/lingbot_video/train.parquet}
@@ -92,7 +91,6 @@ python3 -m verl_omni.trainer.main_diffusion \
     trainer.nnodes=${NNODES:-1} \
     ray_kwargs.ray_init.num_cpus=${NUM_CPUS:-64} \
     +ray_kwargs.ray_init.runtime_env.env_vars.custom_reward_model_path=$custom_reward_model_path \
-    +ray_kwargs.ray_init.runtime_env.env_vars.custom_reward_device=$custom_reward_device \
     trainer.save_freq=${SAVE_FREQ:-30} \
     trainer.max_actor_ckpt_to_keep=${MAX_ACTOR_CKPT_TO_KEEP:-2} \
     trainer.test_freq=${TEST_FREQ:-30} \

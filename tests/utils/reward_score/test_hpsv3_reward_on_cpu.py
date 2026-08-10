@@ -66,7 +66,6 @@ def test_compute_score_hpsv3_uses_env_checkpoint_and_device(monkeypatch):
         return _FakeInferencer()
 
     monkeypatch.setenv("custom_reward_model_path", "/tmp/hpsv3.safetensors")
-    monkeypatch.setenv("custom_reward_device", "cuda:3")
     monkeypatch.setattr(hpsv3_reward, "_get_inferencer", _fake_get_inferencer)
 
     result = hpsv3_reward.compute_score_hpsv3(
@@ -74,7 +73,7 @@ def test_compute_score_hpsv3_uses_env_checkpoint_and_device(monkeypatch):
         solution_image=torch.rand(3, 16, 16),
         ground_truth="a prompt",
         extra_info={"frame_interval": 1},
-        device="npu",
+        device="cuda:3",
         reward_scale=0.1,
     )
 
