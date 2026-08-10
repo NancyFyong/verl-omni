@@ -40,8 +40,9 @@ def test_lingbot_training_scripts_use_simple_example_launcher_shape(script, expe
     assert "CHECK_CONFIG_ONLY" not in text
     assert "must_divide" not in text
     assert "python3 -m verl_omni.trainer.main_diffusion" in text
-    assert f"output_dir=$WORKSPACE/outputs/{experiment_name}" in text
-    assert "checkpoint_dir=$output_dir/checkpoints" in text
+    assert f"EXPERIMENT_NAME=${{EXPERIMENT_NAME:-{experiment_name}}}" in text
+    assert "output_dir=${OUTPUT_DIR:-$WORKSPACE/outputs/$EXPERIMENT_NAME}" in text
+    assert "checkpoint_dir=${CHECKPOINT_DIR:-$output_dir/checkpoints}" in text
     assert 'exec > >(tee -a "$log_file") 2>&1' in text
     assert 'echo "Logging to $log_file"' in text
 
@@ -64,12 +65,21 @@ def test_lingbot_training_scripts_keep_validated_defaults(script):
         "NUM_FRAMES=${NUM_FRAMES:-81}",
         "ROLLOUT_NOISE_LEVEL=${ROLLOUT_NOISE_LEVEL:-0.7}",
         "ROLLOUT_SDE_TYPE=${ROLLOUT_SDE_TYPE:-dance_sde}",
-        "actor_rollout_ref.rollout.pipeline.shift=3.0",
+        "FLOW_SHIFT=${FLOW_SHIFT:-3.0}",
+        "GUIDANCE_SCALE=${GUIDANCE_SCALE:-3.0}",
+        "NUM_INFERENCE_STEPS=${NUM_INFERENCE_STEPS:-10}",
+        "VAL_NUM_INFERENCE_STEPS=${VAL_NUM_INFERENCE_STEPS:-40}",
+        "LR=${LR:-1e-5}",
+        "LORA_RANK=${LORA_RANK:-64}",
+        "LORA_ALPHA=${LORA_ALPHA:-128}",
+        "TRAINER_LOGGER=${TRAINER_LOGGER:-",
+        "actor_rollout_ref.rollout.pipeline.shift=$FLOW_SHIFT",
         "actor_rollout_ref.rollout.algo.sde_type=$ROLLOUT_SDE_TYPE",
-        "reward.custom_reward_function.name=compute_score_hpsv3",
+        'actor_rollout_ref.rollout.algo.sde_window_range="$SDE_WINDOW_RANGE"',
+        "reward.custom_reward_function.name=$REWARD_FUNCTION_NAME",
         "trainer.rollout_data_dir=$rollout_data_dir",
         "trainer.validation_data_dir=$val_data_dir",
-        "trainer.resume_mode=auto",
+        "trainer.resume_mode=$RESUME_MODE",
     ]
     for snippet in expected_snippets:
         assert snippet in text
@@ -81,7 +91,8 @@ def test_lingbot_fsdp2_script_sets_fsdp2_specific_knobs():
     assert "ROLLOUT_TP=${ROLLOUT_TP:-2}" in text
     assert "ACTOR_SP=${ACTOR_SP:-1}" in text
     assert "ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.4}" in text
-    assert "actor_rollout_ref.actor.strategy=fsdp2" in text
+    assert "ACTOR_STRATEGY=${ACTOR_STRATEGY:-fsdp2}" in text
+    assert "actor_rollout_ref.actor.strategy=$ACTOR_STRATEGY" in text
     assert "actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=$ACTOR_SP" in text
 
 
@@ -90,5 +101,7 @@ def test_lingbot_non_fsdp2_script_keeps_fp32_actor_init():
 
     assert "ROLLOUT_TP=${ROLLOUT_TP:-1}" in text
     assert "actor_rollout_ref.actor.strategy=fsdp2" not in text
-    assert "actor_rollout_ref.actor.fsdp_config.model_dtype=fp32" in text
-    assert "actor_rollout_ref.model.lora_dtype=bf16" in text
+    assert "MODEL_DTYPE=${MODEL_DTYPE:-fp32}" in text
+    assert "actor_rollout_ref.actor.fsdp_config.model_dtype=$MODEL_DTYPE" in text
+    assert "LORA_DTYPE=${LORA_DTYPE:-bf16}" in text
+    assert "actor_rollout_ref.model.lora_dtype=$LORA_DTYPE" in text
