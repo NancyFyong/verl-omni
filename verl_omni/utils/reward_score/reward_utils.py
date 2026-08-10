@@ -22,12 +22,16 @@ from PIL import Image
 
 
 def video_tensor_to_pil_frames(video: torch.Tensor) -> list[Image.Image]:
-    """Convert an RGB ``[T, C, H, W]`` tensor in ``[0, 1]`` to PIL frames.
+    """Convert an RGB ``[T, C, H, W]`` (or channels-last ``[T, H, W, C]``) tensor in ``[0, 1]`` to PIL frames.
 
     PIL (not NumPy) frames avoid ``export_to_video`` rescaling already-uint8 input
     by 255, which would invert colors modulo 256.
     """
-    if video.ndim != 4 or video.shape[1] != 3:
+    if video.ndim != 4:
+        raise ValueError(f"Expected an RGB video tensor with shape [T, 3, H, W], got {tuple(video.shape)}")
+    if video.shape[1] != 3 and video.shape[-1] == 3:
+        video = video.permute(0, 3, 1, 2)  # [T, H, W, 3] -> [T, 3, H, W]
+    if video.shape[1] != 3:
         raise ValueError(f"Expected an RGB video tensor with shape [T, 3, H, W], got {tuple(video.shape)}")
 
     video = video.detach().permute(0, 2, 3, 1).to(dtype=torch.float32)

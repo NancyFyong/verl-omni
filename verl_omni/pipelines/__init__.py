@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# _vllm_omni_compat is imported first for its side effect: it re-threads
+# DiffusionOutput.custom_output on vllm-omni >= 0.26 before any adapter constructs one.
 from . import (
+    _vllm_omni_compat,  # noqa: F401
     bagel_flow_grpo,
     ltx2_flow_grpo,
     minimax_h3_diffusion_nft,

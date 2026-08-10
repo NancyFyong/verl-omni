@@ -78,6 +78,17 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
             return model, model_config
         return None
 
+    def load_weights(self, weights):
+        """Forward a base-weight bucket to the diffusion pipeline's loader.
+
+        The full-weight sync path in ``update_weights_from_ipc`` streams buckets
+        through ``self.load_weights`` for pipeline workers -- those whose
+        ``model_runner`` exposes no standard ``get_model().load_weights`` chain
+        (see ``_get_standard_weight_model_and_config``). The loader lives on the
+        pipeline, so forward the bucket there.
+        """
+        return self.model_runner.pipeline.load_weights(weights)
+
     def update_weights_from_ipc(
         self,
         peft_config: dict = None,

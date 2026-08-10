@@ -106,6 +106,36 @@ def _to_pil_hwc(image) -> Image.Image:
     return image
 
 
+def _extract_frames(solution_image, frame_interval: int = 1) -> list[Image.Image]:
+    """Split a float tensor in ``[0, 1]`` into PIL frames, channels-last tolerated.
+
+    Handles ``(C, H, W)`` (one image), ``(C, T, H, W)`` and ``(B, C, T, H, W)``
+    (video), subsampling the time axis by ``frame_interval``. Mirrors the extractor
+    in ``hpsv3_reward.py`` so both scorers read the same rollout video layout.
+    """
+    is_channels_last = solution_image.shape[-1] in (1, 3) if solution_image.ndim >= 3 else False
+
+    if solution_image.ndim == 3:
+        if is_channels_last:
+            solution_image = solution_image.permute(2, 0, 1)
+        solution_image = solution_image.unsqueeze(0)
+
+    elif solution_image.ndim == 4:
+        if is_channels_last:
+            solution_image = solution_image.permute(3, 0, 1, 2)
+        solution_image = solution_image[:, ::frame_interval]
+        solution_image = solution_image.permute(1, 0, 2, 3)
+
+    elif solution_image.ndim == 5:
+        if is_channels_last:
+            solution_image = solution_image.permute(0, 4, 1, 2, 3)
+        solution_image = solution_image[:, :, ::frame_interval]
+        solution_image = solution_image.permute(0, 2, 1, 3, 4)
+        solution_image = solution_image.reshape(-1, *solution_image.shape[2:])
+
+    return [_to_pil_hwc(frame) for frame in solution_image]
+
+
 def _score_batch(requests) -> list[float | Exception]:
     """Convert and score a batch in a thread so the event loop is never blocked."""
     results = [None] * len(requests)
@@ -188,12 +218,31 @@ async def compute_score_pickscore(
     device: str = "cuda",
     **kwargs,
 ) -> dict:
+    """Score a still image or a video against ``ground_truth`` with PickScore.
+
+    A single PIL image or ``(C, H, W)`` tensor is scored directly; a video tensor is
+    split into frames, every frame is scored against the same prompt through the shared
+    batching consumer, and the frame PickScores are averaged. ``extra_info["frame_interval"]``
+    subsamples the frames (default 1, i.e. every frame).
+    """
     await _ensure_consumer(device)
 
     prompt = ground_truth if ground_truth else ""
+    # TODO (gpu-bringup): video stream only; H3 audio needs its own scorer.
+    if isinstance(solution_image, Image.Image):
+        frames = [solution_image]
+    else:
+        frame_interval = int(extra_info.get("frame_interval", 1)) if extra_info else 1
+        frames = _extract_frames(solution_image, frame_interval=frame_interval)
+
     loop = asyncio.get_running_loop()
-    future = loop.create_future()
-    await _score_queue.put((prompt, solution_image, future))
-    raw_score = await future
+    futures = []
+    for frame in frames:
+        future = loop.create_future()
+        await _score_queue.put((prompt, frame, future))
+        futures.append(future)
+
+    frame_scores = await asyncio.gather(*futures)
+    raw_score = sum(frame_scores) / len(frame_scores)
 
     return {"score": raw_score, "pickscore_raw": raw_score}

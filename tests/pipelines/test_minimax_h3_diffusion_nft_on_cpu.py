@@ -34,6 +34,7 @@ from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     TEXT_TAG,
     VIDEO_ROW_WIDTH,
     VIDEO_TAG,
+    MiniMaxH3RolloutWeightSyncMixin,
     build_layout_from_meta,
     h3_dit_timestep,
     h3_velocity_to_flow_match,
@@ -98,6 +99,15 @@ class TestMiniMaxH3DiffusionNFTRegistry:
     def test_registered_for_minimax_h3_diffusion_nft(self):
         resolved = DiffusionModelBase.get_class_by_name("MiniMaxH3Pipeline", "diffusion_nft")
         assert resolved is MiniMaxH3DiffusionNFT
+
+    def test_importing_the_package_registers_the_algorithm(self):
+        # Registration is an import side effect and ``verl_omni/pipelines/__init__.py`` is the only
+        # importer, so a subpackage missing from there silently does not exist. Importing the module
+        # directly (as the test above does) hides that, hence the package-level check.
+        import verl_omni.pipelines as pipelines
+
+        assert hasattr(pipelines, "minimax_h3_diffusion_nft")
+        assert DiffusionModelBase.get_class_by_name("MiniMaxH3Pipeline", "diffusion_nft") is not None
 
 
 class TestMiniMaxH3PackUnpack:
@@ -285,3 +295,109 @@ class TestMiniMaxH3BuildScheduler:
 
         scheduler = MiniMaxH3DiffusionNFT.build_scheduler(cfg)
         assert len(scheduler.timesteps) == 4
+
+
+# Small stand-ins for the real fused DiT dims, so the translation is checked on tensors
+# whose per-head layout can be read by eye: 2 heads * 4 dims, GEGLU half 6, 3 rope pairs.
+_HEADS, _HEAD_DIM, _FF_HALF, _ROPE_LEN = 2, 4, 6, 3
+
+
+class _RecordingLoader:
+    """Stands in for the vllm pipeline's exact-name loader at the end of the MRO."""
+
+    def load_weights(self, weights):
+        self.received = list(weights)
+        return {name for name, _ in self.received}
+
+
+class _StubSyncPipeline(MiniMaxH3RolloutWeightSyncMixin, _RecordingLoader):
+    def __init__(self):
+        self.transformer = MagicMock()
+        self.transformer.arch.num_attention_heads = _HEADS
+        self.transformer.arch.attention_head_dim = _HEAD_DIM
+        self.transformer.arch.ffn_hidden_size = _FF_HALF
+        self.transformer.arch.rope_inv_freq_len = _ROPE_LEN
+
+
+class TestMiniMaxH3RolloutWeightSync:
+    def test_rope_inv_freq_is_synthesized(self):
+        """diffusers never streams this buffer, and the vllm one is registered uninitialized."""
+        pipeline = _StubSyncPipeline()
+        pipeline.load_weights([])
+
+        emitted = dict(pipeline.received)
+        assert "transformer.rope.inv_freq" in emitted
+        expected = 10000.0 ** (-(torch.arange(0, 2 * _ROPE_LEN, 2, dtype=torch.float32) / (2 * _ROPE_LEN)))
+        torch.testing.assert_close(emitted["transformer.rope.inv_freq"], expected)
+
+    def test_qkv_fuses_per_head_across_sync_buckets(self):
+        """The base sync arrives in buckets, so one block's q/k/v may span several calls."""
+        pipeline = _StubSyncPipeline()
+        width = _HEADS * _HEAD_DIM
+        parts = {c: torch.randn(width, width) for c in ("q", "k", "v")}
+
+        pipeline.load_weights([(f"transformer.transformer_blocks.0.attn.to_{c}.weight", parts[c]) for c in ("q", "k")])
+        assert not any("qkv_proj" in name for name, _ in pipeline.received)
+        pipeline.load_weights([("transformer.transformer_blocks.0.attn.to_v.weight", parts["v"])])
+
+        fused = dict(pipeline.received)["transformer.blocks.0.attn.qkv_proj.weight"]
+        assert fused.shape == (3 * width, width)
+        for head in range(_HEADS):
+            for offset, comp in enumerate(("q", "k", "v")):
+                start = (head * 3 + offset) * _HEAD_DIM
+                expected = parts[comp][head * _HEAD_DIM : (head + 1) * _HEAD_DIM]
+                torch.testing.assert_close(fused[start : start + _HEAD_DIM], expected)
+
+    def test_geglu_halves_are_swapped(self):
+        pipeline = _StubSyncPipeline()
+        proj = torch.randn(2 * _FF_HALF, 4)
+
+        pipeline.load_weights([("transformer.transformer_blocks.0.ff.net.0.proj.weight", proj)])
+
+        swapped = dict(pipeline.received)["transformer.blocks.0.mlp.fc1.weight"]
+        torch.testing.assert_close(swapped, torch.cat([proj[_FF_HALF:], proj[:_FF_HALF]]))
+
+    @pytest.mark.parametrize(
+        ("diffusers_name", "vllm_name"),
+        [
+            ("audio_proj_in.weight", "audio_patch_proj.weight"),  # must win over the proj_in rename
+            ("proj_in.weight", "video_patch_proj.weight"),
+            ("norm_out.linear.weight", "final_layer.adaln_proj.linear.weight"),
+            ("transformer_blocks.0.attn.norm_q.weight", "blocks.0.attn.q_norm.weight"),
+            ("token_refiner.refiner_blocks.0.ff.net.2.weight", "token_refiner.blocks.0.mlp.fc2.weight"),
+        ],
+    )
+    def test_names_are_renamed(self, diffusers_name, vllm_name):
+        pipeline = _StubSyncPipeline()
+        pipeline.load_weights([(f"transformer.{diffusers_name}", torch.zeros(1))])
+
+        assert f"transformer.{vllm_name}" in dict(pipeline.received)
+
+    def test_lora_deltas_are_dropped(self):
+        """They reach the engine through ``add_lora``, not the base weight stream."""
+        pipeline = _StubSyncPipeline()
+        pipeline.load_weights([("transformer.transformer_blocks.0.attn.to_q.lora_A.weight", torch.zeros(1))])
+
+        assert [name for name, _ in pipeline.received] == ["transformer.rope.inv_freq"]
+
+
+class TestMiniMaxH3EnsurePromptText:
+    def test_token_ids_are_decoded_into_the_prompt(self):
+        pipeline = _StubSyncPipeline()
+        pipeline.tokenizer = MagicMock()
+        pipeline.tokenizer.decode.return_value = " a campfire "
+        request = MagicMock(prompts=[{"prompt_token_ids": [1, 2, 3]}])
+
+        pipeline._ensure_prompt_text(request)
+
+        assert request.prompts[0]["prompt"] == "a campfire"
+
+    def test_existing_prompt_is_left_alone(self):
+        pipeline = _StubSyncPipeline()
+        pipeline.tokenizer = MagicMock()
+        request = MagicMock(prompts=[{"prompt": "kept", "prompt_token_ids": [1]}])
+
+        pipeline._ensure_prompt_text(request)
+
+        assert request.prompts[0]["prompt"] == "kept"
+        pipeline.tokenizer.decode.assert_not_called()

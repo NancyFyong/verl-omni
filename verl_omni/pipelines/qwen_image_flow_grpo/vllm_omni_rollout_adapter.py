@@ -24,7 +24,11 @@ from vllm_omni.diffusion.models.qwen_image import QwenImagePipeline
 from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
-from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+
+try:  # vllm-omni 0.26 renamed this class StepRequestState
+    from vllm_omni.diffusion.worker.utils import StepRequestState as DiffusionRequestState
+except ImportError:  # vllm-omni < 0.26
+    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.request_batch import (

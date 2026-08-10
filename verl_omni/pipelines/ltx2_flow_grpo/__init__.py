@@ -12,9 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import os
+
 from .agent_loop import LTX2DiffusionSingleTurnAgentLoop
 from .diffusers_training_adapter import LTX23FlowGRPO
-from .vllm_omni_rollout_adapter import LTX23PipelineWithLogProb
+
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+try:
+    from .vllm_omni_rollout_adapter import LTX23PipelineWithLogProb
+except (ImportError, RuntimeError, AttributeError) as e:
+    logger.info(f"LTX2 Flow-GRPO rollout not available: {e}. GPU/NPU required.")
+
+    class _UnavailableModule:
+        def __getattr__(self, _):
+            raise RuntimeError("LTX2 Flow-GRPO rollout requires GPU (CUDA/NPU)")
+
+        def __call__(self, *args, **kwargs):
+            raise RuntimeError("LTX2 Flow-GRPO rollout requires GPU (CUDA/NPU)")
+
+    LTX23PipelineWithLogProb = _UnavailableModule()
 
 __all__ = [
     "LTX2DiffusionSingleTurnAgentLoop",

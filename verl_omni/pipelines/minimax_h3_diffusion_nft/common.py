@@ -28,9 +28,14 @@ tensors). :func:`build_packed_sequence` builds them; it is ported verbatim from
 the diffusers ``minimax-h3`` branch (``MiniMaxH3PrepareLayoutStep``) so training
 lays out byte-identical sequences to rollout without importing diffusers. See
 ``docs/rfcs/rfc-0001-minimax-h3-fl2va.md``.
+
+:class:`MiniMaxH3RolloutWeightSyncMixin` is shared here for the same reason: both
+rollout adapters receive the trainer's diffusers-named weights and have to translate
+them into the fused vllm layout identically, or the DiT generates from dummy weights.
 """
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
+from typing import Any
 
 import numpy as np
 import torch
@@ -69,6 +74,7 @@ __all__ = [
     "build_packed_sequence",
     "build_layout_from_meta",
     "build_row_timesteps",
+    "MiniMaxH3RolloutWeightSyncMixin",
 ]
 
 
@@ -402,3 +408,121 @@ def build_row_timesteps(
     row_timesteps[audio_indices[num_condition_audio_rows:]] = audio_timestep
     row_timesteps[audio_indices[:num_condition_audio_rows]] = condition_audio_timestep
     return torch.unique(row_timesteps, sorted=True, return_inverse=True)
+
+
+# The trainer holds diffusers' MiniMaxH3Transformer3DModel; vllm serves the fused
+# MiniMaxH3DiTModel. Their weights are numerically identical, but four structural
+# differences need bridging when the base weight sync streams diffusers-named params:
+# a set of pure renames, the two GEGLU halves of ff.net.0.proj swapped, separate
+# q/k/v projections packed per-head-interleaved into one qkv_proj, and the fixed
+# rope.inv_freq buffer -- which the vllm DiT carries but diffusers computes on the
+# fly, so it is absent from the stream and must be synthesized. Verified maxdiff=0
+# against both on-disk checkpoints.
+_TOPLEVEL_RENAMES = (
+    ("audio_proj_in", "audio_patch_proj"),
+    ("audio_proj_out", "final_layer.audio_out"),
+    ("proj_in", "video_patch_proj"),
+    ("proj_out", "final_layer.video_out"),
+    ("context_embedder", "condition_proj"),
+    ("time_embedder.linear_1", "time_embedder.proj_in"),
+    ("time_embedder.linear_2", "time_embedder.proj_out"),
+    ("norm_out.linear", "final_layer.adaln_proj.linear"),
+    ("norm_out.norm", "final_layer.norm"),
+)
+
+
+def _diffusers_to_vllm_name(name: str) -> str:
+    """Rename a diffusers transformer param to its fused-vllm counterpart (no reshape)."""
+    name = name.replace("token_refiner.refiner_blocks.", "token_refiner.blocks.")
+    name = name.replace("transformer_blocks.", "blocks.")
+    name = name.replace(".attn.norm_q.", ".attn.q_norm.")
+    name = name.replace(".attn.norm_k.", ".attn.k_norm.")
+    name = name.replace(".attn.to_out.0.", ".attn.out_proj.")
+    name = name.replace(".ff.net.2.", ".mlp.fc2.")
+    for old, new in _TOPLEVEL_RENAMES:  # audio_* listed first so they win over proj_in/out
+        if name.startswith(old + "."):
+            return new + name[len(old) :]
+    return name
+
+
+class MiniMaxH3RolloutWeightSyncMixin:
+    """Bridge the trainer's diffusers weight names and prompt token ids to the vllm H3 pipeline.
+
+    Mix in ahead of ``MiniMaxH3Pipeline`` so ``load_weights`` intercepts the base weight
+    sync. Carries no constructor state -- the q/k/v partial buffer is created on first use
+    -- so the rollout adapters need no cooperative ``__init__``.
+    """
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Translate diffusers-named base weights into fused-vllm names, then load.
+
+        The base weight sync streams the trainer's diffusers checkpoint prefixed with
+        ``transformer.``, in buckets that may split one block's q/k/v across calls.
+        Rename, GEGLU-swap ``ff.net.0.proj``, and per-head-interleave q/k/v into
+        ``qkv_proj`` before delegating to the parent's exact-name loader. LoRA deltas
+        (``lora_`` names) arrive through a separate ``add_lora`` path.
+        """
+        arch = self.transformer.arch
+        heads, head_dim, ff_half = arch.num_attention_heads, arch.attention_head_dim, arch.ffn_hidden_size
+        partials = getattr(self, "_qkv_buffer", None)
+        if partials is None:
+            partials = self._qkv_buffer = {}
+        translated: list[tuple[str, torch.Tensor]] = []
+        for name, tensor in weights:
+            if not name.startswith("transformer."):
+                translated.append((name, tensor))
+                continue
+            inner = name[len("transformer.") :].replace(".base_layer", "")
+            if "lora_" in inner:
+                continue
+            if inner.endswith((".attn.to_q.weight", ".attn.to_k.weight", ".attn.to_v.weight")):
+                block, comp = inner.rsplit(".attn.to_", 1)
+                slot = partials.setdefault(block, {})
+                slot[comp[0]] = tensor
+                if len(slot) == 3:
+                    heads_qkv = [slot[c].view(heads, head_dim, -1) for c in ("q", "k", "v")]
+                    qkv = torch.stack(heads_qkv, dim=1).reshape(heads * 3 * head_dim, -1)
+                    translated.append((f"transformer.{_diffusers_to_vllm_name(block)}.attn.qkv_proj.weight", qkv))
+                    del partials[block]
+                continue
+            if inner.endswith(".ff.net.0.proj.weight"):
+                swapped = torch.cat([tensor[ff_half:], tensor[:ff_half]], dim=0)
+                vname = _diffusers_to_vllm_name(inner).replace(".ff.net.0.proj.", ".mlp.fc1.")
+                translated.append((f"transformer.{vname}", swapped))
+                continue
+            translated.append((f"transformer.{_diffusers_to_vllm_name(inner)}", tensor))
+        # Synthesize the fixed 3D-RoPE frequency table. diffusers computes it on the fly so
+        # it never reaches this stream, and the vllm buffer is registered uninitialized, so
+        # skipping it silently scrambles RoPE. Matches the on-disk vllm checkpoint's
+        # 10000**-(arange(0, 2L, 2) / 2L) to 3.7e-09.
+        rope_len = arch.rope_inv_freq_len
+        inv_freq = 10000.0 ** (-(torch.arange(0, 2 * rope_len, 2, dtype=torch.float32) / (2 * rope_len)))
+        translated.append(("transformer.rope.inv_freq", inv_freq))
+        return super().load_weights(translated)
+
+    def _ensure_prompt_text(self, request: Any) -> None:
+        """Fill ``prompts[0]["prompt"]`` from the request's token ids.
+
+        The agent loop renders the caption via the custom chat template, tokenizes
+        it, and the server forwards only ``prompt_token_ids`` (no decoded text) so
+        pipelines never re-encode. But the H3 pipeline's text encoder consumes the
+        caption *string* (``encode_prompt`` re-tokenizes with the same
+        ``self.tokenizer``), so decode the ids back here. H3 is CFG-distilled, so
+        there is no negative branch to decode.
+        """
+        prompts = getattr(request, "prompts", None)
+        if not prompts or not isinstance(prompts[0], dict):
+            return
+        custom_prompt = prompts[0]
+        if custom_prompt.get("prompt"):
+            return
+        token_ids = custom_prompt.get("prompt_token_ids")
+        if token_ids is None:
+            return
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.detach().cpu().tolist()
+        if token_ids and isinstance(token_ids[0], list):
+            token_ids = token_ids[0]
+        text = self.tokenizer.decode([int(t) for t in token_ids], skip_special_tokens=True).strip()
+        if text:
+            custom_prompt["prompt"] = text
