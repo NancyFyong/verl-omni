@@ -7,8 +7,9 @@
   (image, video, audio) are both in scope.
 - **Not in scope:** the autoregressive omni track, the `TokenOutput` path, and any change to
   the pinned vllm-omni protocol (§3).
-- **Companion:** RFC-0001 / RFC-0002 (MiniMax-H3) are the first consumers needing two output
-  modalities from one request. Neither depends on this RFC landing.
+- **Applies to:** the whole diffusion tree, not one model integration — 10 pipeline packages, 10
+  registered `(architecture, algorithm)` keys, 9 rollout adapters, all re-deciding the same
+  questions independently today.
 - **Last updated:** 2026-08-10
 - **Verified against:** verl-omni `8c0f5fa`, vllm-omni `0.24.1.dev26+gfe478a95a`. Every
   `file:line` below was read at those revisions.
@@ -26,9 +27,10 @@ the contract, in three places:
    the rest (§1.3).
 2. **The layer this repo owns is the only one on the path with no request type** — 12 flat
    kwargs, nine describing the input, re-listed verbatim by two intermediaries (§1.1-1.2).
-3. **Everything else rides in a `dict[str, Any]`** shared with upstream, already policed by a
-   hand-written runtime guard whose only job is to catch one key being mistaken for another
-   (`pipelines/model_base.py:363-372`) (§1.3).
+3. **Everything else rides in a `dict[str, Any]`** merged with upstream's by `setdefault`, so an
+   adapter key silently wins any collision — `audio_sample_rate` already has two producers and no
+   declared owner — and one past collision is policed by a hand-written runtime guard whose only
+   job is to catch one key being mistaken for another (`pipelines/model_base.py:363-372`) (§1.3).
 
 Proposal: one additive, CPU-importable module `verl_omni/pipelines/io.py` holding `MediaRef` +
 `PromptBundle` + `MediaRequest` on the way in and `MediaOut` + `MediaOutput` on the way out.
@@ -142,8 +144,9 @@ arm, `output.output = (video[0], audio)` (`ltx2_flow_grpo/vllm_omni_rollout_adap
 verl-omni flattens it back to `Any`.
 
 Everything that is *not* the primary tensor rides in `extra_fields`, assembled by
-`_process_output` (`:619-635`) from each adapter's `custom_output` unioned with upstream's
-`multimodal_output`. The eight diffusion rollout adapters emit key sets that overlap without
+`_process_output` (`:610-635`) from each adapter's `custom_output` unioned with upstream's
+`multimodal_output`. Nine rollout adapters exist and eight emit `custom_output`
+(`qwen_image_mix_grpo` emits none); their key sets overlap without
 agreeing, and the disagreement does not follow the algorithm boundary: `qwen_image_flow_grpo` and
 `wan22_dance_grpo` emit `all_latents` / `all_log_probs` / `all_timesteps` plus four prompt-embed
 keys, `sd3_flow_grpo` adds the two pooled variants, but `bagel_flow_grpo` — same algorithm —
@@ -167,9 +170,15 @@ emits the three `all_*` keys and **no** prompt-embed keys at all. NFT and DPO su
    (`diffusion_agent_loop.py:348-352`, `:383-388`), so the trainer must look in both — and does
    so in *inconsistent order* for two related keys, reading `batch.batch` first for `audio` and
    `non_tensor_batch` first for `audio_sample_rate` (`ray_diffusion_trainer.py:391-393`).
-4. **Neither of those two keys is produced anywhere under `verl_omni/pipelines/`** — both
-   originate upstream. A pin bump renaming either fails at **training** time with a `KeyError`,
-   or worse yields `None` and silently drops the audio track from every dumped mp4.
+4. **Merge order silently picks the winner.** The union is
+   `extra_fields.setdefault(key, ...)` (`:630-634`), which folds upstream's `multimodal_output` in
+   *under* the adapter's `custom_output` — so on any collision the adapter wins and upstream's
+   value is discarded without a warning. That collision is not hypothetical: `audio_sample_rate`
+   is emitted both by `ltx2_flow_grpo/vllm_omni_rollout_adapter.py:397` (the vocoder's rate) and
+   by upstream's `_build_multimodal_output`, and nothing in the tree declares which is
+   authoritative. The other two keys the trainer reads there, `audio` and `fps`, have **no**
+   in-repo rollout producer at all, so a pin bump renaming either fails at **training** time with
+   a `KeyError`, or worse yields `None` and silently drops the audio track from every dumped mp4.
 
 ### 1.4 What is already partially unified — and where it stopped
 
@@ -204,7 +213,7 @@ split. How far it got:
    `additional_information.condition_images` (`utils.py:79-85`). Two have no producer on this
    branch; one exists only because `_preprocess_input:506-508` writes the same dict into two
    places. This is not defensive coding; it is the cost of having no declared contract.
-3. **Two of eleven pipelines bypass it and hand-roll the same lookup** —
+3. **Two of the ten diffusion pipelines bypass it and hand-roll the same lookup** —
    `bagel_flow_grpo:285-288`, `wan22_dance_grpo:373-381`. Three consumers, three spellings of
    one question. (It also collides by name with upstream's unrelated HTTP model,
    `protocol/images.py:33`; both are importable in the same process.)
@@ -214,7 +223,7 @@ not "the modality works":
 
 | Modality in | Reaches the engine prompt? | Any consumer? | Status |
 | --- | --- | --- | --- |
-| text | yes | all 11 pipelines | **live** |
+| text | yes | all 10 pipelines | **live** |
 | image | yes, written twice (`:506-508`) | `qwen_image_edit_flow_grpo`, `bagel_flow_grpo`, `wan22_dance_grpo` | **live**, three lookup styles |
 | video | yes — `multi_modal_data["video"]` (`:377`) | **none** — `:377` is the only occurrence of the key under `verl_omni/` | **write-only** |
 | audio | only if a caller passes `audio_data` | **none** — no caller on this branch supplies it | **unreachable** |
@@ -238,18 +247,30 @@ which.
 
 ## 2. Motivation
 
-Five failure modes, each traceable to a missing type rather than to a bug in any one file:
+The tree holds **10 diffusion pipeline packages** (11 counting the AR-track `qwen3_omni`, out of
+scope by N4), **10 registered `(architecture, algorithm)` keys** and **9 rollout adapters**. Each
+one independently re-decides the same three questions — how do I pass conditioning, how do I say
+what I emitted, where do I put the per-step trajectory — because no type answers them. The result
+is **4 representations of one request** (§1.1-1.2), **7 sites re-deriving the output modality from
+tensor rank** (§1.3) and **5 candidate locations for one conditioning image** (§1.4). Nothing here
+is a bug in any single file; every entry below is what that missing type costs, and the cost is
+paid once per pipeline, forever.
+
+Five failure modes follow directly:
 
 - **M-1: wrong rewards, no error.** The `ndim == 4` collision (§1.3). A video pipeline
   configured with `http_scorer` scores frame 0 and reports a plausible number.
-- **M-2: pin bumps break at training time, not request time.** The contract is string keys
-  spread over eight adapters plus upstream's `multimodal_output` (§1.3). Not hypothetical: the
-  MiniMax-H3 bring-up (RFC-0001) hit exactly this when a `custom_output` key moved between
-  vllm-omni revisions, surfacing as a `KeyError` minutes into a multi-GPU run.
+- **M-2: pin bumps break at training time, not request time.** The contract is string keys spread
+  over eight adapters plus upstream's `multimodal_output`, unioned by `setdefault` so the adapter
+  silently wins any collision (§1.3). Already live: `audio_sample_rate` has two producers —
+  `ltx2_flow_grpo` and upstream's formatter — and merge order alone decides which one the trainer
+  sees. `audio` and `fps` have no in-repo rollout producer at all, so an upstream rename surfaces
+  as a `KeyError` minutes into a run, or as a silently muted mp4.
 - **M-3: adding a modality costs three signature edits.** A second conditioning image with a
   different role (keyframe vs identity reference) has nowhere to go but a new `*_data` kwarg
-  threaded through three signatures (§1.2), or an untyped `extra_args` key. Both were used
-  during the H3 and LTX-2 bring-ups.
+  threaded through three signatures (§1.2), or an untyped `extra_args` key — the route
+  `bagel_flow_grpo:278-282` already takes to smuggle a `negative_prompt` through
+  `sampling_params`, where a conditioning input does not belong.
 - **M-4: a model emitting two modalities has no representation.** LTX-2 already does, and had to
   smuggle audio through the tuple arm of upstream's union plus an `audio_sample_rate` key
   (§1.3). Every future joint A/V pipeline repeats that choice independently.
@@ -258,9 +279,8 @@ Five failure modes, each traceable to a missing type rather than to a bug in any
   individually harmless; collectively the input contract is whatever the last adapter happened
   to check.
 
-The cost scales with pipeline count: 11 pipeline packages and 10 registered `(architecture,
-algorithm)` keys, each re-deciding the same three questions — how do I pass conditioning, how do
-I say what I emitted, where do I put the trajectory — with no type to answer them.
+None of these is specific to a model or an algorithm — they are properties of the path every
+pipeline shares, so they recur on the next integration whoever writes it.
 
 ---
 
@@ -281,7 +301,7 @@ I say what I emitted, where do I put the trajectory — with no type to answer t
 - **G4.** A first-class slot for the RL trajectory, so a rollout↔training key mismatch is a
   construction-time error rather than a training-time `KeyError`.
 - **G5.** Fully additive: every milestone landable and revertible alone, and **no milestone may
-  require editing all 11 pipeline packages at once.**
+  require editing all 10 diffusion pipeline packages at once.**
 - **G6.** CPU-testable — importable without diffusers, vllm-omni, or a GPU.
 
 **Non-goals**
@@ -341,8 +361,8 @@ MediaOutput(media=[MediaOut(video), MediaOut(audio)], trajectory={…}, extra={�
 ```
 
 Two adaptation points, both in `workers/rollout/`, both against the pinned engine. Everything
-upstream and downstream of them speaks the repo's own types — the 11 pipeline packages, the
-scorers, the trainer and the tracking layer never import a vllm-omni type to answer a question
+upstream and downstream of them speaks the repo's own types — the 10 diffusion pipeline packages,
+the scorers, the trainer and the tracking layer never import a vllm-omni type to answer a question
 about a modality.
 
 ---
@@ -438,7 +458,7 @@ class MediaOut:
 
 @dataclass
 class MediaOutput:
-    media: list[MediaOut]        # >1 for joint A/V: LTX-2's (video, audio) tuple, H3's t2va
+    media: list[MediaOut]        # >1 for joint A/V: LTX-2's (video, audio) tuple
     log_probs: torch.Tensor | None = None
     stop_reason: str | None = None
     num_preempted: int | None = None
@@ -584,8 +604,8 @@ unrelated to these files; all other hooks must pass.
 | R2 | **A fifth representation** — adding types without deleting the old ones. | M3 and M4 are the deletions and they are in the plan. If M3 never lands, `to_generate_kwargs()` is one function and M2 replaced inference with field reads — no new representation, only accessors. |
 | R3 | **`trajectory` becomes the new `extra_fields`** under a nicer name. | The per-algorithm key tables in §7 are the constraint; §5.3 states why it stays a dict and §9 q1 tracks promoting it. |
 | R4 | **`final_output_type` is unreliable** — it defaults to `"text"` on the dataclass (`outputs.py:87`) but to `"image"` in the `from_diffusion` constructor (`:178`), so a video pipeline that never sets it is mislabelled. | §5.4 keeps the rank heuristic as an explicit documented fallback and §7 pins the disagreement case. Prefer-declared-else-infer is strictly better than today's infer-only. |
-| R5 | **Eleven packages, one shared type** — a type fitting eight image pipelines may not fit a joint A/V one. | M1 lands with two consumers of *different* shape (one image pipeline and `ltx2_flow_grpo`), not eight of the same. G5 makes each milestone revertible. |
-| R6 | **Merge conflicts with in-flight work** (H3, and anything touching `_process_output`). | M1 adds a file and two properties; M2 edits one line per site. M3/M4 should follow the H3 bring-up rather than race it. |
+| R5 | **Ten packages, one shared type** — a type fitting eight image pipelines may not fit a joint A/V one. | M1 lands with two consumers of *different* shape (one image pipeline and `ltx2_flow_grpo`), not eight of the same. G5 makes each milestone revertible. |
+| R6 | **Merge conflicts with in-flight work** — anything touching `_process_output` or a rollout adapter. | M1 adds a file and two properties; M2 edits one line per site. M3/M4 touch the adapters and should be sequenced after whatever pipeline work is in flight, rather than racing it. |
 
 ---
 
