@@ -27,15 +27,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class _PipelineLoRAProxy:
-    """Adapter exposing vLLM-Omni's LoRA manager API for custom pipelines.
-
-    Some custom diffusion pipelines (LingBot Dense) cannot use vLLM-Omni's
-    ``DiffusionLoRAManager`` because their transformer layers are plain
-    ``torch.nn.Linear`` modules rather than vLLM ``LinearBase`` layers.  Those
-    pipelines can expose ``add_lora/remove_lora/list_loras/set_active_lora`` and
-    this proxy lets the existing worker activation path call into them without
-    changing other diffusion models.
-    """
+    """Expose custom pipeline LoRA hooks through the worker LoRA API."""
 
     def __init__(self, pipeline):
         self.pipeline = pipeline

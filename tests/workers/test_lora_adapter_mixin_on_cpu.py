@@ -11,18 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU contract tests for generic LoRA adapter lifecycle helpers.
-
-The shared ``LoRAAdapterMixin`` is written against diffusers' ``PeftAdapterMixin``
-API (``add_adapter``/``set_adapter``/``disable_adapters``/``enable_adapters``).
-LingBot's transformer predates PEFT, so the training adapter mixes
-``PeftAdapterMixin`` into the bare module (see
-``LingBotVideoDenseFlowGRPO._peft_capable_transformer_cls``) with the base class
-first in the MRO — which keeps the original ``blocks.*`` module names (no
-``base_model.model.`` wrapper prefix) so FSDP wrapping and LoRA weight export
-behave exactly as they do for the other diffusers transformers.  These tests fix
-that contract on a minimal stand-in.
-"""
+"""CPU tests for generic LoRA adapter lifecycle helpers."""
 
 from types import SimpleNamespace
 
@@ -46,11 +35,7 @@ class _BareLinearBlocks(torch.nn.Module):
 
 
 def _peft_capable_blocks() -> torch.nn.Module:
-    """Mirror the adapter's injection: base class first, ``PeftAdapterMixin`` second.
-
-    Base-first MRO keeps the module tree's ``blocks.*`` names, so the collected
-    LoRA parameter names have no ``base_model.model.`` prefix.
-    """
+    """Return a PEFT-capable stand-in that keeps ``blocks.*`` names."""
     cls = type("BlocksWithPeft", (_BareLinearBlocks, PeftAdapterMixin), {})
     return cls()
 
