@@ -13,16 +13,6 @@
 # limitations under the License.
 """Build a tiny LingBot-Video Dense T2V checkpoint for smoke tests.
 
-Random weights, tiny dims, offline: the FlowGRPO smoke test needs a checkpoint
-that loads through both LingBot transformer implementations (the pip
-``lingbot_video`` package used by FSDP training and vLLM-Omni's in-tree copy
-used by rollout) without downloading multi-GB weights.
-
-The processor and scheduler are re-serialized from a cached source checkpoint
-because the structured-caption tokenization and the FlowMatch sigma schedule
-depend on their exact special-token ids and config keys.  The multi-GB weight
-shards of the source checkpoint are never loaded here.
-
 Usage:
     python tests/special_e2e/build_lingbot_video_dense_tiny_random.py \
         --output-dir ~/models/tiny-random/lingbot-video-dense \
