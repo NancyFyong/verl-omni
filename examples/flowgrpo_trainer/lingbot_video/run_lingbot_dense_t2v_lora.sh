@@ -13,6 +13,11 @@
 #     examples in this repo.
 set -euo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=common.sh
+source "$SCRIPT_DIR/common.sh"
+
+# Paths and reward configuration.
 WORKSPACE=${WORKSPACE:-$HOME}
 MODEL_PATH=${MODEL_PATH:-$WORKSPACE/models/lingbot-video-dense-1.3b}
 # The Qwen tokenizer/processor lives in the checkpoint's ``processor``
@@ -31,10 +36,12 @@ HPSV3_REWARD_DEVICE=${HPSV3_REWARD_DEVICE:-cuda}
 export custom_reward_model_path=${custom_reward_model_path:-$HPSV3_MODEL_PATH}
 export custom_reward_device=${custom_reward_device:-$HPSV3_REWARD_DEVICE}
 
+# Runtime resources.
 NUM_GPUS=${NUM_GPUS:-8}
 ROLLOUT_TP=${ROLLOUT_TP:-1}
 NUM_CPUS=${NUM_CPUS:-64}
 
+# Output and logging.
 PROJECT_NAME=${PROJECT_NAME:-flow_grpo}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-lingbot_dense_t2v_lora}
 CKPT_DIR=${CKPT_DIR:-checkpoints/$PROJECT_NAME/$EXPERIMENT_NAME}
@@ -47,6 +54,7 @@ export WANDB_DIR
 ROLLOUT_DATA_SAVE_FREQ=${ROLLOUT_DATA_SAVE_FREQ:-5}
 VALIDATION_DATA_MAX_SAMPLES=${VALIDATION_DATA_MAX_SAMPLES:-32}
 
+# Batch, rollout, and memory defaults.
 # Formal LingBot video defaults shared with the FSDP2 recipe.  On 8 GPUs this
 # produces 16 prompts x 8 rollouts = 128 videos/step, i.e. 16 rollout samples/GPU.
 # Keep logprob/ref/PPO micro conservative by default for 81-frame videos.
@@ -66,66 +74,15 @@ ROLLOUT_NOISE_LEVEL=${ROLLOUT_NOISE_LEVEL:-0.7}
 ROLLOUT_SDE_TYPE=${ROLLOUT_SDE_TYPE:-dance_sde}
 CHECK_CONFIG_ONLY=${CHECK_CONFIG_ONLY:-False}
 
-require_positive_int() {
-    local name=$1
-    local value=$2
-    if ! [[ "$value" =~ ^[0-9]+$ ]] || (( value <= 0 )); then
-        echo "[config error] $name must be a positive integer, got: $value" >&2
-        exit 2
-    fi
-}
-
-require_divisible() {
-    local dividend_name=$1
-    local dividend=$2
-    local divisor_name=$3
-    local divisor=$4
-    local reason=$5
-    if (( divisor <= 0 )); then
-        echo "[config error] $divisor_name must be > 0 for $reason, got: $divisor" >&2
-        exit 2
-    fi
-    if (( dividend % divisor != 0 )); then
-        echo "[config error] $dividend_name=$dividend must be divisible by $divisor_name=$divisor ($reason)" >&2
-        exit 2
-    fi
-}
-
-require_positive_int NUM_GPUS "$NUM_GPUS"
-require_positive_int ROLLOUT_TP "$ROLLOUT_TP"
-require_positive_int TRAIN_BATCH_SIZE "$TRAIN_BATCH_SIZE"
-require_positive_int VAL_BATCH_SIZE "$VAL_BATCH_SIZE"
-require_positive_int ROLLOUT_GROUP_SIZE "$ROLLOUT_GROUP_SIZE"
-require_positive_int PPO_MINI_BATCH_SIZE "$PPO_MINI_BATCH_SIZE"
-require_positive_int PPO_MICRO_BATCH_SIZE_PER_GPU "$PPO_MICRO_BATCH_SIZE_PER_GPU"
-require_positive_int LOG_PROB_MICRO_BATCH_SIZE_PER_GPU "$LOG_PROB_MICRO_BATCH_SIZE_PER_GPU"
-require_positive_int REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU "$REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU"
-require_divisible NUM_GPUS "$NUM_GPUS" ROLLOUT_TP "$ROLLOUT_TP" "rollout agent workers = NUM_GPUS / ROLLOUT_TP"
-
-GLOBAL_ROLLOUT_BATCH=$((TRAIN_BATCH_SIZE * ROLLOUT_GROUP_SIZE))
-ACTOR_UPDATE_GLOBAL_MINI_BATCH=$((PPO_MINI_BATCH_SIZE * ROLLOUT_GROUP_SIZE))
-require_divisible GLOBAL_ROLLOUT_BATCH "$GLOBAL_ROLLOUT_BATCH" NUM_GPUS "$NUM_GPUS" "rollout samples must shard evenly across actor/data-parallel ranks"
-require_divisible ACTOR_UPDATE_GLOBAL_MINI_BATCH "$ACTOR_UPDATE_GLOBAL_MINI_BATCH" NUM_GPUS "$NUM_GPUS" "trainer passes actor mini_batch_size=PPO_MINI_BATCH_SIZE*ROLLOUT_GROUP_SIZE"
-
-ROLLOUT_BATCH_PER_GPU=$((GLOBAL_ROLLOUT_BATCH / NUM_GPUS))
-ACTOR_UPDATE_MINI_BATCH_PER_GPU=$((ACTOR_UPDATE_GLOBAL_MINI_BATCH / NUM_GPUS))
-require_divisible ROLLOUT_BATCH_PER_GPU "$ROLLOUT_BATCH_PER_GPU" ACTOR_UPDATE_MINI_BATCH_PER_GPU "$ACTOR_UPDATE_MINI_BATCH_PER_GPU" "engine_workers.train_mini_batch local tensordict batch must divide local mini-batch"
-require_divisible ACTOR_UPDATE_MINI_BATCH_PER_GPU "$ACTOR_UPDATE_MINI_BATCH_PER_GPU" PPO_MICRO_BATCH_SIZE_PER_GPU "$PPO_MICRO_BATCH_SIZE_PER_GPU" "actor forward/backward micro-batches must divide each local actor mini-batch"
-require_divisible ROLLOUT_BATCH_PER_GPU "$ROLLOUT_BATCH_PER_GPU" LOG_PROB_MICRO_BATCH_SIZE_PER_GPU "$LOG_PROB_MICRO_BATCH_SIZE_PER_GPU" "old-logprob infer micro-batches must divide local rollout samples"
-require_divisible ROLLOUT_BATCH_PER_GPU "$ROLLOUT_BATCH_PER_GPU" REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU "$REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU" "ref logprob infer micro-batches must divide local rollout samples"
-
-echo "[config check] batch settings are self-consistent:" >&2
-echo "  global_rollout_batch=$GLOBAL_ROLLOUT_BATCH, rollout_batch_per_gpu=$ROLLOUT_BATCH_PER_GPU" >&2
-echo "  actor_update_global_mini_batch=$ACTOR_UPDATE_GLOBAL_MINI_BATCH, actor_update_mini_batch_per_gpu=$ACTOR_UPDATE_MINI_BATCH_PER_GPU" >&2
-echo "  ppo_micro_batch_size_per_gpu=$PPO_MICRO_BATCH_SIZE_PER_GPU, log_prob_micro_batch_size_per_gpu=$LOG_PROB_MICRO_BATCH_SIZE_PER_GPU, ref_log_prob_micro_batch_size_per_gpu=$REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU" >&2
-echo "  enable_gradient_checkpointing=$ENABLE_GRADIENT_CHECKPOINTING" >&2
-echo "  rollout_noise_level=$ROLLOUT_NOISE_LEVEL, rollout_sde_type=$ROLLOUT_SDE_TYPE" >&2
-if [[ "$CHECK_CONFIG_ONLY" == "1" || "$CHECK_CONFIG_ONLY" == "true" || "$CHECK_CONFIG_ONLY" == "True" ]]; then
+validate_lingbot_batch_config
+print_lingbot_batch_config
+if is_truthy "$CHECK_CONFIG_ONLY"; then
     exit 0
 fi
 
 mkdir -p "$RUN_DIR" "$WANDB_DIR"
 
+# Launch configuration.
 # Load the actor in fp32 so base weights and freshly-created LoRA parameters have
 # a uniform pre-FSDP dtype.  FSDP mixed precision still runs forwards with bf16
 # parameters/activations; the engine enables nested input casting to avoid PEFT

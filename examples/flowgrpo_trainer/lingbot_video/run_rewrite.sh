@@ -28,6 +28,7 @@ PY=${PY:-python3}
 REWRITER_DIR=${REWRITER_DIR:-$ROOT/lingbot-video/rewriter}
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
+# Input/output paths.
 INPUT=${INPUT:-$ROOT/data/lingbot_video/prompts_clean.txt}
 OUTPUT=${OUTPUT:-$ROOT/data/lingbot_video/rewritten_vllm/all.jsonl}
 LOGDIR=${LOGDIR:-$ROOT/logs/rewrite}
@@ -35,6 +36,7 @@ BACKEND=${BACKEND:-vllm}
 DURATION=${DURATION:-5}
 MODE=${MODE:-t2v}
 
+# Backend selection and generation defaults.
 # vLLM backend
 BASE_URL=${BASE_URL:-http://127.0.0.1:8137}
 CONCURRENCY=${CONCURRENCY:-256}
@@ -45,6 +47,7 @@ export REWRITER_ADAPTER=${REWRITER_ADAPTER:-$ROOT/models/lingbot-video-rewriter-
 GPUS=${GPUS:-0,1,2,3,4,5,6,7}
 OUTDIR=${OUTDIR:-$(dirname "$OUTPUT")}
 
+# Runtime setup.
 mkdir -p "$(dirname "$OUTPUT")" "$LOGDIR"
 
 # Idempotent merge: fold a set of JSONL shard files into $OUTPUT, deduped by
@@ -105,7 +108,8 @@ if [ "$BACKEND" = "vllm" ]; then
         --output "$OUTPUT" \
         --rewriter-dir "$REWRITER_DIR" \
         --base-url "$BASE_URL" \
-        --mode "$MODE" --duration "$DURATION" \
+        --mode "$MODE" \
+        --duration "$DURATION" \
         --concurrency "$CONCURRENCY"
 elif [ "$BACKEND" = "transformers" ]; then
     IFS=',' read -ra GARR <<< "$GPUS"
@@ -120,10 +124,12 @@ elif [ "$BACKEND" = "transformers" ]; then
             --input "$INPUT" \
             --output "$OUTDIR/shard_${i}.jsonl" \
             --rewriter-dir "$REWRITER_DIR" \
-            --shard "$i" --num-shards "$N" \
-            --mode "$MODE" --duration "$DURATION" \
+            --shard "$i" \
+            --num-shards "$N" \
+            --mode "$MODE" \
+            --duration "$DURATION" \
             > "$LOGDIR/shard_${i}.log" 2>&1 &
-        pids+=($!)
+        pids+=("$!")
         echo "  shard $i on GPU $g -> PID ${pids[-1]}  (log: $LOGDIR/shard_${i}.log)"
     done
     echo "Launched ${#pids[@]} shards; waiting..."
