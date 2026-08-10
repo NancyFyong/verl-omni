@@ -48,95 +48,63 @@ CHECK_CONFIG_ONLY=${CHECK_CONFIG_ONLY:-False}
 MODEL_DTYPE=${MODEL_DTYPE:-fp32}
 PYTHON_BIN=${PYTHON_BIN:-python3}
 
-is_truthy() {
-    [[ "${1:-}" == "1" || "${1:-}" == "true" || "${1:-}" == "True" ]]
+die() {
+    echo "[config error] $*" >&2
+    exit 2
 }
 
-require_positive_int() {
-    local name=$1
-    local value=$2
-
-    if ! [[ "$value" =~ ^[0-9]+$ ]] || ((value <= 0)); then
-        echo "[config error] $name must be a positive integer, got: $value" >&2
-        exit 2
-    fi
+must_divide() {
+    local lhs_name=$1 lhs=$2 rhs_name=$3 rhs=$4
+    ((lhs % rhs == 0)) || die "$lhs_name=$lhs must be divisible by $rhs_name=$rhs"
 }
 
-require_divisible() {
-    local dividend_name=$1
-    local dividend=$2
-    local divisor_name=$3
-    local divisor=$4
-    local reason=$5
+for name in \
+    NUM_GPUS \
+    ROLLOUT_TP \
+    TRAIN_BATCH_SIZE \
+    VAL_BATCH_SIZE \
+    ROLLOUT_GROUP_SIZE \
+    PPO_MINI_BATCH_SIZE \
+    PPO_MICRO_BATCH_SIZE_PER_GPU \
+    LOG_PROB_MICRO_BATCH_SIZE_PER_GPU \
+    REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU; do
+    value=${!name}
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "$name must be a positive integer, got: $value"
+done
 
-    if ((divisor <= 0)); then
-        echo "[config error] $divisor_name must be > 0 for $reason, got: $divisor" >&2
-        exit 2
-    fi
-    if ((dividend % divisor != 0)); then
-        echo "[config error] $dividend_name=$dividend must be divisible by $divisor_name=$divisor ($reason)" >&2
-        exit 2
-    fi
-}
+must_divide NUM_GPUS "$NUM_GPUS" ROLLOUT_TP "$ROLLOUT_TP"
 
-validate_batch_config() {
-    require_positive_int NUM_GPUS "$NUM_GPUS"
-    require_positive_int ROLLOUT_TP "$ROLLOUT_TP"
-    require_positive_int TRAIN_BATCH_SIZE "$TRAIN_BATCH_SIZE"
-    require_positive_int VAL_BATCH_SIZE "$VAL_BATCH_SIZE"
-    require_positive_int ROLLOUT_GROUP_SIZE "$ROLLOUT_GROUP_SIZE"
-    require_positive_int PPO_MINI_BATCH_SIZE "$PPO_MINI_BATCH_SIZE"
-    require_positive_int PPO_MICRO_BATCH_SIZE_PER_GPU "$PPO_MICRO_BATCH_SIZE_PER_GPU"
-    require_positive_int LOG_PROB_MICRO_BATCH_SIZE_PER_GPU "$LOG_PROB_MICRO_BATCH_SIZE_PER_GPU"
-    require_positive_int REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU "$REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU"
+GLOBAL_ROLLOUT_BATCH=$((TRAIN_BATCH_SIZE * ROLLOUT_GROUP_SIZE))
+ACTOR_UPDATE_GLOBAL_MINI_BATCH=$((PPO_MINI_BATCH_SIZE * ROLLOUT_GROUP_SIZE))
 
-    require_divisible NUM_GPUS "$NUM_GPUS" ROLLOUT_TP "$ROLLOUT_TP" "rollout worker sharding"
+must_divide GLOBAL_ROLLOUT_BATCH "$GLOBAL_ROLLOUT_BATCH" NUM_GPUS "$NUM_GPUS"
+must_divide ACTOR_UPDATE_GLOBAL_MINI_BATCH "$ACTOR_UPDATE_GLOBAL_MINI_BATCH" NUM_GPUS "$NUM_GPUS"
 
-    GLOBAL_ROLLOUT_BATCH=$((TRAIN_BATCH_SIZE * ROLLOUT_GROUP_SIZE))
-    ACTOR_UPDATE_GLOBAL_MINI_BATCH=$((PPO_MINI_BATCH_SIZE * ROLLOUT_GROUP_SIZE))
+ROLLOUT_BATCH_PER_GPU=$((GLOBAL_ROLLOUT_BATCH / NUM_GPUS))
+ACTOR_UPDATE_MINI_BATCH_PER_GPU=$((ACTOR_UPDATE_GLOBAL_MINI_BATCH / NUM_GPUS))
 
-    require_divisible GLOBAL_ROLLOUT_BATCH "$GLOBAL_ROLLOUT_BATCH" NUM_GPUS "$NUM_GPUS" "rollout DP sharding"
-    require_divisible \
-        ACTOR_UPDATE_GLOBAL_MINI_BATCH "$ACTOR_UPDATE_GLOBAL_MINI_BATCH" \
-        NUM_GPUS "$NUM_GPUS" \
-        "actor mini-batch sharding"
+must_divide ROLLOUT_BATCH_PER_GPU "$ROLLOUT_BATCH_PER_GPU" \
+    ACTOR_UPDATE_MINI_BATCH_PER_GPU "$ACTOR_UPDATE_MINI_BATCH_PER_GPU"
+must_divide ACTOR_UPDATE_MINI_BATCH_PER_GPU "$ACTOR_UPDATE_MINI_BATCH_PER_GPU" \
+    PPO_MICRO_BATCH_SIZE_PER_GPU "$PPO_MICRO_BATCH_SIZE_PER_GPU"
+must_divide ROLLOUT_BATCH_PER_GPU "$ROLLOUT_BATCH_PER_GPU" \
+    LOG_PROB_MICRO_BATCH_SIZE_PER_GPU "$LOG_PROB_MICRO_BATCH_SIZE_PER_GPU"
+must_divide ROLLOUT_BATCH_PER_GPU "$ROLLOUT_BATCH_PER_GPU" \
+    REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU "$REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU"
 
-    ROLLOUT_BATCH_PER_GPU=$((GLOBAL_ROLLOUT_BATCH / NUM_GPUS))
-    ACTOR_UPDATE_MINI_BATCH_PER_GPU=$((ACTOR_UPDATE_GLOBAL_MINI_BATCH / NUM_GPUS))
+{
+    echo "[config check] batch settings are self-consistent:"
+    echo "  global_rollout_batch=$GLOBAL_ROLLOUT_BATCH, rollout_batch_per_gpu=$ROLLOUT_BATCH_PER_GPU"
+    echo "  actor_update_global_mini_batch=$ACTOR_UPDATE_GLOBAL_MINI_BATCH"
+    echo "  actor_update_mini_batch_per_gpu=$ACTOR_UPDATE_MINI_BATCH_PER_GPU"
+    echo "  ppo_micro_batch_size_per_gpu=$PPO_MICRO_BATCH_SIZE_PER_GPU"
+    echo "  log_prob_micro_batch_size_per_gpu=$LOG_PROB_MICRO_BATCH_SIZE_PER_GPU"
+    echo "  ref_log_prob_micro_batch_size_per_gpu=$REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU"
+    echo "  enable_gradient_checkpointing=$ENABLE_GRADIENT_CHECKPOINTING"
+    echo "  rollout_noise_level=$ROLLOUT_NOISE_LEVEL, rollout_sde_type=$ROLLOUT_SDE_TYPE"
+} >&2
 
-    require_divisible \
-        ROLLOUT_BATCH_PER_GPU "$ROLLOUT_BATCH_PER_GPU" \
-        ACTOR_UPDATE_MINI_BATCH_PER_GPU "$ACTOR_UPDATE_MINI_BATCH_PER_GPU" \
-        "local rollout/train mini-batches"
-    require_divisible \
-        ACTOR_UPDATE_MINI_BATCH_PER_GPU "$ACTOR_UPDATE_MINI_BATCH_PER_GPU" \
-        PPO_MICRO_BATCH_SIZE_PER_GPU "$PPO_MICRO_BATCH_SIZE_PER_GPU" \
-        "actor micro-batches"
-    require_divisible \
-        ROLLOUT_BATCH_PER_GPU "$ROLLOUT_BATCH_PER_GPU" \
-        LOG_PROB_MICRO_BATCH_SIZE_PER_GPU "$LOG_PROB_MICRO_BATCH_SIZE_PER_GPU" \
-        "old-logprob micro-batches"
-    require_divisible \
-        ROLLOUT_BATCH_PER_GPU "$ROLLOUT_BATCH_PER_GPU" \
-        REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU "$REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU" \
-        "ref-logprob micro-batches"
-}
-
-print_batch_config() {
-    echo "[config check] batch settings are self-consistent:" >&2
-    echo "  global_rollout_batch=$GLOBAL_ROLLOUT_BATCH, rollout_batch_per_gpu=$ROLLOUT_BATCH_PER_GPU" >&2
-    printf '  actor_update_global_mini_batch=%s, actor_update_mini_batch_per_gpu=%s\n' \
-        "$ACTOR_UPDATE_GLOBAL_MINI_BATCH" "$ACTOR_UPDATE_MINI_BATCH_PER_GPU" >&2
-    echo "  ppo_micro_batch_size_per_gpu=$PPO_MICRO_BATCH_SIZE_PER_GPU" >&2
-    echo "  log_prob_micro_batch_size_per_gpu=$LOG_PROB_MICRO_BATCH_SIZE_PER_GPU" >&2
-    echo "  ref_log_prob_micro_batch_size_per_gpu=$REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU" >&2
-    echo "  enable_gradient_checkpointing=$ENABLE_GRADIENT_CHECKPOINTING" >&2
-    echo "  rollout_noise_level=$ROLLOUT_NOISE_LEVEL, rollout_sde_type=$ROLLOUT_SDE_TYPE" >&2
-}
-
-validate_batch_config
-print_batch_config
-if is_truthy "$CHECK_CONFIG_ONLY"; then
+if [[ "${CHECK_CONFIG_ONLY,,}" == "1" || "${CHECK_CONFIG_ONLY,,}" == "true" ]]; then
     exit 0
 fi
 
