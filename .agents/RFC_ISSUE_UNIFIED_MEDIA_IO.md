@@ -1,10 +1,10 @@
-# [RFC] Unified multi-input / multi-output interface for diffusion rollout
+# [RFC] Unified multi-input / multi-output interface for the diffusion rollout→train path
 
-> Structured against `.github/ISSUE_TEMPLATE/feature-request.yml` — the repo has no dedicated
-> RFC template — following the two `nemo_automodel` design drafts that set the precedent
-> (`.agents/RFC_ISSUE.md`, `.agents/RFC_ISSUE_DIFFUSION.md`; they live on their own branch).
-> §0 is the template's *Feature request* field, §2 is *Motivation*, a *Your contribution* answer
-> would be scoped from §6 Milestones; §1 and §3-§10 are the technical body.
+> Structured against `.github/ISSUE_TEMPLATE/feature-request.yml` — the repo has no dedicated RFC
+> template — following the two `nemo_automodel` design drafts that set the precedent
+> (`.agents/RFC_ISSUE.md`, `.agents/RFC_ISSUE_DIFFUSION.md`, on their own branch). §0 is the
+> template's *Feature request* field, §2 *Motivation*, and a *Your contribution* answer would be
+> scoped from §6; §1 and §3-§10 are the technical body.
 
 - **Status:** Draft
 - **Scope:** the request and output objects crossing the agent-loop → rollout-server →
@@ -27,23 +27,26 @@
 the contract, in four places:
 
 1. **The generated modality is recorded nowhere in this repo.** Seven sites sniff tensor rank —
-   five to decide *which modality*, two to decide *is this batched* — and because the two
-   questions look identical in the code, they collide: `ndim == 4` means *video* in
-   `utils/tracking.py:156` and *a batch of images* in `http_scorer_client.py:40`, which keeps
-   frame 0 and silently discards the rest (§1.3).
+   five to decide *which modality*, two *is this batched* — and because the two questions look
+   identical in code they collide: `ndim == 4` means *video* in `utils/tracking.py:156` and *a batch
+   of images* in `http_scorer_client.py:40`, which keeps frame 0 and silently discards the rest
+   (§1.3).
 2. **The layer this repo owns is the only one on the path with no request type** — 12 flat
    kwargs, nine describing the input, re-listed verbatim by two intermediaries (§1.1-1.2).
 3. **Everything else rides in a `dict[str, Any]`** merged with upstream's by `setdefault`, so an
-   adapter key silently wins any collision — `audio_sample_rate` already has two producers and no
-   declared owner — and one past collision plus one name reserved by the MFU FLOPs counter are
-   policed by a hand-written runtime guard instead of by a type
+   adapter key silently wins a collision — `audio_sample_rate` already has two producers and no
+   declared owner — and one past collision plus a name reserved by the MFU FLOPs counter are
+   policed by a hand-written runtime guard instead of a type
    (`pipelines/model_base.py:355-371`) (§1.3).
 4. **The *input protocol* is undeclared too, and that one costs a whole class.** Nothing says how a
-   pipeline wants text rendered, so LTX-2 subclasses the agent loop for two overrides that have
-   nothing to do with media (§1.6); and nothing says an input may need more than one
-   representation, so Qwen-Image-Edit's VAE — which needs the condition image at its own
-   resolution while the VL text encoder needs the processor's patch grid — reads two fields
-   (`vae_images`, `vae_image_sizes`) that **no code in the repo can write** (§1.7).
+   pipeline wants text rendered, so LTX-2 subclasses the agent loop for two overrides unrelated to
+   media (§1.6); and nothing says an input may need more than one representation, so
+   Qwen-Image-Edit's VAE — which needs the condition image at its own resolution while the VL text
+   encoder needs the processor's patch grid — reads two fields (`vae_images`, `vae_image_sizes`)
+   that **no code in the repo can write** (§1.7).
+
+The pattern is not historical: PR #373, open now, pays it a fourth time — one uint8 transport
+decision spread across ten modules, plus a second copy of an existing helper (§1.8).
 
 Proposal: one additive, CPU-importable module `verl_omni/pipelines/io.py` holding `MediaRef` +
 `PromptBundle` + `MediaRequest` on the way in and `MediaOut` + `MediaOutput` on the way out.
@@ -71,8 +74,8 @@ Six milestones, cheapest-risk first. **M1+M2 carry most of the value and are rev
 Layers 1 and 2 are each internally coherent. **Layer 3 — the one this repo owns — is the one
 with no type.**
 
-Layer 1's split exists to satisfy the OpenAI Images and Videos API shapes at an HTTP boundary,
-which verl-omni does not have (§3 N2). The one idea worth taking from it is the **tagged-union
+Layer 1's split exists to satisfy the OpenAI Images and Videos API shapes at an HTTP boundary
+verl-omni does not have (§3 N2). The one idea worth taking from it is the **tagged-union
 reference** (`ImageReference = UrlImageReference | FileImageReference`, `videos.py:63-94`): each
 conditioning input carries its own kind, so a consumer never guesses from the payload's Python
 type. That is what §5.2's `MediaRef` is.
@@ -96,7 +99,7 @@ shape. Today it has neither.
 
 One nearby type is deliberately **not** counted as a fourth representation:
 `DiffusionPipelineConfig` (`config/diffusion/rollout.py:58-74`) is a Hydra-side declaration of
-nine sampling knobs that feed `sampling_params` — it never carries a prompt or a conditioning input,
+nine sampling knobs feeding `sampling_params` — it never carries a prompt or a conditioning input,
 so it is a static source *for* the request, not a copy *of* it (§3 N6). One note though:
 `output_type` looks like a modality declaration and is not one. It defaults to `"image"` for every
 pipeline including video ones and is a diffusers-style *format* selector (`"pil"` / `"pt"` / `"np"` /
@@ -113,9 +116,8 @@ Consequences present in the tree:
   (`diffusion_llm_server.py:55-80`) names six verbatim — none of which it uses, it only forwards
   them — purely to wrap the call in a retry loop; `DiffusionSingleTurnAgentLoop.run`
   (`single_turn_agent_loop.py:104-113`) restates seven. Adding a modality means editing two of
-  those signatures: the retry server also takes `**kwargs` and forwards it, so a new kwarg
-  *reaches* `generate` through it — but the six it does name are pure transcription that has to
-  be kept in sync by hand.
+  those signatures: the retry server also takes `**kwargs`, so a new kwarg *reaches* `generate`
+  through it — but the six it does name are pure transcription kept in sync by hand.
 - **The only unification already present** is `_build_multi_modal_data` (`:367-380`), which
   folds three optional lists into `{"image":…, "video":…, "audio":…}` — i.e. it converts
   positional kwargs back into the tagged list they should have been.
@@ -140,10 +142,10 @@ class DiffusionOutput(BaseModel):      # verl_omni/workers/rollout/replica.py:20
     extra_fields: dict[str, Any] = {}
 ```
 
-No modality field, so **seven** sites sniff tensor rank instead. Five of them are asking *"which
-modality is this?"*; the last two are asking *"is this batched?"* — a legitimate use of rank that
-is indistinguishable from the first at the call site, which is precisely how the two get confused.
-The last column is the M2 edit (§6), listed here so the audit and the fix read as one table:
+No modality field, so **seven** sites sniff tensor rank: five ask *"which modality is this?"*, two
+ask *"is this batched?"* — a legitimate use of rank, indistinguishable from the first at the call
+site, which is how the two get confused. The last column is the M2 edit (§6), so audit and fix
+read as one table:
 
 | Site | Today's test | Meaning assigned | Becomes |
 | --- | --- | --- | --- |
@@ -155,39 +157,37 @@ The last column is the M2 edit (§6), listed here so the audit and the fix read 
 | `utils/reward_score/unified_reward.py:70-76` | 3/4 only, `raise` otherwise | image / video | same; its `raise` becomes reachable only for a genuinely unsupported modality |
 | `pipelines/ltx2_flow_grpo/vllm_omni_rollout_adapter.py:381` | `video.ndim == 5` | leading batch axis to squeeze | **unchanged** — this one is about batching, not modality |
 
-`ndim == 4` therefore carries opposite meanings in two files. Nothing prevents a video pipeline
-from being pointed at the HTTP scorer, and if that happens the reward is computed on frame 0 of
-each clip **without any error**. Both files are locally correct; the bug is that "is this a
-video?" has no single answer to consult — and the rank convention is not even stable along the
-path, since the dump site sees batched 5-D where the logging site sees per-sample 4-D.
+`ndim == 4` therefore carries opposite meanings in two files: point a video pipeline at the HTTP
+scorer and the reward is computed on frame 0 of each clip **without any error**. Both are locally
+correct; the bug is that "is this a video?" has no single answer to consult — and the convention is
+not stable along the path, the dump site seeing batched 5-D where the logging site sees
+per-sample 4-D.
 
 Upstream admits the union honestly — `DiffusionOutput.output` is typed `torch.Tensor |
-tuple[Any, ...] | dict[str, Any] | None` (`diffusion/data.py:1202`) and LTX-2 uses the tuple
-arm, `output.output = (video[0], audio)` (`ltx2_flow_grpo/vllm_omni_rollout_adapter.py:383`).
-verl-omni flattens it back to `Any`.
+tuple[Any, ...] | dict[str, Any] | None` (`diffusion/data.py:1202`), and LTX-2 uses the tuple
+arm: `output.output = (video[0], audio)` (`ltx2_flow_grpo/vllm_omni_rollout_adapter.py:383`).
+verl-omni flattens it to `Any`.
 
 Everything that is *not* the primary tensor rides in `extra_fields`, assembled by
 `_process_output` (`vllm_omni_async_server.py:610-635`) from each adapter's `custom_output` unioned with upstream's
-`multimodal_output`. Nine rollout adapters exist and eight emit `custom_output`
-(`qwen_image_mix_grpo` emits none); their key sets overlap without
+`multimodal_output`. Eight of the nine rollout adapters emit `custom_output`
+(`qwen_image_mix_grpo` none); their key sets overlap without
 agreeing, and the disagreement does not follow the algorithm boundary: `qwen_image_flow_grpo` and
 `wan22_dance_grpo` emit `all_latents` / `all_log_probs` / `all_timesteps` plus four prompt-embed
 keys, `sd3_flow_grpo` adds the two pooled variants, but `bagel_flow_grpo` — same algorithm —
 emits the three `all_*` keys and **no** prompt-embed keys at all. NFT and DPO substitute
-`latents_clean` (+ `train_timesteps` for NFT), and `qwen_image_edit` and `ltx2` each add their own
+`latents_clean` (+ `train_timesteps` for NFT); `qwen_image_edit` and `ltx2` each add their own
 (`img_shapes`, `condition_image_latents`; `audio_prompt_embeds`, `audio_sample_rate`). Upstream's
 `_build_multimodal_output` (`diffusion/output_formatter.py:158-171`) merges in `audio`,
 `audio_sample_rate`, `fps` and `actions` on top. Four consequences, all present in the tree:
 
 1. **A hand-written guard exists to catch a key collision.**
    `DiffusionI2IModelBase.inject_condition` raises if the `model_inputs` it is about to populate
-   already contains `image_latents` — a name **reserved by the MFU FLOPs counter** for the
-   denoised latent — with the message *"the rollout adapter likely output 'image_latents' instead
-   of 'condition_image_latents'"* (`pipelines/model_base.py:355-371`). Two separate undeclared
-   contracts collide in one dict: the rollout→training key set, and the counter's reserved name.
-   The guard is the shape of the problem — both are policed at runtime because neither is
-   declared. Note it inspects the **training-side** `model_inputs`, so §5.3's output types do not
-   remove it (§6 M4).
+   already holds `image_latents` — a name **reserved by the MFU FLOPs counter** for the denoised
+   latent — saying *"the rollout adapter likely output 'image_latents' instead of
+   'condition_image_latents'"* (`pipelines/model_base.py:355-371`). Two undeclared contracts
+   collide in one dict, and both are policed at runtime because neither is declared. It inspects
+   the **training-side** `model_inputs`, so §5.3's output types do not remove it (§6 M4).
 2. **Batch slicing is decided by shape coincidence.** `_slice_batch_value`
    (`request_batch.py:197-207`) slices a tensor iff `value.shape[0] == req.num_reqs *
    num_outputs_per_prompt`. Whether a key is per-sample or shared is inferred from a number, not
@@ -198,14 +198,14 @@ emits the three `all_*` keys and **no** prompt-embed keys at all. NFT and DPO su
    so in *inconsistent order* for two related keys, reading `batch.batch` first for `audio` and
    `non_tensor_batch` first for `audio_sample_rate` (`ray_diffusion_trainer.py:391-393`).
 4. **Merge order silently picks the winner.** The union is
-   `extra_fields.setdefault(key, ...)` (`vllm_omni_async_server.py:630-634`), which folds upstream's `multimodal_output` in
-   *under* the adapter's `custom_output` — so on any collision the adapter wins and upstream's
-   value is discarded without a warning. That collision is not hypothetical: `audio_sample_rate`
-   is emitted both by `ltx2_flow_grpo/vllm_omni_rollout_adapter.py:397` (the vocoder's rate) and
-   by upstream's `_build_multimodal_output`, and nothing in the tree declares which is
-   authoritative. The other two keys the trainer reads there, `audio` and `fps`, have **no**
-   in-repo rollout producer at all, so a pin bump renaming either fails at **training** time with
-   a `KeyError`, or worse yields `None` and silently drops the audio track from every dumped mp4.
+   `extra_fields.setdefault(key, ...)` (`vllm_omni_async_server.py:630-634`), folding upstream's
+   `multimodal_output` in *under* the adapter's `custom_output` — on a collision the adapter wins
+   and upstream's value is dropped without a warning. Not hypothetical: `audio_sample_rate` is
+   emitted both by `ltx2_flow_grpo/vllm_omni_rollout_adapter.py:397` (the vocoder's rate) and by
+   `_build_multimodal_output`, with nothing declaring which is authoritative. The trainer's other
+   two keys there, `audio` and `fps`, have **no** in-repo rollout producer, so a pin bump renaming
+   either fails at **training** time with a `KeyError` — or yields `None` and silently drops the
+   audio track from every dumped mp4.
 
 ### 1.4 What is already partially unified — and where it stopped
 
@@ -225,7 +225,7 @@ class ImageGenerationRequest:           # verl_omni/pipelines/utils.py:45
     metadata: Mapping[str, Any] | None = None
 ```
 
-This is the right idea, and it is why this RFC proposes a structure rather than a per-modality
+This is the right idea, and why this RFC proposes a structure rather than a per-modality
 split. How far it got:
 
 1. **The generalisation was deferred in the source.** Its one call site carries a `NOTE`: *"only
@@ -242,24 +242,23 @@ split. How far it got:
    `custom_prompt`, and `additional_information` has consumers (`request_batch.py:75`) and CPU-test
    fixtures (`tests/pipelines/test_image_edit_interface_on_cpu.py:55`) but no writer. Of the two
    that are live, one exists only because `_preprocess_input:506-508` writes the same dict into
-   two places. This is not defensive coding; it is the cost of having no declared contract.
+   two places. This is not defensive coding but the cost of having no declared contract.
 
-   `additional_information` deserves a second look, because it is not merely unwritten — it is
-   **unwritable by construction**. `_preprocess_input` writes a **closed set of exactly seven keys**
-   into `custom_prompt` (`vllm_omni_async_server.py:494-508`), reached through a `generate()` call
-   that passes **seven fixed keyword arguments** (`single_turn_agent_loop.py:104-113`).
-   `additional_information` is on neither list, so no layer can transport it. Two live consumers
-   depend on it anyway: `qwen_image_edit_flow_grpo` reads `vae_images` / `vae_image_sizes` out of it
-   (`:370-372`) and raises
+   `additional_information` is not merely unwritten — it is **unwritable by construction**:
+   `_preprocess_input` writes a **closed set of seven keys** into `custom_prompt`
+   (`vllm_omni_async_server.py:494-508`), reached through a `generate()` call passing **seven fixed
+   keyword arguments** (`single_turn_agent_loop.py:104-113`), and it is on neither list. Two live
+   consumers depend on it anyway: `qwen_image_edit_flow_grpo` reads `vae_images` / `vae_image_sizes`
+   out of it (`:370-372`) and raises
    `ValueError("Qwen-Image-Edit requires non-empty additional_information['vae_image_sizes']")` when
    they are absent (`:73-74`). §1.7 shows what those two fields were reaching for, and why an eighth
    key cannot supply it.
-3. **One of the ten diffusion pipelines bypasses it and hand-rolls the same lookup** —
+3. **One of the ten pipelines bypasses it and hand-rolls the same lookup** —
    `wan22_dance_grpo:373-381` reads `multi_modal_data["image"]` directly. `bagel_flow_grpo` is a
-   second shape of the same problem rather than a third spelling: it does not hand-roll the
-   lookup, it *copies* `extra_args.multi_modal_data` up into `custom_prompt` first (`:285-288`) —
-   a workaround that exists only because `_preprocess_input:506-508` wrote the dict into two
-   places and the two consumers disagree on which one to read.
+   second shape of the problem: rather than hand-rolling the lookup it *copies*
+   `extra_args.multi_modal_data` up into `custom_prompt` (`:285-288`) — a workaround existing only
+   because `_preprocess_input:506-508` wrote the dict into two places and the consumers disagree on
+   which copy to read.
 
 Video and audio are plumbed to different depths, which matters because "the parameter exists" is
 not "the modality works":
@@ -271,34 +270,30 @@ not "the modality works":
 | video | yes — `multi_modal_data["video"]` (`:377`) | **none** — `:377` is the only occurrence of the key under `verl_omni/` | **write-only** |
 | audio | only if a caller passes `audio_data` | **none** — no caller on this branch supplies it | **unreachable** |
 
-A contributor reading `generate`'s signature sees four conditioning modalities and gets one
-working, one silently discarded, and one unreachable. Nothing in the type system says which is
-which.
+A contributor reading `generate`'s signature sees four conditioning modalities; one is silently
+discarded and one unreachable, with nothing in the type system saying which is which.
 
 ### 1.5 What upstream already tags and this repo discards
 
-- `OmniRequestOutput.final_output_type: str` (`outputs.py:87`). The docstring at `:74` lists
-  `"text" | "image" | "audio" | "latents"`, but that is stale — upstream also emits `"video"` and
-  `"videos"` (`stage_configs/wan2_2_ti2v_dit_fp8.yaml:32`, `hunyuan_video_15_dit_fp8.yaml:29`) and
-  `"actions"` (`models/gr00t/pipeline.py:22`), and verl-omni's AR track sets `"codec"`
+- `OmniRequestOutput.final_output_type: str` (`outputs.py:87`). Its docstring (`:74`) lists
+  `"text" | "image" | "audio" | "latents"` and is stale — upstream also emits `"video"` / `"videos"`
+  (`stage_configs/wan2_2_ti2v_dit_fp8.yaml:32`, `hunyuan_video_15_dit_fp8.yaml:29`) and `"actions"`
+  (`models/gr00t/pipeline.py:22`), and verl-omni's AR track sets `"codec"`
   (`qwen3_omni/omni_rollout_adapter.py:91`). **Nothing in verl-omni reads the field off an
-  output** — the only hits are stage-config literals (`:90-95` plus three shipped configs).
-  §5.4 explains why it stays that way.
+  output** — the only hits are stage-config literals (`:90-95`); §5.4 says why that stays.
 - `OmniRequestOutput.images: list[Image.Image]` (`:91`) is declared as PIL images and in practice
-  carries video tensors and `(video, audio)` tuples. verl-omni inherits the ambiguity by reading
-  `final_res.images[0]` into an `Any`. And `multimodal_output` carries `actions` — a fifth
-  modality already in the pinned engine, which today would land in `extra_fields` and be dropped
-  without comment.
+  carries video tensors and `(video, audio)` tuples; verl-omni inherits the ambiguity by reading
+  `final_res.images[0]` into an `Any`. `multimodal_output` also carries `actions` — a fifth modality
+  already in the pinned engine, which today lands in `extra_fields` and is dropped without comment.
 
 ### 1.6 The text-encoding protocol has no owner
 
-§1.1-§1.5 are about *what* travels on the request. This one and the next are about a second gap:
-**how the shared producer should build it for a given pipeline** is undeclared too — and this one is
+§1.1-§1.5 are about *what* travels on the request; this one and the next are a second gap —
+**how the shared producer should build it for a given pipeline** is undeclared too, and that is
 already being paid for with whole classes.
 
-There is a working precedent. SD3.5 needs two text encoders with two different tokenizers, and it
-needs **no agent loop of its own** — the requirement is declared as data on the CLI and a generic
-producer honours it.
+There is a working precedent. SD3.5 needs two text encoders with two tokenizers and **no agent loop
+of its own** — the requirement is declared as data on the CLI and a generic producer honours it.
 
 ```bash
 # examples/flowgrpo_trainer/sd35/run_sd35_medium_ocr_lora.sh:56
@@ -315,7 +310,7 @@ produces per declaration. Two things it does not cover:
 1. **The key names are not part of the declaration.** The consumer hardcodes them —
    `SD3_CLIP_TOKENS_KEY = "clip"` / `SD3_T5_TOKENS_KEY = "t5"` (`sd3_flow_grpo/common.py:23-29`) —
    and indexes the dict with them at `sd3_flow_grpo/vllm_omni_rollout_adapter.py:421`. The contract
-   is therefore *a shell string matching a Python constant*, checked at neither end; a typo in the
+   is *a shell string matching a Python constant*, checked at neither end; a typo in the
    run script surfaces as a `KeyError` mid-rollout.
 2. **How the text is *rendered* is not part of it at all** — and that is what costs a class.
    `extra_tokenizer_map` says *which tokenizers to run*, never *chat template or raw text*. A
@@ -325,15 +320,14 @@ produces per declaration. Two things it does not cover:
 @register("ltx2_diffusion_single_turn_agent")          # pipelines/ltx2_flow_grpo/agent_loop.py:49
 class LTX2DiffusionSingleTurnAgentLoop(DiffusionSingleTurnAgentLoop):
     def __init__(self, ...):                           # :53-80  ten transcribed attribute assignments
-        # "LTX-2 uses its text encoder tokenizer as a raw-text tokenizer. Calling
-        #  AgentLoopBase.__init__ would probe its optional chat template with two consecutive
+        # "AgentLoopBase.__init__ would probe its optional chat template with two consecutive
         #  user messages, which strict templates reject before the LTX-specific raw-text path
         #  gets a chance to run."
     def apply_chat_template(self, messages, ...):      # :82-106  raw text, add_special_tokens=True
         ...                                            # right-truncated to rollout_config.prompt_length
 ```
 
-Exactly **two** overrides, and **neither one is about media** — both are about text rendering. The
+Exactly **two** overrides, and **neither is about media** — both are text rendering. The
 class exists so LTX-2 can say "this model takes raw text", and saying it costs a registry key
 (`:49`), an export (`ltx2_flow_grpo/__init__.py:18,39`), ten transcribed `__init__` lines, and a
 `default_agent_loop` line in each of two run scripts
@@ -343,8 +337,8 @@ is one boolean.
 
 ### 1.7 One source image, two encoders, one geometry
 
-The second half of the same gap, and the one that turns `additional_information` from a loose end
-into a diagnosis. Qwen-Image-Edit's rollout adapter feeds **one source image to two consumers that
+The second half of the same gap, and what turns `additional_information` from a loose end into a
+diagnosis: Qwen-Image-Edit's rollout adapter feeds **one source image to two consumers that
 want it at two different geometries**:
 
 | Consumer | Wants | Why | Site |
@@ -352,8 +346,8 @@ want it at two different geometries**:
 | Qwen2.5-VL text encoder | the processor's patch grid + `image_grid_thw` | the grid length must match the `<\|image_pad\|>` span it replaces in the prompt | `_get_qwen_prompt_embeds:135-137` |
 | VAE | the image at its **source** resolution, plus its original size | condition latents are concatenated to the noise latents, so they must match the generation geometry | `prepare_latents(vae_images, …)` `~:447-448`, `torch.cat([latents, condition_image_latents], dim=1)` `:255` |
 
-The request the loop hands over can carry only one of the two. The shared agent loop decodes the
-image exactly once, keeps the resized view, and drops the source on the next line:
+The request the loop hands over can carry only one of the two: the loop decodes the image once,
+keeps the resized view, and drops the source on the next line:
 
 ```python
 raw_prompt = kwargs["raw_prompt"]                              # :77  un-decoded source, still in scope
@@ -369,7 +363,7 @@ to is read off the processor (`:113`), not off our config. No setting makes it a
 it one would be wrong anyway: the VL tower needs its grid. **The two consumers do not want one
 shared correct size; they want different sizes.**
 
-Two things follow, and both matter for scoping the fix:
+Two things follow, both scoping the fix:
 
 - **The dataset is not the problem.** `RLHFDataset` ships the messages through untouched —
   `row_dict["raw_prompt"] = self._build_messages(row_dict, key=self.prompt_key)` (`:389`), where
@@ -377,9 +371,33 @@ Two things follow, and both matter for scoping the fix:
   available where the loop runs; nothing needs to change upstream or in the dataset (N1, N8).
 - **`vae_images` / `vae_image_sizes` were reaching for exactly this slot**, and a key cannot supply
   it: §1.4's closed seven-key set has no room, and even with room, a `dict` entry does not say what
-  geometry the value is in. The consumer is not wrong to want a second view; the request type has no
-  way to express one, so the adapter invented a field name and left the producer side blank. **That
+  geometry the value is in. The consumer is not wrong to want a second view; the request type cannot
+  express one, so the adapter invented a field name and left the producer side blank. **That
   is the whole failure, in one file, today.**
+
+### 1.8 The same pattern, live in review: PR #373
+
+#373 (*add configurable uint8 response transport*, open) adds
+`actor_rollout_ref.rollout.response_transport_dtype` ∈ {`float32`, `uint8`} to shrink the
+rollout→train payload: `dispatch_lazy_compute_data_proto` costs **5.1 s**, **1.188 s** once fields
+`update_actor` never reads are dropped. The goal is sound; expressing *one* dtype decision with no
+declared output metadata costs §1.3's fan-out again:
+
+- `visual_tensor_to_uint8()` lands in `utils/reward_score/reward_utils.py` and is imported by
+  **10** modules — four scorers, `jpeg_compressibility.py`, `http_scorer_client.py`,
+  `utils/tracking.py`, both trainer entry points, and
+  `workers/rollout/vllm_rollout/vllm_omni_async_server.py`: the **rollout server imports a reward
+  util**, for want of a shared media-IO module (§5.1).
+- Four scorers gain an `if image.dtype != np.uint8:` branch *inside functions that already sniff
+  rank*, and `torch.empty(0, dtype=torch.uint8 if … else torch.float32)` re-derives the decision on
+  the empty path — a second implicit tensor property, tested wherever the first one is.
+- `_diffusion_output_type(sampling_params)` in the async server is a **second implementation** of
+  `sd3_flow_grpo/vllm_omni_rollout_adapter.py:137-142`, reading a dict where that one reads an
+  object and hardcoding `"image"` where that one takes a caller default.
+- `http_scorer_client.py:40`'s frame-0 discard (M-1) survives the PR untouched.
+
+`dtype` / `value_range` on `MediaOut` (§5.3) make quantisation one producer-side declaration every
+consumer reads; the deeper fix the PR itself defers — per-worker field declarations — is q8.
 
 ---
 
@@ -387,14 +405,13 @@ Two things follow, and both matter for scoping the fix:
 
 The tree holds **10 diffusion pipeline packages** (11 counting the AR-track `qwen3_omni`, out of
 scope by N4), **10 registered `(architecture, algorithm)` keys** and **9 rollout adapters**. Each
-one independently re-decides the same four questions — how do I pass conditioning, how do I say
-what I emitted, where do I put the per-step trajectory, and how do I get the shared loop to produce
-text and images the way my encoders need them — because no type answers them. The result is
-**3 representations of one request**, the one this repo owns being the untyped one (§1.1-1.2),
-**7 sites sniffing tensor rank, 5 of them to answer "which modality"** (§1.3), **5 candidate
-locations for one conditioning image, 3 of them with no producer** (§1.4), and **2 fields with live
-consumers that no code in the repo can write** (§1.7). Nothing here is a bug in any single file;
-every entry below is what that missing type costs, once per pipeline, forever.
+re-decides the same four questions — how do I pass conditioning, how do I say what I emitted, where
+does the per-step trajectory go, how do I get the shared loop to produce text and images the way my
+encoders need them — because no type answers them. Result: **3 representations of one request**, the
+one this repo owns being untyped (§1.1-1.2), **7 sites sniffing tensor rank, 5 to answer "which
+modality"** (§1.3), **5 candidate locations for one conditioning image, 3 with no producer**
+(§1.4), and **2 fields with live consumers no code in the repo can write** (§1.7). Nothing here is a
+bug in any single file; each entry below is what the missing type costs, once per pipeline, forever.
 
 Seven failure modes follow directly:
 
@@ -402,9 +419,9 @@ Seven failure modes follow directly:
   configured with `http_scorer` scores frame 0 and reports a plausible number.
 - **M-2: pin bumps break at training time, not request time.** The contract is string keys spread
   over eight adapters plus upstream's `multimodal_output`, unioned by `setdefault` so the adapter
-  silently wins any collision (§1.3). Already live: `audio_sample_rate` has two producers and merge
-  order alone decides which the trainer sees; `audio` and `fps` have no in-repo rollout producer at
-  all, so an upstream rename surfaces as a `KeyError` minutes into a run, or as a muted mp4.
+  silently wins a collision (§1.3). Already live: `audio_sample_rate` has two producers and merge
+  order decides which the trainer sees; `audio` and `fps` have no in-repo producer, so an upstream
+  rename surfaces as a `KeyError` minutes into a run, or as a muted mp4.
 - **M-3: adding a modality costs three signature edits.** A second conditioning image with a
   different role (keyframe vs identity reference) has nowhere to go but a new `*_data` kwarg
   threaded through three signatures (§1.2), or an untyped `extra_args` key — the route
@@ -415,8 +432,7 @@ Seven failure modes follow directly:
   (§1.3). Every future joint A/V pipeline repeats that choice independently.
 - **M-5: one conditioning image is looked for in five places** (§1.4), while
   `multi_modal_data["video"]` is write-only and `audio_data` is unreachable. Each is
-  individually harmless; collectively the input contract is whatever the last adapter happened
-  to check.
+  individually harmless; collectively the input contract is whatever the last adapter checked.
 - **M-6: one boolean about text rendering costs a whole agent-loop subclass.** `extra_tokenizer_map`
   lets SD3.5 declare *which* tokenizers to run and needs no subclass; nothing lets LTX-2 declare
   *raw text instead of a chat template*, so it ships `LTX2DiffusionSingleTurnAgentLoop` — two
@@ -426,11 +442,11 @@ Seven failure modes follow directly:
   VL text encoder wants the processor's patch grid while its VAE wants the source resolution; the
   loop materialises one view and drops the source one line later (`single_turn_agent_loop.py:81-82`).
   The adapter's answer was `vae_images` / `vae_image_sizes`, which the seven-key `custom_prompt` set
-  cannot carry — **live consumers, no possible producer** (§1.7). Not a future risk: a `ValueError`
-  on the only path that reads it.
+  cannot carry — **live consumers, no possible producer** (§1.7), and a `ValueError` on the only
+  path that reads it.
 
 None of these is model- or algorithm-specific: they are properties of the shared path, so they
-recur on the next integration whoever writes it.
+recur on the next integration.
 
 ---
 
@@ -442,17 +458,17 @@ recur on the next integration whoever writes it.
   a conditioning modality or a second input with a different role requires **no signature
   change** on the relay path — by generalising the existing image-only
   `ImageGenerationRequest`, not adding a second partial answer beside it.
-- **G1b.** One place to read a conditioning input, replacing the five candidates, the one
-  hand-rolled lookup and the one copy-up workaround (§1.4); and resolve the two dead paths (write-only video, unreachable audio) in
-  one direction or the other.
+- **G1b.** One place to read a conditioning input, replacing the five candidates, the hand-rolled
+  lookup and the copy-up workaround (§1.4), and resolving the two dead paths (write-only video,
+  unreachable audio) one way or the other.
 - **G2.** One output type in which the generated modality is **declared data**, and one request
   may declare more than one output medium.
 - **G3.** **No site infers the generated modality where a declaration exists.** Not "zero rank
   checks": §1.3's last column keeps rank at the two sites where rank is genuinely the question —
   `ltx2_flow_grpo:381` (squeeze a leading batch axis) and `http_scorer_client.py:40` (is this a
-  batch?) — and keeps `tracking.py:156`'s predicate for the `fps` shape. The five sites that today
-  answer *"which modality is this?"* by rank read `MediaOut.modality` instead, and the two that
-  answer *"is this batched?"* stop being confusable with them.
+  batch?) — and keeps `tracking.py:156`'s predicate for the `fps` shape. The five sites that answer
+  *"which modality is this?"* by rank read `MediaOut.modality` instead; the two that answer *"is
+  this batched?"* stop being confusable with them.
 - **G4.** A first-class slot for the RL trajectory, so a rollout↔training key mismatch is a
   construction-time error rather than a training-time `KeyError`.
 - **G5.** Fully additive: every milestone landable and revertible alone, and **no milestone may
@@ -461,10 +477,9 @@ recur on the next integration whoever writes it.
 - **G7.** The **input protocol becomes declared data on the consumer**, read by the shared agent
   loop: how a pipeline wants its text rendered (chat template vs raw text, §1.6) and which views of
   a conditioning input it needs (VL patch grid, source resolution, or both, §1.7). This generalises
-  what `extra_tokenizer_map` already does for tokenizers, and moves the declaration from a shell
-  string to a class attribute next to the code that consumes it. It is what makes M-7 fixable at all:
-  `MediaRequest` supplies the *slot* for a second view, but something has to say the second view is
-  wanted, and G7 is that something. Bounded by **N8**.
+  `extra_tokenizer_map`, moving the declaration from a shell string to a class attribute beside the
+  code that consumes it. It is what makes M-7 fixable at all: `MediaRequest` supplies the *slot* for
+  a second view, and G7 is what says the second view is wanted. Bounded by **N8**.
 
 **Non-goals**
 
@@ -486,13 +501,13 @@ recur on the next integration whoever writes it.
 - **N7.** Renaming the two existing `DiffusionOutput` classes (§5.5).
 - **N8.** Deleting `LTX2DiffusionSingleTurnAgentLoop`, or changing upstream verl to make that
   possible. G7 retires that class's `apply_chat_template` override and its registry key — the
-  reasons a *reader* has to care. Its `__init__` override survives, because what it works around is
+  reasons a *reader* has to care. Its `__init__` override survives: what it works around is
   upstream's own chat-template probe in `AgentLoopBase.__init__`
   (`verl/experimental/agent_loop/agent_loop.py:239-270`), and N1's rule — adapt at the boundary,
-  never fork the pinned dependency — applies to `verl` exactly as it does to vllm-omni. Same
-  boundary for §1.7: `RLHFDataset._process_multi_modal_info` stays untouched; G7 works from
-  `raw_prompt`, which the dataset already ships intact (`rl_dataset.py:389`). An upstream ask to
-  make the probe opt-out is filed as q7, not assumed.
+  never fork the pin — applies to `verl` too. Same boundary for §1.7:
+  `RLHFDataset._process_multi_modal_info` stays untouched; G7 works from `raw_prompt`, which the
+  dataset already ships intact (`rl_dataset.py:389`). An upstream ask to make the probe opt-out is
+  filed as q7, not assumed.
 
 ---
 
@@ -534,13 +549,11 @@ MediaOutput(media=[MediaOut(video), MediaOut(audio)], trajectory={…}, extra={�
 ```
 
 Two adaptation points, both in `workers/rollout/`, both against the pinned engine. Everything
-upstream and downstream of them speaks the repo's own types — the 10 diffusion pipeline packages,
-the scorers, the trainer and the tracking layer never import a vllm-omni type to answer a question
-about a modality.
-
-The declaration line at the top removes the *third* kind of per-pipeline code: neither a request
-field nor an output field, but a subclass of the shared producer (§1.6) or a field nothing can
-write (§1.7).
+either side of them speaks the repo's own types — the 10 pipeline packages, the scorers, the
+trainer and the tracking layer never import a vllm-omni type to answer a modality question. The
+declaration line at the top removes the *third* kind of per-pipeline code: neither a request field
+nor an output field, but a subclass of the shared producer (§1.6) or a field nothing can write
+(§1.7).
 
 ---
 
@@ -553,19 +566,18 @@ stays CPU-importable (G6). It sits **below** the pipeline registry and imports n
 so it cannot collapse behaviour across an `(architecture, algorithm)` boundary — which
 `.agents/rules/pipelines.md` forbids.
 
-`verl_omni/pipelines/` rather than `workers/rollout/`, because both rollout and training adapters
-are consumers and `request_batch.py` already establishes that shared plumbing lives here. A new
-module rather than extending `pipelines/utils.py` (where `ImageGenerationRequest` lives): that
-module imports `diffusers`, `tensordict` and `verl.utils.device` at module scope (`:21-29`), so
-anything added there fails G6. `utils.py` will import from `io.py`, not the reverse.
+`verl_omni/pipelines/` rather than `workers/rollout/`: both rollout and training adapters are
+consumers, and `request_batch.py` already puts shared plumbing here. A new module rather than
+extending `pipelines/utils.py` (where `ImageGenerationRequest` lives), because that module imports
+`diffusers`, `tensordict` and `verl.utils.device` at module scope (`:21-29`), so anything added
+there fails G6. `utils.py` imports from `io.py`, not the reverse.
 
 ### 5.2 The input types
 
 ```python
-Modality = Literal["text", "image", "video", "audio"]   # this repo's own vocabulary — deliberately
-                                                        # NOT upstream's, which also carries
-                                                        # "video"/"videos", "actions" and "codec"
-                                                        # and is never ingested here (§5.4)
+Modality = Literal["text", "image", "video", "audio"]   # this repo's own vocabulary, deliberately
+                                                        # NOT upstream's ("videos", "actions",
+                                                        # "codec"), never ingested here (§5.4)
 
 
 @dataclass
@@ -575,10 +587,10 @@ class MediaRef:
     modality: Modality
     data: Any                    # decoded PIL / ndarray / tensor, as ImageGenerationRequest.images
     role: str = "condition"      # condition | reference | keyframe | identity — the M-3 case
-    view: str = "native"         # geometry of `data`. Two MediaRefs may share a source and a role
-                                 # and differ only here: "vl_grid" for the processor's patch grid
-                                 # the VL text encoder needs, "native" for the source resolution
-                                 # the VAE needs — the M-7 case (§1.7)
+    view: str = "native"         # geometry of `data`. Two refs may share source+role and differ
+                                 # only here: "vl_grid" = the processor's patch grid the VL text
+                                 # encoder needs, "native" = the source resolution the VAE needs
+                                 # — the M-7 case (§1.7)
     source: Any | None = None    # the un-decoded origin from raw_prompt (path / dict / bytes), so a
                                  # consumer can derive a view the loop did not materialise (q6)
     meta: dict[str, Any] = field(default_factory=dict)   # fps, frame_index: per-input scalars
@@ -620,18 +632,16 @@ class MediaRequest:
         """Lower to the twelve-kwarg form, so M1 needs no server change."""
 ```
 
-Twelve kwargs become seven fields, and the nine input-describing ones become three. **The
+Twelve kwargs become seven fields, the nine input-describing ones become three. **The
 property that matters: `conditions` is a list.** A fifth modality, a second image with a
-different role, or a reference video alongside a keyframe all extend the list; none touches a
-signature. The same property is what makes M-7 expressible: one source image needed at two
-geometries is two `MediaRef` entries sharing a `source` and a `role` and differing in `view`, rather
-than a second field name — and `vae_image_sizes` becomes `meta["size"]` on the `native` entry, a
-field that is *present* rather than one whose absence must be raised on. **What the request type
-does not do is decide that the second view is wanted**; that is the declaration in §5.6, and the two
-are only useful together.
-`Modality` is a `Literal` rather than an `Enum` because these values round-trip
-through `sampling_params` dicts, `extra_args` and `non_tensor_batch` object arrays — all
-plain-data channels.
+different role, a reference video alongside a keyframe — each extends the list; none touches a
+signature. That is what makes M-7 expressible: one source image needed at two geometries is two
+`MediaRef` entries sharing `source` and `role` and differing in `view`, rather than a second field
+name, and `vae_image_sizes` becomes `meta["size"]` on the `native` entry — a field that is *present*
+rather than one whose absence must be raised on. **What the request type does not do is decide that
+the second view is wanted**; that is §5.6's declaration, and the two are only useful together.
+`Modality` is a `Literal` rather than an `Enum` because these values round-trip through
+`sampling_params`, `extra_args` and `non_tensor_batch` object arrays — all plain-data channels.
 
 `MediaRequest` subsumes `ImageGenerationRequest` field for field: `images` becomes the `"image"`
 slice of `conditions`, `metadata` becomes `sampling_params` plus per-`MediaRef` `meta`. A
@@ -649,6 +659,8 @@ class MediaOut:
 
     modality: Modality           # declared, never inferred — replaces every ndim test in §1.3
     data: torch.Tensor           # image [C,H,W]; video [T,C,H,W]; audio [S] or [C,S]
+    dtype: str = "float32"       # transport dtype, declared rather than sniffed off the tensor
+    value_range: tuple[float, float] = (0.0, 1.0)   # the pair a consumer needs with `dtype` (§1.8)
     fps: float | None = None     # attached to the medium it describes, not to a flat namespace
     sample_rate: int | None = None
     meta: dict[str, Any] = field(default_factory=dict)
@@ -670,6 +682,11 @@ class MediaOutput:
     def get(self, modality: Modality) -> MediaOut | None:
         """The first medium of ``modality``, or None."""
 ```
+
+`dtype` and `value_range` exist because #373 (§1.8) must spread one transport decision across ten
+modules for want of them: a consumer reads the declared pair instead of testing
+`image.dtype != np.uint8`, and the empty-output path carries the declaration instead of re-deriving
+it.
 
 `trajectory` takes the per-step keys (`all_latents`, `all_timesteps`, `all_log_probs`,
 `latents_clean`, `train_timesteps`) and `extra` keeps the genuinely private ones (`img_shapes`,
@@ -701,23 +718,23 @@ M-1 rather than fix it: `ray_diffusion_trainer.py:309` would dump `0.jpg` from a
 and `tracking.py:156` would stop emitting `wandb.Video`.
 
 Modality is therefore declared by the **rollout adapter**, the only component that knows what it
-produced: a class attribute on the adapter, or `MediaOut(modality=…)` at construction, consistent
-with `DiffusionPipelineConfig.num_frames` (`config/diffusion/rollout.py:71` — `> 1` implies video).
-`final_output_type` is read only as a cross-check that logs a warning on disagreement, never as the
+produced: a class attribute, or `MediaOut(modality=…)` at construction, consistent with
+`DiffusionPipelineConfig.num_frames` (`config/diffusion/rollout.py:71` — `> 1` implies video).
+`final_output_type` is read only as a cross-check logging a warning on disagreement, never as the
 source — which is why R4 is a *design constraint* rather than an accepted risk.
 
 ### 5.5 Compatibility seam, and naming
 
 M1 adds two derived properties to the existing `DiffusionOutput` (`replica.py:20-32`), computed
 from today's conventions — `modality` (adapter-declared where available, else `ndim`; **not**
-`final_output_type`, §5.4) and `media` (the primary tensor plus audio/fps out of `extra_fields`). Every consumer can migrate to the declared
-field before anything about the wire format changes, and `DiffusionOutput` keeps its name,
-fields and Pydantic base. This is what makes M1 revertible: deleting the two properties and the
-new module restores the tree exactly.
+`final_output_type`, §5.4) and `media` (the primary tensor plus audio/fps out of `extra_fields`).
+Every consumer can migrate to the declared field before the wire format changes, and
+`DiffusionOutput` keeps its name, fields and Pydantic base. This is what makes M1 revertible:
+deleting the two properties and the new module restores the tree exactly.
 
 An earlier draft called these `OmniGenRequest` / `OmniGenOutput`. Both prefixes are wrong here:
-**`Omni*`** denotes the autoregressive track (`OmniModelBase`, `OmniAlgoConfig`, …), which N4
-puts out of scope; **`Diffusion*Output`** already names two different classes coexisting in the
+**`Omni*`** denotes the autoregressive track (`OmniModelBase`, `OmniAlgoConfig`, …), out of scope
+by N4; **`Diffusion*Output`** already names two different classes coexisting in the
 same modules (`replica.py:20` and `vllm_omni/diffusion/data.py:1196`); and
 **`*GenerationRequest`** already collides too (`pipelines/utils.py:45` vs
 `protocol/images.py:33` — two unrelated types, one name, both importable in one process), so
@@ -728,9 +745,9 @@ same modules (`replica.py:20` and `vllm_omni/diffusion/data.py:1196`); and
 ### 5.6 The input protocol as declared data (G7)
 
 `MediaRequest` gives the second view a slot; this is what fills it. The declaration lives on the
-**rollout adapter** as class attributes — the same choice as §5.4's modality declaration, for the
-same reason: it is the component that knows what its encoders need, and it is the component a reader
-goes to when the answer looks wrong.
+**rollout adapter** as class attributes — the same choice as §5.4's modality declaration, and for
+the same reason: it knows what its encoders need, and it is where a reader goes when the answer
+looks wrong.
 
 ```python
 class QwenImageEditPlusFlowGRPO(QwenImage):
@@ -743,9 +760,9 @@ class LTX23PipelineWithLogProb(...):
     input_views = {}                                  # text-only; nothing to materialise
 ```
 
-`DiffusionSingleTurnAgentLoop` reads both and produces accordingly: it renders the prompt per
-`prompt_render` and emits one `MediaRef` per (source, requested view), each tagged with the geometry
-it was produced at. Three consequences worth stating explicitly:
+`DiffusionSingleTurnAgentLoop` reads both: it renders the prompt per `prompt_render` and emits one
+`MediaRef` per (source, requested view), tagged with the geometry it was produced at. Three
+consequences:
 
 - **No new data source, and no dataset change.** Both views are derived on the producing side from
   `raw_prompt`, still in scope at `single_turn_agent_loop.py:77` — one line before today's code
@@ -755,15 +772,15 @@ it was produced at. Three consequences worth stating explicitly:
 - **`vae_images` / `vae_image_sizes` are deleted, not given a producer.** The VAE reads the `native`
   entry of `conditions` and its `meta["size"]`. `_validate_condition_image_sizes:65-92` then
   validates a field the type guarantees is there, instead of raising because nothing in the repo
-  could have written it. That is the difference between a fix and an eighth `custom_prompt` key.
+  could have written it.
 - **A wrong declaration fails at startup.** An `input_views` entry naming a view the loop cannot
   produce, or a `prompt_render` outside the `Literal`, is a construction-time error — where §1.6's
   shell-string-to-Python-constant contract fails as a mid-rollout `KeyError`.
 
 What it does not do: LTX-2 keeps its `__init__` override, which works around upstream's
 chat-template probe (N8). M6's measurable win is the `apply_chat_template` override, the registry
-key, the export and the two run-script lines — the parts a contributor has to read, understand and
-copy for the next raw-text encoder.
+key, the export and the two run-script lines — what a contributor must read and copy for the next
+raw-text encoder.
 
 ---
 
@@ -779,8 +796,8 @@ Nothing calls them yet. Entirely CPU-testable.
 **M2 — read the declared modality at the five modality sites.**
 The last column of §1.3's table, all seven rows: five stop inferring modality, and the two that
 legitimately test for batching stay but are no longer confusable with them. Fixes M-1, and is where
-the review effort belongs because it touches the reward path. Each site keeps its current behaviour
-for the modality it handles today; only how the modality is determined changes.
+review effort belongs because it touches the reward path. Each site keeps its behaviour for the
+modality it handles today; only how the modality is determined changes.
 *Title:* `[trainer, reward] refactor: read declared modality instead of tensor rank`.
 
 **M3 — accept the request object.**
@@ -793,19 +810,18 @@ Fixes M-3.
 **M4 — promote the known keys.**
 `audio`, `audio_sample_rate`, `fps` into `MediaOut`; per-algorithm trajectory keys into
 `MediaOutput.trajectory`; `extra` stays the escape hatch. Fixes M-2 and M-4. It does **not**
-retire the `image_latents` guard (`model_base.py:355-371`): that guard defends a name the MFU
-FLOPs counter reserves in the **training-side** `model_inputs` dict, which no `MediaOut` /
-`MediaOutput` field governs. It does remove the guard's *trigger* — an adapter emitting
-`image_latents` where `condition_image_latents` was meant — since the condition latent becomes a
-named slot. Declaring the reservation itself is training-side follow-up, out of scope.
+retire the `image_latents` guard (`model_base.py:355-371`) — that name is reserved in the
+**training-side** `model_inputs` dict, which no `MediaOut` / `MediaOutput` field governs — but it
+does remove the guard's *trigger*, since the condition latent becomes a named slot. Declaring the
+reservation is a training-side follow-up.
 *Title:* `[rollout, trainer] refactor: promote trajectory and media keys out of extra_fields`.
 
 **M5 — retire the five-candidate lookup.**
 Collapse `utils.py:79-83` to one place and move `wan22_dance_grpo:373-381` onto it.
 `bagel_flow_grpo:285-288` is **deleted rather than migrated** — it only copies
 `extra_args.multi_modal_data` up into `custom_prompt`, and M3 stops `:506-508` writing the dict
-twice, so there is nothing left for it to reconcile. Also where the dead paths get resolved: either give
-`multi_modal_data["video"]` a consumer or stop writing it, and either wire `audio_data` to the
+twice, so there is nothing left for it to reconcile. Also where the dead paths get resolved: give
+`multi_modal_data["video"]` a consumer or stop writing it, and wire `audio_data` to the
 agent loop or delete the parameter. Fixes M-5; deletes more than it adds.
 *Title:* `[pipelines, rollout] refactor: single condition-input lookup via MediaRef`.
 
@@ -814,13 +830,13 @@ not, M1+M2 stand alone and M-1 is still fixed. M5 depends on M3.
 
 **M6 — declare the input protocol (G7).**
 `prompt_render` and `input_views` as adapter class attributes read by
-`DiffusionSingleTurnAgentLoop` (§5.6). Fixes M-6 and M-7. Depends on M3, because a second view of one
+`DiffusionSingleTurnAgentLoop` (§5.6). Fixes M-6 and M-7. Depends on M3: a second view of one
 input needs `conditions` to be a list first. The two halves are independent and **should land as two
 PRs**: the text half retires `LTX2DiffusionSingleTurnAgentLoop`'s `apply_chat_template` override, its
 registry key and export, and the `default_agent_loop` line in two run scripts (its `__init__`
 override stays, per N8); the image half emits the `native` view for `qwen_image_edit_flow_grpo` and
 **deletes** `vae_images` / `vae_image_sizes` with the `ValueError` guarding their absence. Bounded by
-N8: no upstream verl change, no dataset change.
+N8 — no upstream verl change, no dataset change.
 *Title:* `[rollout, pipelines] feat: declare per-pipeline prompt rendering and input views`.
 
 ---
@@ -832,52 +848,46 @@ selects on, so both are load-bearing (`.agents/rules/testing.md`).
 
 **M1 — `tests/pipelines/test_unified_io_on_cpu.py`.** `io.py` imports with `diffusers` and
 `vllm_omni` absent from `sys.modules` (G6); `multi_modal_data()` byte-identical to
-`_build_multi_modal_data` for all eight image/video/audio present-absent combinations including
-the empty dict; `to_generate_kwargs()` round-trips from the twelve kwargs with `None`s included;
+`_build_multi_modal_data` for all eight image/video/audio present-absent combinations; a
+twelve-kwarg round-trip through `to_generate_kwargs()` with `None`s included;
 `DiffusionOutput.modality` is `"image"` for `[C,H,W]`, `"video"` for `[T,C,H,W]`, and still
-`"video"` when `final_output_type` says `"image"` — the wan22 case the engine actually produces
-(§5.4); `get("audio")` returns `None` rather than raising, and `primary` errors clearly on empty
-`media`.
+`"video"` when `final_output_type` says `"image"` — the wan22 case the engine produces (§5.4);
+`get("audio")` returns `None` rather than raising.
 
 **M2 — regression, not new coverage.** The three rank-sniffing scorers keep their existing CPU
-tests green **unchanged** — any diff there means M2 changed behaviour, which it must not. One new
-case pins the §1.3 collision: an image `MediaOut` and a video `MediaOut` with the *same*
-`data.ndim` route differently. This is the test that would have caught M-1, and it is only
-expressible once modality is a field. `tests/trainer/` gains a case for mp4-vs-jpg selection
-from the declared modality.
+tests green **unchanged**; any diff means M2 changed behaviour, which it must not. One new case
+pins the §1.3 collision: an image `MediaOut` and a video `MediaOut` with the *same* `data.ndim`
+route differently — the test that would have caught M-1, expressible only once modality is a
+field. `tests/trainer/` gains an mp4-vs-jpg case driven by the declared modality.
 
 **M3-M5 — contract tests.** `generate(request)` and `generate(**kwargs)` produce identical
 `OmniCustomPrompt` + `OmniDiffusionSamplingParams` pairs, field by field. Per-algorithm
-trajectory-key tables (FlowGRPO / NFT / DPO) asserted against all eight adapters, so a missing
-key fails in CI rather than mid-run. `tests/pipelines/test_image_edit_interface_on_cpu.py`
-already pins the five-candidate precedence (`:47-63`, `:84-85`): it is M3's compatibility test
-(must stay green unchanged) and is deliberately **rewritten** in M5 — as an explicit hunk in
-that PR, never a silent deletion. M5 also asserts either that a `MediaRef(modality="video")`
-reaches the adapter or that `video_data` is gone — one must be true, and CI records which.
+trajectory-key tables (FlowGRPO / NFT / DPO) asserted against all eight adapters, so a missing key
+fails in CI rather than mid-run. `tests/pipelines/test_image_edit_interface_on_cpu.py` already pins
+the five-candidate precedence (`:47-63`, `:84-85`): M3's compatibility test, then deliberately
+**rewritten** in M5 as an explicit hunk, never a silent deletion. M5 also asserts either that a
+`MediaRef(modality="video")` reaches the adapter or that `video_data` is gone.
 
-**M6 — the declaration is the test.** `tests/pipelines/test_input_protocol_on_cpu.py`: a stub adapter
-declaring `prompt_render="raw_text"` produces ids **byte-identical** to
-`LTX2DiffusionSingleTurnAgentLoop.apply_chat_template` on the same messages — which is what makes
-that override safe to delete rather than merely equivalent-looking.
-`input_views={"image": ("vl_grid", "native")}` on one source yields exactly two `MediaRef`s sharing
-`source` and `role`, differing in `view`, with `meta["size"]` set on the `native` one and the
-`vl_grid` one identical to today's `process_vision_info` output. An unknown view name and an invalid
-`prompt_render` both raise at construction. The image half also pins the deletion: no occurrence of
-`vae_images` / `vae_image_sizes` under `verl_omni/`, asserted with the grep-style pattern
+**M6 — the declaration is the test.** `tests/pipelines/test_input_protocol_on_cpu.py`: a stub
+adapter declaring `prompt_render="raw_text"` produces ids **byte-identical** to
+`LTX2DiffusionSingleTurnAgentLoop.apply_chat_template`, which is what makes that override safe to
+delete rather than merely equivalent-looking; `input_views={"image": ("vl_grid", "native")}` yields
+exactly two `MediaRef`s sharing `source` and `role`, differing in `view`, `meta["size"]` on the
+`native` one and the `vl_grid` one identical to today's `process_vision_info` output; an unknown
+view name and an invalid `prompt_render` raise at construction; and no occurrence of `vae_images` /
+`vae_image_sizes` survives under `verl_omni/`, asserted with the grep-style pattern
 `tests/special_sanity/` already uses.
 
-**GPU.** One image pipeline (`qwen_image_flow_grpo`) and one video+audio pipeline
-(`ltx2_flow_grpo`) re-run unchanged after M2 and M4 — the only checks covering the
-`multimodal_output` merge against a real engine. The image-conditioned path needs its own: one
-`qwen_image_edit_flow_grpo` run after M3 and M5, since it is the only live multi-input path. M6
-needs one run per half — an `ltx2_flow_grpo` t2av run for the text half (the CPU test pins the ids;
-only a run proves the strict template is still never probed) and a `qwen_image_edit_flow_grpo` run
-for the image half, where the VAE now reads the `native` view and the output must be no worse than
-the pre-M6 baseline on the same seed.
+**GPU.** `qwen_image_flow_grpo` (image) and `ltx2_flow_grpo` (video+audio) re-run unchanged after
+M2 and M4 — the only checks covering the `multimodal_output` merge against a real engine — plus one
+`qwen_image_edit_flow_grpo` run after M3 and M5, the only live multi-input path. M6 needs one run
+per half: `ltx2_flow_grpo` t2av for the text half (only a run proves the strict template is still
+never probed) and `qwen_image_edit_flow_grpo` for the image half, where the VAE now reads the `native` view and the output must be no worse than the
+pre-M6 baseline on the same seed.
 
-**Every milestone.** `pre-commit run --files <changed>`. Note `autogen-trainer-cfg` fails in the
-current venv with a pre-existing `ModuleNotFoundError: omegaconf` (`scripts/print_cfg.py:16`),
-unrelated to these files; all other hooks must pass.
+**Every milestone.** `pre-commit run --files <changed>`; every hook must pass except
+`autogen-trainer-cfg`, which fails in the current venv with a pre-existing
+`ModuleNotFoundError: omegaconf` (`scripts/print_cfg.py:16`) unrelated to these files.
 
 ---
 
@@ -914,23 +924,28 @@ unrelated to these files; all other hooks must pass.
    support.
 5. **Does `verl` want this, or only verl-omni?** The rank-sniffing pattern is local to the
    diffusion path, which is verl-omni's. Confirm before proposing anything upstream.
-6. **Second materialised view, or a source reference?** §5.6 emits both views eagerly; `MediaRef.source`
-   would instead ship the origin and let the consumer decode what it needs. Eager keeps decode on the
-   CPU side where it already happens; lazy halves the payload (R7) but needs the rollout worker to be
-   able to reach the origin, which fails for parquet-embedded bytes and for any path not visible from
-   the worker. Both fields are in §5.2 deliberately; which one a pipeline should prefer is unresolved.
+6. **Second materialised view, or a source reference?** §5.6 emits both views eagerly;
+   `MediaRef.source` would instead ship the origin and let the consumer decode. Eager keeps decode on
+   the CPU side where it already happens; lazy halves the payload (R7) but needs the rollout worker to
+   reach the origin, which fails for parquet-embedded bytes and any path not visible from the worker.
+   Both fields are in §5.2 deliberately; which a pipeline should prefer is unresolved.
 7. **Upstream ask: can `AgentLoopBase.__init__`'s chat-template probe be made opt-out?** It is the only
    reason `LTX2DiffusionSingleTurnAgentLoop.__init__` survives M6
    (`verl/experimental/agent_loop/agent_loop.py:239-270`); a `probe_chat_template: bool = True`
    parameter there would let the class disappear entirely. Out of scope by N1/N8 — worth raising with
    verl, not worth forking for.
+8. **Does `DataProto` field projection follow?** #373 defers its real fix to per-worker field
+   declarations plus a projecting dispatcher (§1.8). Out of scope here — this RFC touches neither
+   `DataProto` nor the dispatcher (N3) — but `MediaOutput`'s separate `media` / `trajectory` /
+   `extra` slots are its precondition: today `responses` is one flat tensor with the trajectory
+   hidden in `extra_fields`, so there is no named field a worker could decline.
 
 ---
 
 ## 10. Appendix — key upstream references
 
-Verified at vllm-omni `0.24.1.dev26+gfe478a95a`. verl-omni references are cited inline above and
-are greppable in-tree; only the pinned upstream ones are collected here.
+Verified at vllm-omni `0.24.1.dev26+gfe478a95a`. verl-omni references are cited inline and
+greppable in-tree; only the pinned upstream ones are collected here.
 
 | What | Where |
 | --- | --- |
@@ -948,14 +963,12 @@ are greppable in-tree; only the pinned upstream ones are collected here.
 | `DiffusionOutput.output` union | `diffusion/data.py:1196-1202` |
 | `_build_multimodal_output` keys; `final_output_type="audio"` | `diffusion/output_formatter.py:158-171`, `:225` |
 
-§1.6-1.7 and N8 also lean on the **other** pinned dependency, upstream `verl`. These are not
-greppable in this repo, so they are collected too — paths relative to the installed `verl` package:
-
-| What | Where |
-| --- | --- |
-| `RLHFDataset._build_messages` — an image element stays `{"type": "image", "image": image}` | `utils/dataset/rl_dataset.py:299-311` |
-| **`raw_prompt` is shipped un-decoded** — why §1.7 needs no dataset change | `utils/dataset/rl_dataset.py:389` |
-| `_process_multi_modal_info` — a single branch, no per-pipeline choice | `utils/dataset/rl_dataset.py:479-500` |
-| its own comment: *"synchronous PNG decode + smart_resize (CPU-heavy)"* | `utils/dataset/rl_dataset.py:445-446` |
-| patch size read off the processor, not off our config | `utils/dataset/rl_dataset.py:113` |
-| `AgentLoopBase.__init__`'s chat-template probe — what LTX-2's `__init__` override works around (N8, q7) | `experimental/agent_loop/agent_loop.py:239-270` |
+§1.6-1.7 and N8 also lean on the **other** pinned dependency, upstream `verl`, not greppable in
+this repo — paths relative to the installed package. `utils/dataset/rl_dataset.py`:
+`_build_messages` leaves an image element as `{"type": "image", "image": image}` (`:299-311`) and
+ships `raw_prompt` **un-decoded** (`:389`, why §1.7 needs no dataset change);
+`_process_multi_modal_info` is a single branch with no per-pipeline choice (`:479-500`), its own
+comment calling the work *"synchronous PNG decode + smart_resize (CPU-heavy)"* (`:445-446`); the
+patch size is read off the processor, not off our config (`:113`). And
+`experimental/agent_loop/agent_loop.py:239-270` is the chat-template probe in
+`AgentLoopBase.__init__` that LTX-2's override works around (N8, q7).
