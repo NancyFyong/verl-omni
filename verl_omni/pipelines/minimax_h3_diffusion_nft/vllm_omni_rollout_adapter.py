@@ -138,4 +138,8 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
             num_steps=capture["num_steps"],
             shift_scale=capture["video_shift"],
         )
+        if len(sigmas) < 2:
+            raise ValueError(
+                f"Empty DiffusionNFT train-timestep pool: num_steps={capture['num_steps']} yields {len(sigmas)} sigma(s)."
+            )
         return torch.tensor(sigmas[:-1], dtype=torch.float32) * 1000.0

@@ -126,7 +126,8 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
         """
         del step, negative_prompt_embeds, negative_prompt_embeds_mask
         # All samples in a micro-batch share one resolution/duration, so read row 0.
-        meta = micro_batch["latent_meta"][0].tolist()
+        # reshape(-1) tolerates both (B, 6) and (B, 1, 6) latent_meta layouts.
+        meta = micro_batch["latent_meta"][0].reshape(-1).tolist()
         num_video_rows, num_audio_rows = int(meta[0]), int(meta[1])
         video_rows, audio_rows = unpack_video_audio_rows(latents, num_video_rows, num_audio_rows)
 
