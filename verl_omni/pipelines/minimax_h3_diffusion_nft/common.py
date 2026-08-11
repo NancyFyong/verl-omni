@@ -445,6 +445,44 @@ def _diffusers_to_vllm_name(name: str) -> str:
     return name
 
 
+# ---------------------------------------------------------------------------
+# LoRA delta mapping (the add_lora path).
+#
+# The trainer pushes peft-named LoRA tensors (``transformer_blocks.N.attn.to_q.lora_A.weight``)
+# while the fused vllm DiT exposes ``blocks.N.attn.qkv_proj`` / ``out_proj`` / ``mlp.fc1`` /
+# ``mlp.fc2``. Without translation the LoRA manager's target matching finds zero modules and
+# the adapter silently applies to nothing (base-identical rollout). q/k/v keep their
+# sub-names: the manager binds them into the fused qkv_proj slices via
+# ``stacked_params_mapping`` (the runtime qkv weight is contiguous [q|k|v] -- vllm's weight
+# loader de-interleaves the on-disk per-head groups at load time). ``mlp.fc1`` (merged
+# GEGLU) takes a single fused LoRA whose lora_B rows get the same half-swap as the base
+# stream; the manager splits B per output slice at activation.
+# ---------------------------------------------------------------------------
+
+# vllm-side target modules written into the pushed peft_config. q/k/v stay sub-named so the
+# packed fallback in _replace_layers_with_lora matches qkv_proj via its sublayer suffixes.
+_LORA_VLLM_TARGET_MODULES = ["to_q", "to_k", "to_v", "out_proj", "fc1", "fc2"]
+
+# Declared on the vllm DiT so DiffusionLoRAManager derives qkv_proj -> [to_q, to_k, to_v].
+_LORA_STACKED_PARAMS_MAPPING = [
+    (".qkv_proj", ".to_q", "q"),
+    (".qkv_proj", ".to_k", "k"),
+    (".qkv_proj", ".to_v", "v"),
+]
+
+
+def _map_lora_module_to_vllm(module: str) -> tuple[str, bool]:
+    """Map a diffusers LoRA target module path to its fused-vllm path.
+
+    Returns ``(vllm_module_path, needs_geglu_half_swap)``; the swap applies to lora_B rows.
+    """
+    vllm_module = _diffusers_to_vllm_name(module + ".")[:-1]
+    needs_swap = ".ff.net.0.proj" in vllm_module
+    if needs_swap:
+        vllm_module = vllm_module.replace(".ff.net.0.proj", ".mlp.fc1")
+    return vllm_module, needs_swap
+
+
 class MiniMaxH3RolloutWeightSyncMixin:
     """Bridge the trainer's diffusers weight names and prompt token ids to the vllm H3 pipeline.
 
@@ -499,6 +537,55 @@ class MiniMaxH3RolloutWeightSyncMixin:
         inv_freq = 10000.0 ** (-(torch.arange(0, 2 * rope_len, 2, dtype=torch.float32) / (2 * rope_len)))
         translated.append(("transformer.rope.inv_freq", inv_freq))
         return super().load_weights(translated)
+
+    def _install_lora_layout(self) -> None:
+        """Declare the qkv packing on the vllm DiT for the LoRA manager (idempotent).
+
+        ``DiffusionLoRAManager`` derives its packed-module mapping from
+        ``stacked_params_mapping`` at construction; the stock MiniMaxH3DiTModel does
+        not define one (its loader uses custom weight loaders), so without this the
+        manager cannot bind to_q/to_k/to_v sub-LoRAs into the fused qkv_proj.
+        """
+        transformer = getattr(self, "transformer", None)
+        if transformer is not None and not getattr(transformer, "stacked_params_mapping", None):
+            transformer.stacked_params_mapping = list(_LORA_STACKED_PARAMS_MAPPING)
+
+    def map_lora_update_to_engine(
+        self, tensors: dict[str, torch.Tensor], peft_config: dict
+    ) -> tuple[dict[str, torch.Tensor], dict]:
+        """Translate trainer-pushed LoRA deltas to the fused-vllm layout.
+
+        Called from the rollout-side ``_load_adapter`` hijack before the tensors and
+        peft config reach ``LoRAModel.from_lora_tensors``. Renames the module paths
+        (dropping any peft/FSDP prefix), applies the GEGLU half-swap to ``fc1``
+        lora_B rows, and rewrites ``target_modules`` to vllm-side names so the
+        manager's layer wrapping matches real modules.
+        """
+        ff_half = self.transformer.arch.ffn_hidden_size
+        mapped: dict[str, torch.Tensor] = {}
+        for name, tensor in tensors.items():
+            is_lora_a = name.endswith(".lora_A.weight")
+            is_lora_b = name.endswith(".lora_B.weight")
+            if not (is_lora_a or is_lora_b):
+                mapped[name] = tensor
+                continue
+            module = name[: -len(".lora_A.weight")] if is_lora_a else name[: -len(".lora_B.weight")]
+            # Drop peft/FSDP prefixes (base_model.model., _fsdp_wrapped_module., ...):
+            # keep the structural path from the first blocks anchor.
+            anchors = [a for a in (module.find("transformer_blocks."), module.find("token_refiner.refiner_blocks.")) if a >= 0]
+            if not anchors:
+                mapped[name] = tensor
+                continue
+            module = module[min(anchors) :]
+            vllm_module, needs_swap = _map_lora_module_to_vllm(module)
+            if needs_swap and is_lora_b:
+                tensor = torch.cat([tensor[ff_half:], tensor[:ff_half]], dim=0)
+            suffix = ".lora_A.weight" if is_lora_a else ".lora_B.weight"
+            mapped[f"transformer.{vllm_module}{suffix}"] = tensor
+
+        new_config = dict(peft_config) if peft_config is not None else {}
+        new_config["target_modules"] = list(_LORA_VLLM_TARGET_MODULES)
+        return mapped, new_config
 
     def _ensure_prompt_text(self, request: Any) -> None:
         """Fill ``prompts[0]["prompt"]`` from the request's token ids.

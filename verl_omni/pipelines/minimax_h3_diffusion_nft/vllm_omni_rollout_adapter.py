@@ -58,6 +58,7 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
         super().__init__(od_config=od_config, prefix=prefix)
         if hasattr(self, "set_progress_bar_config"):
             self.set_progress_bar_config(disable=True)
+        self._install_lora_layout()
         self._nft_capture: dict[str, Any] | None = None
 
     def diffuse(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
