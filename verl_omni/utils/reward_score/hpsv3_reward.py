@@ -79,6 +79,36 @@ _PROMPT_WITHOUT_SPECIAL_TOKEN = """
 Please provide the overall ratings of this image: 
 """
 
+
+def _device_available(device: str) -> bool:
+    device_type = str(device).split(":", 1)[0]
+    if device_type == "cpu":
+        return True
+    if device_type == "cuda":
+        return torch.cuda.is_available()
+    if device_type == "npu":
+        npu = getattr(torch, "npu", None)
+        if npu is None or not hasattr(npu, "is_available"):
+            return False
+        return bool(npu.is_available())
+    try:
+        torch.empty(0, device=device)
+    except (RuntimeError, AssertionError, ValueError):
+        return False
+    return True
+
+
+def _resolve_device(device: str) -> str:
+    requested = os.getenv("custom_reward_device", device)
+    if _device_available(requested):
+        return requested
+    if torch.cuda.is_available():
+        logger.warning("Requested HPSv3 device %s is unavailable; using cuda instead.", requested)
+        return "cuda"
+    logger.warning("Requested HPSv3 device %s is unavailable; using cpu instead.", requested)
+    return "cpu"
+
+
 _BASE_MODEL = "Qwen/Qwen2-VL-7B-Instruct"
 
 _IMAGE_FACTOR = 28
@@ -385,25 +415,38 @@ def _to_pil_hwc(image) -> Image.Image:
 
 
 def _extract_frames(solution_image, frame_interval: int = 1) -> list[Image.Image]:
-    is_channels_last = solution_image.shape[-1] in (1, 3) if solution_image.ndim >= 3 else False
+    if isinstance(solution_image, np.ndarray):
+        solution_image = torch.from_numpy(solution_image)
 
     if solution_image.ndim == 3:
-        if is_channels_last:
+        if solution_image.shape[-1] in (1, 3):
             solution_image = solution_image.permute(2, 0, 1)
         solution_image = solution_image.unsqueeze(0)
 
     elif solution_image.ndim == 4:
-        if is_channels_last:
-            solution_image = solution_image.permute(3, 0, 1, 2)
-        solution_image = solution_image[:, ::frame_interval]
-        solution_image = solution_image.permute(1, 0, 2, 3)
+        if solution_image.shape[1] in (1, 3):  # [T, C, H, W]
+            solution_image = solution_image[::frame_interval]
+        elif solution_image.shape[0] in (1, 3):  # [C, T, H, W]
+            solution_image = solution_image[:, ::frame_interval].permute(1, 0, 2, 3)
+        elif solution_image.shape[-1] in (1, 3):  # [T, H, W, C]
+            solution_image = solution_image[::frame_interval].permute(0, 3, 1, 2)
+        else:
+            raise ValueError(f"Unsupported video tensor shape: {tuple(solution_image.shape)}")
 
     elif solution_image.ndim == 5:
-        if is_channels_last:
-            solution_image = solution_image.permute(0, 4, 1, 2, 3)
-        solution_image = solution_image[:, :, ::frame_interval]
-        solution_image = solution_image.permute(0, 2, 1, 3, 4)
-        solution_image = solution_image.reshape(-1, *solution_image.shape[2:])
+        if solution_image.shape[2] in (1, 3):  # [B, T, C, H, W]
+            solution_image = solution_image[:, ::frame_interval].reshape(-1, *solution_image.shape[2:])
+        elif solution_image.shape[1] in (1, 3):  # [B, C, T, H, W]
+            solution_image = solution_image[:, :, ::frame_interval].permute(0, 2, 1, 3, 4)
+            solution_image = solution_image.reshape(-1, *solution_image.shape[2:])
+        elif solution_image.shape[-1] in (1, 3):  # [B, T, H, W, C]
+            solution_image = solution_image[:, ::frame_interval].permute(0, 1, 4, 2, 3)
+            solution_image = solution_image.reshape(-1, *solution_image.shape[2:])
+        else:
+            raise ValueError(f"Unsupported batched video tensor shape: {tuple(solution_image.shape)}")
+
+    else:
+        raise ValueError(f"Unsupported visual tensor rank: {solution_image.ndim}")
 
     return [_to_pil_hwc(frame) for frame in solution_image]
 
@@ -420,6 +463,7 @@ def compute_score_hpsv3(
 ) -> dict:
     checkpoint_path = os.getenv("custom_reward_model_path", model_name)
     assert checkpoint_path is not None, "HPSv3 checkpoint path must be provided via reward.reward_model.model_path"
+    device = _resolve_device(device)
 
     inferencer = _get_inferencer(checkpoint_path, device)
 
