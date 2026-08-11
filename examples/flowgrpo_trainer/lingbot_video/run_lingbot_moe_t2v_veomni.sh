@@ -23,6 +23,18 @@ ROLLOUT_TP=${ROLLOUT_TP:-8}
 # (asserted by ParallelPlan.apply) and the FSDP world size.
 EXPERT_PARALLEL_SIZE=${EXPERT_PARALLEL_SIZE:-8}
 TRAINER_BACKEND=veomni
+EXPERIMENT_NAME=lingbot_moe_t2v_${TRAINER_BACKEND}_ep${EXPERT_PARALLEL_SIZE}
+
+run_timestamp=$(date +"%Y%m%d_%H%M")
+run_dir=${RUN_DIR:-$WORKSPACE/logs/$EXPERIMENT_NAME/$run_timestamp}
+checkpoint_dir=${CHECKPOINT_DIR:-$run_dir/checkpoints}
+rollout_data_dir=${ROLLOUT_DATA_DIR:-$run_dir/rollout_videos}
+validation_data_dir=${VALIDATION_DATA_DIR:-$run_dir/val_videos}
+log_file=${LOG_FILE:-$run_dir/${NODE_RANK:-0}.log}
+mkdir -p "$checkpoint_dir" "$rollout_data_dir" "$validation_data_dir" "$(dirname "$log_file")"
+exec > >(tee -a "$log_file") 2>&1
+
+echo "Logging to $log_file"
 
 python3 -m verl_omni.trainer.main_diffusion \
     diffusion/model_engine=veomni_diffusion \
@@ -76,7 +88,16 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.rollout.val_kwargs.algo.noise_level=0.0 \
     reward.custom_reward_function.path=$REWARD_FUNCTION_PATH \
     reward.custom_reward_function.name=$REWARD_FUNCTION_NAME \
+    trainer.logger='["console", "tensorboard", "wandb"]' \
     trainer.n_gpus_per_node=$NUM_GPUS \
     trainer.nnodes=1 \
     trainer.project_name=flow_grpo \
-    trainer.experiment_name=lingbot_moe_t2v_${TRAINER_BACKEND}_ep${EXPERT_PARALLEL_SIZE} "$@"
+    trainer.experiment_name=$EXPERIMENT_NAME \
+    trainer.default_local_dir=$checkpoint_dir \
+    trainer.rollout_data_dir=$rollout_data_dir \
+    trainer.validation_data_dir=$validation_data_dir \
+    trainer.val_before_train=True \
+    trainer.save_freq=10 \
+    trainer.test_freq=20 \
+    trainer.total_training_steps=10000 \
+    trainer.total_epochs=100 "$@"

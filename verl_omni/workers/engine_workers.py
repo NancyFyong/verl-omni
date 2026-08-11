@@ -878,14 +878,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         set_expandable_segments(False)
         log_gpu_memory_usage("Before resume weights", logger=logger)
 
-        # 1. resume rollout weight memory (released during sleep). This targets the
-        #    rollout process and is independent of the actor-side param gather below,
-        #    so launch it concurrently and await it before pushing weights.
+        # 1. Rollout weight memory is released during sleep. LoRA-only sync can
+        #    overlap rollout wake-up with actor-side adapter gather/offload because
+        #    only small adapter tensors are transferred. Full-model sync must delay
+        #    wake-up until after the actor export path has offloaded actor params;
+        #    otherwise large colocated models can hold actor and rollout weights on
+        #    GPU at the same time and OOM during the second training step.
         resume_weights_task = None
-        if self.config.rollout.free_cache_engine:
-            resume_weights_task = asyncio.create_task(
-                _timed_await("resume_weights", timings, self.rollout.resume(tags=["weights"]))
-            )
 
         # 2. Detect the actor's adapter setup *without* triggering the heavy param
         #    gather (which runs collectives), so the right path can be chosen up
@@ -901,6 +900,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         offloaded = False
         offload_task = None
         if use_lora_fast_path:
+            if self.config.rollout.free_cache_engine:
+                resume_weights_task = asyncio.create_task(
+                    _timed_await("resume_weights", timings, self.rollout.resume(tags=["weights"]))
+                )
+
             # LoRA-only fast path. Three independent stages overlap:
             #   (a) gather the LoRA adapter into a CPU dict in a worker thread,
             #       overlapping with resuming rollout weight memory;
@@ -948,13 +952,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             timings["update_weights_sync"] = time.perf_counter() - sync_start
             offloaded = True
         else:
-            # Normal path: resume rollout weight memory, gather actor params and
-            # sync via the standard bucketed-IPC pipeline.
-            if resume_weights_task is not None:
-                await resume_weights_task
-            log_gpu_memory_usage("After resume weights", logger=logger)
-
-            # determine if we need a base weight sync (adapter path only)
+            # Normal/full-model path: export actor params first. Engine export
+            # implementations offload actor params before returning the lazy tensor
+            # iterator when param_offload is enabled, leaving room to wake rollout
+            # weights before the IPC transfer begins.
             per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
                 layered_summon=self.layered_summon,
                 base_sync_done=True,
@@ -962,6 +963,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
 
             do_lora_base_sync = False
+            per_tensor_param_base = None
             if not self.peft_merge and peft_config is not None:
                 self.rollout.sleep_level = 1
                 do_lora_base_sync = not self.base_sync_done
@@ -973,6 +975,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     base_sync_done=False,
                     adapter_name=self.config.rollout.rollout_adapter,
                 )
+
+            if self.config.rollout.free_cache_engine:
+                await _timed_await("resume_weights", timings, self.rollout.resume(tags=["weights"]))
+            log_gpu_memory_usage("After resume weights", logger=logger)
+
+            if do_lora_base_sync:
                 await self.rollout.update_weights(
                     per_tensor_param_base, peft_config=peft_config, base_sync_done=False, global_steps=global_steps
                 )
