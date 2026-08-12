@@ -454,33 +454,35 @@ def _diffusers_to_vllm_name(name: str) -> str:
 # the adapter silently applies to nothing (base-identical rollout). q/k/v keep their
 # sub-names: the manager binds them into the fused qkv_proj slices via
 # ``stacked_params_mapping`` (the runtime qkv weight is contiguous [q|k|v] -- vllm's weight
-# loader de-interleaves the on-disk per-head groups at load time). ``mlp.fc1`` (merged
-# GEGLU) takes a single fused LoRA whose lora_B rows get the same half-swap as the base
-# stream; the manager splits B per output slice at activation.
+# loader de-interleaves the on-disk per-head groups at load time).
+#
+# ``mlp.fc1`` (merged GEGLU) is split into per-slice sub-LoRAs ``fc1_0``/``fc1_1``: the
+# manager's fused-single-LoRA path checks ``lora_B.shape[0]`` against the TP-local
+# ``output_slices`` and skips the layer under tensor parallelism, while the packed
+# sub-LoRA path shards correctly through vllm's set_lora narrowing. lora_B rows get the
+# same GEGLU half-swap as the base stream before splitting (slice 0 = diffusers' second
+# half); lora_A is shared by both slices and is never swapped.
 # ---------------------------------------------------------------------------
 
-# vllm-side target modules written into the pushed peft_config. q/k/v stay sub-named so the
-# packed fallback in _replace_layers_with_lora matches qkv_proj via its sublayer suffixes.
-_LORA_VLLM_TARGET_MODULES = ["to_q", "to_k", "to_v", "out_proj", "fc1", "fc2"]
+# vllm-side target modules written into the pushed peft_config. q/k/v and the fc1 slices
+# stay sub-named so the packed fallback in _replace_layers_with_lora matches qkv_proj/fc1
+# via their sublayer suffixes.
+_LORA_VLLM_TARGET_MODULES = ["to_q", "to_k", "to_v", "out_proj", "fc1_0", "fc1_1", "fc2"]
 
-# Declared on the vllm DiT so DiffusionLoRAManager derives qkv_proj -> [to_q, to_k, to_v].
+# Declared on the vllm DiT so DiffusionLoRAManager derives the packed sublayer suffixes
+# qkv_proj -> [to_q, to_k, to_v] and fc1 -> [fc1_0, fc1_1].
 _LORA_STACKED_PARAMS_MAPPING = [
     (".qkv_proj", ".to_q", "q"),
     (".qkv_proj", ".to_k", "k"),
     (".qkv_proj", ".to_v", "v"),
+    (".fc1", ".fc1_0", "0"),
+    (".fc1", ".fc1_1", "1"),
 ]
 
 
-def _map_lora_module_to_vllm(module: str) -> tuple[str, bool]:
-    """Map a diffusers LoRA target module path to its fused-vllm path.
-
-    Returns ``(vllm_module_path, needs_geglu_half_swap)``; the swap applies to lora_B rows.
-    """
-    vllm_module = _diffusers_to_vllm_name(module + ".")[:-1]
-    needs_swap = ".ff.net.0.proj" in vllm_module
-    if needs_swap:
-        vllm_module = vllm_module.replace(".ff.net.0.proj", ".mlp.fc1")
-    return vllm_module, needs_swap
+def _map_lora_module_to_vllm(module: str) -> str:
+    """Map a diffusers LoRA target module path to its fused-vllm path (fc1 handled separately)."""
+    return _diffusers_to_vllm_name(module + ".")[:-1]
 
 
 class MiniMaxH3RolloutWeightSyncMixin:
@@ -557,8 +559,9 @@ class MiniMaxH3RolloutWeightSyncMixin:
 
         Called from the rollout-side ``_load_adapter`` hijack before the tensors and
         peft config reach ``LoRAModel.from_lora_tensors``. Renames the module paths
-        (dropping any peft/FSDP prefix), applies the GEGLU half-swap to ``fc1``
-        lora_B rows, and rewrites ``target_modules`` to vllm-side names so the
+        (dropping any peft/FSDP prefix), splits the merged-GEGLU ``fc1`` LoRA into
+        per-slice sub-LoRAs (``fc1_0``/``fc1_1``, GEGLU half-swap applied to lora_B
+        rows first), and rewrites ``target_modules`` to vllm-side names so the
         manager's layer wrapping matches real modules.
         """
         ff_half = self.transformer.arch.ffn_hidden_size
@@ -569,7 +572,8 @@ class MiniMaxH3RolloutWeightSyncMixin:
             if not (is_lora_a or is_lora_b):
                 mapped[name] = tensor
                 continue
-            module = name[: -len(".lora_A.weight")] if is_lora_a else name[: -len(".lora_B.weight")]
+            suffix = ".lora_A.weight" if is_lora_a else ".lora_B.weight"
+            module = name[: -len(suffix)]
             # Drop peft/FSDP prefixes (base_model.model., _fsdp_wrapped_module., ...):
             # keep the structural path from the first blocks anchor.
             anchors = [a for a in (module.find("transformer_blocks."), module.find("token_refiner.refiner_blocks.")) if a >= 0]
@@ -577,10 +581,19 @@ class MiniMaxH3RolloutWeightSyncMixin:
                 mapped[name] = tensor
                 continue
             module = module[min(anchors) :]
-            vllm_module, needs_swap = _map_lora_module_to_vllm(module)
-            if needs_swap and is_lora_b:
-                tensor = torch.cat([tensor[ff_half:], tensor[:ff_half]], dim=0)
-            suffix = ".lora_A.weight" if is_lora_a else ".lora_B.weight"
+            if ".ff.net.0.proj" in module:
+                # Merged GEGLU fc1: swap halves (vllm order) then split per slice.
+                base = _diffusers_to_vllm_name(module + ".")[:-1].replace(".ff.net.0.proj", ".mlp.fc1")
+                if is_lora_b:
+                    swapped = torch.cat([tensor[ff_half:], tensor[:ff_half]], dim=0)
+                    mapped[f"transformer.{base}_0{suffix}"] = swapped[:ff_half].contiguous()
+                    mapped[f"transformer.{base}_1{suffix}"] = swapped[ff_half:].contiguous()
+                else:
+                    # lora_A is shared by both slices; no swap on the input side.
+                    mapped[f"transformer.{base}_0{suffix}"] = tensor
+                    mapped[f"transformer.{base}_1{suffix}"] = tensor
+                continue
+            vllm_module = _map_lora_module_to_vllm(module)
             mapped[f"transformer.{vllm_module}{suffix}"] = tensor
 
         new_config = dict(peft_config) if peft_config is not None else {}

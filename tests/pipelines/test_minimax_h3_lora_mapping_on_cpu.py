@@ -70,7 +70,8 @@ class TestLoraNameMapping:
             "transformer.blocks.3.attn.to_k",
             "transformer.blocks.3.attn.to_v",
             "transformer.blocks.3.attn.out_proj",
-            "transformer.blocks.3.mlp.fc1",
+            "transformer.blocks.3.mlp.fc1_0",
+            "transformer.blocks.3.mlp.fc1_1",
             "transformer.blocks.3.mlp.fc2",
         }
         modules = {name.rsplit(".lora_", 1)[0] for name in mapped}
@@ -87,20 +88,22 @@ class TestLoraNameMapping:
         mapped, _ = _make_mixin().map_lora_update_to_engine(tensors, _peft_config())
         assert list(mapped) == ["transformer.blocks.0.attn.to_q.lora_A.weight"]
 
-    def test_fc1_lora_b_half_swapped(self):
+    def test_fc1_lora_b_swapped_then_split_per_slice(self):
         tensors = _trainer_lora_tensors()
         key = "base_model.model.transformer_blocks.3.ff.net.0.proj.lora_B.weight"
         original = tensors[key]
         mapped, _ = _make_mixin().map_lora_update_to_engine(tensors, _peft_config())
-        swapped = mapped["transformer.blocks.3.mlp.fc1.lora_B.weight"]
-        assert torch.equal(swapped, torch.cat([original[FFN_HALF:], original[:FFN_HALF]], dim=0))
+        # vllm slice order is swapped vs diffusers: slice 0 = diffusers' second half.
+        assert torch.equal(mapped["transformer.blocks.3.mlp.fc1_0.lora_B.weight"], original[FFN_HALF:])
+        assert torch.equal(mapped["transformer.blocks.3.mlp.fc1_1.lora_B.weight"], original[:FFN_HALF])
 
-    def test_no_swap_for_fc1_lora_a_or_fc2_lora_b(self):
+    def test_fc1_lora_a_shared_unswapped_and_fc2_untouched(self):
         tensors = _trainer_lora_tensors()
         a_key = "base_model.model.transformer_blocks.3.ff.net.0.proj.lora_A.weight"
         b_key = "base_model.model.transformer_blocks.3.ff.net.2.lora_B.weight"
         mapped, _ = _make_mixin().map_lora_update_to_engine(tensors, _peft_config())
-        assert torch.equal(mapped["transformer.blocks.3.mlp.fc1.lora_A.weight"], tensors[a_key])
+        assert torch.equal(mapped["transformer.blocks.3.mlp.fc1_0.lora_A.weight"], tensors[a_key])
+        assert torch.equal(mapped["transformer.blocks.3.mlp.fc1_1.lora_A.weight"], tensors[a_key])
         assert torch.equal(mapped["transformer.blocks.3.mlp.fc2.lora_B.weight"], tensors[b_key])
 
     def test_target_modules_rewritten_to_vllm_names(self):
@@ -138,25 +141,24 @@ class TestVllmManagerInterplay:
         for module in self.VLLM_MODULES:
             assert not match(module, original_targets)
 
-    def test_rewritten_targets_match_all_vllm_modules(self, match):
-        hits = {m: match(m, _LORA_VLLM_TARGET_MODULES) for m in self.VLLM_MODULES}
-        # qkv_proj matches via the packed-sublayer fallback, exercised separately below.
-        assert hits["transformer.blocks.0.attn.out_proj"]
-        assert hits["transformer.blocks.0.mlp.fc1"]
-        assert hits["transformer.blocks.0.mlp.fc2"]
+    def test_rewritten_targets_match_vllm_modules(self, match):
+        # qkv_proj and fc1 match via the packed-sublayer fallback (tested separately below).
+        assert match("transformer.blocks.0.attn.out_proj", _LORA_VLLM_TARGET_MODULES)
+        assert match("transformer.blocks.0.mlp.fc2", _LORA_VLLM_TARGET_MODULES)
 
-    def test_qkv_sublayer_names_match(self, match):
+    def test_packed_sublayer_names_match(self, match):
         # The manager's packed fallback checks prefix + sub-suffix from the mapping.
         sub_suffixes = [sub.strip(".").split(".")[-1] for _, sub, _ in _LORA_STACKED_PARAMS_MAPPING]
-        assert sub_suffixes == ["to_q", "to_k", "to_v"]
-        for sub in sub_suffixes:
-            assert match(f"transformer.blocks.0.attn.{sub}", _LORA_VLLM_TARGET_MODULES)
+        assert sub_suffixes == ["to_q", "to_k", "to_v", "fc1_0", "fc1_1"]
+        for prefix, subs in (("attn", ["to_q", "to_k", "to_v"]), ("mlp", ["fc1_0", "fc1_1"])):
+            for sub in subs:
+                assert match(f"transformer.blocks.0.{prefix}.{sub}", _LORA_VLLM_TARGET_MODULES)
 
-    def test_stacked_mapping_declares_qkv_slices(self):
+    def test_stacked_mapping_declares_packed_slices(self):
         packed = [packed for packed, _, _ in _LORA_STACKED_PARAMS_MAPPING]
         shard_ids = [shard for _, _, shard in _LORA_STACKED_PARAMS_MAPPING]
-        assert packed == [".qkv_proj"] * 3
-        assert shard_ids == ["q", "k", "v"]
+        assert packed == [".qkv_proj"] * 3 + [".fc1"] * 2
+        assert shard_ids == ["q", "k", "v", "0", "1"]
 
 
 class TestInstallLoraLayout:
