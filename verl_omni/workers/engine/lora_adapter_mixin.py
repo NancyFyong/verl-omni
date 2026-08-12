@@ -36,7 +36,9 @@ class LoRAAdapterMixin:
             print(f"Loading pre-trained LoRA adapter to from: {lora_adapter_path}")
             local_adapter_path = copy_to_local(lora_adapter_path, use_shm=self.model_config.use_shm)
 
-            module.load_lora_adapter(local_adapter_path)
+            # diffusers' loader auto-names the first adapter "default_0" when no name
+            # is given, but the policy-adapter plumbing below expects "default".
+            module.load_lora_adapter(local_adapter_path, adapter_name="default")
             peft_config = getattr(module, "peft_config", {}).get("default", None)
             for adapter_name in extra_adapters:
                 if peft_config is not None and adapter_name not in getattr(module, "peft_config", {}):
