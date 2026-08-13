@@ -11,16 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests for the MiniMax H3 DiffusionNFT training adapter.
-
-MiniMax H3 is dual-stream but DiffusionNFT's engine and loss are single-tensor,
-so the rollout packs video rows (width 96) and audio rows (width 32) into one
-flat vector and the adapter unpacks it, runs the transformer per micro-batch
-sample on its real packed-sequence interface, and re-packs the
-``(v_video, v_audio)`` velocity. These tests pin the pack/unpack round trip, the
-static layout the forward derives from ``latent_meta``, and the per-sample
-forward loop with a mocked transformer -- no diffusers weights, no vllm_omni.
-"""
+"""CPU tests for the MiniMax H3 DiffusionNFT adapter."""
 
 from unittest.mock import MagicMock
 
@@ -46,8 +37,6 @@ from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.workers.config.diffusion.model import DiffusionModelConfig
 from verl_omni.workers.config.diffusion.rollout import DiffusionPipelineConfig
 
-# latent_meta = [Nv, Na, latent_t, latent_h, latent_w, audio_t], internally consistent with the layout
-# builder: Nv = latent_t * (latent_h // 2) * (latent_w // 2) = 1*2*2 = 4; Na = audio_t * audio_ch = 3*2 = 6.
 _META = [4, 6, 1, 4, 4, 3]
 _NUM_VIDEO_ROWS, _NUM_AUDIO_ROWS = 4, 6
 _BATCH = 2
@@ -66,7 +55,7 @@ def _micro_batch(batch=_BATCH):
 
 
 def _module(side_effect):
-    """A mock transformer with the given per-call behavior and no real ``config`` (patch falls back)."""
+    """Build a mock transformer."""
     module = MagicMock(side_effect=side_effect)
     module.config = None
     return module
@@ -329,6 +318,13 @@ class TestMiniMaxH3RolloutWeightSync:
         assert "transformer.rope.inv_freq" in emitted
         expected = 10000.0 ** (-(torch.arange(0, 2 * _ROPE_LEN, 2, dtype=torch.float32) / (2 * _ROPE_LEN)))
         torch.testing.assert_close(emitted["transformer.rope.inv_freq"], expected)
+
+    def test_rope_inv_freq_is_loaded_once(self):
+        pipeline = _StubSyncPipeline()
+        pipeline.load_weights([])
+        pipeline.load_weights([])
+
+        assert pipeline.received == []
 
     def test_qkv_fuses_per_head_across_sync_buckets(self):
         """The base sync arrives in buckets, so one block's q/k/v may span several calls."""

@@ -11,23 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MiniMax H3 training adapter for DiffusionNFT.
-
-MiniMax H3 is a CFG-distilled joint video+audio rectified-flow transformer that
-consumes and produces separate video rows (width 96) and audio rows (width 32).
-DiffusionNFT's shared engine noises a single ``latents_clean`` tensor at one
-timestep per sample and its loss is fully elementwise, so both row streams are
-packed into one flat vector on the rollout side (see :mod:`.common`). This
-adapter unpacks that vector into the two row streams, runs the transformer, and
-re-packs the ``(v_video, v_audio)`` velocity into the same flat layout.
-
-The transformer reads one packed sequence whose timestep plan and row layout are
-shared across the batch — its ``timestep``/``token_tags``/``position_ids`` carry
-no batch dimension and it takes no attention mask. DiffusionNFT samples a
-per-sample timestep and prompts vary in length, so the forward runs one
-micro-batch sample at a time, each with its own sampled timestep and true text
-length, and stacks the packed results.
-"""
+"""MiniMax H3 training adapter for DiffusionNFT."""
 
 from typing import Optional
 
@@ -55,37 +39,17 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
 
     @classmethod
     def build_scheduler(cls, model_config: DiffusionModelConfig):
-        """Build a rectified-flow scheduler shifted for the video stream.
-
-        DiffusionNFT noises ``latents_clean`` directly and never samples through
-        the scheduler, so it is only used to satisfy the engine contract. Audio
-        uses a separate shift at rollout time; the packed training objective
-        shares the video timestep (Option C, see the RFC).
-
-        Args:
-            model_config: Configuration for the diffusion model.
-
-        Returns:
-            FlowMatchEulerDiscreteScheduler: Scheduler with timesteps set.
-        """
+        """Build the video-shifted rectified-flow scheduler."""
         from diffusers import FlowMatchEulerDiscreteScheduler
 
         pipeline = model_config.pipeline
-        # TODO(gpu-bringup): confirm MiniMax H3 ships a diffusers scheduler config;
-        # if so, prefer FlowMatchEulerDiscreteScheduler.from_pretrained(subfolder="scheduler").
         scheduler = FlowMatchEulerDiscreteScheduler(shift=pipeline.get("video_flow_shift", 12.0))
         cls.set_timesteps(scheduler, model_config, device="cpu")
         return scheduler
 
     @classmethod
     def set_timesteps(cls, scheduler, model_config: DiffusionModelConfig, device: str):
-        """Set the video-stream timesteps on the scheduler.
-
-        Args:
-            scheduler: The scheduler whose timesteps will be set.
-            model_config: Configuration providing the inference-step count.
-            device: Target device.
-        """
+        """Set video-stream timesteps."""
         scheduler.set_timesteps(model_config.pipeline.num_inference_steps, device=device)
 
     @classmethod
@@ -102,31 +66,8 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
         micro_batch: TensorDict,
         step: int,
     ) -> tuple[dict, Optional[dict]]:
-        """Unpack the packed-flat latent into video + audio rows and gather forward inputs.
-
-        The static packed-sequence layout (``token_tags`` / ``position_ids`` / row indices) depends on
-        the per-sample text length, so it is built inside :meth:`forward`; this method only unpacks the
-        two row streams and forwards the raw pieces the loop needs.
-
-        Args:
-            module: The MiniMax H3 transformer module.
-            model_config: Configuration for the diffusion model.
-            latents: Packed-flat noised latent ``xt`` of shape ``(B, Nv * 96 + Na * 32)``.
-            timesteps: Per-sample timestep of shape ``(B,)`` in ``[0, 1000]``.
-            prompt_embeds: Text embeddings of shape ``(B, L, D)``.
-            prompt_embeds_mask: Text-length mask, shape ``(B, L)`` (``None`` -> use the full ``L``).
-            negative_prompt_embeds: Unused; MiniMax H3 is CFG-distilled.
-            negative_prompt_embeds_mask: Unused; MiniMax H3 is CFG-distilled.
-            micro_batch: Micro-batch carrying ``latent_meta`` ``(B, 6)`` =
-                ``[Nv, Na, latent_t, latent_h, latent_w, audio_t]``.
-            step: Current denoising-step index (unused; forward-process objective).
-
-        Returns:
-            tuple[dict, None]: ``(model_inputs, None)`` — no negative branch.
-        """
+        """Unpack joint latents and prepare H3 transformer inputs."""
         del step, negative_prompt_embeds, negative_prompt_embeds_mask
-        # All samples in a micro-batch share one resolution/duration, so read row 0.
-        # reshape(-1) tolerates both (B, 6) and (B, 1, 6) latent_meta layouts.
         meta = micro_batch["latent_meta"][0].reshape(-1).tolist()
         num_video_rows, num_audio_rows = int(meta[0]), int(meta[1])
         video_rows, audio_rows = unpack_video_audio_rows(latents, num_video_rows, num_audio_rows)
@@ -149,24 +90,7 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
         model_inputs: dict,
         negative_model_inputs: Optional[dict] = None,
     ) -> torch.Tensor:
-        """Run the transformer per micro-batch sample and re-pack the dual velocity into packed-flat form.
-
-        The transformer reads one packed sequence whose timestep plan and row layout are shared across
-        the batch (its ``timestep`` / ``token_tags`` / ``position_ids`` carry no batch dim, and it takes
-        no attention mask), so each sample is run on its own — with its sampled ``timestep`` and true
-        text length — and the packed velocities are stacked back to ``(B, ...)``.
-
-        Args:
-            module: The MiniMax H3 transformer module.
-            model_config: Configuration for the diffusion model (unused).
-            model_inputs: Inputs from :meth:`prepare_model_inputs`.
-            negative_model_inputs: Unused; MiniMax H3 is CFG-distilled.
-
-        Returns:
-            torch.Tensor: Packed-flat velocity of shape ``(B, Nv * 96 + Na * 32)``, matching ``xt`` so
-                the shared elementwise loss applies directly. Sign-converted to the diffusers
-                flow-match convention the NFT loss expects (see :func:`.common.h3_velocity_to_flow_match`).
-        """
+        """Run H3 per sample and return packed flow-match velocities."""
         del negative_model_inputs
         video_rows = model_inputs["video_rows"]
         audio_rows = model_inputs["audio_rows"]
@@ -175,7 +99,6 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
         timestep = model_inputs["timestep"]
         meta = model_inputs["latent_meta"]
         device = video_rows.device
-        # The video patch is a fixed checkpoint property; fall back for the CPU-test stub module.
         raw_patch = getattr(getattr(module, "config", None), "patch_size", (1, 2, 2))
         patch_size = (int(raw_patch[0]), int(raw_patch[1]), int(raw_patch[2]))
 
@@ -191,11 +114,6 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
             position_ids, token_tags, video_indices, audio_indices, text_indices, _, _ = build_layout_from_meta(
                 meta, num_text_tokens, patch_size
             )
-            # TODO(gpu-bringup): fl2va keyframe conditioning tags a keyframe's vision-block rows 0 (video)
-            # inside the text stream and passes keyframe_anchors; t2va (this path) tags all text rows 1.
-            # TODO(gpu-bringup): every row shares the sampled timestep (timestep_indices all 0), matching
-            # the engine noising the whole packed latent at one level; real H3 may hold text/conditioning
-            # rows at a distinct clean level, which would make timestep a 2-vector with text -> index 1.
             result = module(
                 hidden_states=video_rows[index : index + 1],
                 audio_hidden_states=audio_rows[index : index + 1],
@@ -226,11 +144,7 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
         scheduler_inputs,
         step: int,
     ):
-        """Not used by DiffusionNFT (a forward-process objective).
-
-        Reverse-sampling log-probabilities belong to policy-gradient algorithms
-        (FlowGRPO/DanceGRPO), which are a separate RFC-0001 milestone.
-        """
+        """Reject reverse-SDE sampling for the forward-process objective."""
         raise NotImplementedError(
             "MiniMaxH3DiffusionNFT is a forward-process objective and does not "
             "sample the reverse SDE. Reverse-sampling (flow_grpo) is a separate milestone."

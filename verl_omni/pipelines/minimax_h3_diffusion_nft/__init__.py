@@ -23,9 +23,6 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 try:
     from .vllm_omni_rollout_adapter import MiniMaxH3DiffusionNFTPipeline
 except (ImportError, RuntimeError, AttributeError) as e:
-    # Warning level: on a GPU box a genuine import bug (vllm API drift, typo) must
-    # be visible; the default WARN level would hide an info-level explanation and the
-    # failure would only surface later as a misleading "not registered" error.
     logger.warning(f"MiniMax H3 DiffusionNFT rollout not available: {e}. GPU/NPU required.")
 
     class _UnavailableModule:

@@ -107,13 +107,20 @@ def _to_pil_hwc(image) -> Image.Image:
 
 
 def _extract_frames(solution_image, frame_interval: int = 1) -> list[Image.Image]:
-    """Split a float tensor in ``[0, 1]`` into PIL frames, channels-last tolerated.
+    """Convert an image or video tensor into sampled PIL frames."""
+    if not isinstance(solution_image, torch.Tensor):
+        raise TypeError(f"solution_image must be a torch.Tensor, got {type(solution_image).__name__}.")
+    if frame_interval <= 0:
+        raise ValueError(f"frame_interval must be positive, got {frame_interval}.")
+    if solution_image.ndim not in (3, 4, 5):
+        raise ValueError(f"solution_image must be 3-D, 4-D, or 5-D, got shape {tuple(solution_image.shape)}.")
 
-    Handles ``(C, H, W)`` (one image), ``(C, T, H, W)`` and ``(B, C, T, H, W)``
-    (video), subsampling the time axis by ``frame_interval``. Mirrors the extractor
-    in ``hpsv3_reward.py`` so both scorers read the same rollout video layout.
-    """
-    is_channels_last = solution_image.shape[-1] in (1, 3) if solution_image.ndim >= 3 else False
+    is_channels_last = solution_image.shape[-1] in (1, 3)
+    channel_dim = (
+        solution_image.shape[-1] if is_channels_last else solution_image.shape[1 if solution_image.ndim == 5 else 0]
+    )
+    if channel_dim not in (1, 3):
+        raise ValueError(f"solution_image must have 1 or 3 channels, got shape {tuple(solution_image.shape)}.")
 
     if solution_image.ndim == 3:
         if is_channels_last:

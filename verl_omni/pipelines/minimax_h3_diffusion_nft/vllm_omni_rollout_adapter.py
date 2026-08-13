@@ -11,23 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MiniMax H3 rollout adapter for DiffusionNFT (GPU-only).
-
-DiffusionNFT trains from the final clean latent with a forward-process
-objective, so rollout does not collect a reverse-SDE trajectory. This adapter
-runs the standard MiniMax H3 generation (``t2va`` / ``fl2va``), captures the
-clean video+audio latents, patchifies them back into DiT rows, packs both
-streams into one flat ``latents_clean`` (see :mod:`.common`), and emits the
-per-sample row/shape metadata the training adapter needs to invert the pack.
-
-This module imports vllm_omni at module scope and is therefore GPU-only; the
-package ``__init__`` guards the import so the training side stays CPU-importable.
-
-Version note: this targets vllm-omni >= 0.26 (``.github/vllm_omni_pin.txt``), which
-dropped ``DiffusionOutput.custom_output``. The adapter still emits ``custom_output`` the
-same way as every sibling; :mod:`verl_omni.pipelines._vllm_omni_compat` re-threads that
-channel at import so the engine and read-sites keep consuming ``result.custom_output``.
-"""
+"""GPU rollout adapter for MiniMax H3 DiffusionNFT."""
 
 import dataclasses
 from typing import Any
@@ -46,7 +30,6 @@ from .common import MiniMaxH3RolloutWeightSyncMixin, pack_video_audio_rows
 
 __all__ = ["MiniMaxH3DiffusionNFTPipeline"]
 
-# Video latent patch size: (temporal, height, width). 24 channels * 1 * 2 * 2 = 96-wide rows.
 _VIDEO_PATCH_SIZE = (1, 2, 2)
 
 
@@ -62,7 +45,13 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
         self._nft_capture: dict[str, Any] | None = None
 
     def diffuse(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the parent denoiser and capture the clean latents + shape metadata."""
+        """Run a t2va denoiser and capture the clean latents + shape metadata."""
+        task = str(kwargs.get("task", "t2va"))
+        if task != "t2va":
+            raise NotImplementedError(
+                f"MiniMax H3 DiffusionNFT supports task='t2va' only, got {task!r}. "
+                "Conditional H3 rows are not yet transported to the actor batch."
+            )
         video_latent, audio_latent = super().diffuse(**kwargs)
         self._nft_capture = {
             "video_latent": video_latent,
@@ -86,8 +75,6 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
         if capture is None:
             return output
 
-        # Patchify the clean latents back into the transformer's row layout so the
-        # packed tensor lives in the same space as the model's velocity prediction.
         video_rows = minimax_h3_patchify_video_latent(capture["video_latent"], patch_size=_VIDEO_PATCH_SIZE)
         audio_rows = minimax_h3_pack_audio_latent(capture["audio_latent"])
         latents_clean = pack_video_audio_rows(video_rows, audio_rows).float()
@@ -128,18 +115,14 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
 
     @staticmethod
     def _build_train_timesteps(capture: dict[str, Any]) -> torch.Tensor:
-        """Return the video-stream sigma schedule (x1000) as a candidate timestep pool.
-
-        DiffusionNFT samples one shared timestep per training step from this pool
-        (Option C). The audio stream uses a different shift at generation time but
-        the packed objective trains at the video timestep. See the RFC.
-        """
+        """Build the video-stream training timestep pool."""
         sigmas = minimax_h3_time_shift_sigmas(
             num_steps=capture["num_steps"],
             shift_scale=capture["video_shift"],
         )
         if len(sigmas) < 2:
             raise ValueError(
-                f"Empty DiffusionNFT train-timestep pool: num_steps={capture['num_steps']} yields {len(sigmas)} sigma(s)."
+                "Empty DiffusionNFT train-timestep pool: "
+                f"num_steps={capture['num_steps']} yields {len(sigmas)} sigma(s)."
             )
         return torch.tensor(sigmas[:-1], dtype=torch.float32) * 1000.0

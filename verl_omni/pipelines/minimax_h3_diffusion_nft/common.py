@@ -11,28 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared dual-stream helpers for the MiniMax H3 pipelines (DiffusionNFT + FlowGRPO).
-
-MiniMax H3 is genuinely dual-stream: the transformer consumes and produces
-separate video token rows (width 96) and audio token rows (width 32). The shared
-diffusion engine and losses operate on a single latent tensor, so rollout packs
-both row streams into one flat vector and the training adapter inverts it, then
-splits the transformer's ``(v_video, v_audio)`` output back apart. Keeping the
-pack/unpack/split here makes rollout and training layouts consistent by
-construction and CPU-testable without diffusers or vllm_omni, and lets the
-DiffusionNFT and FlowGRPO adapters share one layout contract.
-
-The transformer forward reads the packed sequence through a set of static
-structural tensors (``token_tags``, ``position_ids`` and the three row-index
-tensors). :func:`build_packed_sequence` builds them; it is ported verbatim from
-the diffusers ``minimax-h3`` branch (``MiniMaxH3PrepareLayoutStep``) so training
-lays out byte-identical sequences to rollout without importing diffusers. See
-``docs/rfcs/rfc-0001-minimax-h3-fl2va.md``.
-
-:class:`MiniMaxH3RolloutWeightSyncMixin` is shared here for the same reason: both
-rollout adapters receive the trainer's diffusers-named weights and have to translate
-them into the fused vllm layout identically, or the DiT generates from dummy weights.
-"""
+"""Shared MiniMax H3 latent-layout and weight-sync helpers."""
 
 from collections.abc import Iterable, Sequence
 from typing import Any
@@ -40,21 +19,11 @@ from typing import Any
 import numpy as np
 import torch
 
-# DiT row widths: patchified 24-channel video latent with patch (1, 2, 2) -> 96; audio -> 32.
 VIDEO_ROW_WIDTH = 96
 AUDIO_ROW_WIDTH = 32
-
-# Number of leading columns of ``latent_meta`` consumed by the training-side unpack:
-# ``[Nv, Na, latent_t, latent_h, latent_w, audio_t]``.
 LATENT_META_WIDTH = 6
-
-# Packed-sequence modality tags, per the transformer's ``token_tags`` contract.
 VIDEO_TAG, TEXT_TAG, AUDIO_TAG = 0, 1, 2
 
-# Rotary-time constants, ported verbatim from the diffusers minimax-h3 layout builder so training and
-# rollout lay out identical sequences. One latent frame spans 5/3 * frames_per_latent rotary units; the
-# (1, 4, 4, 4, 4) pattern mirrors the VAE's 17-pixel-frames-to-5-latent-frames grouping, and the spatial
-# axes are normalized by the square root of the latent area and scaled by 32.
 _ROPE_FRAME_RESCALE = 5.0 / 3.0
 _ROPE_FRAMES_PER_LATENT = (1, 4, 4, 4, 4)
 _ROPE_SPATIAL_SCALE = 32
@@ -79,54 +48,17 @@ __all__ = [
 
 
 def h3_dit_timestep(timesteps: torch.Tensor) -> torch.Tensor:
-    """Convert diffusers-style timesteps (``sigma * 1000``) to the DiT's own convention.
-
-    MiniMax H3's DiT consumes ``t`` in ``[0, 1]`` as a *data* fraction, not a noise
-    fraction: vllm-omni feeds it ``t = 1 - sigma`` (``denoise_loop.py``, and
-    ``scheduling_minimax_h3_euler_ancestral._validate_unit_timestep`` rejects any pair
-    where ``sigma_curr != 1 - timestep``). Sigmas descend ``1.0 -> 0.0``, so the noisiest
-    step is ``sigma=1`` / ``t=0``. Passing ``sigma`` straight through tells the model it is
-    looking at clean data when it is looking at pure noise.
-
-    Args:
-        timesteps: Timesteps on the diffusers ``[0, 1000]`` scale.
-
-    Returns:
-        The same tensor as DiT timesteps in ``[0, 1]``.
-    """
+    """Convert ``sigma * 1000`` to H3's data-fraction timestep."""
     return 1.0 - timesteps / 1000.0
 
 
 def h3_velocity_to_flow_match(velocity: torch.Tensor) -> torch.Tensor:
-    """Flip a MiniMax H3 velocity into the diffusers flow-match sign convention.
-
-    vllm-omni defines ``x0 = x_t + sigma * v`` (``minimax_h3_rf_v_to_x0``), so H3's
-    velocity is ``x0 - noise``. Every consumer in this tree assumes the opposite
-    ``noise - x0``: the SDE scheduler recovers ``x0 = sample - sigma * model_output``
-    (``schedulers/flow_match_sde.py``) and the DiffusionNFT loss uses
-    ``x0_prediction = xt - t * prediction`` (``trainer/diffusion/diffusion_algos.py``).
-    Feeding the raw velocity therefore steps *away* from the data.
-
-    Args:
-        velocity: A raw DiT velocity row tensor.
-
-    Returns:
-        The negated velocity.
-    """
+    """Convert H3 velocity to the diffusers flow-match sign."""
     return -velocity
 
 
 def pack_video_audio_rows(video_rows: torch.Tensor, audio_rows: torch.Tensor) -> torch.Tensor:
-    """Flatten and concatenate video + audio DiT rows into one packed vector.
-
-    Args:
-        video_rows: video token rows, shape ``(B, Nv, 96)`` or ``(Nv, 96)``.
-        audio_rows: audio token rows, shape ``(B, Na, 32)`` or ``(Na, 32)``.
-
-    Returns:
-        Packed tensor of shape ``(B, Nv * 96 + Na * 32)``. A leading batch dim of
-        1 is added when the inputs are unbatched (the per-request rollout case).
-    """
+    """Flatten and concatenate video and audio rows."""
     if video_rows.ndim == 2:
         video_rows = video_rows.unsqueeze(0)
     if audio_rows.ndim == 2:
@@ -140,17 +72,7 @@ def unpack_video_audio_rows(
     num_video_rows: int,
     num_audio_rows: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Invert :func:`pack_video_audio_rows`.
-
-    Args:
-        packed: packed tensor of shape ``(B, Nv * 96 + Na * 32)``.
-        num_video_rows: ``Nv``, the number of video token rows.
-        num_audio_rows: ``Na``, the number of audio token rows.
-
-    Returns:
-        A pair ``(video_rows, audio_rows)`` of shapes ``(B, Nv, 96)`` and
-        ``(B, Na, 32)``.
-    """
+    """Unpack flattened video and audio rows."""
     batch = packed.shape[0]
     split = num_video_rows * VIDEO_ROW_WIDTH
     video_rows = packed[:, :split].reshape(batch, num_video_rows, VIDEO_ROW_WIDTH)
@@ -159,19 +81,7 @@ def unpack_video_audio_rows(
 
 
 def split_dual_velocity(result) -> tuple[torch.Tensor, torch.Tensor]:
-    """Split a MiniMax H3 transformer output into ``(v_video, v_audio)`` rows.
-
-    Args:
-        result: The transformer forward output. With ``return_dict=False`` it is a
-            2-tuple/list ``(v_video, v_audio)``; with ``return_dict=True`` it is a
-            ``MiniMaxH3TransformerOutput`` exposing ``sample`` / ``audio_sample``.
-
-    Returns:
-        A pair ``(v_video, v_audio)`` of the video and audio velocity tensors.
-
-    Raises:
-        TypeError: If *result* is neither a tuple/list nor a sample/audio_sample container.
-    """
+    """Split a transformer output into video and audio velocity rows."""
     if isinstance(result, tuple | list):
         return result[0], result[1]
     if hasattr(result, "sample") and hasattr(result, "audio_sample"):
@@ -180,12 +90,7 @@ def split_dual_velocity(result) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _spatial_position_grid(dim: int, patch: int, sqrt_area: float) -> torch.Tensor:
-    """One aspect-normalized spatial rotary axis: ``dim // patch`` coords on ``[0, 32)`` for a square canvas.
-
-    Built with numpy because ``np.linspace(..., endpoint=False)`` is
-    ``start + arange(num) * (stop - start) / num`` (not ``torch.linspace``), and the
-    float64 grid has to be reproduced exactly.
-    """
+    """Build one aspect-normalized spatial rotary axis."""
     ratio = dim / sqrt_area
     left = (1.0 - ratio) / 2.0
     grid = np.linspace(left, left + ratio, dim // patch, endpoint=False) * _ROPE_SPATIAL_SCALE
@@ -227,30 +132,7 @@ def build_packed_sequence(
     video_tag: int = VIDEO_TAG,
     keyframe_anchors: tuple[str, ...] = (),
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
-    """Build the ``[text | keyframe conditions | target audio | target video]`` packed layout.
-
-    Ported verbatim from the diffusers ``minimax-h3`` branch ``MiniMaxH3PrepareLayoutStep`` so training
-    and rollout produce byte-identical structural tensors. This is the ``t2va`` / ``fl2va`` layout.
-
-    Args:
-        text_token_tags: modality tag of every text row, shape ``(num_text_tokens,)``. Text is ``1``
-            except the rows of a keyframe's vision block, which are tagged ``0`` (video).
-        num_latent_frames: number of target latent frames.
-        latent_height: target latent height.
-        latent_width: target latent width.
-        num_audio_latents: number of target audio latents per channel.
-        patch_size: the transformer's ``(t, h, w)`` patch.
-        audio_channels: channels the soundtrack is packed channel-major over.
-        audio_tag: modality tag an audio row carries.
-        video_tag: modality tag a video row carries.
-        keyframe_anchors: one entry per keyframe conditioning block, in packed order — ``"first"`` anchors
-            it at the first latent frame, ``"last"`` at the last.
-
-    Returns:
-        ``position_ids`` ``(seq_len, 3)`` float64, ``token_tags`` ``(seq_len,)``, ``video_indices``,
-        ``audio_indices``, ``text_indices``, and the number of leading video and audio rows that are
-        conditioning rather than generated.
-    """
+    """Build the packed H3 text, condition, audio, and video layout."""
     _, patch_h, patch_w = patch_size
     rows_per_frame = (latent_height // patch_h) * (latent_width // patch_w)
     num_text_tokens = text_token_tags.shape[0]
@@ -263,8 +145,6 @@ def build_packed_sequence(
     audio_start = condition_start + num_condition_rows
     video_start = audio_start + num_audio_rows
 
-    # 1. The (t, h, w) grid. Text rows sit on the time axis at their row index, and the media rows
-    # continue the time axis from there, so text length shifts the whole media clock.
     position_ids = torch.zeros(sequence_length, 3, dtype=torch.float64)
     position_ids[:num_text_tokens, 0] = torch.arange(num_text_tokens, dtype=torch.float64)
 
@@ -274,8 +154,6 @@ def build_packed_sequence(
         if anchor == "first":
             anchor_time = float(num_text_tokens)
         elif anchor == "last":
-            # The rotary time the generated frames span, summed by numpy's pairwise summation because that
-            # is how the reference computes this anchor.
             spans = np.ones(num_latent_frames, dtype=np.float64) * _ROPE_FRAME_RESCALE
             for offset in range(len(_ROPE_FRAMES_PER_LATENT)):
                 spans[offset :: len(_ROPE_FRAMES_PER_LATENT)] *= _ROPE_FRAMES_PER_LATENT[offset]
@@ -286,8 +164,6 @@ def build_packed_sequence(
         position_ids[rows, 0] = anchor_time
         position_ids[rows, 1:] = frame_grid
 
-    # Audio rows are channel-major and share the video's rotary clock: one unit per latent at 40 latents/s
-    # equals 24 fps * 5/3. They carry no height coordinate and are pinned to the two extremes of the width grid.
     audio_time = float(num_text_tokens) + torch.arange(num_audio_latents, dtype=torch.float64)
     position_ids[audio_start:video_start, 0] = audio_time.repeat(audio_channels)
     position_ids[audio_start:video_start, 2] = torch.cat(
@@ -302,7 +178,6 @@ def build_packed_sequence(
     video_position_ids[:, :, 1:] = frame_grid[None]
     position_ids[video_start:] = video_position_ids.reshape(-1, 3)
 
-    # 2. Row indices and modality tags.
     video_indices = torch.cat([torch.arange(condition_start, audio_start), torch.arange(video_start, sequence_length)])
     audio_indices = torch.arange(audio_start, video_start)
     text_indices = torch.arange(num_text_tokens)
@@ -321,24 +196,7 @@ def build_layout_from_meta(
     patch_size: tuple[int, int, int] = (1, 2, 2),
     keyframe_anchors: tuple[str, ...] = (),
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
-    """Derive :func:`build_packed_sequence` arguments from a ``latent_meta`` row and call it.
-
-    The training adapter only carries the per-sample grid dims through ``latent_meta``
-    ``[Nv, Na, latent_t, latent_h, latent_w, audio_t]`` and the text length; this rebuilds the full
-    static layout the transformer forward reads by name.
-
-    Args:
-        meta: one ``latent_meta`` row ``[Nv, Na, latent_t, latent_h, latent_w, audio_t]``.
-        num_text_tokens: the sample's true (unpadded) text length; ``t2va`` tags them all ``TEXT_TAG``.
-        patch_size: the transformer's ``(t, h, w)`` patch (video defaults to ``(1, 2, 2)``).
-        keyframe_anchors: keyframe conditioning blocks (``fl2va``); empty for ``t2va``.
-
-    Returns:
-        The 7-tuple returned by :func:`build_packed_sequence`.
-
-    Raises:
-        ValueError: if ``audio_t`` is non-positive, or the derived layout row counts disagree with ``meta``.
-    """
+    """Build an H3 layout from latent metadata and text length."""
     num_video_rows, num_audio_rows = int(meta[0]), int(meta[1])
     num_latent_frames, latent_height, latent_width = int(meta[2]), int(meta[3]), int(meta[4])
     num_audio_latents = int(meta[5])
@@ -375,33 +233,7 @@ def build_row_timesteps(
     condition_video_timestep: float,
     condition_audio_timestep: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Assign a timestep to every packed row, then reduce to the transformer's ``(timestep, timestep_indices)``.
-
-    Ported verbatim from the diffusers ``minimax-h3`` branch. One forward serves rows sitting at different
-    noise levels: generated video and audio rows step down their own schedules (so are at distinct levels),
-    conditioning rows stay pinned at their augmentation level, and text rows inherit the video timestep (the
-    default fill — they never reach an output head). The transformer only needs the *distinct* timesteps plus
-    a per-row index into them, which is what ``torch.unique(..., return_inverse=True)`` yields.
-
-    ``diffusion_nft`` (Option C) noises the whole packed latent at one level, so ``video_timestep`` and
-    ``audio_timestep`` coincide and this collapses to one distinct value with all indices ``0``. ``flow_grpo``
-    reverses two schedules, so the two differ and this returns two distinct values with per-modality routing.
-
-    Args:
-        video_indices: packed row positions of the video rows, shape ``(Nv,)``.
-        audio_indices: packed row positions of the audio rows, shape ``(Na,)``.
-        num_condition_video_rows: leading video rows that are keyframe conditioning (``0`` for ``t2va``).
-        num_condition_audio_rows: leading audio rows that are audio-reference conditioning (``0`` for ``t2va``).
-        num_text_tokens: number of text rows (they inherit ``video_timestep``).
-        video_timestep: noise level of the generated video rows and text rows.
-        audio_timestep: noise level of the generated audio rows.
-        condition_video_timestep: noise level of the conditioning video rows (unused when there are none).
-        condition_audio_timestep: noise level of the conditioning audio rows (unused when there are none).
-
-    Returns:
-        ``timestep`` ``(num_distinct,)`` — the sorted distinct timesteps — and ``timestep_indices``
-        ``(seq_len,)`` — the index of every packed row into ``timestep``.
-    """
+    """Build distinct H3 timesteps and per-row indices."""
     sequence_length = int(video_indices.numel() + audio_indices.numel() + num_text_tokens)
     row_timesteps = torch.full((sequence_length,), video_timestep, dtype=torch.float32)
     row_timesteps[video_indices[:num_condition_video_rows]] = condition_video_timestep
@@ -410,14 +242,6 @@ def build_row_timesteps(
     return torch.unique(row_timesteps, sorted=True, return_inverse=True)
 
 
-# The trainer holds diffusers' MiniMaxH3Transformer3DModel; vllm serves the fused
-# MiniMaxH3DiTModel. Their weights are numerically identical, but four structural
-# differences need bridging when the base weight sync streams diffusers-named params:
-# a set of pure renames, the two GEGLU halves of ff.net.0.proj swapped, separate
-# q/k/v projections packed per-head-interleaved into one qkv_proj, and the fixed
-# rope.inv_freq buffer -- which the vllm DiT carries but diffusers computes on the
-# fly, so it is absent from the stream and must be synthesized. Verified maxdiff=0
-# against both on-disk checkpoints.
 _TOPLEVEL_RENAMES = (
     ("audio_proj_in", "audio_patch_proj"),
     ("audio_proj_out", "final_layer.audio_out"),
@@ -445,32 +269,9 @@ def _diffusers_to_vllm_name(name: str) -> str:
     return name
 
 
-# ---------------------------------------------------------------------------
-# LoRA delta mapping (the add_lora path).
-#
-# The trainer pushes peft-named LoRA tensors (``transformer_blocks.N.attn.to_q.lora_A.weight``)
-# while the fused vllm DiT exposes ``blocks.N.attn.qkv_proj`` / ``out_proj`` / ``mlp.fc1`` /
-# ``mlp.fc2``. Without translation the LoRA manager's target matching finds zero modules and
-# the adapter silently applies to nothing (base-identical rollout). q/k/v keep their
-# sub-names: the manager binds them into the fused qkv_proj slices via
-# ``stacked_params_mapping`` (the runtime qkv weight is contiguous [q|k|v] -- vllm's weight
-# loader de-interleaves the on-disk per-head groups at load time).
-#
-# ``mlp.fc1`` (merged GEGLU) is split into per-slice sub-LoRAs ``fc1_0``/``fc1_1``: the
-# manager's fused-single-LoRA path checks ``lora_B.shape[0]`` against the TP-local
-# ``output_slices`` and skips the layer under tensor parallelism, while the packed
-# sub-LoRA path shards correctly through vllm's set_lora narrowing. lora_B rows get the
-# same GEGLU half-swap as the base stream before splitting (slice 0 = diffusers' second
-# half); lora_A is shared by both slices and is never swapped.
-# ---------------------------------------------------------------------------
-
-# vllm-side target modules written into the pushed peft_config. q/k/v and the fc1 slices
-# stay sub-named so the packed fallback in _replace_layers_with_lora matches qkv_proj/fc1
-# via their sublayer suffixes.
 _LORA_VLLM_TARGET_MODULES = ["to_q", "to_k", "to_v", "out_proj", "fc1_0", "fc1_1", "fc2"]
+_SUPPORTED_DIFFUSERS_LORA_TARGETS = frozenset({"to_q", "to_k", "to_v", "to_out.0", "ff.net.0.proj", "ff.net.2"})
 
-# Declared on the vllm DiT so DiffusionLoRAManager derives the packed sublayer suffixes
-# qkv_proj -> [to_q, to_k, to_v] and fc1 -> [fc1_0, fc1_1].
 _LORA_STACKED_PARAMS_MAPPING = [
     (".qkv_proj", ".to_q", "q"),
     (".qkv_proj", ".to_k", "k"),
@@ -486,22 +287,10 @@ def _map_lora_module_to_vllm(module: str) -> str:
 
 
 class MiniMaxH3RolloutWeightSyncMixin:
-    """Bridge the trainer's diffusers weight names and prompt token ids to the vllm H3 pipeline.
-
-    Mix in ahead of ``MiniMaxH3Pipeline`` so ``load_weights`` intercepts the base weight
-    sync. Carries no constructor state -- the q/k/v partial buffer is created on first use
-    -- so the rollout adapters need no cooperative ``__init__``.
-    """
+    """Map Diffusers H3 weights and prompts to vLLM-Omni."""
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Translate diffusers-named base weights into fused-vllm names, then load.
-
-        The base weight sync streams the trainer's diffusers checkpoint prefixed with
-        ``transformer.``, in buckets that may split one block's q/k/v across calls.
-        Rename, GEGLU-swap ``ff.net.0.proj``, and per-head-interleave q/k/v into
-        ``qkv_proj`` before delegating to the parent's exact-name loader. LoRA deltas
-        (``lora_`` names) arrive through a separate ``add_lora`` path.
-        """
+        """Translate Diffusers weights into the fused vLLM H3 layout."""
         arch = self.transformer.arch
         heads, head_dim, ff_half = arch.num_attention_heads, arch.attention_head_dim, arch.ffn_hidden_size
         partials = getattr(self, "_qkv_buffer", None)
@@ -531,23 +320,19 @@ class MiniMaxH3RolloutWeightSyncMixin:
                 translated.append((f"transformer.{vname}", swapped))
                 continue
             translated.append((f"transformer.{_diffusers_to_vllm_name(inner)}", tensor))
-        # Synthesize the fixed 3D-RoPE frequency table. diffusers computes it on the fly so
-        # it never reaches this stream, and the vllm buffer is registered uninitialized, so
-        # skipping it silently scrambles RoPE. Matches the on-disk vllm checkpoint's
-        # 10000**-(arange(0, 2L, 2) / 2L) to 3.7e-09.
-        rope_len = arch.rope_inv_freq_len
-        inv_freq = 10000.0 ** (-(torch.arange(0, 2 * rope_len, 2, dtype=torch.float32) / (2 * rope_len)))
-        translated.append(("transformer.rope.inv_freq", inv_freq))
-        return super().load_weights(translated)
+        needs_rope = not getattr(self, "_rope_inv_freq_loaded", False)
+        if needs_rope:
+            rope_len = arch.rope_inv_freq_len
+            inv_freq = 10000.0 ** (-(torch.arange(0, 2 * rope_len, 2, dtype=torch.float32) / (2 * rope_len)))
+            translated.append(("transformer.rope.inv_freq", inv_freq))
+
+        loaded = super().load_weights(translated)
+        if needs_rope and "transformer.rope.inv_freq" in loaded:
+            self._rope_inv_freq_loaded = True
+        return loaded
 
     def _install_lora_layout(self) -> None:
-        """Declare the qkv packing on the vllm DiT for the LoRA manager (idempotent).
-
-        ``DiffusionLoRAManager`` derives its packed-module mapping from
-        ``stacked_params_mapping`` at construction; the stock MiniMaxH3DiTModel does
-        not define one (its loader uses custom weight loaders), so without this the
-        manager cannot bind to_q/to_k/to_v sub-LoRAs into the fused qkv_proj.
-        """
+        """Install H3 QKV and FC1 LoRA slice metadata."""
         transformer = getattr(self, "transformer", None)
         if transformer is not None and not getattr(transformer, "stacked_params_mapping", None):
             transformer.stacked_params_mapping = list(_LORA_STACKED_PARAMS_MAPPING)
@@ -555,15 +340,23 @@ class MiniMaxH3RolloutWeightSyncMixin:
     def map_lora_update_to_engine(
         self, tensors: dict[str, torch.Tensor], peft_config: dict
     ) -> tuple[dict[str, torch.Tensor], dict]:
-        """Translate trainer-pushed LoRA deltas to the fused-vllm layout.
+        """Translate LoRA deltas to the fused vLLM H3 layout."""
+        target_modules = peft_config.get("target_modules") if peft_config is not None else None
+        if isinstance(target_modules, str):
+            requested_targets = {target_modules}
+        elif isinstance(target_modules, list | tuple | set | frozenset):
+            requested_targets = {str(target) for target in target_modules}
+        else:
+            raise ValueError(f"MiniMax H3 LoRA sync requires an explicit target_modules list; got {target_modules!r}.")
+        unsupported_targets = requested_targets - _SUPPORTED_DIFFUSERS_LORA_TARGETS
+        if unsupported_targets:
+            raise ValueError(
+                "MiniMax H3 LoRA rollout sync supports only transformer/refiner block targets "
+                f"{sorted(_SUPPORTED_DIFFUSERS_LORA_TARGETS)}, got unsupported targets "
+                f"{sorted(unsupported_targets)}. In particular, `all-linear` is unsafe: it trains top-level "
+                "LoRAs that FSDP layered-summon does not transport to rollout."
+            )
 
-        Called from the rollout-side ``_load_adapter`` hijack before the tensors and
-        peft config reach ``LoRAModel.from_lora_tensors``. Renames the module paths
-        (dropping any peft/FSDP prefix), splits the merged-GEGLU ``fc1`` LoRA into
-        per-slice sub-LoRAs (``fc1_0``/``fc1_1``, GEGLU half-swap applied to lora_B
-        rows first), and rewrites ``target_modules`` to vllm-side names so the
-        manager's layer wrapping matches real modules.
-        """
         ff_half = self.transformer.arch.ffn_hidden_size
         mapped: dict[str, torch.Tensor] = {}
         for name, tensor in tensors.items():
@@ -574,22 +367,20 @@ class MiniMaxH3RolloutWeightSyncMixin:
                 continue
             suffix = ".lora_A.weight" if is_lora_a else ".lora_B.weight"
             module = name[: -len(suffix)]
-            # Drop peft/FSDP prefixes (base_model.model., _fsdp_wrapped_module., ...):
-            # keep the structural path from the first blocks anchor.
-            anchors = [a for a in (module.find("transformer_blocks."), module.find("token_refiner.refiner_blocks.")) if a >= 0]
+            anchors = [
+                a for a in (module.find("transformer_blocks."), module.find("token_refiner.refiner_blocks.")) if a >= 0
+            ]
             if not anchors:
                 mapped[name] = tensor
                 continue
             module = module[min(anchors) :]
             if ".ff.net.0.proj" in module:
-                # Merged GEGLU fc1: swap halves (vllm order) then split per slice.
                 base = _diffusers_to_vllm_name(module + ".")[:-1].replace(".ff.net.0.proj", ".mlp.fc1")
                 if is_lora_b:
                     swapped = torch.cat([tensor[ff_half:], tensor[:ff_half]], dim=0)
                     mapped[f"transformer.{base}_0{suffix}"] = swapped[:ff_half].contiguous()
                     mapped[f"transformer.{base}_1{suffix}"] = swapped[ff_half:].contiguous()
                 else:
-                    # lora_A is shared by both slices; no swap on the input side.
                     mapped[f"transformer.{base}_0{suffix}"] = tensor
                     mapped[f"transformer.{base}_1{suffix}"] = tensor
                 continue
@@ -601,15 +392,7 @@ class MiniMaxH3RolloutWeightSyncMixin:
         return mapped, new_config
 
     def _ensure_prompt_text(self, request: Any) -> None:
-        """Fill ``prompts[0]["prompt"]`` from the request's token ids.
-
-        The agent loop renders the caption via the custom chat template, tokenizes
-        it, and the server forwards only ``prompt_token_ids`` (no decoded text) so
-        pipelines never re-encode. But the H3 pipeline's text encoder consumes the
-        caption *string* (``encode_prompt`` re-tokenizes with the same
-        ``self.tokenizer``), so decode the ids back here. H3 is CFG-distilled, so
-        there is no negative branch to decode.
-        """
+        """Decode request token IDs for the H3 text encoder."""
         prompts = getattr(request, "prompts", None)
         if not prompts or not isinstance(prompts[0], dict):
             return

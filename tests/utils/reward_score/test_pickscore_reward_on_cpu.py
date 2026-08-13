@@ -176,6 +176,24 @@ def test_extract_frames_handles_image_and_video_shapes():
     assert all(isinstance(frame, Image.Image) for frame in single + video + subsampled + batched)
 
 
+@pytest.mark.parametrize(
+    ("value", "error"),
+    [
+        (torch.rand(2, 2), ValueError),
+        (torch.rand(2, 4, 2, 2), ValueError),
+        (torch.rand(3, 2, 2).numpy(), TypeError),
+    ],
+)
+def test_extract_frames_rejects_invalid_inputs(value, error):
+    with pytest.raises(error):
+        pickscore_reward._extract_frames(value)
+
+
+def test_extract_frames_rejects_nonpositive_interval():
+    with pytest.raises(ValueError, match="frame_interval must be positive"):
+        pickscore_reward._extract_frames(torch.rand(3, 2, 2), frame_interval=0)
+
+
 class _CountingInferencer:
     def __init__(self):
         self.batches = []

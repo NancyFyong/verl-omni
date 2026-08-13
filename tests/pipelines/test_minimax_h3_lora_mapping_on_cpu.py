@@ -11,18 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests for the MiniMax H3 LoRA name mapping (rollout weight sync).
-
-The trainer pushes peft-named LoRA deltas; the fused vllm DiT exposes different
-module names (qkv_proj / out_proj / mlp.fc1 / mlp.fc2). These tests pin the
-translation in ``MiniMaxH3RolloutWeightSyncMixin.map_lora_update_to_engine``
-and its interplay with vllm-omni's ``_match_target_modules``.
-"""
+"""CPU tests for MiniMax H3 LoRA mapping."""
 
 from types import SimpleNamespace
 
-import torch
 import pytest
+import torch
 
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     _LORA_STACKED_PARAMS_MAPPING,
@@ -30,7 +24,7 @@ from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     MiniMaxH3RolloutWeightSyncMixin,
 )
 
-FFN_HALF = 16  # fake ffn_hidden_size (vllm fc1 output is 2*FFN_HALF)
+FFN_HALF = 16
 RANK = 4
 HIDDEN = 8
 
@@ -42,12 +36,16 @@ def _make_mixin() -> MiniMaxH3RolloutWeightSyncMixin:
 
 
 def _trainer_lora_tensors(block: str = "transformer_blocks.3") -> dict[str, torch.Tensor]:
-    """peft-style names as pushed by the trainer (with base_model.model. prefix)."""
+    """Build a PEFT-style LoRA state dict."""
     prefix = f"base_model.model.{block}"
     tensors = {}
     for mod, out_f in [
-        ("attn.to_q", HIDDEN), ("attn.to_k", HIDDEN), ("attn.to_v", HIDDEN),
-        ("attn.to_out.0", HIDDEN), ("ff.net.0.proj", 2 * FFN_HALF), ("ff.net.2", HIDDEN),
+        ("attn.to_q", HIDDEN),
+        ("attn.to_k", HIDDEN),
+        ("attn.to_v", HIDDEN),
+        ("attn.to_out.0", HIDDEN),
+        ("ff.net.0.proj", 2 * FFN_HALF),
+        ("ff.net.2", HIDDEN),
     ]:
         tensors[f"{prefix}.{mod}.lora_A.weight"] = torch.randn(RANK, HIDDEN)
         tensors[f"{prefix}.{mod}.lora_B.weight"] = torch.randn(out_f, RANK)
@@ -84,7 +82,8 @@ class TestLoraNameMapping:
         assert "transformer.token_refiner.blocks.1.attn.to_q.lora_A.weight" in mapped
 
     def test_prefixes_dropped(self):
-        tensors = {"_fsdp_wrapped_module.base_model.model.transformer_blocks.0.attn.to_q.lora_A.weight": torch.randn(RANK, HIDDEN)}
+        name = "_fsdp_wrapped_module.base_model.model.transformer_blocks.0.attn.to_q.lora_A.weight"
+        tensors = {name: torch.randn(RANK, HIDDEN)}
         mapped, _ = _make_mixin().map_lora_update_to_engine(tensors, _peft_config())
         assert list(mapped) == ["transformer.blocks.0.attn.to_q.lora_A.weight"]
 
@@ -110,6 +109,19 @@ class TestLoraNameMapping:
         _, config = _make_mixin().map_lora_update_to_engine(_trainer_lora_tensors(), _peft_config())
         assert config["target_modules"] == _LORA_VLLM_TARGET_MODULES
         assert config["r"] == RANK  # other fields untouched
+
+    @pytest.mark.parametrize(
+        "target_modules",
+        [
+            "all-linear",
+            ["to_q", "adaln_proj.linear"],
+            ["to_q", "proj_in"],
+        ],
+    )
+    def test_rejects_targets_not_transportable_by_layered_summon(self, target_modules):
+        config = {**_peft_config(), "target_modules": target_modules}
+        with pytest.raises(ValueError, match="all-linear|unsupported targets"):
+            _make_mixin().map_lora_update_to_engine({}, config)
 
     def test_non_lora_names_pass_through(self):
         tensors = {"some_unrelated.weight": torch.randn(2, 2)}

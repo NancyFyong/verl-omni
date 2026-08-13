@@ -33,4 +33,8 @@ run_test 5 "visual reward manager" \
     env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" \
     pytest -s tests/reward_loop/test_visual_reward_manager.py
 
+run_test 6 "MiniMax H3 LoRA actor-to-rollout TP=2 sync" \
+    env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" NUM_GPUS="${NUM_GPUS}" \
+    bash tests/special_e2e/run_minimax_h3_lora_sync_tp2.sh
+
 gpu_smoke_summary
