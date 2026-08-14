@@ -15,6 +15,7 @@
 import logging
 import os
 
+from .agent_loop import MiniMaxH3DiffusionSingleTurnAgentLoop
 from .diffusers_training_adapter import MiniMaxH3DiffusionNFT
 
 logger = logging.getLogger(__name__)
@@ -34,4 +35,8 @@ except (ImportError, RuntimeError, AttributeError) as e:
 
     MiniMaxH3DiffusionNFTPipeline = _UnavailableModule()
 
-__all__ = ["MiniMaxH3DiffusionNFT", "MiniMaxH3DiffusionNFTPipeline"]
+__all__ = [
+    "MiniMaxH3DiffusionNFT",
+    "MiniMaxH3DiffusionNFTPipeline",
+    "MiniMaxH3DiffusionSingleTurnAgentLoop",
+]

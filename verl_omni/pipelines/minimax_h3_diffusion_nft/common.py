@@ -13,7 +13,9 @@
 # limitations under the License.
 """Shared MiniMax H3 latent-layout and weight-sync helpers."""
 
+import json
 from collections.abc import Iterable, Sequence
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -40,6 +42,8 @@ __all__ = [
     "split_dual_velocity",
     "h3_dit_timestep",
     "h3_velocity_to_flow_match",
+    "prepare_h3_processor_files",
+    "keyframe_indices_to_anchors",
     "build_packed_sequence",
     "build_layout_from_meta",
     "build_row_timesteps",
@@ -55,6 +59,31 @@ def h3_dit_timestep(timesteps: torch.Tensor) -> torch.Tensor:
 def h3_velocity_to_flow_match(velocity: torch.Tensor) -> torch.Tensor:
     """Convert H3 velocity to the diffusers flow-match sign."""
     return -velocity
+
+
+def prepare_h3_processor_files(model_path: str) -> str:
+    """Add the model type omitted from the official H3 processor directory."""
+    processor_dir = Path(model_path) / "processor"
+    if not processor_dir.is_dir():
+        raise FileNotFoundError(f"MiniMax H3 processor directory not found: {processor_dir}")
+    config_path = processor_dir / "config.json"
+    if not config_path.is_file():
+        config_path.write_text(json.dumps({"model_type": "qwen3_vl"}), encoding="utf-8")
+    return str(processor_dir)
+
+
+def keyframe_indices_to_anchors(frame_indices: Sequence[int]) -> tuple[str, ...]:
+    """Map vLLM-Omni's FL2VA frame-index signatures to Actor anchors."""
+    signature = tuple(int(index) for index in frame_indices)
+    mapping = {
+        (): (),
+        (0,): ("first",),
+        (-1,): ("last",),
+        (0, -1): ("first", "last"),
+    }
+    if signature not in mapping:
+        raise ValueError(f"MiniMax H3 FL2VA frame_indices must be [0], [-1], or [0, -1], got {list(signature)}.")
+    return mapping[signature]
 
 
 def pack_video_audio_rows(video_rows: torch.Tensor, audio_rows: torch.Tensor) -> torch.Tensor:
@@ -195,17 +224,24 @@ def build_layout_from_meta(
     num_text_tokens: int,
     patch_size: tuple[int, int, int] = (1, 2, 2),
     keyframe_anchors: tuple[str, ...] = (),
+    text_token_tags: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
-    """Build an H3 layout from latent metadata and text length."""
+    """Build an H3 layout from target metadata and optional FL2VA anchors."""
     num_video_rows, num_audio_rows = int(meta[0]), int(meta[1])
     num_latent_frames, latent_height, latent_width = int(meta[2]), int(meta[3]), int(meta[4])
     num_audio_latents = int(meta[5])
     if num_audio_latents <= 0:
         raise ValueError(f"latent_meta audio_t must be positive, got {num_audio_latents}.")
     audio_channels = num_audio_rows // num_audio_latents
+    if text_token_tags is None:
+        text_token_tags = torch.full((num_text_tokens,), TEXT_TAG, dtype=torch.long)
+    else:
+        text_token_tags = text_token_tags.reshape(-1)[:num_text_tokens].to(dtype=torch.long, device="cpu")
+        if text_token_tags.numel() != num_text_tokens:
+            raise ValueError(f"Expected {num_text_tokens} MiniMax H3 text token tags, got {text_token_tags.numel()}.")
 
     layout = build_packed_sequence(
-        text_token_tags=torch.full((num_text_tokens,), TEXT_TAG, dtype=torch.long),
+        text_token_tags=text_token_tags,
         num_latent_frames=num_latent_frames,
         latent_height=latent_height,
         latent_width=latent_width,
@@ -214,11 +250,12 @@ def build_layout_from_meta(
         audio_channels=audio_channels,
         keyframe_anchors=keyframe_anchors,
     )
-    _, _, video_indices, audio_indices, *_ = layout
+    _, _, video_indices, audio_indices, _, num_condition_rows, _ = layout
     if audio_indices.shape[0] != num_audio_rows:
         raise ValueError(f"Derived {audio_indices.shape[0]} audio rows, latent_meta says {num_audio_rows}.")
-    if not keyframe_anchors and video_indices.shape[0] != num_video_rows:
-        raise ValueError(f"Derived {video_indices.shape[0]} video rows, latent_meta says {num_video_rows}.")
+    derived_target_rows = video_indices.shape[0] - num_condition_rows
+    if derived_target_rows != num_video_rows:
+        raise ValueError(f"Derived {derived_target_rows} target video rows, latent_meta says {num_video_rows}.")
     return layout
 
 
@@ -287,7 +324,56 @@ def _map_lora_module_to_vllm(module: str) -> str:
 
 
 class MiniMaxH3RolloutWeightSyncMixin:
-    """Map Diffusers H3 weights and prompts to vLLM-Omni."""
+    """Map Diffusers H3 weights and token-id-native prompts to vLLM-Omni."""
+
+    def encode_prompt(self, *, task: str, prompt: str, image=None, images=None, **kwargs):
+        """Encode Agent Loop IDs while letting vLLM-Omni build FL2VA vision spans."""
+        prompt_ids = getattr(self, "_h3_prompt_ids", None)
+        if prompt_ids is None or task not in {"t2va", "fl2va"}:
+            return super().encode_prompt(task=task, prompt=prompt, image=image, images=images, **kwargs)
+
+        from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _broadcast_tensor, _dit_rank_world
+        from vllm_omni.diffusion.models.minimax_h3.presentation import (
+            minimax_h3_multi_image_presentation_ids,
+            minimax_h3_multi_image_presentation_token_tags,
+        )
+
+        _, rank, _ = _dit_rank_world()
+        hidden = None
+        tags = None
+        ids = None
+        vision_kwargs: dict[str, torch.Tensor] = {}
+        condition_images = list(images) if images is not None else ([image] if image is not None else [])
+        if rank == 0:
+            if task == "t2va":
+                ids = prompt_ids
+                tags = torch.ones(ids.shape[0], dtype=torch.long)
+            else:
+                if not condition_images:
+                    raise ValueError("MiniMax H3 FL2VA requires at least one condition image.")
+                vision = self.processor.image_processor(images=condition_images, return_tensors="pt")
+                image_grid = vision["image_grid_thw"]
+                merge = int(self.processor.image_processor.merge_size) ** 2
+                image_token_counts = [int(grid.prod().item()) // merge for grid in image_grid]
+                prefix_ids = minimax_h3_multi_image_presentation_ids(
+                    self.tokenizer, prompt="", image_token_counts=image_token_counts
+                )
+                prefix_tags = minimax_h3_multi_image_presentation_token_tags(
+                    self.tokenizer, prompt="", image_token_counts=image_token_counts
+                )
+                ids = torch.cat([prefix_ids, prompt_ids])
+                tags = torch.cat([prefix_tags, torch.ones(prompt_ids.shape[0], dtype=torch.long)])
+                vision_kwargs = {
+                    "pixel_values": vision["pixel_values"],
+                    "image_grid_thw": image_grid,
+                }
+
+        if rank < self.text_encoder_tp_size:
+            ids = self._distribute_encode_inputs(ids, vision_kwargs)
+            hidden = self._encode_text_hidden(ids, vision_kwargs)
+        hidden = _broadcast_tensor(hidden, dtype=torch.bfloat16, device=self.device)
+        tags = _broadcast_tensor(tags, dtype=torch.long, device=self.device)
+        return hidden, tags
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Translate Diffusers weights into the fused vLLM H3 layout."""
@@ -392,13 +478,12 @@ class MiniMaxH3RolloutWeightSyncMixin:
         return mapped, new_config
 
     def _ensure_prompt_text(self, request: Any) -> None:
-        """Decode request token IDs for the H3 text encoder."""
+        """Expose pre-tokenized IDs and satisfy the upstream non-empty-text check."""
+        self._h3_prompt_ids = None
         prompts = getattr(request, "prompts", None)
         if not prompts or not isinstance(prompts[0], dict):
             return
         custom_prompt = prompts[0]
-        if custom_prompt.get("prompt"):
-            return
         token_ids = custom_prompt.get("prompt_token_ids")
         if token_ids is None:
             return
@@ -406,6 +491,7 @@ class MiniMaxH3RolloutWeightSyncMixin:
             token_ids = token_ids.detach().cpu().tolist()
         if token_ids and isinstance(token_ids[0], list):
             token_ids = token_ids[0]
-        text = self.tokenizer.decode([int(t) for t in token_ids], skip_special_tokens=True).strip()
-        if text:
-            custom_prompt["prompt"] = text
+        self._h3_prompt_ids = torch.as_tensor([int(token) for token in token_ids], dtype=torch.long)
+        if self._h3_prompt_ids.numel() == 0:
+            raise ValueError("MiniMax H3 requires non-empty prompt_token_ids.")
+        custom_prompt["prompt"] = "[pretokenized]"

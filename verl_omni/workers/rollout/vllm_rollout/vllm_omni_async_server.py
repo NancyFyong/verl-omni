@@ -577,6 +577,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             )
 
         # diffusion
+        request_output = None if final_res is None else getattr(final_res, "request_output", None)
         # Handle aborted requests: the engine may yield a terminal output with
         # finish_reason="abort" and no images (e.g. when abort_all_requests
         # synthesizes an abort OutputMessage to unblock the generate() coroutine).
@@ -584,8 +585,8 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         # can retry the whole sample.
         if final_res is None or not final_res.images:
             finish_reason = "abort"
-            if final_res is not None and final_res.request_output is not None:
-                finish_reason = getattr(final_res.request_output, "finish_reason", None) or "abort"
+            if request_output is not None:
+                finish_reason = getattr(request_output, "finish_reason", None) or "abort"
             stop_reason = self._map_stop_reason(finish_reason)
             logger.debug(
                 "diffusion rollout produced no image (finish_reason=%s); returning %s", finish_reason, stop_reason
@@ -634,16 +635,16 @@ class vLLMOmniHttpServer(vLLMHttpServer):
                 extra_fields.setdefault(key, _maybe_unbatch(value))
         extra_fields["global_steps"] = self.global_steps
 
-        if final_res.request_output is not None and hasattr(final_res.request_output, "finish_reason"):
-            finish_reason = final_res.request_output.finish_reason or "stop"
+        if request_output is not None and hasattr(request_output, "finish_reason"):
+            finish_reason = request_output.finish_reason or "stop"
         else:
             finish_reason = "stop"
 
         stop_reason = self._map_stop_reason(finish_reason)
 
         num_preempted = None
-        if final_res.request_output is not None and hasattr(final_res.request_output, "num_preempted"):
-            num_preempted = final_res.request_output.num_preempted
+        if request_output is not None and hasattr(request_output, "num_preempted"):
+            num_preempted = request_output.num_preempted
 
         return DiffusionOutput(
             diffusion_output=diffusion_output,

@@ -73,6 +73,10 @@ class DiffusionPipelineConfig(BaseConfig):
     # Audio-video generation frame rate.
     frame_rate: float = 24.0
 
+    # MiniMax H3 request contract.
+    task: Optional[str] = None
+    frame_indices: Optional[list[int]] = None
+
     # MiniMax H3: sigma-schedule shift for the video stream (maps to vllm-omni's flow_shift)
     video_flow_shift: float = 12.0
 
