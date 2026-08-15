@@ -19,6 +19,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from verl_omni.agent_loop.utils import MINIMAX_H3_TOKEN_ID_NATIVE_KEY
+
 VIDEO_ROW_WIDTH = 96
 AUDIO_ROW_WIDTH = 32
 LATENT_META_WIDTH = 6
@@ -439,6 +441,14 @@ class MiniMaxH3RolloutWeightSyncMixin:
         token_ids = custom_prompt.get("prompt_token_ids")
         if token_ids is None:
             return
+        sampling_params = getattr(request, "sampling_params", None)
+        extra_args = getattr(sampling_params, "extra_args", None) or {}
+        if extra_args.get(MINIMAX_H3_TOKEN_ID_NATIVE_KEY) is not True:
+            raise ValueError(
+                "MiniMax H3 token-ID-native rollout requires "
+                "actor_rollout_ref.rollout.agent.default_agent_loop="
+                "minimax_h3_diffusion_single_turn_agent."
+            )
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.detach().cpu().tolist()
         if token_ids and isinstance(token_ids[0], list):

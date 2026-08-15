@@ -14,6 +14,8 @@
 
 from typing import Any, Optional
 
+MINIMAX_H3_TOKEN_ID_NATIVE_KEY = "minimax_h3_token_id_native"
+
 
 def messages_to_text(messages: Any) -> str:
     """Extract plain text items from chat messages without rendering a template."""

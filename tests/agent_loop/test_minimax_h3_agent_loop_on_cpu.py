@@ -19,7 +19,8 @@ from types import SimpleNamespace
 import pytest
 
 from verl_omni.agent_loop.minimax_h3_agent_loop import MiniMaxH3DiffusionSingleTurnAgentLoop
-from verl_omni.agent_loop.utils import messages_to_text
+from verl_omni.agent_loop.single_turn_agent_loop import DiffusionSingleTurnAgentLoop
+from verl_omni.agent_loop.utils import MINIMAX_H3_TOKEN_ID_NATIVE_KEY, messages_to_text
 
 
 def test_messages_to_text_ignores_structured_media_items():
@@ -35,6 +36,19 @@ def test_messages_to_text_ignores_structured_media_items():
     ]
 
     assert messages_to_text(messages) == "A campfire under the stars."
+
+
+def test_h3_agent_loop_marks_token_ids_as_native(monkeypatch):
+    async def capture_sampling_params(self, sampling_params, **kwargs):
+        del self, kwargs
+        return sampling_params
+
+    monkeypatch.setattr(DiffusionSingleTurnAgentLoop, "run", capture_sampling_params)
+    agent = object.__new__(MiniMaxH3DiffusionSingleTurnAgentLoop)
+
+    result = asyncio.run(agent.run({"temperature": 1.0}, raw_prompt=[]))
+
+    assert result == {"temperature": 1.0, MINIMAX_H3_TOKEN_ID_NATIVE_KEY: True}
 
 
 def test_h3_agent_loop_tokenizes_raw_text_without_special_tokens():

@@ -14,13 +14,14 @@
 """CPU tests for the MiniMax H3 DiffusionNFT adapter."""
 
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 from tensordict import TensorDict
 
+from verl_omni.agent_loop.utils import MINIMAX_H3_TOKEN_ID_NATIVE_KEY
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     AUDIO_ROW_WIDTH,
     AUDIO_TAG,
@@ -380,10 +381,15 @@ class TestMiniMaxH3RolloutWeightSync:
 
 
 class TestMiniMaxH3TokenIdNativePrompt:
+    @staticmethod
+    def _request(prompt: dict):
+        sampling_params = SimpleNamespace(extra_args={MINIMAX_H3_TOKEN_ID_NATIVE_KEY: True})
+        return MagicMock(prompts=[prompt], sampling_params=sampling_params)
+
     def test_request_ids_are_retained_without_tokenizer_decode(self):
         pipeline = _StubSyncPipeline()
         pipeline.tokenizer = MagicMock()
-        request = MagicMock(prompts=[{"prompt_token_ids": [1, 2, 3]}])
+        request = self._request({"prompt_token_ids": [1, 2, 3]})
 
         pipeline._ensure_prompt_text(request)
 
@@ -395,7 +401,17 @@ class TestMiniMaxH3TokenIdNativePrompt:
         pipeline = _StubSyncPipeline()
 
         with pytest.raises(ValueError, match="non-empty prompt_token_ids"):
-            pipeline._ensure_prompt_text(MagicMock(prompts=[{"prompt_token_ids": []}]))
+            pipeline._ensure_prompt_text(self._request({"prompt_token_ids": []}))
+
+    def test_generic_agent_loop_ids_are_rejected(self):
+        pipeline = _StubSyncPipeline()
+        request = MagicMock(
+            prompts=[{"prompt_token_ids": [1, 2, 3]}],
+            sampling_params=SimpleNamespace(extra_args={}),
+        )
+
+        with pytest.raises(ValueError, match="default_agent_loop=minimax_h3_diffusion_single_turn_agent"):
+            pipeline._ensure_prompt_text(request)
 
     def test_missing_prompt_ids_clear_stale_request_state(self):
         pipeline = _StubSyncPipeline()
