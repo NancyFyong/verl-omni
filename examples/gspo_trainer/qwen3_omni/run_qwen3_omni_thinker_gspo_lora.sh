@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# DEPRECATED: This script uses the legacy verl.trainer.main_ppo entrypoint with
+# external_lib monkey-patches, and is deprecated. It will be removed in v0.3.0.
+# Please use the V1 trainer instead:
+#   bash examples/gspo_trainer/qwen3_omni/run_qwen3_omni_thinker_gspo_lora_v1.sh
+# For image-input (MMK12) training on the V1 trainer:
+#   bash examples/gspo_trainer/qwen3_omni/run_qwen3_omni_thinker_gspo_lora_mmk12_v1.sh
+#
 # Qwen3-Omni Thinker GSPO + LoRA training (FSDP + vLLM-Omni AR rollout).
 # Hardware: 4× H100 80GB.
 #

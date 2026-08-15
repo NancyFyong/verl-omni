@@ -35,9 +35,11 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 from verl import DataProto
 from verl.checkpoint_engine import CheckpointEngineManager
+from verl.plugin.platform import get_platform
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
+from verl.trainer.distillation import is_distillation_enabled
 from verl.trainer.ppo.metric_utils import compute_variance_proxy_metrics, process_validation_metrics
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import Role, WorkerType, need_reference_policy, need_reward_model
@@ -64,12 +66,18 @@ from verl_omni.trainer.diffusion.diffusion_metric_utils import (
     compute_throughput_metrics_diffusion,
     compute_timing_metrics_diffusion,
 )
-from verl_omni.trainer.diffusion.diffusion_trainer_utils import NoOpCheckpointManager, old_policy_decay
+from verl_omni.trainer.diffusion.diffusion_trainer_utils import (
+    NoOpCheckpointManager,
+    old_policy_decay,
+    validate_distillation_config,
+)
 from verl_omni.trainer.diffusion.rollout_correction import (
     apply_bypass_mode_to_diffusion_batch,
     apply_rollout_correction_to_diffusion_batch,
+    compute_rollout_corr_metrics_from_batch,
     rollout_correction_enabled,
 )
+from verl_omni.utils.tracking import _export_video, batch_items, log_wandb_media, wrap_val_samples_for_wandb
 from verl_omni.workers.utils.padding import embeds_padding_2_no_padding
 
 sys_logger = logging.getLogger(__name__)
@@ -106,7 +114,11 @@ def compute_advantage(
         "config": config,
     }
     if "uid" in data.non_tensor_batch:
-        adv_kwargs["index"] = data.non_tensor_batch["uid"]
+        raw_uid = data.non_tensor_batch["uid"]
+        adv_kwargs["index"] = np.array(
+            [str(item.data) if hasattr(item, "data") and not isinstance(item, str) else str(item) for item in raw_uid],
+            dtype=object,
+        )
     if "reward_baselines" in data.batch:
         adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
 
@@ -192,9 +204,22 @@ class BaseRayDiffusionTrainer(ABC):
             lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
         self.ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
 
+        self.use_teacher_policy = is_distillation_enabled(config.get("distillation"))
+        validate_distillation_config(config)
+
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.checkpoint_manager = None
+        controller_nsight_options = OmegaConf.select(
+            self.config,
+            "global_profiler.global_tool_config.nsys.controller_nsight_options",
+            default={},
+        )
+        self._controller_nsys_profile_enabled = (
+            OmegaConf.select(self.config, "global_profiler.tool") == "nsys"
+            and controller_nsight_options.get("capture-range") == "cudaProfilerApi"
+        )
+        self._controller_nsys_profile_active = False
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -274,42 +299,76 @@ class BaseRayDiffusionTrainer(ABC):
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
-        """Dump rollout/validation samples as JSONL."""
+    def _dump_generations(
+        self,
+        inputs,
+        outputs,
+        gts,
+        scores,
+        reward_extra_infos_dict,
+        dump_path,
+        max_samples=None,
+        fps=24,
+        audios=None,
+        audio_sample_rates=None,
+    ):
+        """Dump samples to disk as media files plus a JSONL index.
+
+        ``outputs`` is a batch of images ``[N, C, H, W]`` (-> ``{i}.jpg``) or videos
+        ``[N, T, C, H, W]`` (-> ``{i}.mp4`` at ``fps``). ``max_samples`` caps how many
+        are written (``None`` = all). Optional generated audio is muxed into video files.
+        """
         os.makedirs(dump_path, exist_ok=True)
 
         visual_folder = os.path.join(dump_path, f"{self.global_steps}")
         os.makedirs(visual_folder, exist_ok=True)
 
+        n_full = outputs.shape[0]
+        n = n_full if max_samples is None else min(max_samples, n_full)
+        is_video = outputs.ndim == 5  # [N, T, C, H, W] vs image [N, C, H, W]
+
         output_paths = []
-        images_pil = outputs.cpu().float().permute(0, 2, 3, 1).numpy()
-        images_pil = (images_pil * 255).round().clip(0, 255).astype("uint8")
-        for i, image in enumerate(images_pil):
-            image_path = os.path.join(visual_folder, f"{i}.jpg")
-            Image.fromarray(image).save(image_path)
-            output_paths.append(image_path)
+        if is_video:
+            audios = batch_items(audios, n_full, "audio")
+            audio_sample_rates = batch_items(audio_sample_rates, n_full, "audio_sample_rate")
+            for i in range(n):
+                video_path = os.path.join(visual_folder, f"{i}.mp4")
+                _export_video(
+                    outputs[i],
+                    video_path,
+                    fps=fps,
+                    audio=audios[i],
+                    audio_sample_rate=audio_sample_rates[i],
+                )
+                output_paths.append(video_path)
+        else:
+            images_pil = outputs[:n].cpu().float().permute(0, 2, 3, 1).numpy()
+            images_pil = (images_pil * 255).round().clip(0, 255).astype("uint8")
+            for i, image in enumerate(images_pil):
+                image_path = os.path.join(visual_folder, f"{i}.jpg")
+                Image.fromarray(image).save(image_path)
+                output_paths.append(image_path)
 
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
 
-        n = len(inputs)
         base_data = {
-            "input": inputs,
+            "input": list(inputs)[:n],
             "output": output_paths,
-            "gts": gts,
-            "score": scores,
+            "gts": list(gts)[:n],
+            "score": list(scores)[:n],
             "step": [self.global_steps] * n,
         }
 
         for k, v in reward_extra_infos_dict.items():
-            if len(v) == n:
-                base_data[k] = v
+            if len(v) == n_full:
+                base_data[k] = list(v)[:n]
 
         lines = []
         for i in range(n):
             entry = {k: v[i] for k, v in base_data.items()}
             lines.append(json.dumps(entry, ensure_ascii=False))
 
-        with open(filename, "w") as f:
+        with open(filename, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
 
         print(f"Dumped generations to {filename}")
@@ -346,9 +405,15 @@ class BaseRayDiffusionTrainer(ABC):
                 scores=scores,
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
+                max_samples=self.config.trainer.get("rollout_data_max_samples", None),
+                fps=int(self.config.trainer.get("video_fps", 24)),
+                audios=batch.batch.get("audio", batch.non_tensor_batch.get("audio")),
+                audio_sample_rates=batch.non_tensor_batch.get(
+                    "audio_sample_rate", batch.batch.get("audio_sample_rate")
+                ),
             )
 
-    def _maybe_log_val_generations(self, inputs, outputs, scores):
+    def _maybe_log_val_generations(self, inputs, outputs, scores, audios=None, audio_sample_rates=None):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
         generations_to_log = self.config.trainer.log_val_generations
@@ -356,14 +421,13 @@ class BaseRayDiffusionTrainer(ABC):
         if generations_to_log == 0:
             return
 
+        import shutil
+
         import numpy as np
 
-        # Create tuples of (input, output, score) and sort by input text
-        if "wandb" in self.config.trainer.logger:
-            import wandb
-
-            outputs = [wandb.Image(image.float(), file_type="jpg") for image in outputs]
-        samples = list(zip(inputs, outputs, scores, strict=True))
+        audios = batch_items(audios, len(inputs), "audio")
+        audio_sample_rates = batch_items(audio_sample_rates, len(inputs), "audio_sample_rate")
+        samples = list(zip(inputs, list(outputs), scores, audios, audio_sample_rates, strict=True))
         samples.sort(key=lambda x: x[0])  # Sort by input text
 
         # Use fixed random seed for deterministic shuffling
@@ -373,8 +437,28 @@ class BaseRayDiffusionTrainer(ABC):
         # Take first N samples after shuffling
         samples = samples[:generations_to_log]
 
+        # Wrap only retained samples; keep wandb videos in persistent storage.
+        video_tmp_dir = None
+        wandb_media = {}
+        if "wandb" in self.config.trainer.logger:
+            validation_data_dir = self.config.trainer.get("validation_data_dir", None)
+            default_local_dir = self.config.trainer.get("default_local_dir", None)
+            wandb_video_dir = validation_data_dir or default_local_dir
+            if wandb_video_dir:
+                wandb_video_dir = os.path.join(wandb_video_dir, "wandb_val_media", f"global_step_{self.global_steps}")
+            samples, video_tmp_dir, wandb_media = wrap_val_samples_for_wandb(
+                samples, fps=int(self.config.trainer.get("video_fps", 24)), output_dir=wandb_video_dir
+            )
+        else:
+            samples = [(input_, output, score) for input_, output, score, _, _ in samples]
+
         # Log to each configured logger
-        self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+        try:
+            log_wandb_media(wandb_media, self.global_steps)
+            self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+        finally:
+            if video_tmp_dir is not None:
+                shutil.rmtree(video_tmp_dir, ignore_errors=True)
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
@@ -407,6 +491,8 @@ class BaseRayDiffusionTrainer(ABC):
         # Lists to collect samples for the table
         sample_inputs = []
         sample_outputs = []
+        sample_audios = []
+        sample_audio_sample_rates = []
         sample_gts = []
         sample_scores = []
         sample_turns = []
@@ -461,6 +547,15 @@ class BaseRayDiffusionTrainer(ABC):
             # Store generated outputs
             output_images = test_output_gen_batch.batch["responses"]
             sample_outputs.append(output_images)
+            batch_size = len(output_images)
+            sample_audios.extend(batch_items(test_output_gen_batch.batch.get("audio"), batch_size, "audio"))
+            sample_audio_sample_rates.extend(
+                batch_items(
+                    test_output_gen_batch.non_tensor_batch.get("audio_sample_rate"),
+                    batch_size,
+                    "audio_sample_rate",
+                )
+            )
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
@@ -493,7 +588,13 @@ class BaseRayDiffusionTrainer(ABC):
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
         sample_outputs = torch.cat(sample_outputs, dim=0)
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        self._maybe_log_val_generations(
+            inputs=sample_inputs,
+            outputs=sample_outputs,
+            scores=sample_scores,
+            audios=sample_audios,
+            audio_sample_rates=sample_audio_sample_rates,
+        )
 
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
@@ -505,6 +606,10 @@ class BaseRayDiffusionTrainer(ABC):
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
+                max_samples=self.config.trainer.get("validation_data_max_samples", None),
+                fps=int(self.config.trainer.get("video_fps", 24)),
+                audios=sample_audios,
+                audio_sample_rates=sample_audio_sample_rates,
             )
 
         for key_info, lst in reward_extra_infos_dict.items():
@@ -565,6 +670,7 @@ class BaseRayDiffusionTrainer(ABC):
             actor_rollout_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[actor_role],
                 config=self.config.actor_rollout_ref,
+                distillation_config=self.config.get("distillation"),
                 role=str(actor_role),
             )
             self.resource_pool_to_cls[actor_rollout_resource_pool][str(actor_role)] = actor_rollout_cls
@@ -590,6 +696,8 @@ class BaseRayDiffusionTrainer(ABC):
         wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
         if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
             wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
+        if OmegaConf.select(self.config.trainer, "ray_master_port_range") is not None:
+            wg_kwargs["master_port_range"] = OmegaConf.to_container(self.config.trainer.ray_master_port_range)
         # Forward profiling steps and (when nsys is selected) per-worker Nsight options to the
         # Ray worker group so that workers can be launched under nsys with the right capture range.
         if OmegaConf.select(self.config, "global_profiler.steps") is not None:
@@ -638,13 +746,13 @@ class BaseRayDiffusionTrainer(ABC):
     def _init_online_rollout_stack(self, actor_rollout_resource_pool):
         """Initialize rollout, reward, and checkpoint engines (online sampling only)."""
         # create reward loop manager
-        from verl.experimental.reward_loop import RewardLoopManager
+        from verl_omni.reward_loop import OmniRewardLoopManager
 
         # initalize reward loop manager
         # reward model (colocate or standalone): get resource_pool
         # no reward model: resource_pool = None
         resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel) if self.use_rm else None
-        self.reward_loop_manager = RewardLoopManager(
+        self.reward_loop_manager = OmniRewardLoopManager(
             config=self.config,
             rm_resource_pool=resource_pool,
         )
@@ -667,11 +775,13 @@ class BaseRayDiffusionTrainer(ABC):
         # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
         # agent_reward_loop: streaming reward computation with actor rollout
         # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
-        enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
+        self.enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
 
         # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
         # to stream reward computation with actor rollout
-        reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
+        reward_loop_worker_handles = (
+            self.reward_loop_manager.reward_loop_workers if self.enable_agent_reward_loop else None
+        )
 
         self.llm_server_manager = LLMServerManager.create(
             config=self.config,
@@ -826,17 +936,44 @@ class BaseRayDiffusionTrainer(ABC):
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
-        if do_profile:
+        if not do_profile:
+            return
+
+        controller_profile_started = False
+        try:
+            if self._controller_nsys_profile_enabled:
+                if self._controller_nsys_profile_active:
+                    raise RuntimeError("Controller Nsight profiling is already active")
+                get_platform().profiler_start()
+                self._controller_nsys_profile_active = True
+                controller_profile_started = True
+
             self.actor_rollout_wg.start_profile(role="e2e", profile_step=self.global_steps)
             if self.use_reference_policy and not self.ref_in_actor:
                 self.ref_policy_wg.start_profile(profile_step=self.global_steps)
+        except Exception:
+            if controller_profile_started:
+                try:
+                    get_platform().profiler_stop()
+                finally:
+                    self._controller_nsys_profile_active = False
+            raise
 
     def _stop_profiling(self, do_profile: bool) -> None:
         """Stop profiling for all worker groups if profiling is enabled."""
-        if do_profile:
+        if not do_profile:
+            return
+
+        try:
             self.actor_rollout_wg.stop_profile()
             if self.use_reference_policy and not self.ref_in_actor:
                 self.ref_policy_wg.stop_profile()
+        finally:
+            if self._controller_nsys_profile_active:
+                try:
+                    get_platform().profiler_stop()
+                finally:
+                    self._controller_nsys_profile_active = False
 
     @abstractmethod
     def fit(self):
@@ -870,6 +1007,21 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
             {"ref_log_prob": log_probs.float(), "ref_prev_sample_mean": prev_sample_mean.float()}
         )
         return DataProto.from_tensordict(ref_log_prob)
+
+    def _compute_teacher_prev_sample_mean(self, batch: DataProto) -> DataProto:
+        batch_td = batch.to_tensordict()
+        batch_td = embeds_padding_2_no_padding(batch_td)
+        tu.assign_non_tensor(
+            batch_td,
+            compute_loss=False,
+            height=self.config.actor_rollout_ref.model.pipeline.height,
+            width=self.config.actor_rollout_ref.model.pipeline.width,
+            vae_scale_factor=self.config.actor_rollout_ref.model.get("vae_scale_factor", 8),
+        )
+        output = self.actor_rollout_wg.infer_teacher_batch(batch_td)
+        prev_sample_mean = tu.get(output, "prev_sample_mean")
+        teacher_output = tu.get_tensordict({"teacher_prev_sample_mean": prev_sample_mean.float()})
+        return DataProto.from_tensordict(teacher_output)
 
     def _compute_old_log_prob(self, batch: DataProto) -> tuple[DataProto, Optional[float]]:
         batch_td = batch.to_tensordict()
@@ -987,10 +1139,15 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                     with marked_timer("gen", timing_raw, color="red"):
                         if curr_step_profile:
                             self.llm_server_manager.start_profile()
+                            # streaming reward scores inside the gen window; colocate in the reward phase
+                            if self.enable_agent_reward_loop:
+                                self.reward_loop_manager.start_profile()
                         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
                         self.checkpoint_manager.sleep_replicas()
                         if curr_step_profile:
                             self.llm_server_manager.stop_profile()
+                            if self.enable_agent_reward_loop:
+                                self.reward_loop_manager.stop_profile()
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
@@ -1002,7 +1159,11 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
+                            if curr_step_profile:
+                                self.reward_loop_manager.start_profile()
                             batch_reward = self._compute_reward_colocate(batch)
+                            if curr_step_profile:
+                                self.reward_loop_manager.stop_profile()
                             batch = batch.union(batch_reward)
 
                         # extract reward_tensor and reward_extra_infos_dict for training
@@ -1021,7 +1182,14 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                                 metrics.update({"perf/mfu/actor_infer": old_log_prob_mfu})
                             batch = batch.union(old_log_prob)
 
-                    assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+                    assert "old_log_probs" in batch.batch, f'"old_log_probs" not in {batch.batch.keys()=}'
+
+                    metrics.update(
+                        compute_rollout_corr_metrics_from_batch(
+                            batch,
+                            bypass_mode=bool(bypass_recomputing_logprobs),
+                        )
+                    )
 
                     # Decoupled-mode rollout correction (old vs rollout).
                     # In bypass mode old == rollout, so correction runs per-step in ``diffusion_loss``.
@@ -1037,6 +1205,11 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
+
+                    if self.use_teacher_policy:
+                        # score the rollout trajectories with the frozen teacher
+                        with marked_timer("teacher", timing_raw, color="olive"):
+                            batch = batch.union(self._compute_teacher_prev_sample_mean(batch))
 
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
@@ -1099,7 +1272,8 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir:
+                    save_freq = self.config.trainer.get("rollout_data_save_freq", 1)
+                    if rollout_data_dir and save_freq > 0 and self.global_steps % save_freq == 0:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                 # validate
@@ -1203,6 +1377,7 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
         if self.is_offline:
             self.reward_loop_manager = None
             self.llm_server_manager = None
+            self.enable_agent_reward_loop = False
             self.checkpoint_manager = NoOpCheckpointManager()
             return
         self._init_online_rollout_stack(actor_rollout_resource_pool)
@@ -1424,10 +1599,15 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
                         with marked_timer("gen", timing_raw, color="red"):
                             if curr_step_profile:
                                 self.llm_server_manager.start_profile()
+                                # streaming reward scores inside the gen window; colocate in the reward phase
+                                if self.enable_agent_reward_loop:
+                                    self.reward_loop_manager.start_profile()
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
                             self.checkpoint_manager.sleep_replicas()
                             if curr_step_profile:
                                 self.llm_server_manager.stop_profile()
+                                if self.enable_agent_reward_loop:
+                                    self.reward_loop_manager.stop_profile()
                             timing_raw.update(gen_batch_output.meta_info["timing"])
                             gen_batch_output.meta_info.pop("timing", None)
 
@@ -1436,7 +1616,11 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
 
                         with marked_timer("reward", timing_raw, color="yellow"):
                             if self.use_rm and "rm_scores" not in batch.batch.keys():
+                                if curr_step_profile:
+                                    self.reward_loop_manager.start_profile()
                                 batch_reward = self._compute_reward_colocate(batch)
+                                if curr_step_profile:
+                                    self.reward_loop_manager.stop_profile()
                                 batch = batch.union(batch_reward)
                             reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
@@ -1491,7 +1675,13 @@ class DirectPreferenceRayTrainer(BaseRayDiffusionTrainer):
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir and not self.is_offline:
+                    save_freq = self.config.trainer.get("rollout_data_save_freq", 1)
+                    if (
+                        rollout_data_dir
+                        and not self.is_offline
+                        and save_freq > 0
+                        and self.global_steps % save_freq == 0
+                    ):
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                 # validate

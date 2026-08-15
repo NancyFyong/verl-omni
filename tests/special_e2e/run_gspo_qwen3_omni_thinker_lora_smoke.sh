@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# DEPRECATED: This e2e smoke test uses the legacy verl.trainer.main_ppo
+# entrypoint with external_lib monkey-patches, and is deprecated. It will be
+# removed in v0.3.0. Please use the V1 equivalent instead:
+#   bash tests/special_e2e/run_gspo_qwen3_omni_thinker_lora_v1_smoke.sh
+#
 # Qwen3-Omni Thinker GSPO + LoRA e2e smoke test (minimal runtime).
 #
 # Builds a tiny random-weight Qwen3-Omni model, then runs a couple of training
@@ -54,8 +59,8 @@ if [ -z "${MODEL_PATH}" ]; then
         MODEL_PATH="${MODEL_REPO}"
     else
         MODEL_PATH="${HOME}/models/tiny-random/Qwen3-Omni"
-        [ -d "${MODEL_PATH}" ] || python3 "${REPO_ROOT}/tests/special_e2e/build_qwen3_omni_tiny_random.py" \
-            --output-dir "${MODEL_PATH}"
+        python3 "${REPO_ROOT}/tests/special_e2e/build_qwen3_omni_tiny_random.py" \
+            --output-dir "${MODEL_PATH}" --force
     fi
 fi
 

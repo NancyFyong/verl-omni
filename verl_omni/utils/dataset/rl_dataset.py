@@ -17,7 +17,7 @@ import logging
 
 from omegaconf import DictConfig
 from verl.trainer.ppo.utils import create_rl_dataset as _upstream_create_rl_dataset
-from verl.trainer.ppo.utils import create_rl_sampler
+from verl.trainer.ppo.utils import create_rl_sampler as _upstream_create_rl_sampler
 from verl.utils.dataset.rl_dataset import RLHFDataset as _UpstreamRLHFDataset
 from verl.utils.dataset.rl_dataset import collate_fn as _upstream_collate_fn
 from verl.utils.dataset.rl_dataset import get_dataset_class as _upstream_get_dataset_class
@@ -120,3 +120,34 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
         config=data_config,
         max_samples=max_samples,
     )
+
+
+def create_rl_sampler(data_config: DictConfig, dataset, sampler_config: DictConfig | dict | None = None):
+    """Create an RL dataset sampler with optional verl-omni custom classes.
+
+    When a sampler config provides both ``class_path`` and ``class_name``, the
+    sampler class is loaded dynamically and initialized with the dataset, data
+    config, and optional ``sampler_kwargs``. If ``sampler_config`` is omitted,
+    this falls back to the legacy ``data_config.sampler`` field.
+
+    Args:
+        data_config: Data config that may contain a custom sampler definition.
+        dataset: Dataset instance to sample from.
+        sampler_config: Optional explicit sampler config, e.g.
+            ``data.train_sampler`` or ``data.val_sampler``.
+
+    Returns:
+        Sampler instance used by the RL DataLoader.
+    """
+    if sampler_config is None:
+        sampler_config = data_config.get("sampler", None)
+    if sampler_config is not None:
+        class_path = sampler_config.get("class_path", None)
+        class_name = sampler_config.get("class_name", None)
+        if class_path is not None and class_name is not None:
+            sampler_cls = load_extern_object(class_path, class_name)
+            sampler_kwargs = sampler_config.get("sampler_kwargs", {}) or {}
+            logger.info("Using custom sampler: %s from %s", class_name, class_path)
+            return sampler_cls(data_source=dataset, data_config=data_config, **sampler_kwargs)
+
+    return _upstream_create_rl_sampler(data_config, dataset)

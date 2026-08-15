@@ -42,6 +42,7 @@ class DiffusionRolloutAlgoConfig(BaseConfig):
     sde_type: str = "sde"
     sde_window_size: Optional[int] = None
     sde_window_range: Optional[list[int]] = None
+    sde_contiguous: bool = True
 
     # MixGRPO-only configs
     sample_strategy: str = "random"
@@ -61,12 +62,16 @@ class DiffusionPipelineConfig(BaseConfig):
     height: int = 512
     width: int = 512
     num_inference_steps: int = 10
+    output_type: str = "image"
     true_cfg_scale: float = 1.0
     max_sequence_length: int = 512
     guidance_scale: Optional[float] = None
 
     # Wan2.2 video generation: number of frames (81 = ~3s at 24fps)
     num_frames: int = 1
+
+    # Audio-video generation frame rate.
+    frame_rate: float = 24.0
 
 
 @dataclass
@@ -76,6 +81,11 @@ class DiffusionSamplingConfig(BaseConfig):
     seed: int = 42
     pipeline: DiffusionPipelineConfig = field(default_factory=DiffusionPipelineConfig)
     algo: DiffusionRolloutAlgoConfig = field(default_factory=DiffusionRolloutAlgoConfig)
+
+    # for llm part when needed
+    temperature: float = 1.0
+    top_k: int = 0
+    top_p: float = 1.0
 
 
 @dataclass
@@ -88,11 +98,22 @@ class DiffusionRolloutConfig(BaseConfig):
     n_gpus_per_node: int = 8
     n: int = 1
 
+    # for llm part when needed
+    temperature: float = 1.0
+    top_k: int = 0
+    top_p: float = 1.0
+    repetition_penalty: float = 1.0
+    max_new_tokens: int = 256
+
     # Base seed for deterministic training rollout RNG. Per-step base is
     # ``seed + global_step - 1``. null disables rollout seeding.
     seed: Optional[int] = None
 
     prompt_length: int = 512
+
+    # Final prompt-embedding sequence length after combining all text encoders.
+    # Falls back to pipeline.max_sequence_length for single-encoder models.
+    max_prompt_embed_length: Optional[int] = None
 
     dtype: str = "bfloat16"
     gpu_memory_utilization: float = 0.5
@@ -100,8 +121,8 @@ class DiffusionRolloutConfig(BaseConfig):
     cudagraph_capture_sizes: Optional[list] = None
 
     # vLLM-omni diffusion attention backend.
-    # Allow custom select of attention backend for rollout.
-    rollout_attn_backend: str = "FLASH_ATTN"
+    # Default FLASH_ATTN_3_HUB pairs with actor attn_backend=_flash_3_varlen_hub.
+    rollout_attn_backend: str = "FLASH_ATTN_3_HUB"
     free_cache_engine: bool = True
     data_parallel_size: int = 1
     expert_parallel_size: int = 1
@@ -116,12 +137,14 @@ class DiffusionRolloutConfig(BaseConfig):
     max_model_len: Optional[int] = None
     max_num_seqs: int = 1024
 
-    # When True, the vLLM-Omni engine runs in step-execution mode and selects
-    # the *_stepwise variant of the pipeline (e.g. flow_grpo_stepwise).
+    # When True, the vLLM-Omni engine runs the registered pipeline in
+    # step-execution mode.
     step_execution: bool = False
 
     # note that the logprob computation should belong to the actor
     log_prob_micro_batch_size_per_gpu: Optional[int] = None
+    log_prob_use_dynamic_bsz: bool = False
+    log_prob_max_token_len_per_gpu: int = 16384
 
     disable_log_stats: bool = True
 
@@ -130,6 +153,8 @@ class DiffusionRolloutConfig(BaseConfig):
     pipeline: DiffusionPipelineConfig = field(default_factory=DiffusionPipelineConfig)
 
     calculate_log_probs: bool = False
+    llm_calculate_log_probs: bool = False
+
     rollout_adapter: str = "default"
 
     agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)
@@ -170,6 +195,8 @@ class DiffusionRolloutConfig(BaseConfig):
 
     def __post_init__(self):
         """Validate the diffusion rollout config"""
+        if self.max_prompt_embed_length is not None and self.max_prompt_embed_length <= 0:
+            raise ValueError(f"max_prompt_embed_length must be positive when set, got {self.max_prompt_embed_length}.")
         if self.mode == "sync":
             raise ValueError(
                 "Rollout mode 'sync' has been removed. Please set "
@@ -185,17 +212,3 @@ class DiffusionRolloutConfig(BaseConfig):
                 raise NotImplementedError(
                     f"Current rollout {self.name=} not implemented pipeline_model_parallel_size > 1 yet."
                 )
-
-    def resolve_algorithm(self, model_config) -> None:
-        """Update model_config.algorithm to the _stepwise variant when step_execution is enabled.
-
-        When ``step_execution=True`` and a ``<algorithm>_stepwise`` pipeline class is registered
-        for the given architecture, model_config.algorithm is updated in-place so that the engine
-        uses the experimental prepare_encode / step_scheduler / post_decode overrides.
-        """
-        if self.step_execution:
-            from verl_omni.pipelines.model_base import VllmOmniPipelineBase
-
-            stepwise = f"{model_config.algorithm}_stepwise"
-            if VllmOmniPipelineBase.get_class(model_config.architecture, stepwise):
-                model_config.algorithm = stepwise

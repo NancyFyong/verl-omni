@@ -12,11 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .composite_agent_loop import CompositeAgentLoopWorker
 from .diffusion_agent_loop import DiffusionAgentLoopOutput, DiffusionAgentLoopWorker
+from .diffusion_agent_loop_tq import (
+    DiffusionAgentLoopWorkerTQ,
+    create_diffusion_agent_loop_manager,
+)
 from .single_turn_agent_loop import DiffusionSingleTurnAgentLoop
 
 __all__ = [
+    "CompositeAgentLoopWorker",
     "DiffusionAgentLoopOutput",
     "DiffusionAgentLoopWorker",
+    "DiffusionAgentLoopWorkerTQ",
+    "create_diffusion_agent_loop_manager",
     "DiffusionSingleTurnAgentLoop",
 ]

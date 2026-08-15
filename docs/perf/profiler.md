@@ -1,6 +1,6 @@
 # Profiling FlowGRPO / diffusion training in VeRL-Omni
 
-Last updated: 07/10/2026.
+Last updated: 08/07/2026.
 
 VeRL-Omni reuses the profiler subsystem from upstream
 [verl](https://github.com/verl-project/verl) (`verl.utils.profiler`) and exposes
@@ -142,15 +142,108 @@ actor_rollout_ref.actor.profiler.all_ranks=True \
 actor_rollout_ref.actor.profiler.tool=nsys
 ```
 
-When `global_profiler.tool=nsys` and `steps` is non-empty, the FlowGRPO
-entrypoint launches the Ray TaskRunner under `nsys` using the
-`controller_nsight_options` from `global_profiler.global_tool_config.nsys`.
-Workers are launched with `worker_nsight_options`, including the required
-`capture-range: cudaProfilerApi` flag.
+When `global_profiler.tool=nsys` and `steps` is non-empty, the legacy FlowGRPO
+entrypoint (`python -m verl_omni.trainer.main_diffusion`) launches the Ray
+TaskRunner under `nsys` using the `controller_nsight_options` from
+`global_profiler.global_tool_config.nsys`.
+Workers use `capture-range: cudaProfilerApi`, and the trainer starts and stops
+their collection around the configured steps. The controller records the full
+TaskRunner lifetime when its Nsight options do not specify a capture range. To
+restrict controller collection to the configured steps, add these options:
+
+```bash
++global_profiler.global_tool_config.nsys.controller_nsight_options.capture-range=cudaProfilerApi \
++global_profiler.global_tool_config.nsys.controller_nsight_options.capture-range-end=null \
++global_profiler.global_tool_config.nsys.controller_nsight_options.kill=none
+```
+
+When controller `capture-range-end` is null, it is resolved to the number of
+discrete profiled steps or contiguous step groups before Ray starts the
+TaskRunner.
+
+This step-scoped controller capture is not supported by
+`verl_omni.trainer.main_diffusion_v1`. The v1 entrypoint can launch its
+TaskRunner under `nsys`, but its trainer does not yet implement the step-based
+profiling lifecycle driven by `global_profiler.steps`, including coordinated
+start/stop control for the controller and workers. Consequently, controller
+`capture-range: cudaProfilerApi` is not supported by the v1 trainer.
 
 `*.nsys-rep` files are written by Ray under
 `/tmp/ray/session_latest/logs/nsight/` on each node (this path is fixed by
 Ray). Open them with `nsys-ui`.
+
+### 4a. Continuous `old_log_prob` and `update_actor` timeline
+
+Use the dedicated Qwen-Image recipe to inspect Python control flow while the
+controller waits for old-log-prob inference or an actor update:
+
+```bash
+bash examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_fsdp2_benchmark_nsys.sh
+```
+
+The default run trains for three steps and captures them in one continuous
+window. Step 2 is the best steady-state sample: step 1 includes profiler
+startup, while step 3 closes the capture. The recipe profiles the Ray
+`TaskRunner` and ActorRollout rank 0 with Python stack sampling and NVTX. Set
+`PROFILE_RANKS=all` only for a follow-up rank-straggler investigation. The
+controller and actor workers each use one CUDA-profiler start/stop pair around
+the same continuous window.
+
+The recipe uses 20 Hz Python stack sampling. Python GIL events, OS-runtime
+events, native CPU sampling, and context-switch events remain disabled to keep
+the diagnostic focused and low overhead.
+
+Although the recipe sets `trace="nvtx"`, `capture-range=cudaProfilerApi`
+requires CUDA tracing for `cudaProfilerStart` and `cudaProfilerStop`. Nsight
+Systems therefore enables CUDA tracing automatically for both the controller
+and workers. The GUI only shows **CUDA API** and **CUDA HW** tracks when the
+report contains corresponding CUDA activity. The controller in the example
+below has no such tracks, while the worker does. Setting
+`cuda-memory-usage=false`, `sample=none`, or `cpuctxsw=none` does not disable
+CUDA tracing; those options disable CUDA memory-usage tracking, native CPU
+sampling, and context-switch tracing, respectively.
+
+The following screenshot shows aligned controller and worker reports from an
+example capture:
+
+![Aligned Nsight Systems controller and worker timelines](../assets/nsys_controller_actor_timeline.png)
+
+In the controller process:
+
+- **NVTX** ranges show the duration of each training phase.
+- **Python Backtrace** shows individual sampling points after zooming in on the
+  timeline. Hover over a sampling point to see its captured Python call stack.
+
+The worker process has the same **NVTX** and **Python Backtrace** information.
+It also has these tracks:
+
+- Expand **CUDA HW** with the triangle on the left, then zoom in to see the
+  kernels executed on each CUDA stream.
+- Zoom in on **CUDA API** to see each host-side CUDA API call.
+
+> [!WARNING]
+> The recipe does not set `discard-environment` because the option is not
+> available in every Nsight Systems release. If your version supports it, you
+> can set it to `true` for both the controller and workers:
+>
+> ```bash
+> +global_profiler.global_tool_config.nsys.controller_nsight_options.discard-environment='"true"' \
+> +global_profiler.global_tool_config.nsys.worker_nsight_options.discard-environment='"true"'
+> ```
+>
+> Without this option, reports may contain environment variables such as
+> `HF_TOKEN`, so take care when sharing report files.
+
+Ray writes one report per target process. A unique capture ID prevents stale
+files in a reused Ray session from entering the result, and the recipe waits
+for stable reports before copying them into `$RUN_DIR/nsight_update_actor`.
+Open the controller and actor reports together with Nsight Systems' multi-report
+view. For reports collected on one host, prefer `TSC` alignment and verify the
+alignment source in **Analysis Summary**. `UTC` is suitable for coarse phase
+analysis but not millisecond-scale cross-process latency comparisons.
+
+This recipe intentionally requires one node. A multi-node variant needs a
+collector on every node and synchronized clocks.
 
 ### 5. Rollout servers (vLLM-Omni)
 
@@ -176,6 +269,29 @@ actor_rollout_ref.rollout.profiler.tool_config.torch.discrete=True
 Combine with recipe 1 to capture the actor train phase and the rollout in the
 same step.
 
+### 6. Reward-model servers
+
+When `reward.reward_model.enable=True`, the reward model runs in its own
+vLLM server processes — the same server stack as recipe 5, driven by
+`reward.reward_model.rollout.profiler`:
+
+```bash
+global_profiler.tool=torch \
+global_profiler.steps=[1] \
+reward.reward_model.rollout.profiler.enable=True \
+reward.reward_model.rollout.profiler.ranks=[0] \
+reward.reward_model.rollout.profiler.tool=torch \
+reward.reward_model.rollout.profiler.tool_config.torch.contents=[cpu,cuda] \
+reward.reward_model.rollout.profiler.tool_config.torch.discrete=True
+```
+
+The trainer starts/stops it around the phase where the servers actually
+score: the generation phase when reward computation streams with the rollout
+(`reward.reward_model.enable_resource_pool=True`), or the reward phase in
+colocate mode. Each profiled replica writes to
+`{save_path}/reward_model/agent_loop_rollout_replica_{rank}`, keeping reward
+traces apart from the actor rollout ones.
+
 ## Lightweight profiling recipe
 
 Profiling a full FlowGRPO step produces a large trace that is slow to open.
@@ -185,7 +301,8 @@ last-wins — so appending overrides to any recipe shrinks its footprint
 without editing the script. The following profiles a single lightweight step
 of the SD3.5 OCR recipe (2 rollouts instead of 8, 4 denoising steps instead
 of 10, 256px instead of 384px, train batch 4 instead of 8), capturing the
-actor train phase and the rollout servers (recipes 1 and 5 combined):
+actor train phase, the rollout servers and the reward-model servers
+(recipes 1, 5 and 6 combined):
 
 ```bash
 bash examples/flowgrpo_trainer/sd35/run_sd35_medium_ocr_lora.sh \
@@ -215,7 +332,12 @@ bash examples/flowgrpo_trainer/sd35/run_sd35_medium_ocr_lora.sh \
     actor_rollout_ref.rollout.profiler.ranks=[0] \
     actor_rollout_ref.rollout.profiler.tool=torch \
     actor_rollout_ref.rollout.profiler.tool_config.torch.contents=[cpu,cuda] \
-    actor_rollout_ref.rollout.profiler.tool_config.torch.discrete=True
+    actor_rollout_ref.rollout.profiler.tool_config.torch.discrete=True \
+    reward.reward_model.rollout.profiler.enable=True \
+    reward.reward_model.rollout.profiler.ranks=[0] \
+    reward.reward_model.rollout.profiler.tool=torch \
+    reward.reward_model.rollout.profiler.tool_config.torch.contents=[cpu,cuda] \
+    reward.reward_model.rollout.profiler.tool_config.torch.discrete=True
 ```
 
 Measured on 3×RTX 4090 against the recipe defaults: traces 163 MB → 32 MB,
@@ -255,7 +377,8 @@ recipe's own values, minding two couplings:
 * For the rollout servers, the trainer calls
   `llm_server_manager.start_profile()`/`stop_profile()` around the generation
   phase of profiled steps; the servers record through vLLM's built-in torch
-  profiler (recipe 5).
+  profiler (recipe 5). The reward-model servers are driven the same way
+  through `verl_omni.reward_loop.OmniRewardLoopManager` (recipe 6).
 
 ## Further reading
 
