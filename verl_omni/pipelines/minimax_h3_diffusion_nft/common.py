@@ -287,7 +287,45 @@ def _map_lora_module_to_vllm(module: str) -> str:
 
 
 class MiniMaxH3RolloutWeightSyncMixin:
-    """Map Diffusers H3 weights and prompts to vLLM-Omni."""
+    """Map Diffusers H3 weights and token-id-native prompts to vLLM-Omni."""
+
+    def encode_prompt(
+        self,
+        *,
+        task: str,
+        prompt: str,
+        image=None,
+        prepared_videos: list[dict[str, Any]] | None = None,
+        **kwargs,
+    ):
+        """Encode pre-tokenized T2VA IDs without decode/re-tokenize drift."""
+        prompt_ids = getattr(self, "_h3_prompt_ids", None)
+        if prompt_ids is None or task != "t2va":
+            return super().encode_prompt(
+                task=task,
+                prompt=prompt,
+                image=image,
+                prepared_videos=prepared_videos,
+                **kwargs,
+            )
+
+        from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _broadcast_tensor, _dit_rank_world
+
+        _, rank, _ = _dit_rank_world()
+        hidden = None
+        tags = None
+        ids = None
+        vision_kwargs: dict[str, torch.Tensor] = {}
+        if rank == 0:
+            ids = prompt_ids
+            tags = torch.ones(ids.shape[0], dtype=torch.long)
+
+        if rank < self.text_encoder_tp_size:
+            ids = self._distribute_encode_inputs(ids, vision_kwargs)
+            hidden = self._encode_text_hidden(ids, vision_kwargs)
+        hidden = _broadcast_tensor(hidden, dtype=torch.bfloat16, device=self.device)
+        tags = _broadcast_tensor(tags, dtype=torch.long, device=self.device)
+        return hidden, tags
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Translate Diffusers weights into the fused vLLM H3 layout."""
@@ -392,13 +430,12 @@ class MiniMaxH3RolloutWeightSyncMixin:
         return mapped, new_config
 
     def _ensure_prompt_text(self, request: Any) -> None:
-        """Decode request token IDs for the H3 text encoder."""
+        """Expose pre-tokenized IDs and satisfy the upstream non-empty-text check."""
+        self._h3_prompt_ids = None
         prompts = getattr(request, "prompts", None)
         if not prompts or not isinstance(prompts[0], dict):
             return
         custom_prompt = prompts[0]
-        if custom_prompt.get("prompt"):
-            return
         token_ids = custom_prompt.get("prompt_token_ids")
         if token_ids is None:
             return
@@ -406,6 +443,7 @@ class MiniMaxH3RolloutWeightSyncMixin:
             token_ids = token_ids.detach().cpu().tolist()
         if token_ids and isinstance(token_ids[0], list):
             token_ids = token_ids[0]
-        text = self.tokenizer.decode([int(t) for t in token_ids], skip_special_tokens=True).strip()
-        if text:
-            custom_prompt["prompt"] = text
+        self._h3_prompt_ids = torch.as_tensor([int(token) for token in token_ids], dtype=torch.long)
+        if self._h3_prompt_ids.numel() == 0:
+            raise ValueError("MiniMax H3 requires non-empty prompt_token_ids.")
+        custom_prompt["prompt"] = "[pretokenized]"

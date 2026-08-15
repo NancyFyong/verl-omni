@@ -13,6 +13,8 @@
 # limitations under the License.
 """CPU tests for the MiniMax H3 DiffusionNFT adapter."""
 
+import sys
+from types import ModuleType
 from unittest.mock import MagicMock
 
 import pytest
@@ -377,23 +379,52 @@ class TestMiniMaxH3RolloutWeightSync:
         assert [name for name, _ in pipeline.received] == ["transformer.rope.inv_freq"]
 
 
-class TestMiniMaxH3EnsurePromptText:
-    def test_token_ids_are_decoded_into_the_prompt(self):
+class TestMiniMaxH3TokenIdNativePrompt:
+    def test_request_ids_are_retained_without_tokenizer_decode(self):
         pipeline = _StubSyncPipeline()
         pipeline.tokenizer = MagicMock()
-        pipeline.tokenizer.decode.return_value = " a campfire "
         request = MagicMock(prompts=[{"prompt_token_ids": [1, 2, 3]}])
 
         pipeline._ensure_prompt_text(request)
 
-        assert request.prompts[0]["prompt"] == "a campfire"
-
-    def test_existing_prompt_is_left_alone(self):
-        pipeline = _StubSyncPipeline()
-        pipeline.tokenizer = MagicMock()
-        request = MagicMock(prompts=[{"prompt": "kept", "prompt_token_ids": [1]}])
-
-        pipeline._ensure_prompt_text(request)
-
-        assert request.prompts[0]["prompt"] == "kept"
+        assert request.prompts[0]["prompt"] == "[pretokenized]"
+        assert torch.equal(pipeline._h3_prompt_ids, torch.tensor([1, 2, 3]))
         pipeline.tokenizer.decode.assert_not_called()
+
+    def test_empty_prompt_ids_are_rejected(self):
+        pipeline = _StubSyncPipeline()
+
+        with pytest.raises(ValueError, match="non-empty prompt_token_ids"):
+            pipeline._ensure_prompt_text(MagicMock(prompts=[{"prompt_token_ids": []}]))
+
+    def test_missing_prompt_ids_clear_stale_request_state(self):
+        pipeline = _StubSyncPipeline()
+        pipeline._h3_prompt_ids = torch.tensor([7])
+
+        pipeline._ensure_prompt_text(MagicMock(prompts=[{"prompt": "plain text"}]))
+
+        assert pipeline._h3_prompt_ids is None
+
+    def test_t2va_encoder_consumes_exact_request_ids(self, monkeypatch):
+        module_name = "vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3"
+        pipeline_module = ModuleType(module_name)
+        pipeline_module._dit_rank_world = lambda: (None, 0, 1)
+        pipeline_module._broadcast_tensor = lambda value, **kwargs: value
+        monkeypatch.setitem(sys.modules, module_name, pipeline_module)
+
+        pipeline = _StubSyncPipeline()
+        pipeline._h3_prompt_ids = torch.tensor([101, 17, 202])
+        pipeline.text_encoder_tp_size = 1
+        pipeline.device = torch.device("cpu")
+        pipeline._distribute_encode_inputs = lambda ids, vision_kwargs: ids
+        pipeline._encode_text_hidden = lambda ids, vision_kwargs: ids[:, None].float()
+
+        hidden, tags = pipeline.encode_prompt(
+            task="t2va",
+            prompt="[pretokenized]",
+            image=None,
+            prepared_videos=None,
+        )
+
+        assert hidden[:, 0].tolist() == [101.0, 17.0, 202.0]
+        assert tags.tolist() == [1, 1, 1]

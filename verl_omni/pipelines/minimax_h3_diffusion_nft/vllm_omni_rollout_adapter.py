@@ -69,7 +69,10 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
     def forward(self, request: Any):
         """Generate video+audio and attach DiffusionNFT training tensors."""
         self._ensure_prompt_text(request)
-        output = super().forward(request)
+        try:
+            output = super().forward(request)
+        finally:
+            self._h3_prompt_ids = None
         capture = self._nft_capture
         self._nft_capture = None
         if capture is None:

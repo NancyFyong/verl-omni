@@ -1,0 +1,87 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""CPU tests for MiniMax H3 token-id-native prompt preparation."""
+
+import asyncio
+from types import SimpleNamespace
+
+import pytest
+
+from verl_omni.agent_loop.minimax_h3_agent_loop import MiniMaxH3DiffusionSingleTurnAgentLoop
+from verl_omni.agent_loop.utils import messages_to_text
+
+
+def test_messages_to_text_ignores_structured_media_items():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": object()},
+                {"type": "video", "video": object()},
+                {"type": "text", "text": "A campfire under the stars."},
+            ],
+        }
+    ]
+
+    assert messages_to_text(messages) == "A campfire under the stars."
+
+
+def test_h3_agent_loop_tokenizes_raw_text_without_special_tokens():
+    calls = []
+
+    class Tokenizer:
+        def __call__(self, text, **kwargs):
+            calls.append((text, kwargs))
+            return {"input_ids": [11, 12, 13]}
+
+    async def run():
+        agent = object.__new__(MiniMaxH3DiffusionSingleTurnAgentLoop)
+        agent.tokenizer = Tokenizer()
+        agent.rollout_config = SimpleNamespace(prompt_length=128)
+        agent.loop = asyncio.get_running_loop()
+        return await agent.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": object()},
+                        {"type": "text", "text": "Raw H3 prompt"},
+                    ],
+                }
+            ],
+            images=[object()],
+        )
+
+    assert asyncio.run(run()) == [11, 12, 13]
+    assert calls == [
+        (
+            "Raw H3 prompt",
+            {
+                "padding": False,
+                "truncation": True,
+                "max_length": 128,
+                "add_special_tokens": False,
+            },
+        )
+    ]
+
+
+def test_h3_agent_loop_rejects_empty_text():
+    async def run():
+        agent = object.__new__(MiniMaxH3DiffusionSingleTurnAgentLoop)
+        agent.rollout_config = SimpleNamespace(prompt_length=128)
+        return await agent.apply_chat_template([{"role": "user", "content": [{"type": "image"}]}])
+
+    with pytest.raises(ValueError, match="non-empty text prompt"):
+        asyncio.run(run())
