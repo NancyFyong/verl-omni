@@ -1,7 +1,7 @@
 """Build FL2VA train/test JSONL splits from a prompt file and generated images.
 
 Pairs each prompt (one per line) with its same-index condition image
-(``{index:06d}.jpg``, e.g. produced by ``scripts/gen_flux_images.py``),
+(``{index:06d}.jpg``, e.g. produced by ``examples/diffusionnft_trainer/minimax_h3/gen_flux_images.py``),
 shuffles with a fixed seed, and writes ``train.jsonl`` / ``test.jsonl``
 in the format consumed by the MiniMax H3 FL2VA ``prepare_data.py``:
 
@@ -12,7 +12,7 @@ Image paths are written relative to ``--output_dir``, so point
 
 Example:
 
-    python3 scripts/build_fl2va_jsonl.py \
+    python3 examples/diffusionnft_trainer/minimax_h3/build_fl2va_jsonl.py \
         --prompt_file dancegrpo_consist-id.txt \
         --image_dir data/flux_images/images \
         --output_dir data/flux_images \
@@ -50,7 +50,7 @@ def main() -> None:
     if missing:
         raise FileNotFoundError(
             f"{len(missing)} images missing under {args.image_dir} (e.g. {missing[:5]}); "
-            "run scripts/gen_flux_images.py to completion first."
+            "run examples/diffusionnft_trainer/minimax_h3/gen_flux_images.py to completion first."
         )
 
     indices = list(range(len(prompts)))

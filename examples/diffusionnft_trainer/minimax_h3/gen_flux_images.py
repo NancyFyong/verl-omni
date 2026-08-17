@@ -6,7 +6,7 @@ metadata jsonl mapping each image to its prompt.
 
 Launch with torchrun:
 
-    torchrun --nproc_per_node=8 scripts/gen_flux_images.py \
+    torchrun --nproc_per_node=8 examples/diffusionnft_trainer/minimax_h3/gen_flux_images.py \
         --prompt_file data/ConsisID-preview-Data/dancegrpo_consist-id.txt \
         --model_path /path/to/FLUX.1-dev \
         --output_dir data/flux_images \
