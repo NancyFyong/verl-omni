@@ -25,6 +25,24 @@ prompts.txt ──► gen_flux_images.py ──► images/{index:06d}.jpg
                                 train.parquet / test.parquet
 ```
 
+## Getting the prompt file
+
+`dancegrpo_consist-id.txt` is the filtered ConsisID prompt list released by
+DanceGRPO (27,815 prompts, one per line). Download it directly from the
+DanceGRPO repository:
+
+```bash
+curl -L -o dancegrpo_consist-id.txt \
+  https://raw.githubusercontent.com/XueZeyue/DanceGRPO/main/assets/consist-id.txt
+```
+
+The prompts originate from
+[ConsisID-preview-Data](https://huggingface.co/datasets/BestWishYsh/ConsisID-preview-Data)
+captions; DanceGRPO ships the filtered result as-is and does not document the
+exact filtering criteria, so downloading the released file is the reproducible
+way to get the identical prompt set (verified line-for-line against the copy
+used for the published dataset).
+
 ## Scripts
 
 ### `gen_flux_images.py`
@@ -40,7 +58,7 @@ aligned by construction.
 
 ```bash
 torchrun --nproc_per_node=8 examples/diffusionnft_trainer/minimax_h3/gen_flux_images.py \
-    --prompt_file dancegrpo_consist-id.txt \
+    --prompt_file dancegrpo_consist-id.txt  # see "Getting the prompt file" \
     --model_path /path/to/FLUX.1-dev \
     --output_dir data/flux_images \
     --height 400 --width 640
@@ -54,7 +72,7 @@ relative image paths — the input format of `prepare_data.py`:
 
 ```bash
 python3 examples/diffusionnft_trainer/minimax_h3/build_fl2va_jsonl.py \
-    --prompt_file dancegrpo_consist-id.txt \
+    --prompt_file dancegrpo_consist-id.txt  # see "Getting the prompt file" \
     --image_dir data/flux_images/images \
     --output_dir data/flux_images \
     --test_size 128 --seed 42
