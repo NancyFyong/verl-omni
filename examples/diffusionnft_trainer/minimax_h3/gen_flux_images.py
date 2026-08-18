@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Offline multi-GPU image generation with FLUX.
 
 Reads a prompt file (one prompt per line, e.g. dancegrpo_consist-id.txt),
@@ -36,12 +49,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_inference_steps", type=int, default=30)
     parser.add_argument("--guidance_scale", type=float, default=3.5)
     parser.add_argument("--max_sequence_length", type=int, default=512)
-    parser.add_argument("--num_per_prompt", type=int, default=1,
-                        help="Images to generate per prompt.")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Base seed; per-image seed is seed + global_index.")
-    parser.add_argument("--max_prompts", type=int, default=-1,
-                        help="Limit total prompts for smoke tests (-1 = all).")
+    parser.add_argument("--num_per_prompt", type=int, default=1, help="Images to generate per prompt.")
+    parser.add_argument("--seed", type=int, default=42, help="Base seed; per-image seed is seed + global_index.")
+    parser.add_argument("--max_prompts", type=int, default=-1, help="Limit total prompts for smoke tests (-1 = all).")
     return parser.parse_args()
 
 
@@ -74,9 +84,7 @@ def main() -> None:
     with meta_path.open("a", encoding="utf-8") as meta_file:
         for global_index, prompt in shard:
             for sample_idx in range(args.num_per_prompt):
-                name = f"{global_index:06d}" + (
-                    f"_{sample_idx}" if args.num_per_prompt > 1 else ""
-                )
+                name = f"{global_index:06d}" + (f"_{sample_idx}" if args.num_per_prompt > 1 else "")
                 image_path = image_dir / f"{name}.jpg"
                 if image_path.exists():
                     skipped += 1
@@ -110,8 +118,7 @@ def main() -> None:
                 done += 1
             if (done + skipped) % 50 == 0:
                 print(
-                    f"[rank {rank}] progress {done + skipped}/{len(shard)} "
-                    f"(generated {done}, skipped {skipped})",
+                    f"[rank {rank}] progress {done + skipped}/{len(shard)} (generated {done}, skipped {skipped})",
                     flush=True,
                 )
 
