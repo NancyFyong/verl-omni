@@ -91,3 +91,20 @@ bash examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_t2va_lora.sh
 ```
 
 Additional Hydra overrides may be appended to the command.
+
+## FLUX first-frame data (FL2VA)
+
+For the image-conditioned FL2VA variant, an offline data pipeline turns a
+prompt list into FLUX reference images and train/test JSONL pairs:
+
+- `gen_flux_images.py` — multi-GPU FLUX batch image generator (prompt file ->
+  one JPEG per prompt, deterministic per-index seeds, resume by skipping
+  existing files). Defaults mirror DanceGRPO's online reference pipeline
+  (400x640, 30 steps, guidance 3.5, max_sequence_length 512).
+- `build_fl2va_jsonl.py` — pairs each prompt with its same-index image,
+  shuffles with a fixed seed, and writes `train.jsonl` / `test.jsonl` with
+  relative paths for `prepare_data.py`.
+
+A ready-made dataset built with this pipeline (27,815 prompt/image pairs from
+the DanceGRPO ConsisID prompt list) is published at
+https://huggingface.co/datasets/zyfenghit/dancegrpo-t2av
