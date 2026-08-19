@@ -83,3 +83,20 @@ Rollout quantization is intentionally not enabled. On the pinned vLLM-Omni
 commit, a native custom pipeline combined with online FP8 can hit a meta-tensor
 placement failure during custom-pipeline initialization; BF16 TP=4 is the
 validated path.
+
+## Offline first-frame data generation
+
+An offline data pipeline turns a prompt list into FLUX reference images and
+train/test JSONL pairs:
+
+- `gen_flux_images.py` — multi-GPU FLUX batch image generator (prompt file ->
+  one JPEG per prompt, deterministic per-index seeds, resume by skipping
+  existing files). Defaults mirror DanceGRPO's online reference pipeline
+  (400x640, 30 steps, guidance 3.5, max_sequence_length 512).
+- `build_fl2va_jsonl.py` — pairs each prompt with its same-index image,
+  shuffles with a fixed seed, and writes `train.jsonl` / `test.jsonl` with
+  relative paths for `prepare_data.py`.
+
+A ready-made dataset built with this pipeline (27,815 prompt/image pairs from
+the DanceGRPO ConsisID prompt list) is published at
+https://huggingface.co/datasets/zyfenghit/dancegrpo-t2av
