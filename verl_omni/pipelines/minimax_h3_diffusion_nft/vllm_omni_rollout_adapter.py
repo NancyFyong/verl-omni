@@ -13,7 +13,6 @@
 # limitations under the License.
 """GPU rollout adapter for MiniMax H3 DiffusionNFT."""
 
-import dataclasses
 from typing import Any
 
 import torch
@@ -26,6 +25,7 @@ from vllm_omni.diffusion.models.minimax_h3.packed_tokens import (
 from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
 
+from verl_omni.pipelines.diffusion_rollout_output import with_rollout_data
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 
 from .common import MiniMaxH3RolloutWeightSyncMixin, pack_video_audio_rows
@@ -130,14 +130,16 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
 
         train_timesteps = self._build_train_timesteps(capture).unsqueeze(0)
 
-        return dataclasses.replace(
+        return with_rollout_data(
             output,
-            custom_output={
+            prompt_embeddings={
+                "prompt_embeds": prompt_embeds,
+                "prompt_embeds_mask": prompt_embeds_mask,
+            },
+            rl={
                 "latents_clean": latents_clean,
                 "train_timesteps": train_timesteps,
                 "latent_meta": latent_meta,
-                "prompt_embeds": prompt_embeds,
-                "prompt_embeds_mask": prompt_embeds_mask,
                 "prompt_token_tags": text_tags.unsqueeze(0),
                 "condition_video_rows": capture["condition_video_rows"].unsqueeze(0),
                 "keyframe_frame_indices": torch.tensor(
