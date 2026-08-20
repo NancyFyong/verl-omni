@@ -2,8 +2,8 @@
 
 This recipe trains a rank-64 MiniMax H3 LoRA with online DiffusionNFT. A
 Diffusers transformer is trained with FSDP2, while vLLM-Omni generates joint
-video and audio rollouts from text prompts. PickScore provides the default
-video reward.
+video and audio rollouts from text prompts. CLAP and ImageBind provide the
+default multi-reward (audio-video alignment).
 
 ## Install
 
