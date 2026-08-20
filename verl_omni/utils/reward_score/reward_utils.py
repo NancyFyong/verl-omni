@@ -22,17 +22,21 @@ from PIL import Image
 
 
 def video_tensor_to_pil_frames(video: torch.Tensor) -> list[Image.Image]:
-    """Convert an RGB uint8 ``[T, C, H, W]`` tensor to PIL frames.
+    """Convert an RGB ``[T, C, H, W]`` (or channels-last ``[T, H, W, C]``) tensor in ``[0, 1]`` to PIL frames.
 
     PIL (not NumPy) frames avoid ``export_to_video`` rescaling already-uint8 input
     by 255, which would invert colors modulo 256.
     """
-    if video.dtype != torch.uint8:
-        raise ValueError(f"Expected a uint8 video tensor, got {video.dtype}")
-    if video.ndim != 4 or video.shape[1] != 3:
+    if video.ndim != 4:
+        raise ValueError(f"Expected an RGB video tensor with shape [T, 3, H, W], got {tuple(video.shape)}")
+    if video.shape[1] != 3 and video.shape[-1] == 3:
+        video = video.permute(0, 3, 1, 2)  # [T, H, W, 3] -> [T, 3, H, W]
+    if video.shape[1] != 3:
         raise ValueError(f"Expected an RGB video tensor with shape [T, 3, H, W], got {tuple(video.shape)}")
 
-    frames = video.detach().permute(0, 2, 3, 1).to(device="cpu").contiguous().numpy()
+    video = video.detach().permute(0, 2, 3, 1).to(dtype=torch.float32)
+    video = torch.nan_to_num(video, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0, 1)
+    frames = video.mul_(255).round_().to(dtype=torch.uint8, device="cpu").contiguous().numpy()
     return [Image.fromarray(frame) for frame in frames]
 
 
