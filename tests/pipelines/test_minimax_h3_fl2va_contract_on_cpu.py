@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from verl_omni.agent_loop.utils import messages_to_text
+from verl_omni.pipelines.minimax_h3_diffusion_nft.common import messages_to_text
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     MiniMaxH3RolloutWeightSyncMixin,
     build_layout_from_meta,
