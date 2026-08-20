@@ -12,29 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
-import os
-
-from verl_omni.agent_loop.minimax_h3_agent_loop import MiniMaxH3DiffusionSingleTurnAgentLoop
-
+from .agent_loop import MiniMaxH3DiffusionSingleTurnAgentLoop
 from .diffusers_training_adapter import MiniMaxH3DiffusionNFT
-
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-
-try:
-    from .vllm_omni_rollout_adapter import MiniMaxH3DiffusionNFTPipeline
-except (ImportError, RuntimeError, AttributeError) as e:
-    logger.warning(f"MiniMax H3 DiffusionNFT rollout not available: {e}. GPU/NPU required.")
-
-    class _UnavailableModule:
-        def __getattr__(self, _):
-            raise RuntimeError("MiniMax H3 DiffusionNFT rollout requires GPU (CUDA/NPU)")
-
-        def __call__(self, *args, **kwargs):
-            raise RuntimeError("MiniMax H3 DiffusionNFT rollout requires GPU (CUDA/NPU)")
-
-    MiniMaxH3DiffusionNFTPipeline = _UnavailableModule()
+from .vllm_omni_rollout_adapter import MiniMaxH3DiffusionNFTPipeline
 
 __all__ = [
     "MiniMaxH3DiffusionNFT",
