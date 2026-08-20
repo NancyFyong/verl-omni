@@ -710,13 +710,6 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             log_probs = None
 
         extra_fields: dict[str, Any] = {"global_steps": self.global_steps}
-        # Branch adapters (e.g. MiniMax H3 DiffusionNFT) return training
-        # tensors through OmniRequestOutput.custom_output; forward them so the
-        # actor receives latents/timesteps/prompt embeds.
-        custom_output = getattr(final_res, "custom_output", None) or {}
-        for key, value in custom_output.items():
-            if key != "all_log_probs":
-                extra_fields[key] = _maybe_unbatch(value)
         if final_res.trajectory_latents is not None:
             extra_fields["all_latents"] = _maybe_unbatch(final_res.trajectory_latents)
         if final_res.trajectory_timesteps is not None:
