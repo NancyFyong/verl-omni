@@ -73,10 +73,6 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
             return model, model_config
         return None
 
-    def load_weights(self, weights):
-        """Forward the bucket to the diffusion pipeline's loader (no standard model chain here)."""
-        return self.model_runner.pipeline.load_weights(weights)
-
     def update_weights_from_ipc(
         self,
         peft_config: dict = None,
