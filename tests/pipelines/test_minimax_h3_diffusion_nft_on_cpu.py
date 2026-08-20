@@ -21,7 +21,7 @@ import pytest
 import torch
 from tensordict import TensorDict
 
-from verl_omni.agent_loop.utils import MINIMAX_H3_TOKEN_ID_NATIVE_KEY
+from verl_omni.pipelines.minimax_h3_diffusion_nft.common import MINIMAX_H3_TOKEN_ID_NATIVE_KEY
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     AUDIO_ROW_WIDTH,
     AUDIO_TAG,
