@@ -63,7 +63,12 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
         self._pending_lora_peft_config = peft_config
 
     def _get_standard_weight_model_and_config(self):
-        """``(model, model_config)`` for the standard AR weight path, else None (diffusion workers)."""
+        """Return ``(model, model_config)`` for the standard (non-LoRA) AR weight path.
+
+        Reaches the underlying vLLM model + ``ModelConfig`` via the worker's
+        ``model_runner``. Returns ``None`` for workers without this chain (e.g. the
+        diffusion pipeline worker), so the caller falls back to ``self.load_weights``.
+        """
         model_runner = getattr(self, "model_runner", None)
         if model_runner is None:
             return None
