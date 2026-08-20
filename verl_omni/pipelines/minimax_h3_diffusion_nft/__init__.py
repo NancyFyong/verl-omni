@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .agent_loop import MiniMaxH3DiffusionSingleTurnAgentLoop
+from verl_omni.agent_loop.minimax_h3_agent_loop import MiniMaxH3DiffusionSingleTurnAgentLoop
 from .diffusers_training_adapter import MiniMaxH3DiffusionNFT
 from .vllm_omni_rollout_adapter import MiniMaxH3DiffusionNFTPipeline
 
