@@ -30,6 +30,10 @@ class LoRAAdapterMixin:
         lora_adapter_path = getattr(self.model_config, "lora_adapter_path", None)
         policy_state_adapters = tuple(getattr(self.model_config, "policy_state_adapters", ("default",)))
         extra_adapters = tuple(adapter for adapter in policy_state_adapters if adapter not in ("default", "reference"))
+        # The warm-started adapter takes the primary policy-adapter name from the
+        # recipe config (policy_state_adapters[0]) instead of being hardcoded, so
+        # recipes choose the name in their launch scripts.
+        primary_adapter = policy_state_adapters[0] if policy_state_adapters else "default"
         if lora_adapter_path is not None:
             from verl.utils.fs import copy_to_local
 
@@ -37,9 +41,10 @@ class LoRAAdapterMixin:
             local_adapter_path = copy_to_local(lora_adapter_path, use_shm=self.model_config.use_shm)
 
             # diffusers' loader auto-names the first adapter "default_0" when no name
-            # is given, but the policy-adapter plumbing below expects "default".
-            module.load_lora_adapter(local_adapter_path, adapter_name="default")
-            peft_config = getattr(module, "peft_config", {}).get("default", None)
+            # is given; pass the primary policy-adapter name explicitly so the
+            # policy-adapter plumbing below finds it under the configured name.
+            module.load_lora_adapter(local_adapter_path, adapter_name=primary_adapter)
+            peft_config = getattr(module, "peft_config", {}).get(primary_adapter, None)
             for adapter_name in extra_adapters:
                 if peft_config is not None and adapter_name not in getattr(module, "peft_config", {}):
                     module.add_adapter(peft_config, adapter_name=adapter_name)
