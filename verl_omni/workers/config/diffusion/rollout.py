@@ -73,6 +73,11 @@ class DiffusionPipelineConfig(BaseConfig):
     # Audio-video generation frame rate.
     frame_rate: float = 24.0
 
+    # MiniMax H3 t2va: explicit named canvas ratio required by the vllm-omni
+    # pipeline (one of "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"). Flows to the
+    # rollout request's extra_args alongside height/width.
+    aspect_ratio: Optional[str] = None
+
     # MiniMax H3: sigma-schedule shift for the video stream (maps to vllm-omni's flow_shift)
     video_flow_shift: float = 12.0
 

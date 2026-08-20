@@ -18,8 +18,13 @@ from .diffusion_agent_loop_tq import (
     DiffusionAgentLoopWorkerTQ,
     create_diffusion_agent_loop_manager,
 )
-from .minimax_h3_agent_loop import MiniMaxH3DiffusionSingleTurnAgentLoop
 from .single_turn_agent_loop import DiffusionSingleTurnAgentLoop
+
+# The MiniMax H3 agent loop lives in its pipeline package; import it here so the
+# @register decorator fires when the agent_loop package is imported. Keep this
+# import after the base agent-loop modules above, and do not re-export the class
+# from the pipeline package __init__ (that re-creates the import cycle).
+from verl_omni.pipelines.minimax_h3_diffusion_nft.agent_loop import MiniMaxH3DiffusionSingleTurnAgentLoop
 
 __all__ = [
     "CompositeAgentLoopWorker",
