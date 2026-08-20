@@ -20,7 +20,7 @@ from verl.utils.ray_utils import get_event_loop
 from verl.utils.tokenizer import normalize_token_ids
 
 from verl_omni.agent_loop.single_turn_agent_loop import DiffusionSingleTurnAgentLoop
-from verl_omni.agent_loop.utils import messages_to_text
+from .common import messages_to_text
 
 
 @register("minimax_h3_diffusion_single_turn_agent")
