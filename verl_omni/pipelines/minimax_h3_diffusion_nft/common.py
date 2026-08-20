@@ -433,7 +433,15 @@ class MiniMaxH3RolloutWeightSyncMixin:
         if needs_rope:
             rope_len = arch.rope_inv_freq_len
             inv_freq = 10000.0 ** (-(torch.arange(0, 2 * rope_len, 2, dtype=torch.float32) / (2 * rope_len)))
-            translated.append(("transformer.rope.inv_freq", inv_freq))
+            # vllm-omni >= 0.27 groups the weight stream by component prefix and
+            # requires each prefix to be contiguous, so the synthesized rope table
+            # must sit inside the "transformer." run, not trail the text-encoder
+            # weights (which would re-open the "transformer." group).
+            insert_at = next(
+                (i for i, (n, _) in enumerate(translated) if not n.startswith("transformer.")),
+                len(translated),
+            )
+            translated.insert(insert_at, ("transformer.rope.inv_freq", inv_freq))
 
         loaded = super().load_weights(translated)
         if needs_rope and "transformer.rope.inv_freq" in loaded:

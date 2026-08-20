@@ -25,10 +25,12 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 N_GPUS=${N_GPUS:-8}
 ROLLOUT_TP=${ROLLOUT_TP:-4}
 ROLLOUT_N=${ROLLOUT_N:-16}
-# Training resolution keeps the 400x640 data aspect (~1:1.61) at a cheaper
+# Training resolution keeps the 400x640 data aspect (~1:1.6) at a cheaper
 # token count; the pipeline LANCZOS-resizes condition images to this size.
+# Both edges must be multiples of 32 -- the H3 pipeline silently floors
+# anything else.
 HEIGHT=${HEIGHT:-288}
-WIDTH=${WIDTH:-464}
+WIDTH=${WIDTH:-448}
 # Validation doubles the training resolution, mirroring the t2av recipe
 # (256x384 -> 512x768), same aspect ratio.
 VAL_HEIGHT=${VAL_HEIGHT:-576}
