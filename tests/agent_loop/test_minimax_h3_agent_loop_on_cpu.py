@@ -18,8 +18,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from verl_omni.pipelines.minimax_h3_diffusion_nft.agent_loop import MiniMaxH3DiffusionSingleTurnAgentLoop
 from verl_omni.agent_loop.single_turn_agent_loop import DiffusionSingleTurnAgentLoop
+from verl_omni.pipelines.minimax_h3_diffusion_nft.agent_loop import MiniMaxH3DiffusionSingleTurnAgentLoop
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     MINIMAX_H3_TOKEN_ID_NATIVE_KEY,
     messages_to_text,
@@ -52,6 +52,39 @@ def test_h3_agent_loop_marks_token_ids_as_native(monkeypatch):
     result = asyncio.run(agent.run({"temperature": 1.0}, raw_prompt=[]))
 
     assert result == {"temperature": 1.0, MINIMAX_H3_TOKEN_ID_NATIVE_KEY: True}
+
+
+def test_h3_agent_loop_init_does_not_touch_the_tokenizer():
+    """Guard the fix for "RuntimeError: Already borrowed".
+
+    The upstream base ``__init__`` derives a chat-template system prompt, which
+    mutates the shared Rust tokenizer. Agent loops are built concurrently, so
+    that mutation races. H3 must not perform it.
+    """
+
+    class ExplodingTokenizer:
+        def __call__(self, *args, **kwargs):
+            raise AssertionError("H3 __init__ must not tokenize")
+
+        def apply_chat_template(self, *args, **kwargs):
+            raise AssertionError("H3 __init__ must not apply a chat template")
+
+    rollout = SimpleNamespace(prompt_length=64)
+    trainer_config = SimpleNamespace(config=SimpleNamespace(actor_rollout_ref=SimpleNamespace(rollout=rollout)))
+    tokenizer = ExplodingTokenizer()
+
+    agent = MiniMaxH3DiffusionSingleTurnAgentLoop(
+        trainer_config,
+        server_manager=object(),
+        tokenizer=tokenizer,
+        processor=None,
+        dataset_cls=None,
+        data_config=SimpleNamespace(config={}),
+    )
+
+    assert agent.system_prompt == []
+    assert agent.tokenizer is tokenizer
+    assert agent.rollout_config is rollout
 
 
 def test_h3_agent_loop_tokenizes_raw_text_without_special_tokens():
