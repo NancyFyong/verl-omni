@@ -12,32 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Optional
-
-MINIMAX_H3_TOKEN_ID_NATIVE_KEY = "minimax_h3_token_id_native"
-
-
-def messages_to_text(messages: Any) -> str:
-    """Extract plain text items from chat messages without rendering a template."""
-    if isinstance(messages, str):
-        return messages
-    if isinstance(messages, dict):
-        messages = [messages]
-
-    parts: list[str] = []
-    for message in messages or []:
-        if not isinstance(message, dict):
-            continue
-        content = message.get("content", "")
-        if isinstance(content, str):
-            parts.append(content)
-            continue
-        for item in content or []:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict) and item.get("type") == "text":
-                parts.append(str(item.get("text", "")))
-    return "\n".join(part for part in parts if part).strip()
+from typing import Optional
 
 
 def _derive_rollout_seed(base_seed: int, rollout_index: int) -> int:

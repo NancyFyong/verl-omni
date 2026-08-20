@@ -19,7 +19,6 @@ from typing import Any
 import numpy as np
 import torch
 
-from verl_omni.agent_loop.utils import MINIMAX_H3_TOKEN_ID_NATIVE_KEY
 
 VIDEO_ROW_WIDTH = 96
 AUDIO_ROW_WIDTH = 32
@@ -48,6 +47,32 @@ __all__ = [
     "MiniMaxH3RolloutWeightSyncMixin",
 ]
 
+
+
+MINIMAX_H3_TOKEN_ID_NATIVE_KEY = "minimax_h3_token_id_native"
+
+
+def messages_to_text(messages: Any) -> str:
+    """Extract plain text items from chat messages without rendering a template."""
+    if isinstance(messages, str):
+        return messages
+    if isinstance(messages, dict):
+        messages = [messages]
+
+    parts: list[str] = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content", "")
+        if isinstance(content, str):
+            parts.append(content)
+            continue
+        for item in content or []:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text", "")))
+    return "\n".join(part for part in parts if part).strip()
 
 def h3_dit_timestep(timesteps: torch.Tensor) -> torch.Tensor:
     """Convert ``sigma * 1000`` to H3's data-fraction timestep."""

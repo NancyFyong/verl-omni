@@ -20,7 +20,10 @@ import pytest
 
 from verl_omni.agent_loop.minimax_h3_agent_loop import MiniMaxH3DiffusionSingleTurnAgentLoop
 from verl_omni.agent_loop.single_turn_agent_loop import DiffusionSingleTurnAgentLoop
-from verl_omni.agent_loop.utils import MINIMAX_H3_TOKEN_ID_NATIVE_KEY, messages_to_text
+from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
+    MINIMAX_H3_TOKEN_ID_NATIVE_KEY,
+    messages_to_text,
+)
 
 
 def test_messages_to_text_ignores_structured_media_items():

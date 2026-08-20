@@ -19,7 +19,10 @@ from verl.experimental.agent_loop.agent_loop import register
 from verl.utils.tokenizer import normalize_token_ids
 
 from verl_omni.agent_loop.single_turn_agent_loop import DiffusionSingleTurnAgentLoop
-from verl_omni.agent_loop.utils import MINIMAX_H3_TOKEN_ID_NATIVE_KEY, messages_to_text
+from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
+    MINIMAX_H3_TOKEN_ID_NATIVE_KEY,
+    messages_to_text,
+)
 
 
 @register("minimax_h3_diffusion_single_turn_agent")
