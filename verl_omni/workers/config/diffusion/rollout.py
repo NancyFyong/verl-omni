@@ -77,6 +77,9 @@ class DiffusionPipelineConfig(BaseConfig):
     task: Optional[str] = None
     frame_indices: Optional[list[int]] = None
 
+    # MiniMax H3 t2va: named canvas ratio (21:9/16:9/4:3/1:1/3:4/9:16).
+    aspect_ratio: Optional[str] = None
+
     # MiniMax H3: sigma-schedule shift for the video stream (maps to vllm-omni's flow_shift)
     video_flow_shift: float = 12.0
 
