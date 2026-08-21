@@ -28,6 +28,7 @@ from .common import (
     pack_video_audio_rows,
     split_dual_velocity,
     unpack_video_audio_rows,
+    validate_lora_target_modules,
 )
 
 __all__ = ["MiniMaxH3DiffusionNFT"]
@@ -36,6 +37,17 @@ __all__ = ["MiniMaxH3DiffusionNFT"]
 @DiffusionModelBase.register("MiniMaxH3Pipeline", algorithm="diffusion_nft")
 class MiniMaxH3DiffusionNFT(DiffusionModelBase):
     """Forward-process MiniMax H3 adapter used by DiffusionNFT."""
+
+    @classmethod
+    def validate_lora_config(cls, model_config: DiffusionModelConfig) -> None:
+        """Reject LoRA targets the rollout weight sync cannot transport.
+
+        H3 only syncs transformer/refiner block LoRAs; ``all-linear`` and other
+        top-level modules are unsafe under FSDP layered-summon. Shares the
+        whitelist with the weight-sync path in ``common.py``.
+        """
+        if model_config.lora_rank > 0:
+            validate_lora_target_modules(model_config.target_modules)
 
     @classmethod
     def build_scheduler(cls, model_config: DiffusionModelConfig):

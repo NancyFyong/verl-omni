@@ -246,6 +246,7 @@ class TestDiffusionModelConfigPolicyAdapters:
                     f"tokenizer_path={model_dir}",
                     "+load_tokenizer=false",
                     "attn_backend=native",
+                    "algorithm=diffusion_nft",
                     "lora_rank=8",
                     "target_modules=all-linear",
                 ],
