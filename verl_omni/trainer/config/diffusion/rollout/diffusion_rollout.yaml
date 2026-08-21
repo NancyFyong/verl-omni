@@ -169,6 +169,8 @@ val_kwargs:
 
     # MiniMax H3 video-stream sigma-schedule shift (validation)
     video_flow_shift: ${oc.select:actor_rollout_ref.rollout.pipeline.video_flow_shift,12.0}
+    task: ${oc.select:actor_rollout_ref.rollout.pipeline.task,null}
+    frame_indices: ${oc.select:actor_rollout_ref.rollout.pipeline.frame_indices,null}
     aspect_ratio: ${oc.select:actor_rollout_ref.rollout.pipeline.aspect_ratio,null}
 
 # Rollout Algorithm configuration for validation
@@ -257,6 +259,8 @@ pipeline:
 
   # MiniMax H3 video-stream sigma-schedule shift
   video_flow_shift: 12.0
+  task: null
+  frame_indices: null
   aspect_ratio: null
 
 # support logging rollout prob for debugging purpose
