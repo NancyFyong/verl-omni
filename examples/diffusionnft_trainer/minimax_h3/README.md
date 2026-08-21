@@ -144,9 +144,11 @@ bash examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_fl2va_lora.sh
 
 The latest vLLM-Omni contract requires 4–15 seconds at 24 FPS. The launcher's
 `NUM_FRAMES=96` is aligned by vLLM-Omni to the next valid `17n+5` boundary.
-This checkpoint is not a low-step distilled model, so the launcher defaults to
-`INFER_STEPS=50`; 2–4 steps are suitable only for contract smoke tests and
-produce noisy video and audio. Do not use the old short 22/29-frame settings.
+Sampling edges must be multiples of 32 (the H3 pipeline silently floors
+anything else); the recipe uses 288x448 for training and 576x928 for
+validation. Training rollouts sample with `INFER_STEPS=10` diffusion steps for
+throughput and validation uses 40; 2–4 steps are suitable only for contract
+smoke tests. Do not use the old short 22/29-frame settings.
 
 To verify that the two checkpoint directories represent exactly the same base
 policy after fused-QKV and GEGLU conversion, run:
@@ -168,11 +170,11 @@ synchronization on a 96 GB GPU. With the 8-GPU recipe, `ROLLOUT_N=4` also
 makes the two-prompt Actor batch divisible by the FSDP data-parallel world
 size.
 
-The launcher uses the diffusers `native` Actor attention and vLLM-Omni
-`TORCH_SDPA` rollout attention by default. This validated combination does not
-need to download the optional `kernels-community/flash-attn3` Hub kernel at
-startup. Override `ACTOR_ATTN_BACKEND` and `ROLLOUT_ATTN_BACKEND` together only
-after validating the replacement backends.
+The launcher defaults to FlashAttention 3 for both the Actor
+(`_flash_3_varlen_hub`) and the rollout (`FLASH_ATTN_3_HUB`), which requires
+the `kernels` package. Override `ACTOR_ATTN_BACKEND` and
+`ROLLOUT_ATTN_BACKEND` together (e.g. `native` / `TORCH_SDPA`) only after
+validating the replacement backends.
 
 Rollout quantization is intentionally not enabled. On the pinned vLLM-Omni
 commit, a native custom pipeline combined with online FP8 can hit a meta-tensor

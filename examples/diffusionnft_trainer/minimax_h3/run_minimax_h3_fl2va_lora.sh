@@ -1,20 +1,10 @@
 #!/usr/bin/env bash
-# MiniMax H3 FL2VA DiffusionNFT. MODEL_PATH is the official rollout checkpoint;
-# ACTOR_TRANSFORMER_PATH is the converted diffusers transformer for FSDP.
-#
-# Training/sampling hyperparameters are aligned with the t2av DiffusionNFT
-# recipe (run_minimax_h3_t2av_lora.sh on the minimax-h3-nft branch); only
-# FL2VA-specific knobs differ (task/frame conditioning, prompt-embed agent
-# loop, resolution matched to the first-frame data, PickScore reward).
+# MiniMax H3 FL2VA (image-conditioned) DiffusionNFT LoRA recipe.
 set -euo pipefail
 
 export WANDB_MODE=${WANDB_MODE:-offline}
-# Pin a stable wandb run id so restarts append to the same online run instead
-# of fragmenting the curves across runs.
 export WANDB_RUN_ID=${WANDB_RUN_ID:-minimax_h3_fl2va_lora}
 export WANDB_RESUME=${WANDB_RESUME:-allow}
-# RewardLoopWorker actors are created with num_gpus=0; keep Ray from hiding
-# GPUs from them.
 export RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
@@ -25,22 +15,14 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 N_GPUS=${N_GPUS:-8}
 ROLLOUT_TP=${ROLLOUT_TP:-4}
 ROLLOUT_N=${ROLLOUT_N:-16}
-# Training resolution keeps the 400x640 data aspect (~1:1.6) at a cheaper
-# token count; the pipeline LANCZOS-resizes condition images to this size.
-# Both edges must be multiples of 32 -- the H3 pipeline silently floors
-# anything else.
 HEIGHT=${HEIGHT:-288}
 WIDTH=${WIDTH:-448}
-# Validation doubles the training resolution, mirroring the t2av recipe
-# (256x384 -> 512x768), same aspect ratio.
 VAL_HEIGHT=${VAL_HEIGHT:-576}
 VAL_WIDTH=${VAL_WIDTH:-928}
 NUM_FRAMES=${NUM_FRAMES:-96}
 INFER_STEPS=${INFER_STEPS:-10}
 MAX_PROMPT_EMBEDS=${MAX_PROMPT_EMBEDS:-1024}
-# Must match --frame_mode used by prepare_data.py ('first' -> '[0]').
 FRAME_INDICES=${FRAME_INDICES:-'[0]'}
-# FlashAttention 3 for both training and rollout (requires the `kernels` package).
 ACTOR_ATTN_BACKEND=${ACTOR_ATTN_BACKEND:-_flash_3_varlen_hub}
 ROLLOUT_ATTN_BACKEND=${ROLLOUT_ATTN_BACKEND:-FLASH_ATTN_3_HUB}
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-1000}
@@ -57,19 +39,10 @@ run_timestamp=$(date +"%Y%m%d_%H%M")
 log_file=$output_dir/logs/$run_timestamp/${NODE_RANK:-0}.log
 mkdir -p "$checkpoint_dir" "$(dirname "$log_file")"
 
-# Optional LoRA warm start: set LORA_WARMSTART_PATH to a peft adapter dir to
-# initialize the default adapter from it; unset/empty trains from scratch.
 lora_warmstart_arg=()
 if [[ -n "${LORA_WARMSTART_PATH:-}" ]]; then
     lora_warmstart_arg=(actor_rollout_ref.model.lora_adapter_path=$LORA_WARMSTART_PATH)
 fi
-
-# Use the uv env's bundled cuDNN (matches the PyTorch build); the machine's
-# /usr/local/cuda/lib64 may ship an older cuDNN that breaks torch.backends.cudnn
-# inside the vllm-omni diffusion workers.
-VENV_SITE=$(python3 -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
-LD_LIBRARY_PATH=$(echo "${LD_LIBRARY_PATH:-}" | tr ':' '\n' | grep -vx '/usr/local/cuda/lib64' | grep -v '^$' | paste -sd:)
-export LD_LIBRARY_PATH="$VENV_SITE/nvidia/cudnn/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 python3 -m verl_omni.trainer.main_diffusion \
   algorithm.trainer_type=direct_preference \
