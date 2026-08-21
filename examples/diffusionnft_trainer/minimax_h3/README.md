@@ -95,8 +95,32 @@ python3 examples/diffusionnft_trainer/minimax_h3/build_fl2va_jsonl.py \
 
 Prompt-only sibling of the FL2VA recipe: trains a rank-64 MiniMax H3 LoRA
 with online DiffusionNFT. A Diffusers transformer is trained with FSDP2
-while vLLM-Omni generates joint video and audio rollouts; CLAP + ImageBind
-provide the audio-video alignment rewards.
+while vLLM-Omni generates joint video and audio rollouts. CLAP and ImageBind
+provide the default multi-reward (audio-video alignment).
+
+### Install
+
+Follow the project [installation guide](../../../docs/start/install.md),
+then install the repository-pinned vLLM-Omni revision:
+
+```bash
+uv pip install -e ".[gpu]" --torch-backend=auto
+uv pip install "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@$(cat .github/vllm_omni_pin.txt)"
+uv pip install -e ".[train,dev]"
+uv pip install "diffusers @ git+https://github.com/huggingface/diffusers.git@245d78fb48f1c87dfb560a94be6e191c9f9f1c0"
+```
+
+The explicit Diffusers revision is the tested API target that provides
+`MiniMaxH3Transformer3DModel`.
+
+### Checkpoint
+
+`MODEL_PATH` must be a local MiniMax-H3 repo root containing `FL2VA/`
+(vLLM-Omni rollout checkpoint) and `transformer/` (converted Diffusers
+`MiniMaxH3Transformer3DModel` for FSDP training). Do not replace the official
+rollout transformer with a symlink to the Diffusers conversion.
+
+### Prepare data
 
 Convert prompt splits to prompt-only parquet (no condition images, and no
 negative prompts, since H3 is CFG-distilled):
@@ -107,9 +131,10 @@ python3 examples/diffusionnft_trainer/minimax_h3/prepare_t2av_data.py \
     --output_dir /path/to/h3_t2va_data
 ```
 
-`MODEL_PATH` must be a local MiniMax-H3 repo root containing `FL2VA/`
-(vLLM-Omni rollout checkpoint) and `transformer/` (converted Diffusers
-`MiniMaxH3Transformer3DModel` for FSDP training):
+Input is `train.txt`/`test.txt` (one prompt per line) or
+`train.jsonl`/`test.jsonl` (`prompt`/`text`/`caption` fields).
+
+### Launch
 
 ```bash
 export MODEL_PATH=/path/to/MiniMax-H3
@@ -118,10 +143,23 @@ export DATA_DIR=/path/to/h3_t2va_data
 bash examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_t2va_lora.sh
 ```
 
-The t2va rollout requires an explicit named `aspect_ratio` (the script
-sets `16:9`); `height`/`width` control the actual canvas and must be
-multiples of 32. Install pins, checkpoint notes, and common overrides are
-documented in [T2VA.md](T2VA.md).
+MiniMax H3 t2va requires an explicit named `aspect_ratio` (one of
+`21:9/16:9/4:3/1:1/3:4/9:16`); the launch script sets `16:9` and explicit
+`height`/`width` control the actual canvas (must be multiples of 32).
+
+The H3-specific agent loop (`minimax_h3_diffusion_single_turn_agent`) is
+required: it tokenizes raw text once and sends those token IDs directly to
+the H3 text encoder.
+
+Training rollouts sample with `INFER_STEPS=10` diffusion steps for
+throughput; validation always uses 40. Raise `INFER_STEPS` (e.g. 50) for
+higher-quality rollouts. Common overrides:
+
+```bash
+NUM_GPUS=8 ROLLOUT_TP=4 ROLLOUT_N=4 INFER_STEPS=50 \
+TOTAL_TRAINING_STEPS=100 OUTPUT_DIR=/path/to/output \
+bash examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_t2va_lora.sh
+```
 
 ## License
 
