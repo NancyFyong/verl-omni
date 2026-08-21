@@ -1,24 +1,10 @@
 #!/usr/bin/env bash
 # MiniMax-H3 text-to-audio-video (t2va) DiffusionNFT LoRA recipe.
-#
-# Reuses the LTX-2.3 t2av prompt data (VidProM subset) and the CLAP +
-# ImageBind multi-reward setup. DiffusionNFT trains from final clean latents:
-# rollout runs the `old` LoRA adapter (no log-probs), the `default` adapter
-# is updated with the forward-process loss.
-#
-# MiniMax-H3 notes (see docs/rfcs/rfc-0001-minimax-h3-fl2va.md):
-# - MODEL_PATH is a LOCAL MiniMax-H3 repo root. Rollout serves the FL2VA
-#   partition (model.path=$MODEL_PATH/FL2VA, declares MiniMaxH3Pipeline);
-#   training loads the DiT from $MODEL_PATH/transformer (diffusers format)
-#   via model.config_path — the root model_index.json uses the 3-element
-#   Modular format that diffusers.AutoModel cannot unpack.
 # - H3 is CFG-distilled: true_cfg_scale stays 1.0 (no negative branch), and
 #   the pipeline does not support request batching: max_num_seqs=1.
 set -x
 
 export WANDB_MODE=${WANDB_MODE:-offline}
-# RewardLoopWorker actors are created with num_gpus=0; keep Ray from hiding
-# GPUs from them (CLAP/ImageBind pin cuda:0/cuda:1 explicitly).
 export RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
 
 WORKSPACE=${WORKSPACE:-$HOME}
@@ -28,9 +14,6 @@ NUM_GPUS=${NUM_GPUS:-8}
 ROLLOUT_TP=${ROLLOUT_TP:-2}
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-1000}
 
-# MODEL_PATH must be a LOCAL MiniMax-H3 repo root: rollout serves
-# $MODEL_PATH/FL2VA and training reads $MODEL_PATH/transformer, neither of
-# which exists under a bare hub id.
 if [[ -z "$MODEL_PATH" || ! -d "$MODEL_PATH/FL2VA" || ! -d "$MODEL_PATH/transformer" ]]; then
     echo "MODEL_PATH must point to a local MiniMax-H3 repo root containing FL2VA/ and transformer/ (got: '${MODEL_PATH:-<unset>}')" >&2
     exit 1
@@ -60,16 +43,11 @@ exec > >(tee -a "$log_file") 2>&1
 # MiniMaxH3TransformerBlock submodules: attn.to_q/to_k/to_v/to_out.0 + swiglu ff.
 h3_lora_targets="['to_q','to_k','to_v','to_out.0','ff.net.0.proj','ff.net.2']"
 
-# Optional LoRA warm start: set LORA_WARMSTART_PATH to a peft adapter dir to
-# initialize the default adapter from it; unset/empty trains from scratch.
 lora_warmstart_arg=()
 if [[ -n "${LORA_WARMSTART_PATH:-}" ]]; then
     lora_warmstart_arg=(actor_rollout_ref.model.lora_adapter_path=$LORA_WARMSTART_PATH)
 fi
 
-# Use the uv env's bundled cuDNN (9.19.0, matches the PyTorch build); the
-# machine's /usr/local/cuda/lib64 ships cuDNN 9.10.2 which breaks
-# torch.backends.cudnn inside the vllm-omni diffusion workers.
 VENV_SITE=$(python3 -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
 LD_LIBRARY_PATH=$(echo "${LD_LIBRARY_PATH:-}" | tr ':' '\n' | grep -vx '/usr/local/cuda/lib64' | grep -v '^$' | paste -sd:)
 export LD_LIBRARY_PATH="$VENV_SITE/nvidia/cudnn/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
