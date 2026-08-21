@@ -121,6 +121,46 @@ class TestH3RolloutOutputContract:
 
         shutil.rmtree(tmpdir, ignore_errors=True)
 
+    @pytest.mark.parametrize(
+        "shape, expect",
+        [
+            # Channels-first [N, C, T, H, W] must be normalized to [N, T, C, H, W].
+            ((2, _VIDEO_C, 9, 32, 48), (9, _VIDEO_C, 32, 48)),
+            # Already [N, T, C, H, W]; must be left untouched.
+            ((2, 9, _VIDEO_C, 32, 48), (9, _VIDEO_C, 32, 48)),
+        ],
+        ids=["channels_first", "already_normalized"],
+    )
+    def test_dump_generations_normalizes_5d_layout(self, shape, expect, monkeypatch, tmp_path):
+        """_dump_generations must hand ``_export_video`` per-sample ``[T, C, H, W]``.
+
+        Both batched layouts must converge on the same per-sample shape; assert on the
+        tensor reaching the exporter so a transposed guard cannot slip through.
+        """
+        from verl_omni.trainer.diffusion import ray_diffusion_trainer as rdt
+
+        seen = []
+
+        def _fake_export(output, output_path, **kwargs):
+            seen.append(tuple(output.shape))
+            open(output_path, "wb").close()
+
+        monkeypatch.setattr(rdt, "_export_video", _fake_export)
+
+        outputs = torch.randint(0, 256, shape, dtype=torch.uint8)
+        stand_in = SimpleNamespace(global_steps=1)
+        rdt.BaseRayDiffusionTrainer._dump_generations(
+            stand_in,
+            inputs=["p0", "p1"],
+            outputs=outputs,
+            gts=["g0", "g1"],
+            scores=[0.1, 0.2],
+            reward_extra_infos_dict={},
+            dump_path=str(tmp_path),
+        )
+
+        assert seen == [expect] * 2, f"{shape} produced per-sample shapes {seen}, expected {expect}"
+
     def test_dump_generations_6d(self):
         """_dump_generations handles [N,1,T,C,H,W] 6D outputs."""
         import tempfile
