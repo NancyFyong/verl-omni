@@ -46,8 +46,6 @@ log_file=$output_dir/logs/$run_timestamp/${NODE_RANK:-0}.log
 mkdir -p "$checkpoint_dir" "$(dirname "$log_file")"
 exec > >(tee -a "$log_file") 2>&1
 
-# RewardLoopWorker actors are created with num_gpus=0; keep Ray from hiding
-# GPUs from them (CLAP/ImageBind pin cuda:0/cuda:1 explicitly).
 export RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
 
 h3_lora_targets="['to_q','to_k','to_v','to_out.0','ff.net.0.proj','ff.net.2']"
