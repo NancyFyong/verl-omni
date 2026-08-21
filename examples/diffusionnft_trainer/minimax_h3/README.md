@@ -91,6 +91,38 @@ python3 examples/diffusionnft_trainer/minimax_h3/build_fl2va_jsonl.py \
   pipeline LANCZOS-resizes condition images to the sampling resolution, so
   training at e.g. 288x464 (same ~1:1.61 aspect) works directly.
 
+## T2VA (text-to-audio-video) training
+
+Prompt-only sibling of the FL2VA recipe: trains a rank-64 MiniMax H3 LoRA
+with online DiffusionNFT. A Diffusers transformer is trained with FSDP2
+while vLLM-Omni generates joint video and audio rollouts; CLAP + ImageBind
+provide the audio-video alignment rewards.
+
+Convert prompt splits to prompt-only parquet (no condition images, and no
+negative prompts, since H3 is CFG-distilled):
+
+```bash
+python3 examples/diffusionnft_trainer/minimax_h3/prepare_t2av_data.py \
+    --input_dir /path/to/raw_prompts \
+    --output_dir /path/to/h3_t2va_data
+```
+
+`MODEL_PATH` must be a local MiniMax-H3 repo root containing `FL2VA/`
+(vLLM-Omni rollout checkpoint) and `transformer/` (converted Diffusers
+`MiniMaxH3Transformer3DModel` for FSDP training):
+
+```bash
+export MODEL_PATH=/path/to/MiniMax-H3
+export DATA_DIR=/path/to/h3_t2va_data
+
+bash examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_t2va_lora.sh
+```
+
+The t2va rollout requires an explicit named `aspect_ratio` (the script
+sets `16:9`); `height`/`width` control the actual canvas and must be
+multiples of 32. Install pins, checkpoint notes, and common overrides are
+documented in [T2VA.md](T2VA.md).
+
 ## License
 
 - Prompts: CC-BY-4.0 (ConsisID-preview-Data)

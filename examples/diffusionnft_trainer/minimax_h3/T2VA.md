@@ -25,11 +25,12 @@ The explicit Diffusers revision is the tested API target that provides
 
 ## Checkpoint
 
-`MODEL_PATH` points at the official MiniMax-H3 `FL2VA` rollout directory
-(tokenizer, text encoder, VAE, fused QKV and GEGLU transformer used by
-vLLM-Omni), while `ACTOR_TRANSFORMER_PATH` points at the converted Diffusers
-`MiniMaxH3Transformer3DModel` for FSDP training. Do not replace the official
-rollout transformer with a symlink to the Diffusers conversion.
+`MODEL_PATH` is a local MiniMax-H3 repo root with two subdirectories:
+`FL2VA/`, the official rollout checkpoint (tokenizer, text encoder, VAE,
+fused QKV and GEGLU transformer used by vLLM-Omni), and `transformer/`,
+the converted Diffusers `MiniMaxH3Transformer3DModel` loaded via
+`model.config_path` for FSDP training. Do not replace the official rollout
+transformer with a symlink to the Diffusers conversion.
 
 ## Prepare data
 
@@ -47,8 +48,7 @@ Input is `train.txt`/`test.txt` (one prompt per line) or
 ## Launch
 
 ```bash
-export MODEL_PATH=/path/to/MiniMax-H3/FL2VA
-export ACTOR_TRANSFORMER_PATH=/path/to/MiniMax-H3-diffusers/transformer
+export MODEL_PATH=/path/to/MiniMax-H3
 export DATA_DIR=/path/to/h3_t2va_data
 
 bash examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_t2va_lora.sh
@@ -62,11 +62,12 @@ The H3-specific agent loop (`minimax_h3_diffusion_single_turn_agent`) is
 required: it tokenizes raw text once and sends those token IDs directly to the
 H3 text encoder.
 
-The checkpoint is not a low-step distilled model; `INFER_STEPS=50` is the
-default. Common overrides:
+Training rollouts sample with `INFER_STEPS=10` diffusion steps for
+throughput; validation always uses 40. Raise `INFER_STEPS` (e.g. 50) for
+higher-quality rollouts. Common overrides:
 
 ```bash
-N_GPUS=8 ROLLOUT_TP=4 ROLLOUT_N=4 INFER_STEPS=50 \
+NUM_GPUS=8 ROLLOUT_TP=4 ROLLOUT_N=4 INFER_STEPS=50 \
 TOTAL_TRAINING_STEPS=100 OUTPUT_DIR=/path/to/output \
 bash examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_t2va_lora.sh
 ```
