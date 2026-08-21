@@ -40,12 +40,7 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
 
     @classmethod
     def validate_lora_config(cls, model_config: DiffusionModelConfig) -> None:
-        """Reject LoRA targets the rollout weight sync cannot transport.
-
-        H3 only syncs transformer/refiner block LoRAs; ``all-linear`` and other
-        top-level modules are unsafe under FSDP layered-summon. Shares the
-        whitelist with the weight-sync path in ``common.py``.
-        """
+        """Reject LoRA targets the rollout weight sync cannot transport (shares common.py whitelist)."""
         if model_config.lora_rank > 0:
             validate_lora_target_modules(model_config.target_modules)
 

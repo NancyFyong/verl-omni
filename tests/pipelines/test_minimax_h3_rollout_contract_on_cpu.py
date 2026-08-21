@@ -132,12 +132,10 @@ class TestH3RolloutOutputContract:
         ids=["channels_first", "already_normalized"],
     )
     def test_dump_generations_normalizes_5d_layout(self, shape, expect, monkeypatch, tmp_path):
-        """_dump_generations hands ``_export_video`` per-sample ``[T, C, H, W]``.
+        """_dump_generations must hand ``_export_video`` per-sample ``[T, C, H, W]``.
 
-        Both batched video layouts must converge on the same per-sample shape. A
-        transposed guard silently permutes the already-correct layout into
-        channels-first instead of fixing channels-first, so assert on the tensor
-        that actually reaches the exporter rather than on the file being written.
+        Both batched layouts must converge on the same per-sample shape; assert on the
+        tensor reaching the exporter so a transposed guard cannot slip through.
         """
         from verl_omni.trainer.diffusion import ray_diffusion_trainer as rdt
 

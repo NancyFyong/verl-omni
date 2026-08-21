@@ -116,12 +116,9 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         self._is_offload_param = self.engine_config.param_offload
         self._is_offload_optimizer = self.engine_config.optimizer_offload
         self._is_lora = self.model_config.lora_rank > 0
-        # Mirrors upstream verl's transformer_impl.py flag for verl-project/verl#5995:
-        # when FSDP2 CPUOffloadPolicy owns CPU<->GPU placement, calling
-        # load_fsdp_model_to_gpu (model.to(device)) leaves the offloaded shards on CPU
-        # and the later state_dict()/weight-sync crashes with a CPU-vs-CUDA device
-        # mismatch. Set True in _build_fsdp_module when that policy is configured, then
-        # used to skip the manual GPU load at checkpoint save and get_per_tensor_param.
+        # FSDP2 CPUOffloadPolicy owns param placement; a manual model.to(device) would
+        # leave shards on CPU and crash state_dict()/weight-sync (upstream verl#5995).
+        # Set True in _build_fsdp_module to skip that manual load.
         self._uses_fsdp2_cpu_offload_policy = False
 
     @property

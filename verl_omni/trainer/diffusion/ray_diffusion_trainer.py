@@ -333,8 +333,7 @@ class BaseRayDiffusionTrainer(ABC):
             # Per-sample batch dim from single-seq rollouts: [N, 1, T, C, H, W].
             outputs = outputs.squeeze(1)
         if outputs.ndim == 5 and outputs.shape[1] == 3 and outputs.shape[2] != 3:
-            # Channels-first [N, C, T, H, W]; permute to [N, T, C, H, W]. This mirrors
-            # video_tensor_to_pil_frames' per-sample check one axis to the right.
+            # Channels-first [N, C, T, H, W] -> [N, T, C, H, W].
             outputs = outputs.permute(0, 2, 1, 3, 4)
         is_video = outputs.ndim == 5  # [N, T, C, H, W] vs image [N, C, H, W]
 

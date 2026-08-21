@@ -201,11 +201,9 @@ class DiffusionModelConfig(BaseConfig):
                         )
 
         if self.lora_rank > 0:
-            # Delegate LoRA-target validation to the model adapter so this generic
-            # config stays architecture-agnostic. Non-fatal lookup: the H3 adapter
-            # is already registered here because ``import_external_libs`` ran at the
-            # top of ``__post_init__``; models without a registered adapter fall back
-            # to the default no-op hook.
+            # Validate LoRA targets via the model adapter's hook so this generic config
+            # stays architecture-agnostic (non-fatal lookup; unregistered architectures
+            # fall back to the default no-op).
             from verl_omni.pipelines.model_base import DiffusionModelBase
 
             adapter = DiffusionModelBase.peek_class(self.architecture, self.algorithm)

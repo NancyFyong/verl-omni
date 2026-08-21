@@ -308,16 +308,10 @@ _LORA_STACKED_PARAMS_MAPPING = [
 
 
 def validate_lora_target_modules(target_modules) -> set[str]:
-    """Validate H3 LoRA target modules against the sync-safe whitelist.
+    """Validate H3 LoRA targets against the sync-safe whitelist (single source of truth).
 
-    MiniMax H3 only transports transformer/refiner block LoRAs to the rollout
-    engine; ``all-linear`` and other top-level modules are unsafe because FSDP
-    layered-summon does not carry them across the actor-to-rollout weight sync.
-    Shared by config-time validation (fail fast at startup) and the rollout
-    weight-sync path so the whitelist has a single source of truth.
-
-    Returns the normalized set of requested targets; raises ``ValueError`` when
-    the targets are missing, malformed, or fall outside the whitelist.
+    ``all-linear`` and top-level modules are rejected because FSDP layered-summon does
+    not transport them to rollout. Returns the normalized set; raises on violations.
     """
     if isinstance(target_modules, str):
         requested = {target_modules}

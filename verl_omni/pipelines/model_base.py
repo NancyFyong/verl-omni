@@ -76,12 +76,7 @@ class DiffusionModelBase(ABC):
 
     @classmethod
     def peek_class(cls, architecture: str, algorithm: str) -> Optional[type["DiffusionModelBase"]]:
-        """Return the registered adapter for ``(architecture, algorithm)`` or ``None``.
-
-        Non-fatal counterpart to :meth:`get_class_by_name` for callers such as
-        config validation that must not trigger ``import_external_libs`` or raise
-        when the adapter is not registered yet.
-        """
+        """Return the registered adapter for ``(architecture, algorithm)`` or ``None`` (non-fatal)."""
         return cls._registry.get((architecture, algorithm))
 
     @classmethod
@@ -123,12 +118,7 @@ class DiffusionModelBase(ABC):
 
     @classmethod
     def validate_lora_config(cls, model_config: DiffusionModelConfig) -> None:
-        """Validate LoRA settings for architectures with rollout-sync constraints.
-
-        Default no-op. Override for models whose actor-to-rollout weight sync only
-        supports a subset of LoRA target modules, so misconfigurations fail fast at
-        config-build time instead of at the first weight sync.
-        """
+        """Validate LoRA settings; default no-op. Override for rollout-sync-constrained models."""
         return
 
     @classmethod
