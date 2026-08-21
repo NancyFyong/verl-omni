@@ -1,9 +1,10 @@
-# MiniMax H3 T2VA DiffusionNFT
+# MiniMax H3 DiffusionNFT Recipes
 
-This recipe trains a rank-64 MiniMax H3 LoRA with online DiffusionNFT. A
-Diffusers transformer is trained with FSDP2, while vLLM-Omni generates joint
-video and audio rollouts from text prompts. CLAP and ImageBind provide the
-default multi-reward (audio-video alignment).
+Two recipes share this directory: **T2VA** (text-to-audio-video) and **FL2VA**
+(first/last-frame-conditioned text-to-audio-video). Both train rank-64 MiniMax H3
+LoRA with online DiffusionNFT: a Diffusers transformer is trained with FSDP2
+while vLLM-Omni generates joint video and audio rollouts. CLAP and ImageBind
+provide the default multi-reward (audio-video alignment).
 
 ## Install
 
@@ -14,40 +15,39 @@ install the repository-pinned vLLM-Omni revision:
 uv pip install -e ".[gpu]" --torch-backend=auto
 uv pip install "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@$(cat .github/vllm_omni_pin.txt)"
 uv pip install -e ".[train,dev]"
-uv pip install "diffusers @ git+https://github.com/huggingface/diffusers.git@245d78fb48f1c87dfb560a94bea6e191c9f9f1c0"
+uv pip install "diffusers @ git+https://github.com/huggingface/diffusers.git@245d78fb48f1c87dfb560a94be6e191c9f9f1c0"
 ```
 
 The explicit Diffusers revision is the tested API target that provides
 `MiniMaxH3Transformer3DModel`.
 
-## Prepare the model
+## Checkpoint
 
-The actor and rollout consume different transformer checkpoint layouts:
+Both recipes consume the same two checkpoint layouts. `MODEL_PATH` points at
+the official MiniMax-H3 `FL2VA` rollout directory (tokenizer, text encoder,
+VAE, fused QKV and GEGLU transformer used by vLLM-Omni), while
+`ACTOR_TRANSFORMER_PATH` points at the converted Diffusers
+`MiniMaxH3Transformer3DModel` for FSDP training. Do not replace the official
+rollout transformer with a symlink to the Diffusers conversion — that silently
+breaks the rollout weight loader.
 
-- `MODEL_PATH` must point to the official MiniMax-H3 `FL2VA` rollout directory,
-  including the tokenizer, text encoder, VAE, and official fused transformer.
-- `ACTOR_TRANSFORMER_PATH` must point to the converted Diffusers transformer
-  directory containing its `config.json` and safetensor shards.
+## T2VA (text-to-audio-video)
 
-Do not replace the official rollout transformer with a symlink to the
-Diffusers transformer. vLLM-Omni expects fused QKV and GEGLU weights, while the
-actor expects the Diffusers split layout.
+### Prepare data
 
-## Prepare text prompts
-
-The recipe accepts RLHFDataset-compatible text-only parquet files. The LTX-2
-prompt converter can be reused for `train.txt`/`test.txt` or
-`train.jsonl`/`test.jsonl` inputs:
+The recipe accepts RLHFDataset-compatible text-only parquet files. Convert
+prompt lists with:
 
 ```bash
-python3 examples/flowgrpo_trainer/ltx2/prepare_data.py \
+python3 examples/diffusionnft_trainer/minimax_h3/prepare_t2av_data.py \
   --input_dir /path/to/raw_prompts \
   --output_dir /path/to/h3_t2va_data
 ```
 
-Each JSONL row may use a `prompt`, `text`, or `caption` field.
+Input is `train.txt`/`test.txt` (one prompt per line) or
+`train.jsonl`/`test.jsonl` (`prompt`/`text`/`caption` fields).
 
-## Launch
+### Launch
 
 ```bash
 export MODEL_PATH=/path/to/MiniMax-H3/FL2VA
@@ -57,45 +57,77 @@ export DATA_DIR=/path/to/h3_t2va_data
 bash examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_t2va_lora.sh
 ```
 
-The launch script explicitly selects:
+MiniMax H3 t2va requires an explicit named `aspect_ratio` (one of
+`21:9/16:9/4:3/1:1/3:4/9:16`); the launch script sets `16:9` and explicit
+`height`/`width` control the actual canvas (must be multiples of 32).
 
-```bash
-actor_rollout_ref.rollout.agent.default_agent_loop=minimax_h3_diffusion_single_turn_agent
+## FL2VA (image-conditioned)
+
+### Prepare data
+
+Prepare `train.jsonl` and `test.jsonl`. Each row has a prompt and either an
+`images` list or explicit first/last names:
+
+```json
+{"prompt":"A sunrise becomes a starry night.","images":["images/first.png","images/last.png"]}
 ```
 
-This AgentLoop extracts the plain text from each dataset message, tokenizes it
-with `add_special_tokens=False`, and sends those token IDs directly to the H3
-text encoder. The H3 rollout rejects generic chat-template token IDs instead
-of silently decoding and re-tokenizing them.
-
-The default topology uses eight GPUs, rollout TP=4, text-encoder TP=2, four
-rollouts per prompt, FSDP2 actor training, and rank-64/alpha-128 LoRA. The actor
-uses native attention and rollout uses `TORCH_SDPA`; override both backends
-together if using a matched FA3 installation.
-
-The checkpoint is not a 2–4-step distilled model. The recipe therefore defaults
-to 50 inference steps. Lower values are useful only for contract smoke tests
-and generally produce noisy video and audio.
-
-Common environment overrides include:
+Convert with:
 
 ```bash
-N_GPUS=8 \
-ROLLOUT_TP=4 \
-TEXT_ENCODER_TP=2 \
-ROLLOUT_N=4 \
-INFER_STEPS=50 \
-TOTAL_TRAINING_STEPS=100 \
-OUTPUT_DIR=/path/to/output \
+python examples/diffusionnft_trainer/minimax_h3/prepare_data.py \
+  --input_dir /path/to/raw \
+  --output_dir /path/to/parquet \
+  --frame_mode first_last
+```
+
+`frame_mode` can be `first`, `last`, or `first_last`. Set the matching launcher
+value: `export FRAME_INDICES='[0,-1]'` (or `'[0]'` / `'[-1]'`).
+
+### Launch
+
+```bash
+MODEL_PATH=/path/to/MiniMax-H3/FL2VA \
+ACTOR_TRANSFORMER_PATH=/path/to/MiniMax-H3-diffusers/transformer \
+DATA_DIR=/path/to/parquet \
+bash examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_fl2va_lora.sh
+```
+
+The vLLM-Omni contract requires 4–15 seconds at 24 FPS. `NUM_FRAMES=96` is
+aligned by vLLM-Omni to the next valid `17n+5` boundary. The checkpoint is not
+a low-step distilled model, so `INFER_STEPS=50` is the default; 2–4 steps are
+suitable only for contract smoke tests.
+
+To verify that the two checkpoint directories represent the same base policy
+after fused-QKV and GEGLU conversion:
+
+```bash
+python tests/special_e2e/minimax_h3_checkpoint_parity.py \
+  --vllm-transformer "$MODEL_PATH/transformer" \
+  --diffusers-transformer "$ACTOR_TRANSFORMER_PATH"
+```
+
+## Shared notes
+
+- The H3-specific agent loop (`minimax_h3_diffusion_single_turn_agent`) is
+  required for both recipes: it tokenizes raw text once and sends those token
+  IDs directly to the H3 text encoder. Replacing it with the generic diffusion
+  agent loop changes the prompt contract.
+- The actor uses `native` attention and rollout uses `TORCH_SDPA` by default.
+  Override `ACTOR_ATTN_BACKEND` and `ROLLOUT_ATTN_BACKEND` together only after
+  validating the replacement backends.
+- Common environment overrides:
+
+```bash
+N_GPUS=8 ROLLOUT_TP=4 ROLLOUT_N=4 INFER_STEPS=50 \
+TOTAL_TRAINING_STEPS=100 OUTPUT_DIR=/path/to/output \
 bash examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_t2va_lora.sh
 ```
 
-Additional Hydra overrides may be appended to the command.
+## Offline first-frame data generation
 
-## FLUX first-frame data (FL2VA)
-
-For the image-conditioned FL2VA variant, an offline data pipeline turns a
-prompt list into FLUX reference images and train/test JSONL pairs:
+An offline data pipeline turns a prompt list into FLUX reference images and
+train/test JSONL pairs:
 
 - `gen_flux_images.py` — multi-GPU FLUX batch image generator (prompt file ->
   one JPEG per prompt, deterministic per-index seeds, resume by skipping
