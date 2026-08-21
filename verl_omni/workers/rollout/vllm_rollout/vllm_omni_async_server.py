@@ -708,7 +708,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
                     diffusion_output = diffusion_output[key]
                     break
         rollout_audio: Any = None
-        if isinstance(diffusion_output, (tuple, list)):
+        if isinstance(diffusion_output, tuple | list):
             # Joint audio-video pipelines (e.g. MiniMax H3) return
             # (video, audio); the visual stream drives the tensor path.
             rollout_audio = diffusion_output[1] if len(diffusion_output) > 1 else None
