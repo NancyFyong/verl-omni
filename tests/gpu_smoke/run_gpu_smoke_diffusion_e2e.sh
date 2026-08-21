@@ -40,4 +40,8 @@ run_test 6 "Bagel PickScore LoRA FlowGRPO e2e" \
     env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" NUM_GPUS="${NUM_GPUS}" \
     bash tests/special_e2e/run_flowgrpo_bagel_pickscore.sh "${diffusion_trainer_args[@]}"
 
+run_test 7 "MiniMax H3 FlowGRPO parity" \
+    env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" \
+    bash tests/special_e2e/run_flowgrpo_minimax_h3_parity.sh
+
 gpu_smoke_summary

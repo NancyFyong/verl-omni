@@ -222,7 +222,8 @@ class TestDiffusionModelConfigPolicyAdapters:
             model_cfg: DiffusionModelConfig = omega_conf_to_dataclass(cfg)
         assert tuple(model_cfg.policy_state_adapters) == ("default", "old")
 
-    def test_h3_rejects_all_linear_lora_before_rollout_sync(self, tmp_path):
+    @pytest.mark.parametrize("algorithm", ["diffusion_nft", "flow_grpo"])
+    def test_h3_rejects_all_linear_lora_before_rollout_sync(self, tmp_path, algorithm):
         import json
         import os
         from unittest.mock import patch
@@ -246,7 +247,7 @@ class TestDiffusionModelConfigPolicyAdapters:
                     f"tokenizer_path={model_dir}",
                     "+load_tokenizer=false",
                     "attn_backend=native",
-                    "algorithm=diffusion_nft",
+                    f"algorithm={algorithm}",
                     "lora_rank=8",
                     "target_modules=all-linear",
                 ],

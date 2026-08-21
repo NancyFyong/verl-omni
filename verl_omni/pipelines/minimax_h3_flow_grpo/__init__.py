@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .flow_match_dual_sde import FlowMatchDualSDEDiscreteScheduler, flow_match_shift_sigmas
-from .flow_match_sde import FlowMatchSDEDiscreteScheduler
+from .diffusers_training_adapter import MiniMaxH3FlowGRPO
+from .vllm_omni_rollout_adapter import MiniMaxH3PipelineWithLogProb
 
+# The shared H3 agent loop stays in minimax_h3_diffusion_nft; re-exporting it here would recreate an import cycle.
 __all__ = [
-    "FlowMatchDualSDEDiscreteScheduler",
-    "FlowMatchSDEDiscreteScheduler",
-    "flow_match_shift_sigmas",
+    "MiniMaxH3FlowGRPO",
+    "MiniMaxH3PipelineWithLogProb",
 ]

@@ -80,6 +80,15 @@ class DiffusionPipelineConfig(BaseConfig):
     # Flow-matching sigma-schedule shift for the video stream (maps to vllm-omni's flow_shift)
     video_flow_shift: float = 12.0
 
+    # Flow-matching sigma-schedule shift for the audio stream (maps to vllm-omni's audio_flow_shift)
+    audio_flow_shift: float = 3.0
+
+    # Weight on the video stream's per-step log-prob when a pipeline combines dual-stream log-probs
+    av_logprob_video_weight: float = 1.0
+
+    # Weight on the audio stream's per-step log-prob when a pipeline combines dual-stream log-probs
+    av_logprob_audio_weight: float = 1.0
+
 
 @dataclass
 class DiffusionSamplingConfig(BaseConfig):

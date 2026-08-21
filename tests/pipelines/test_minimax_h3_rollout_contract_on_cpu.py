@@ -59,6 +59,37 @@ def _make_h3_final_res(batch_size: int = 1):
     )
 
 
+_WINDOW = 3
+_PACKED_DIM = 96
+_META_FIELDS = 6
+
+
+def _make_h3_flow_grpo_final_res():
+    """Build a fake output matching what the H3 FlowGRPO rollout adapter publishes."""
+    video = torch.randint(0, 256, (1, _VIDEO_C, 9, 32, 48), dtype=torch.uint8)
+    audio = torch.randn(1, _AUDIO_SAMPLES)
+    metadata = {
+        "rl": {
+            "audio_all_timesteps": torch.randn(1, _WINDOW),
+            "latent_meta": torch.zeros(1, _META_FIELDS, dtype=torch.long),
+        },
+        "prompt_embeddings": {
+            "prompt_embeds": torch.randn(1, 5, 8),
+            "prompt_embeds_mask": torch.ones(1, 5, dtype=torch.long),
+            "negative_prompt_embeds": torch.randn(1, 0, 8),
+            "negative_prompt_embeds_mask": torch.ones(1, 0, dtype=torch.long),
+        },
+    }
+    return SimpleNamespace(
+        images=[(video, audio)],
+        multimodal_output={"payload": {"image": (video, audio)}, "metadata": metadata},
+        trajectory_latents=torch.randn(1, _WINDOW + 1, _PACKED_DIM),
+        trajectory_timesteps=torch.randn(1, _WINDOW),
+        trajectory_log_probs=torch.randn(1, _WINDOW),
+        request_output=None,
+    )
+
+
 def _server():
     server = object.__new__(server_module.vLLMOmniHttpServer)
     server._ar_mode = False
@@ -175,6 +206,35 @@ class TestH3RolloutOutputContract:
                 squeezed = outputs[i].squeeze(0)  # [T, C, H, W]
                 _export_video(squeezed, str(Path(tmpdir) / f"{i}.mp4"), fps=24)
                 assert (Path(tmpdir) / f"{i}.mp4").exists()
+
+
+class TestH3FlowGRPORolloutOutputContract:
+    """Verify the server unpacks the FlowGRPO trajectory the actor replays."""
+
+    @staticmethod
+    def _process(sampling_params):
+        server = _server()
+        return server._process_output(_make_h3_flow_grpo_final_res(), None, sampling_params)
+
+    def test_trajectory_reaches_extra_fields_unbatched(self):
+        """trajectory_* lose the request batch dim, as the actor's ``[:, step]`` indexing assumes."""
+        result = self._process({"output_type": "pt", "logprobs": True})
+        assert result.extra_fields["all_latents"].shape == (_WINDOW + 1, _PACKED_DIM)
+        assert result.extra_fields["all_timesteps"].shape == (_WINDOW,)
+        assert result.log_probs.shape == (_WINDOW,)
+
+    def test_dual_stream_metadata_reaches_extra_fields(self):
+        """The audio timestep pool and latent layout survive the rl group."""
+        result = self._process({"output_type": "pt", "logprobs": True})
+        assert result.extra_fields["audio_all_timesteps"].shape == (_WINDOW,)
+        assert result.extra_fields["latent_meta"].shape == (_META_FIELDS,)
+        assert "prompt_embeds" in result.extra_fields
+
+    def test_log_probs_dropped_without_logprobs(self):
+        """The server only forwards log probs when the request asked for them."""
+        result = self._process({"output_type": "pt"})
+        assert result.log_probs is None
+        assert "all_latents" in result.extra_fields
 
 
 def _run_generate(server, final_res, sampling_params):
