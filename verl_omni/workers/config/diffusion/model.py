@@ -200,21 +200,13 @@ class DiffusionModelConfig(BaseConfig):
                             f"All elements in target_modules list must be strings, but found {type(x).__name__}"
                         )
 
-        if self.architecture == "MiniMaxH3Pipeline" and self.lora_rank > 0:
-            supported_h3_targets = {"to_q", "to_k", "to_v", "to_out.0", "ff.net.0.proj", "ff.net.2"}
-            if isinstance(self.target_modules, str):
-                requested_h3_targets = {self.target_modules}
-            elif isinstance(self.target_modules, list):
-                requested_h3_targets = set(self.target_modules)
-            else:
-                requested_h3_targets = set()
-            unsupported_h3_targets = requested_h3_targets - supported_h3_targets
-            if not requested_h3_targets or unsupported_h3_targets:
-                raise ValueError(
-                    "MiniMax H3 LoRA supports only transformer/refiner block targets "
-                    f"{sorted(supported_h3_targets)}, got {sorted(requested_h3_targets)}. "
-                    "`all-linear` is unsupported because its top-level LoRAs are not synced to rollout."
-                )
+        if self.lora_rank > 0:
+            # Delegate LoRA-target validation to the registered adapter (no-op when unregistered).
+            from verl_omni.pipelines.model_base import DiffusionModelBase
+
+            adapter = DiffusionModelBase.peek_class(self.architecture, self.algorithm)
+            if adapter is not None:
+                adapter.validate_lora_config(self)
 
     def get_processor(self):
         return self.processor if self.processor is not None else self.tokenizer

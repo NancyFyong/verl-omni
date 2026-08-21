@@ -31,6 +31,7 @@ from .common import (
     prepare_h3_processor_files,
     split_dual_velocity,
     unpack_video_audio_rows,
+    validate_lora_target_modules,
 )
 
 __all__ = ["MiniMaxH3DiffusionNFT"]
@@ -39,6 +40,12 @@ __all__ = ["MiniMaxH3DiffusionNFT"]
 @DiffusionModelBase.register("MiniMaxH3Pipeline", algorithm="diffusion_nft")
 class MiniMaxH3DiffusionNFT(DiffusionModelBase):
     """Forward-process MiniMax H3 adapter used by DiffusionNFT."""
+
+    @classmethod
+    def validate_lora_config(cls, model_config: DiffusionModelConfig) -> None:
+        """Reject LoRA targets the rollout weight sync cannot transport (shares common.py whitelist)."""
+        if model_config.lora_rank > 0:
+            validate_lora_target_modules(model_config.target_modules)
 
     @classmethod
     def prepare_processor_files(cls, model_path: str) -> str:

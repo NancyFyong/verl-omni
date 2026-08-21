@@ -167,7 +167,7 @@ val_kwargs:
     # Audio-video frame rate (validation)
     frame_rate: ${oc.select:actor_rollout_ref.rollout.pipeline.frame_rate,24.0}
 
-    # MiniMax H3 video-stream sigma-schedule shift (validation)
+    # Flow-matching sigma-schedule shift for the video stream (validation)
     video_flow_shift: ${oc.select:actor_rollout_ref.rollout.pipeline.video_flow_shift,12.0}
     task: ${oc.select:actor_rollout_ref.rollout.pipeline.task,null}
     frame_indices: ${oc.select:actor_rollout_ref.rollout.pipeline.frame_indices,null}
@@ -257,7 +257,7 @@ pipeline:
   # Audio-video frame rate
   frame_rate: 24.0
 
-  # MiniMax H3 video-stream sigma-schedule shift
+  # Flow-matching sigma-schedule shift for the video stream
   video_flow_shift: 12.0
   task: null
   frame_indices: null

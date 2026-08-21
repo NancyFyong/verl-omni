@@ -73,14 +73,14 @@ class DiffusionPipelineConfig(BaseConfig):
     # Audio-video generation frame rate.
     frame_rate: float = 24.0
 
-    # MiniMax H3 request contract.
+    # Optional request-contract fields for pipelines that accept a task label or frame indices.
     task: Optional[str] = None
     frame_indices: Optional[list[int]] = None
 
-    # MiniMax H3 t2va: named canvas ratio (21:9/16:9/4:3/1:1/3:4/9:16).
+    # Named canvas aspect ratio for pipelines that accept one (supported ratios are pipeline-specific).
     aspect_ratio: Optional[str] = None
 
-    # MiniMax H3: sigma-schedule shift for the video stream (maps to vllm-omni's flow_shift)
+    # Flow-matching sigma-schedule shift for the video stream (maps to vllm-omni's flow_shift)
     video_flow_shift: float = 12.0
 
 

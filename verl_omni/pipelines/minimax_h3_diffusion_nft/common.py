@@ -332,6 +332,30 @@ def _diffusers_to_vllm_name(name: str) -> str:
 _LORA_VLLM_TARGET_MODULES = ["to_q", "to_k", "to_v", "out_proj", "fc1_0", "fc1_1", "fc2"]
 _SUPPORTED_DIFFUSERS_LORA_TARGETS = frozenset({"to_q", "to_k", "to_v", "to_out.0", "ff.net.0.proj", "ff.net.2"})
 
+
+def validate_lora_target_modules(target_modules) -> set[str]:
+    """Validate H3 LoRA targets against the sync-safe whitelist (single source of truth).
+
+    ``all-linear`` and top-level modules are rejected because FSDP layered-summon does
+    not transport them to rollout. Returns the normalized set; raises on violations.
+    """
+    if isinstance(target_modules, str):
+        requested = {target_modules}
+    elif isinstance(target_modules, list | tuple | set | frozenset):
+        requested = {str(target) for target in target_modules}
+    else:
+        raise ValueError(f"MiniMax H3 LoRA requires an explicit target_modules list; got {target_modules!r}.")
+    unsupported = requested - _SUPPORTED_DIFFUSERS_LORA_TARGETS
+    if not requested or unsupported:
+        raise ValueError(
+            "MiniMax H3 LoRA supports only transformer/refiner block targets "
+            f"{sorted(_SUPPORTED_DIFFUSERS_LORA_TARGETS)}, got {sorted(requested)}. "
+            "`all-linear` and other top-level modules are not synced to rollout "
+            "(FSDP layered-summon does not transport them)."
+        )
+    return requested
+
+
 _LORA_STACKED_PARAMS_MAPPING = [
     (".qkv_proj", ".to_q", "q"),
     (".qkv_proj", ".to_k", "k"),
@@ -457,20 +481,7 @@ class MiniMaxH3RolloutWeightSyncMixin:
     ) -> tuple[dict[str, torch.Tensor], dict]:
         """Translate LoRA deltas to the fused vLLM H3 layout."""
         target_modules = peft_config.get("target_modules") if peft_config is not None else None
-        if isinstance(target_modules, str):
-            requested_targets = {target_modules}
-        elif isinstance(target_modules, list | tuple | set | frozenset):
-            requested_targets = {str(target) for target in target_modules}
-        else:
-            raise ValueError(f"MiniMax H3 LoRA sync requires an explicit target_modules list; got {target_modules!r}.")
-        unsupported_targets = requested_targets - _SUPPORTED_DIFFUSERS_LORA_TARGETS
-        if unsupported_targets:
-            raise ValueError(
-                "MiniMax H3 LoRA rollout sync supports only transformer/refiner block targets "
-                f"{sorted(_SUPPORTED_DIFFUSERS_LORA_TARGETS)}, got unsupported targets "
-                f"{sorted(unsupported_targets)}. In particular, `all-linear` is unsafe: it trains top-level "
-                "LoRAs that FSDP layered-summon does not transport to rollout."
-            )
+        validate_lora_target_modules(target_modules)
 
         ff_half = self.transformer.arch.ffn_hidden_size
         mapped: dict[str, torch.Tensor] = {}
