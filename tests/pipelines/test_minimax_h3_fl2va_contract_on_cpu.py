@@ -18,11 +18,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from verl_omni.pipelines.minimax_h3_diffusion_nft.common import messages_to_text
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     MiniMaxH3RolloutWeightSyncMixin,
     build_layout_from_meta,
     keyframe_indices_to_anchors,
+    messages_to_text,
 )
 
 vllm_packed = pytest.importorskip("vllm_omni.diffusion.models.minimax_h3.packed_sequence")

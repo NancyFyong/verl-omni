@@ -411,12 +411,9 @@ class BaseRayDiffusionTrainer(ABC):
             # extract it so _dump_generations can mux it into the mp4 files.
             tool_extra = batch.non_tensor_batch.get("tool_extra_fields", None)
             if tool_extra is not None:
-                audios_to_dump = [
-                    item.get("audio") if isinstance(item, dict) else None for item in tool_extra
-                ]
+                audios_to_dump = [item.get("audio") if isinstance(item, dict) else None for item in tool_extra]
                 audio_rates_to_dump = [
-                    item.get("audio_sample_rate") if isinstance(item, dict) else None
-                    for item in tool_extra
+                    item.get("audio_sample_rate") if isinstance(item, dict) else None for item in tool_extra
                 ]
             else:
                 audios_to_dump = batch.batch.get("audio", batch.non_tensor_batch.get("audio"))

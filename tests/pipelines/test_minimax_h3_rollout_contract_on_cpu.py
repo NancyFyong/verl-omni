@@ -139,7 +139,6 @@ class TestH3RolloutOutputContract:
 
 def _run_generate(server, final_res, sampling_params):
     """Run the server's generate path with the fake final_res."""
-    import asyncio
 
     async def _fake():
         return final_res
@@ -157,7 +156,7 @@ def _process_output(server, final_res, sampling_params):
     diffusion_output = final_res.images[0]
 
     rollout_audio = None
-    if isinstance(diffusion_output, (tuple, list)):
+    if isinstance(diffusion_output, tuple | list):
         rollout_audio = diffusion_output[1] if len(diffusion_output) > 1 else None
         diffusion_output = diffusion_output[0]
 

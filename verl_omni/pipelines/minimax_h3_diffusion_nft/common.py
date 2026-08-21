@@ -51,7 +51,6 @@ __all__ = [
 ]
 
 
-
 def messages_to_text(messages: Any) -> str:
     """Extract plain text items from chat messages without rendering a template."""
     if isinstance(messages, str):
@@ -73,6 +72,7 @@ def messages_to_text(messages: Any) -> str:
             elif isinstance(item, dict) and item.get("type") == "text":
                 parts.append(str(item.get("text", "")))
     return "\n".join(part for part in parts if part).strip()
+
 
 def h3_dit_timestep(timesteps: torch.Tensor) -> torch.Tensor:
     """Convert ``sigma * 1000`` to H3's data-fraction timestep."""
