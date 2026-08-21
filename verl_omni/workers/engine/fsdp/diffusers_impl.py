@@ -136,7 +136,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         self._is_offload_param = self.engine_config.param_offload
         self._is_offload_optimizer = self.engine_config.optimizer_offload
         self._is_lora = self.model_config.lora_rank > 0
-        # Set in _build_fsdp_module when FSDP2 CPUOffloadPolicy is configured (see #5995).
+        # Set in _build_fsdp_module when FSDP2 CPUOffloadPolicy is configured (see verl#5995).
         self._uses_fsdp2_cpu_offload_policy = False
 
     @property
