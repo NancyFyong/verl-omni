@@ -169,7 +169,15 @@ The run below trains the rank-64 LoRA with the default CLAP + ImageBind
 multi-reward; the weighted-sum reward rises steadily as audio-video alignment
 improves.
 
-<!-- PERF_IMAGE_PLACEHOLDER -->
+### Train Reward
+<img width="1851" height="613" alt="image" src="https://github.com/user-attachments/assets/5caf849a-f76c-4edd-a7cb-1820fbae08c1" />
+<img width="1852" height="623" alt="image" src="https://github.com/user-attachments/assets/61cef5be-a552-4e97-91bc-b4f1a27ad4e2" />
+
+### Eval Reward
+<img width="1856" height="648" alt="image" src="https://github.com/user-attachments/assets/73bd6b28-60af-4fec-a661-e6e9ce9a90d7" />
+### Time consumption
+<img width="1263" height="317" alt="image" src="https://github.com/user-attachments/assets/68e82be9-175d-49d5-88a0-efe434a92698" />
+
 
 ## License
 
