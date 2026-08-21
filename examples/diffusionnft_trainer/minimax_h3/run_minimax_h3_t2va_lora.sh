@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
 # MiniMax-H3 text-to-audio-video (t2va) DiffusionNFT LoRA recipe.
-# - H3 is CFG-distilled: true_cfg_scale stays 1.0 (no negative branch), and
-#   the pipeline does not support request batching: max_num_seqs=1.
 set -x
 
 export WANDB_MODE=${WANDB_MODE:-offline}
-export RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
 
 WORKSPACE=${WORKSPACE:-$HOME}
 MODEL_PATH=${MODEL_PATH:-}
 DATA_DIR=${DATA_DIR:-$WORKSPACE/data/vid_prompt/verl_omni}
 NUM_GPUS=${NUM_GPUS:-8}
 ROLLOUT_TP=${ROLLOUT_TP:-2}
+ROLLOUT_N=${ROLLOUT_N:-16}
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-1000}
+HEIGHT=${HEIGHT:-256}
+WIDTH=${WIDTH:-384}
+NUM_FRAMES=${NUM_FRAMES:-121}
+INFER_STEPS=${INFER_STEPS:-10}
+VAL_HEIGHT=${VAL_HEIGHT:-512}
+VAL_WIDTH=${VAL_WIDTH:-768}
+ACTOR_ATTN_BACKEND=${ACTOR_ATTN_BACKEND:-_flash_3_varlen_hub}
+ROLLOUT_ATTN_BACKEND=${ROLLOUT_ATTN_BACKEND:-FLASH_ATTN_3_HUB}
 
 if [[ -z "$MODEL_PATH" || ! -d "$MODEL_PATH/FL2VA" || ! -d "$MODEL_PATH/transformer" ]]; then
     echo "MODEL_PATH must point to a local MiniMax-H3 repo root containing FL2VA/ and transformer/ (got: '${MODEL_PATH:-<unset>}')" >&2
@@ -40,21 +46,16 @@ log_file=$output_dir/logs/$run_timestamp/${NODE_RANK:-0}.log
 mkdir -p "$checkpoint_dir" "$(dirname "$log_file")"
 exec > >(tee -a "$log_file") 2>&1
 
-# MiniMaxH3TransformerBlock submodules: attn.to_q/to_k/to_v/to_out.0 + swiglu ff.
+# RewardLoopWorker actors are created with num_gpus=0; keep Ray from hiding
+# GPUs from them (CLAP/ImageBind pin cuda:0/cuda:1 explicitly).
+export RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+
 h3_lora_targets="['to_q','to_k','to_v','to_out.0','ff.net.0.proj','ff.net.2']"
 
 lora_warmstart_arg=()
 if [[ -n "${LORA_WARMSTART_PATH:-}" ]]; then
     lora_warmstart_arg=(actor_rollout_ref.model.lora_adapter_path=$LORA_WARMSTART_PATH)
 fi
-
-VENV_SITE=$(python3 -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
-LD_LIBRARY_PATH=$(echo "${LD_LIBRARY_PATH:-}" | tr ':' '\n' | grep -vx '/usr/local/cuda/lib64' | grep -v '^$' | paste -sd:)
-export LD_LIBRARY_PATH="$VENV_SITE/nvidia/cudnn/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-
-# FlashAttention 3 for both training and rollout (requires the `kernels` package).
-ATTN_BACKEND=_flash_3_varlen_hub
-ROLLOUT_ATTN_BACKEND=FLASH_ATTN_3_HUB
 
 python3 -m verl_omni.trainer.main_diffusion \
     data.train_files=$train_path \
@@ -75,7 +76,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     +actor_rollout_ref.model.architecture=MiniMaxH3Pipeline \
     actor_rollout_ref.model.algorithm=diffusion_nft \
     actor_rollout_ref.model.model_type=diffusion_nft_model \
-    actor_rollout_ref.model.attn_backend=$ATTN_BACKEND \
+    actor_rollout_ref.model.attn_backend=$ACTOR_ATTN_BACKEND \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.model.lora_rank=64 \
     actor_rollout_ref.model.lora_alpha=128 \
@@ -106,28 +107,28 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.rollout.max_num_seqs=1 \
     actor_rollout_ref.rollout.rollout_attn_backend=$ROLLOUT_ATTN_BACKEND \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP \
-    actor_rollout_ref.rollout.n=16 \
+    actor_rollout_ref.rollout.n=$ROLLOUT_N \
     actor_rollout_ref.rollout.seed=42 \
     actor_rollout_ref.rollout.agent.num_workers=$((NUM_GPUS / ROLLOUT_TP)) \
+    actor_rollout_ref.rollout.agent.default_agent_loop=minimax_h3_diffusion_single_turn_agent \
     actor_rollout_ref.rollout.load_format=safetensors \
     actor_rollout_ref.rollout.layered_summon=True \
     actor_rollout_ref.rollout.calculate_log_probs=False \
     actor_rollout_ref.rollout.rollout_adapter=old \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.rollout.agent.default_agent_loop=minimax_h3_diffusion_single_turn_agent \
     actor_rollout_ref.rollout.pipeline.aspect_ratio=16:9 \
-    actor_rollout_ref.rollout.pipeline.height=256 \
-    actor_rollout_ref.rollout.pipeline.width=384 \
-    actor_rollout_ref.rollout.pipeline.num_frames=121 \
+    actor_rollout_ref.rollout.pipeline.height=$HEIGHT \
+    actor_rollout_ref.rollout.pipeline.width=$WIDTH \
+    actor_rollout_ref.rollout.pipeline.num_frames=$NUM_FRAMES \
     actor_rollout_ref.rollout.pipeline.frame_rate=24.0 \
-    actor_rollout_ref.rollout.pipeline.num_inference_steps=10 \
+    actor_rollout_ref.rollout.pipeline.num_inference_steps=$INFER_STEPS \
     actor_rollout_ref.rollout.pipeline.true_cfg_scale=1.0 \
     actor_rollout_ref.rollout.pipeline.max_sequence_length=1024 \
     actor_rollout_ref.rollout.pipeline.video_flow_shift=12.0 \
     +actor_rollout_ref.rollout.pipeline.output_type=pt \
-    actor_rollout_ref.rollout.val_kwargs.pipeline.height=512 \
-    actor_rollout_ref.rollout.val_kwargs.pipeline.width=768 \
-    actor_rollout_ref.rollout.val_kwargs.pipeline.num_frames=121 \
+    actor_rollout_ref.rollout.val_kwargs.pipeline.height=$VAL_HEIGHT \
+    actor_rollout_ref.rollout.val_kwargs.pipeline.width=$VAL_WIDTH \
+    actor_rollout_ref.rollout.val_kwargs.pipeline.num_frames=$NUM_FRAMES \
     actor_rollout_ref.rollout.val_kwargs.pipeline.frame_rate=24.0 \
     actor_rollout_ref.rollout.val_kwargs.pipeline.num_inference_steps=40 \
     actor_rollout_ref.rollout.val_kwargs.pipeline.true_cfg_scale=1.0 \
@@ -164,6 +165,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     trainer.n_gpus_per_node=$NUM_GPUS \
     trainer.nnodes=1 \
     trainer.save_freq=5 \
+    trainer.max_ckpt_to_keep=5 \
     trainer.test_freq=10 \
     trainer.total_epochs=15 \
     trainer.total_training_steps=$TOTAL_TRAINING_STEPS "$@"
