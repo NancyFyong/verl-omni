@@ -63,6 +63,9 @@ MiniMax H3 t2va requires an explicit named `aspect_ratio` (one of
 
 ## FL2VA (image-conditioned)
 
+> The FL2VA scripts (`prepare_data.py`, `run_minimax_h3_fl2va_lora.sh`, and
+> the checkpoint parity test) ship in the companion FL2VA PR.
+
 ### Prepare data
 
 Prepare `train.jsonl` and `test.jsonl`. Each row has a prompt and either an
@@ -139,4 +142,4 @@ train/test JSONL pairs:
 
 A ready-made dataset built with this pipeline (27,815 prompt/image pairs from
 the DanceGRPO ConsisID prompt list) is published at
-https://huggingface.co/datasets/zyfenghit/dancegrpo-t2av
+[zyfenghit/dancegrpo-t2av](https://huggingface.co/datasets/zyfenghit/dancegrpo-t2av).
