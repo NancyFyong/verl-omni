@@ -31,6 +31,7 @@ from vllm.distributed import (
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3DiTModel
+from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import MiniMaxH3RolloutWeightSyncMixin
 from verl_omni.utils.vllm_omni import OmniTensorLoRARequest, VLLMOmniHijack
@@ -92,6 +93,40 @@ def _old_adapter_payload() -> tuple[dict[str, torch.Tensor], dict]:
     for tensor in payload.values():
         tensor.copy_(torch.randn_like(tensor))
     return payload, config.to_dict()
+
+
+def _check_text_encoder_tp(rank: int, device: torch.device) -> None:
+    """Exercise the text-encoder TP group at ``text_encoder_tp_size=2``.
+
+    ``text_encoder_tp_size`` never reaches the DiT: ``MiniMaxH3DiTModel`` does not
+    read it, so putting it on this test's ``DiffusionParallelConfig`` would assert
+    nothing. It is consumed only by ``MiniMaxH3Pipeline.__init__``, which builds the
+    encoder process group and fans prompt/vision tensors to the encoder ranks. Both
+    of those touch just ``_dit_rank`` and ``text_encoder_group``, so they run on a
+    bare pipeline stand-in without any checkpoint on disk.
+    """
+    stand_in = object.__new__(MiniMaxH3Pipeline)
+    stand_in._dit_rank = rank
+
+    single = MiniMaxH3Pipeline._build_text_encoder_group(stand_in, 1)
+    assert single.world_size == 1, f"ETP=1 must stay single-rank, got {single.world_size}"
+
+    group = MiniMaxH3Pipeline._build_text_encoder_group(stand_in, 2)
+    assert group.world_size == 2, f"ETP=2 group must span 2 ranks, got {group.world_size}"
+    assert list(group.ranks) == [0, 1], f"ETP=2 group must cover DiT ranks [0, 1], got {group.ranks}"
+    assert group.rank_in_group == rank, f"rank_in_group {group.rank_in_group} != rank {rank}"
+    stand_in.text_encoder_group = group
+
+    # Prompt IDs are broadcast from encoder rank 0; ranks > 0 pass None and must
+    # recover rank 0's payload exactly, otherwise the sharded encode desynchronizes.
+    source = torch.arange(12, device=device, dtype=torch.long).reshape(3, 4) if rank == 0 else None
+    received = MiniMaxH3Pipeline._encoder_group_broadcast_tensor(stand_in, source, dtype=torch.long, device=device)
+    expected = torch.arange(12, device=device, dtype=torch.long).reshape(3, 4)
+    assert tuple(received.shape) == (3, 4), f"broadcast reshaped the tensor: {tuple(received.shape)}"
+    assert received.dtype is torch.long, f"broadcast changed dtype: {received.dtype}"
+    assert torch.equal(received, expected), f"rank={rank} received a mismatched broadcast payload"
+
+    print(f"rank={rank}: text_encoder_tp=2 group={list(group.ranks)}, broadcast OK", flush=True)
 
 
 def main() -> None:
@@ -160,6 +195,8 @@ def main() -> None:
                 f"fc1_delta={fc1_delta.item():.6g}, qkv_B={qkv_b_shapes}, fc1_B={fc1_b_shapes}",
                 flush=True,
             )
+            _check_text_encoder_tp(rank, device)
+
             torch.distributed.barrier()
             if rank == 0:
                 print("MiniMax H3 LoRA TP=2 actor-to-rollout regression: PASS", flush=True)

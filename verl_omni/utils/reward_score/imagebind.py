@@ -20,6 +20,7 @@ combination.
 """
 
 import os
+import sys
 import threading
 import warnings
 from collections.abc import Mapping
@@ -27,6 +28,29 @@ from collections.abc import Mapping
 import torch
 import torch.nn.functional as F
 from verl.utils.device import get_device_name
+
+
+def _install_torchvision_functional_tensor_shim() -> None:
+    """Alias the ``torchvision.transforms.functional_tensor`` module removed in 0.17.
+
+    ``imagebind/__init__.py`` eagerly imports ``imagebind.data``, which pulls in
+    ``pytorchvideo.transforms.augmentations``; that module still does
+    ``import torchvision.transforms.functional_tensor as F_t``. The module was
+    folded into ``torchvision.transforms.functional`` in torchvision 0.17, so on
+    any supported torchvision the plain ``imagebind`` import fails with
+    ``ModuleNotFoundError`` before reaching the model code. ImageBind is pinned to
+    a 2023 revision upstream and cannot be patched here, and the only symbol
+    ``augmentations`` uses (``F_t.affine``) is re-exported from the new module, so
+    aliasing is sufficient. Registering the alias is a no-op when torchvision
+    still ships the module.
+    """
+    name = "torchvision.transforms.functional_tensor"
+    if name in sys.modules:
+        return
+    import torchvision.transforms.functional as tv_functional
+
+    sys.modules[name] = tv_functional
+
 
 _AUDIO_SAMPLE_RATE = 16_000
 _AUDIO_NUM_MEL_BINS = 128
@@ -55,6 +79,7 @@ def _load_imagebind(device: str, model_path: str):
     key = (model_path, device)
     if key not in _MODEL_CACHE:
         try:
+            _install_torchvision_functional_tensor_shim()
             from imagebind.models import imagebind_model
         except ImportError as exc:
             raise ImportError(
@@ -188,6 +213,7 @@ def _preprocess_video(video, device: str) -> torch.Tensor:
 
 def _preprocess_text(text: str, device: str) -> torch.Tensor:
     try:
+        _install_torchvision_functional_tensor_shim()
         from imagebind.data import load_and_transform_text
     except ImportError as exc:
         raise ImportError("ImageBind text rewards require imagebind.data.load_and_transform_text.") from exc
@@ -235,6 +261,7 @@ def compute_score(
     """Compute a configured ImageBind cross-modal cosine similarity."""
     del data_source, kwargs
     try:
+        _install_torchvision_functional_tensor_shim()
         from imagebind.models.imagebind_model import ModalityType
     except ImportError as exc:
         raise ImportError("ImageBind reward requires the non-commercial ImageBind package.") from exc
