@@ -163,6 +163,14 @@ TOTAL_TRAINING_STEPS=100 OUTPUT_DIR=/path/to/output \
 bash examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_t2va_lora.sh
 ```
 
+### Performance reference
+
+The run below trains the rank-64 LoRA with the default CLAP + ImageBind
+multi-reward; the weighted-sum reward rises steadily as audio-video alignment
+improves.
+
+<!-- PERF_IMAGE_PLACEHOLDER -->
+
 ## License
 
 - Prompts: CC-BY-4.0 (ConsisID-preview-Data)
