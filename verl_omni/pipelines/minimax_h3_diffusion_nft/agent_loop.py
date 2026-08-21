@@ -16,49 +16,18 @@
 from typing import Any
 
 from verl.experimental.agent_loop.agent_loop import register
-from verl.utils.ray_utils import get_event_loop
 from verl.utils.tokenizer import normalize_token_ids
 
 from verl_omni.agent_loop.single_turn_agent_loop import DiffusionSingleTurnAgentLoop
 
 from .common import MINIMAX_H3_TOKEN_ID_NATIVE_KEY, messages_to_text
 
+__all__ = ["MiniMaxH3DiffusionSingleTurnAgentLoop"]
+
 
 @register("minimax_h3_diffusion_single_turn_agent")
 class MiniMaxH3DiffusionSingleTurnAgentLoop(DiffusionSingleTurnAgentLoop):
     """Tokenize H3 prompt text verbatim without applying a chat template."""
-
-    def __init__(
-        self,
-        trainer_config,
-        server_manager,
-        tokenizer,
-        processor,
-        dataset_cls,
-        data_config,
-        extra_tokenizer_map: dict[str, dict[str, Any]] | None = None,
-        **kwargs,
-    ) -> None:
-        # Deliberately not calling ``super().__init__``: the upstream base runs
-        # ``initialize_system_prompt``, which mutates the shared Rust tokenizer
-        # through ``no_truncation()``. ``DiffusionAgentLoopWorker`` instantiates
-        # agent loops concurrently under ``asyncio.gather``, so that mutation
-        # races and aborts the rollout with "RuntimeError: Already borrowed".
-        # H3 tokenizes prompt text verbatim and never applies a chat template,
-        # so there is no system prompt to derive here.
-        del kwargs
-        self.config = trainer_config.config
-        self.rollout_config = self.config.actor_rollout_ref.rollout
-        self.server_manager = server_manager
-        self.tokenizer = tokenizer
-        self.processor = processor
-        self.dataset_cls = dataset_cls
-        self.data_config = data_config.config
-        self.apply_chat_template_kwargs = self.data_config.get("apply_chat_template_kwargs", {})
-        self.mm_processor_kwargs = self.data_config.get("mm_processor_kwargs", {})
-        self.extra_tokenizer_map = extra_tokenizer_map or {}
-        self.system_prompt = []
-        self.loop = get_event_loop()
 
     async def run(self, sampling_params: dict[str, Any], **kwargs):
         """Mark IDs so the H3 rollout can reject generic chat-template tokens."""
@@ -92,6 +61,3 @@ class MiniMaxH3DiffusionSingleTurnAgentLoop(DiffusionSingleTurnAgentLoop):
             )["input_ids"],
         )
         return normalize_token_ids(tokenized)
-
-
-__all__ = ["MiniMaxH3DiffusionSingleTurnAgentLoop"]

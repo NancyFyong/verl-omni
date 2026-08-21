@@ -136,6 +136,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.rollout.calculate_log_probs=False \
     actor_rollout_ref.rollout.rollout_adapter=old \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.rollout.agent.default_agent_loop=minimax_h3_diffusion_single_turn_agent \
     actor_rollout_ref.rollout.pipeline.aspect_ratio=16:9 \
     actor_rollout_ref.rollout.pipeline.height=256 \
     actor_rollout_ref.rollout.pipeline.width=384 \
