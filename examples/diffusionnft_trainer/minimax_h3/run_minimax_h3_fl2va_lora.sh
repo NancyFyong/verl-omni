@@ -8,9 +8,11 @@ export WANDB_RESUME=${WANDB_RESUME:-allow}
 export RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
-: "${MODEL_PATH:?Set MODEL_PATH to the official MiniMax-H3 FL2VA rollout checkpoint}"
-: "${ACTOR_TRANSFORMER_PATH:?Set ACTOR_TRANSFORMER_PATH to the converted diffusers transformer}"
 : "${DATA_DIR:?Set DATA_DIR to the parquet directory produced by prepare_data.py}"
+if [[ -z "${MODEL_PATH:-}" || ! -d "$MODEL_PATH/FL2VA" || ! -d "$MODEL_PATH/transformer" ]]; then
+    echo "MODEL_PATH must point to a MiniMax-H3 repo root containing FL2VA/ (fused rollout) and transformer/ (diffusers actor) (got: '${MODEL_PATH:-<unset>}')" >&2
+    exit 1
+fi
 
 N_GPUS=${N_GPUS:-8}
 ROLLOUT_TP=${ROLLOUT_TP:-4}
@@ -58,9 +60,9 @@ python3 -m verl_omni.trainer.main_diffusion \
   data.max_prompt_length=4096 \
   data.truncation=error \
   data.seed=42 \
-  actor_rollout_ref.model.path="$MODEL_PATH" \
-  actor_rollout_ref.model.tokenizer_path="$MODEL_PATH/tokenizer" \
-  actor_rollout_ref.model.config_path="$ACTOR_TRANSFORMER_PATH" \
+  actor_rollout_ref.model.path="$MODEL_PATH/FL2VA" \
+  actor_rollout_ref.model.tokenizer_path="$MODEL_PATH/FL2VA/tokenizer" \
+  actor_rollout_ref.model.config_path="$MODEL_PATH/transformer" \
   +actor_rollout_ref.model.architecture=MiniMaxH3Pipeline \
   actor_rollout_ref.model.external_lib=verl_omni.pipelines.minimax_h3_diffusion_nft \
   actor_rollout_ref.model.algorithm=diffusion_nft \

@@ -198,18 +198,18 @@ export FRAME_INDICES='[0,-1]'  # '[0]' or '[-1]' for one-image datasets
 
 ### Checkpoint
 
-The two runtimes intentionally use different transformer layouts. `MODEL_PATH`
-points at the official FL2VA checkpoint used by vLLM-Omni (fused QKV and GEGLU
-weights), while `ACTOR_TRANSFORMER_PATH` points at the converted diffusers
-`MiniMaxH3Transformer3DModel`. Do not replace the official checkpoint's
-`transformer/` directory with the diffusers conversion: that silently breaks the
-rollout weight loader.
+`MODEL_PATH` is a single MiniMax-H3 repo root that already ships both transformer
+layouts as siblings: `FL2VA/` (the fused QKV+GEGLU rollout checkpoint used by
+vLLM-Omni, with rollout weights under `FL2VA/transformer/`) and `transformer/`
+(the diffusers `MiniMaxH3Transformer3DModel` used for FSDP actor training). The
+official `MiniMaxAI/MiniMax-H3` repo provides both, so no manual conversion is
+needed. Do not overwrite `FL2VA/transformer/` with the diffusers `transformer/`:
+that silently breaks the rollout weight loader.
 
 ### Run
 
 ```bash
-MODEL_PATH=/path/to/MiniMax-H3/FL2VA \
-ACTOR_TRANSFORMER_PATH=/path/to/MiniMax-H3-diffusers/transformer \
+MODEL_PATH=/path/to/MiniMax-H3 \
 DATA_DIR=/path/to/parquet \
 bash examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_fl2va_lora.sh
 ```
@@ -227,8 +227,8 @@ policy after fused-QKV and GEGLU conversion, run:
 
 ```bash
 python tests/special_e2e/minimax_h3_checkpoint_parity.py \
-  --vllm-transformer "$MODEL_PATH/transformer" \
-  --diffusers-transformer "$ACTOR_TRANSFORMER_PATH"
+  --vllm-transformer "$MODEL_PATH/FL2VA/transformer" \
+  --diffusers-transformer "$MODEL_PATH/transformer"
 ```
 
 The H3-specific agent loop is required: it tokenizes raw text once and lets
