@@ -283,16 +283,17 @@ ImageBind multi-reward as T2VA and follows the same layout as above.
      GitHub user-attachments CDN URLs here, mirroring the T2VA image blocks. -->
 
 ### Train Reward
+![Train reward](https://github.com/user-attachments/assets/718f85c4-8cd0-4bb8-987f-c4e3dd597dfb)
 
-_Placeholder — FL2VA train reward curve to be added._
+![Train reward (detail)](https://github.com/user-attachments/assets/7a355c98-4ce0-4bdc-a3b4-db560a7f67c5)
+
 
 ### Eval Reward
-
-_Placeholder — FL2VA eval reward curve to be added._
+![Eval reward](https://github.com/user-attachments/assets/9508dd62-3def-4bcb-abe4-0fc5394f4b11)
 
 ### Time consumption
 
-_Placeholder — FL2VA time consumption to be added._
+![Time consumption](https://github.com/user-attachments/assets/02f53c81-b98e-4e73-ab16-5683792ae574)
 
 ## License
 
