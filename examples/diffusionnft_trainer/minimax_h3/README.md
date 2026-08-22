@@ -253,7 +253,7 @@ commit, a native custom pipeline combined with online FP8 can hit a meta-tensor
 placement failure during custom-pipeline initialization; BF16 TP=4 is the
 validated path.
 
-## Performance reference
+## T2VA performance reference
 
 The run below trains the rank-64 LoRA with the default CLAP + ImageBind
 multi-reward; the weighted-sum reward rises steadily as audio-video alignment
@@ -272,6 +272,27 @@ improves.
 ### Time consumption
 
 ![Time consumption](https://github.com/user-attachments/assets/68e82be9-175d-49d5-88a0-efe434a92698)
+
+## FL2VA performance reference
+
+The FL2VA (image-conditioned) run uses the same rank-64 LoRA and CLAP +
+ImageBind multi-reward as T2VA and follows the same layout as above.
+
+<!-- TODO(fl2va): replace the placeholders below with the FL2VA DiffusionNFT run
+     curves. Drag the wandb screenshots into a PR comment and paste the resulting
+     GitHub user-attachments CDN URLs here, mirroring the T2VA image blocks. -->
+
+### Train Reward
+
+_Placeholder — FL2VA train reward curve to be added._
+
+### Eval Reward
+
+_Placeholder — FL2VA eval reward curve to be added._
+
+### Time consumption
+
+_Placeholder — FL2VA time consumption to be added._
 
 ## License
 
