@@ -59,6 +59,10 @@ free_cache_engine: True
 # TP size for rollout
 tensor_model_parallel_size: 2
 
+# TP shard size for the diffusion text encoder. 1 keeps the encoder on the DiT
+# main rank; set equal to tensor_model_parallel_size to shard it across ranks.
+text_encoder_tp_size: 1
+
 # DP size for rollout
 data_parallel_size: 1
 
