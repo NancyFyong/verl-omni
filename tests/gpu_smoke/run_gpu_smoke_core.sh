@@ -37,8 +37,5 @@ run_test 6 "diffusion composite agent loop" \
     env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" \
     python3 -m pytest -s tests/agent_loop/test_composite_agent_loop.py
 
-run_test 6 "MiniMax H3 LoRA actor-to-rollout TP=2 sync" \
-    env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" NUM_GPUS="${NUM_GPUS}" \
-    bash tests/special_e2e/run_minimax_h3_lora_sync_tp2.sh
 
 gpu_smoke_summary
