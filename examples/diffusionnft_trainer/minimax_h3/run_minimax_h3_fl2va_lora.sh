@@ -158,7 +158,6 @@ python3 -m verl_omni.trainer.main_diffusion \
   trainer.n_gpus_per_node="$N_GPUS" \
   trainer.nnodes=1 \
   trainer.save_freq=5 \
-  trainer.max_ckpt_to_keep=5 \
   trainer.test_freq=10 \
   trainer.total_epochs=15 \
   trainer.total_training_steps="$TOTAL_TRAINING_STEPS" \
