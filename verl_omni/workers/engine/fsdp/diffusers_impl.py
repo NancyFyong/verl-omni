@@ -306,9 +306,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
                 else:
                     raise e
 
-            # ``from_pretrained(torch_dtype=...)`` already casts ordinary parameters while
-            # preserving architecture-declared fp32 islands. A blanket ``to(dtype)`` here
-            # destroys those islands (some models keep e.g. patch/time/output projections or rope in fp32).
+            # Keep architecture-declared fp32 islands; a blanket to(dtype) would flatten them.
             _cast_loaded_diffusers_module(module, torch_dtype)
 
             if self.model_config.enable_gradient_checkpointing:
@@ -340,7 +338,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
             reduce_dtype = torch.float32
             buffer_dtype = torch.float32
 
-        # None keeps a model's fp32 islands intact; a real dtype makes FSDP recast every param, destroying them.
+        # None preserves fp32 islands; a real dtype makes FSDP flatten them.
         param_dtype = _fsdp_param_dtype(module, param_dtype)
         mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
 

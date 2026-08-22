@@ -138,9 +138,7 @@ class DiffusionRolloutConfig(BaseConfig):
     data_parallel_size: int = 1
     expert_parallel_size: int = 1
     tensor_model_parallel_size: int = 2
-    # Tensor-parallel shard size for the diffusion text encoder (e.g. MiniMax-H3's
-    # Qwen3-VL). Must be 1 (encoder resident on the DiT main rank) or equal to
-    # tensor_model_parallel_size; intermediate values are rejected in __post_init__.
+    # Text-encoder TP shard size: 1 or tensor_model_parallel_size (validated below).
     text_encoder_tp_size: int = 1
     pipeline_model_parallel_size: int = 1
     max_num_batched_tokens: int = 8192
