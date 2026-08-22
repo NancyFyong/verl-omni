@@ -51,6 +51,9 @@ __all__ = [
 ]
 
 
+MINIMAX_H3_TOKEN_ID_NATIVE_KEY = "minimax_h3_token_id_native"
+
+
 def messages_to_text(messages: Any) -> str:
     """Extract plain text items from chat messages without rendering a template."""
     if isinstance(messages, str):
@@ -527,6 +530,14 @@ class MiniMaxH3RolloutWeightSyncMixin:
         token_ids = custom_prompt.get("prompt_token_ids")
         if token_ids is None:
             return
+        sampling_params = getattr(request, "sampling_params", None)
+        extra_args = getattr(sampling_params, "extra_args", None) or {}
+        if extra_args.get(MINIMAX_H3_TOKEN_ID_NATIVE_KEY) is not True:
+            raise ValueError(
+                "MiniMax H3 token-ID-native rollout requires "
+                "actor_rollout_ref.rollout.agent.default_agent_loop="
+                "minimax_h3_diffusion_single_turn_agent."
+            )
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.detach().cpu().tolist()
         if token_ids and isinstance(token_ids[0], list):

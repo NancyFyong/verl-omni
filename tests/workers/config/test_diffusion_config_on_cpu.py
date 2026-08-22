@@ -246,9 +246,9 @@ class TestDiffusionModelConfigPolicyAdapters:
                     f"tokenizer_path={model_dir}",
                     "+load_tokenizer=false",
                     "attn_backend=native",
+                    "algorithm=diffusion_nft",
                     "lora_rank=8",
                     "target_modules=all-linear",
-                    "algorithm=diffusion_nft",
                 ],
             )
         with patch("verl_omni.workers.config.diffusion.model.resolve_model_local_dir", return_value=str(model_dir)):

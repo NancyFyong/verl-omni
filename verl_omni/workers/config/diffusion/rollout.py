@@ -77,7 +77,8 @@ class DiffusionPipelineConfig(BaseConfig):
     task: Optional[str] = None
     frame_indices: Optional[list[int]] = None
 
-    # Named canvas aspect ratio for pipelines that accept one (supported ratios are pipeline-specific).
+    # Named canvas aspect ratio for pipelines that accept one (e.g. 16:9);
+    # the set of supported ratios is pipeline-specific.
     aspect_ratio: Optional[str] = None
 
     # Flow-matching sigma-schedule shift for the video stream (maps to vllm-omni's flow_shift)

@@ -122,7 +122,7 @@ class TestH3RolloutOutputContract:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
     @pytest.mark.parametrize(
-        "shape, expect",
+        ("shape", "expect"),
         [
             # Channels-first [N, C, T, H, W] must be normalized to [N, T, C, H, W].
             ((2, _VIDEO_C, 9, 32, 48), (9, _VIDEO_C, 32, 48)),

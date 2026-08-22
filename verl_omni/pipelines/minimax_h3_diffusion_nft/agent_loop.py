@@ -21,12 +21,14 @@ from verl.utils.tokenizer import normalize_token_ids
 
 from verl_omni.agent_loop.single_turn_agent_loop import DiffusionSingleTurnAgentLoop
 
-from .common import messages_to_text
+from .common import MINIMAX_H3_TOKEN_ID_NATIVE_KEY, messages_to_text
+
+__all__ = ["MiniMaxH3DiffusionSingleTurnAgentLoop"]
 
 
 @register("minimax_h3_diffusion_single_turn_agent")
 class MiniMaxH3DiffusionSingleTurnAgentLoop(DiffusionSingleTurnAgentLoop):
-    """Tokenize only message text; vLLM-Omni adds H3 vision presentation IDs."""
+    """Tokenize H3 prompt text verbatim without applying a chat template."""
 
     def __init__(
         self,
@@ -39,6 +41,10 @@ class MiniMaxH3DiffusionSingleTurnAgentLoop(DiffusionSingleTurnAgentLoop):
         extra_tokenizer_map: dict[str, dict[str, Any]] | None = None,
         **kwargs,
     ) -> None:
+        # H3 consumes raw text token IDs and never applies a chat template,
+        # so there is no system prompt to derive; probing the shared Rust
+        # tokenizer in AgentLoopBase.__init__ races when agent loops are
+        # built concurrently under asyncio.gather.
         del kwargs
         self.config = trainer_config.config
         self.rollout_config = self.config.actor_rollout_ref.rollout
@@ -53,6 +59,11 @@ class MiniMaxH3DiffusionSingleTurnAgentLoop(DiffusionSingleTurnAgentLoop):
         self.system_prompt = []
         self.loop = get_event_loop()
 
+    async def run(self, sampling_params: dict[str, Any], **kwargs):
+        """Mark IDs so the H3 rollout can reject generic chat-template tokens."""
+        sampling_params = {**sampling_params, MINIMAX_H3_TOKEN_ID_NATIVE_KEY: True}
+        return await super().run(sampling_params, **kwargs)
+
     async def apply_chat_template(
         self,
         messages: list[dict],
@@ -63,7 +74,7 @@ class MiniMaxH3DiffusionSingleTurnAgentLoop(DiffusionSingleTurnAgentLoop):
         mm_processor_kwargs: dict[str, Any] | None = None,
         remove_system_prompt: bool = False,
     ) -> list[int]:
-        """Match H3's verbatim prompt tokenization without chat/image tokens."""
+        """Produce the exact raw-text IDs consumed by the H3 text encoder."""
         del tools, images, videos, audios, mm_processor_kwargs, remove_system_prompt
         text = messages_to_text(messages)
         if not text:
@@ -80,6 +91,3 @@ class MiniMaxH3DiffusionSingleTurnAgentLoop(DiffusionSingleTurnAgentLoop):
             )["input_ids"],
         )
         return normalize_token_ids(tokenized)
-
-
-__all__ = ["MiniMaxH3DiffusionSingleTurnAgentLoop"]
