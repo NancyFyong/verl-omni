@@ -37,5 +37,4 @@ run_test 6 "diffusion composite agent loop" \
     env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" \
     python3 -m pytest -s tests/agent_loop/test_composite_agent_loop.py
 
-
 gpu_smoke_summary
