@@ -73,8 +73,10 @@ class DiffusionPipelineConfig(BaseConfig):
     # Audio-video generation frame rate.
     frame_rate: float = 24.0
 
-    # Optional request-contract fields for pipelines that accept a task label or frame indices.
+    # Task label forwarded to the pipeline request contract, read by vLLM-Omni as
+    # the request `task`; values are pipeline-specific (e.g. t2va / fl2va / ref2va).
     task: Optional[str] = None
+    # Frame indices (e.g. keyframe positions) for pipelines that condition on them.
     frame_indices: Optional[list[int]] = None
 
     # Named canvas aspect ratio for pipelines that accept one (e.g. 16:9);

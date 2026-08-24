@@ -176,8 +176,10 @@ val_kwargs:
     # Flow-matching sigma-schedule shift for the video stream (validation)
     video_flow_shift: ${oc.select:actor_rollout_ref.rollout.pipeline.video_flow_shift,12.0}
 
-    # Optional request-contract fields for pipelines that accept a task label or frame indices (validation)
+    # Task label forwarded to the vLLM-Omni request `task`, pipeline-specific (validation)
     task: ${oc.select:actor_rollout_ref.rollout.pipeline.task,null}
+
+    # Optional frame indices for pipelines that accept them (validation)
     frame_indices: ${oc.select:actor_rollout_ref.rollout.pipeline.frame_indices,null}
 
     # Named canvas aspect ratio for compatible pipelines (validation)
@@ -270,8 +272,10 @@ pipeline:
   # Flow-matching sigma-schedule shift for the video stream
   video_flow_shift: 12.0
 
-  # Optional request-contract fields for pipelines that accept a task label or frame indices
+  # Task label forwarded to the vLLM-Omni request `task`, pipeline-specific
   task: null
+
+  # Optional frame indices for pipelines that accept them
   frame_indices: null
 
   # Named canvas aspect ratio for compatible pipelines

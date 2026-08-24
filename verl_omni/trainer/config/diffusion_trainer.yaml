@@ -169,7 +169,9 @@ trainer:
 
   # Save frequency (by iteration) for model checkpoints
   save_freq: -1
-  max_ckpt_to_keep: null  # Maximum number of checkpoints to keep, null = keep all
+
+  # Maximum number of checkpoints to keep, null = keep all
+  max_ckpt_to_keep: null
 
   # ESI refers to the elastic server instance used during training, similar to the training plan. For example,
   # if you purchase 10 hours of computing power, the ESI will automatically shut down after 10 hours of training.
