@@ -10,6 +10,16 @@ the default multi-reward (audio-video alignment).
 A ready-made FL2VA first-frame dataset built with the data pipeline below is
 published at https://huggingface.co/datasets/zyfenghit/dancegrpo-t2av
 
+## Video Examples
+
+| ID | Prompt | MiniMax H3 base model | MiniMax H3 + DiffusionNFT |
+| --- | --- | --- | --- |
+| 4 | stickman monigote shooting a energy sphere from his hands | _To be added_ | _To be added_ |
+| 64 | a husky dog with sunglasses riding on santas sled | _To be added_ | _To be added_ |
+| 80 | minimalist polygonal human skull in green flames with strong movement, uhd | _To be added_ | _To be added_ |
+| 82 | 17th century sailing ship making a path through the waves during a storm | _To be added_ | _To be added_ |
+| 91 | close up of a skin texture, two hands with black gloves tatoo a red butterfly over it | _To be added_ | _To be added_ |
+
 ## Install
 
 Follow the project [installation guide](../../../docs/start/install.md),
