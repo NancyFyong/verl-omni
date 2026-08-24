@@ -256,7 +256,6 @@ class vLLMOmniHttpServer(vLLMHttpServer):
                     "stage_id": sid,
                     "devices": devices,
                     "tensor_parallel_size": tp_size,
-                    # Diffusion-only field; the AR/omni RolloutConfig lacks it, so default to 1 (no-op).
                     "text_encoder_tp_size": getattr(self.config, "text_encoder_tp_size", 1),
                     "engine_extras": adapter_cls.get_stage_engine_extras(sid, pipeline_mode=pipeline_mode),
                 }
