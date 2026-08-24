@@ -30,12 +30,14 @@ from verl.utils.device import get_visible_devices_keyword
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_async_server import vLLMOmniHttpServer
 
 
-def _run_write_deploy_config(monkeypatch, *, tensor_parallel_size, text_encoder_tp_size):
+def _run_write_deploy_config(
+    monkeypatch, *, tensor_parallel_size, text_encoder_tp_size=1, include_text_encoder_tp_size=True
+):
+    config_kwargs = {"tensor_model_parallel_size": tensor_parallel_size}
+    if include_text_encoder_tp_size:
+        config_kwargs["text_encoder_tp_size"] = text_encoder_tp_size
     fake_self = types.SimpleNamespace(
-        config=types.SimpleNamespace(
-            tensor_model_parallel_size=tensor_parallel_size,
-            text_encoder_tp_size=text_encoder_tp_size,
-        ),
+        config=types.SimpleNamespace(**config_kwargs),
     )
     adapter = MagicMock()
     adapter.build_stage_configs.return_value = [types.SimpleNamespace(stage_id=0)]
@@ -59,5 +61,13 @@ def test_deploy_config_stage_carries_sharded_text_encoder_tp_size(monkeypatch):
 
 def test_deploy_config_stage_defaults_text_encoder_tp_size_to_one(monkeypatch):
     deploy = _run_write_deploy_config(monkeypatch, tensor_parallel_size=4, text_encoder_tp_size=1)
+    for stage in deploy["stages"]:
+        assert stage["text_encoder_tp_size"] == 1
+
+
+def test_deploy_config_stage_defaults_when_config_lacks_text_encoder_tp_size(monkeypatch):
+    # The AR/omni RolloutConfig has no text_encoder_tp_size; _write_deploy_config must not
+    # crash and should default the stage field to 1 (regression for the Qwen3-Omni e2e).
+    deploy = _run_write_deploy_config(monkeypatch, tensor_parallel_size=2, include_text_encoder_tp_size=False)
     for stage in deploy["stages"]:
         assert stage["text_encoder_tp_size"] == 1
