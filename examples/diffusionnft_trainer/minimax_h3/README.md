@@ -1,6 +1,3 @@
-
-
-
 # MiniMax-H3 text-to-audio-video DiffusionNFT training
 
 Last updated: 08/22/2026
