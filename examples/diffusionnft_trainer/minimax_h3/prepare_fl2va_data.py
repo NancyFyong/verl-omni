@@ -34,8 +34,16 @@ def _image_names(example: dict, expected: int) -> list[str]:
     return names
 
 
-def _convert_split(input_dir: Path, split: str, frame_mode: str, max_samples: int) -> pd.DataFrame:
-    frame_indices, expected_images = _FRAME_MODES[frame_mode]
+def convert_image_conditioned_split(
+    input_dir: Path,
+    split: str,
+    expected_images: int,
+    max_samples: int,
+    *,
+    data_source: str,
+    extra_info: dict,
+) -> pd.DataFrame:
+    """Convert one JSONL split with a fixed number of condition images."""
     rows = []
     with (input_dir / f"{split}.jsonl").open(encoding="utf-8") as source:
         for index, line in enumerate(source):
@@ -51,7 +59,7 @@ def _convert_split(input_dir: Path, split: str, frame_mode: str, max_samples: in
                 raise FileNotFoundError(f"Condition image(s) not found: {missing}")
             rows.append(
                 {
-                    "data_source": "minimax_h3_fl2va",
+                    "data_source": data_source,
                     "prompt": [{"role": "user", "content": "<image>" * expected_images + prompt}],
                     "ability": "video_generation",
                     "images": [{"bytes": path.read_bytes()} for path in image_paths],
@@ -59,12 +67,24 @@ def _convert_split(input_dir: Path, split: str, frame_mode: str, max_samples: in
                     "extra_info": {
                         "split": split,
                         "index": index,
-                        "frame_indices": frame_indices,
                         "source_images": [str(path.relative_to(input_dir)) for path in image_paths],
+                        **extra_info,
                     },
                 }
             )
     return pd.DataFrame(rows)
+
+
+def _convert_split(input_dir: Path, split: str, frame_mode: str, max_samples: int) -> pd.DataFrame:
+    frame_indices, expected_images = _FRAME_MODES[frame_mode]
+    return convert_image_conditioned_split(
+        input_dir,
+        split,
+        expected_images,
+        max_samples,
+        data_source="minimax_h3_fl2va",
+        extra_info={"frame_indices": frame_indices},
+    )
 
 
 def main() -> None:

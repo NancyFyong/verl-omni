@@ -127,6 +127,8 @@ class DiffusionSingleTurnAgentLoop(AgentLoopBase):
                 sampling_params=sampling_params,
                 image_data=images,
                 video_data=videos,
+                audio_data=audios,
+                mm_processor_kwargs=self.mm_processor_kwargs,
                 negative_prompt_ids=negative_prompt_ids,
                 extra_prompt_ids=extra_prompt_ids,
                 negative_extra_prompt_ids=negative_extra_prompt_ids,

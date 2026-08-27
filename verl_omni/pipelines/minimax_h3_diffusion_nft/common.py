@@ -14,7 +14,7 @@
 """Shared MiniMax H3 latent-layout and weight-sync helpers."""
 
 import json
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +24,11 @@ import torch
 VIDEO_ROW_WIDTH = 96
 AUDIO_ROW_WIDTH = 32
 LATENT_META_WIDTH = 6
+REF_BLOCK_META_WIDTH = 5
 VIDEO_TAG, TEXT_TAG, AUDIO_TAG = 0, 1, 2
+
+_REF_BLOCK_KIND_TO_ID = {"image": 1, "audio": 2, "video": 3, "video_audio": 4}
+_REF_BLOCK_ID_TO_KIND = {value: key for key, value in _REF_BLOCK_KIND_TO_ID.items()}
 
 _ROPE_FRAME_RESCALE = 5.0 / 3.0
 _ROPE_FRAMES_PER_LATENT = (1, 4, 4, 4, 4)
@@ -34,6 +38,7 @@ __all__ = [
     "VIDEO_ROW_WIDTH",
     "AUDIO_ROW_WIDTH",
     "LATENT_META_WIDTH",
+    "REF_BLOCK_META_WIDTH",
     "VIDEO_TAG",
     "TEXT_TAG",
     "AUDIO_TAG",
@@ -44,8 +49,10 @@ __all__ = [
     "h3_velocity_to_flow_match",
     "prepare_h3_processor_files",
     "keyframe_indices_to_anchors",
+    "serialize_ref_blocks",
     "build_packed_sequence",
     "build_layout_from_meta",
+    "build_ref2va_layout_from_meta",
     "build_row_timesteps",
     "MiniMaxH3RolloutWeightSyncMixin",
 ]
@@ -110,6 +117,54 @@ def keyframe_indices_to_anchors(frame_indices: Sequence[int]) -> tuple[str, ...]
     if signature not in mapping:
         raise ValueError(f"MiniMax H3 FL2VA frame_indices must be [0], [-1], or [0, -1], got {list(signature)}.")
     return mapping[signature]
+
+
+def serialize_ref_blocks(ref_blocks: Sequence[Mapping[str, Any]]) -> torch.Tensor:
+    """Encode Ref2VA block dictionaries as integer metadata rows."""
+    if not ref_blocks:
+        raise ValueError("MiniMax H3 Ref2VA requires at least one reference block.")
+    rows = []
+    for index, block in enumerate(ref_blocks):
+        kind = str(block.get("kind", block.get("type", "")))
+        if kind not in _REF_BLOCK_KIND_TO_ID:
+            raise ValueError(f"Unsupported Ref2VA block kind at index {index}: {kind!r}.")
+        rows.append(
+            [
+                _REF_BLOCK_KIND_TO_ID[kind],
+                int(block.get("ref_audio_t", 0)),
+                int(block.get("latent_t", 0)),
+                int(block.get("latent_h", 0)),
+                int(block.get("latent_w", 0)),
+            ]
+        )
+    return torch.tensor(rows, dtype=torch.long)
+
+
+def _deserialize_ref_blocks(metadata: torch.Tensor, count: int) -> list[dict[str, int | str]]:
+    """Decode compact Ref2VA block metadata for the upstream layout helper."""
+    rows = metadata.reshape(-1, REF_BLOCK_META_WIDTH)
+    if count <= 0 or count > rows.shape[0]:
+        raise ValueError(f"Ref2VA block count {count} is incompatible with {rows.shape[0]} metadata rows.")
+    blocks: list[dict[str, int | str]] = []
+    for index, row in enumerate(rows[:count].tolist()):
+        kind = _REF_BLOCK_ID_TO_KIND.get(int(row[0]))
+        if kind is None:
+            raise ValueError(f"Unsupported Ref2VA block kind id at index {index}: {int(row[0])}.")
+        ref_audio_t, latent_t, latent_h, latent_w = (int(value) for value in row[1:])
+        if kind == "image":
+            block = {"kind": kind, "latent_h": latent_h, "latent_w": latent_w}
+        elif kind == "audio":
+            block = {"kind": kind, "ref_audio_t": ref_audio_t}
+        else:
+            block = {
+                "kind": kind,
+                "ref_audio_t": ref_audio_t,
+                "latent_t": latent_t,
+                "latent_h": latent_h,
+                "latent_w": latent_w,
+            }
+        blocks.append(block)
+    return blocks
 
 
 def pack_video_audio_rows(video_rows: torch.Tensor, audio_rows: torch.Tensor) -> torch.Tensor:
@@ -285,6 +340,56 @@ def build_layout_from_meta(
     return layout
 
 
+def build_ref2va_layout_from_meta(
+    meta: Sequence[int],
+    num_text_tokens: int,
+    ref_block_meta: torch.Tensor,
+    ref_block_count: int,
+    text_token_tags: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Build the Actor layout from compact Ref2VA reference metadata."""
+    from vllm_omni.diffusion.models.minimax_h3.packed_sequence import minimax_h3_packed_sequence_ref2va_blocks
+
+    num_video_rows, num_audio_rows = int(meta[0]), int(meta[1])
+    latent_t, latent_h, latent_w, audio_t = (int(value) for value in meta[2:6])
+    blocks = _deserialize_ref_blocks(ref_block_meta, ref_block_count)
+    packed = minimax_h3_packed_sequence_ref2va_blocks(
+        text_len=num_text_tokens,
+        latent_t=latent_t,
+        latent_h=latent_h,
+        latent_w=latent_w,
+        audio_t=audio_t,
+        ref_blocks=blocks,
+    )
+    used = int(packed["cu_seqlens"][1])
+    token_tags = packed["token_tags"][:used].clone()
+    if text_token_tags is not None:
+        text_token_tags = text_token_tags.reshape(-1)[:num_text_tokens].to(dtype=torch.long, device="cpu")
+        if text_token_tags.numel() != num_text_tokens:
+            raise ValueError(f"Expected {num_text_tokens} MiniMax H3 text token tags, got {text_token_tags.numel()}.")
+        token_tags[packed["text_pos"]] = text_token_tags
+
+    video_indices = packed["img_pos"]
+    audio_indices = packed["audio_pos"]
+    num_condition_video_rows = int((~packed["update_mask"]).sum())
+    num_condition_audio_rows = int((~packed["audio_update_mask"]).sum())
+    target_video_rows = int(packed["update_mask"].sum())
+    target_audio_rows = int(packed["audio_update_mask"].sum())
+    if target_video_rows != num_video_rows:
+        raise ValueError(f"Ref2VA layout has {target_video_rows} target video rows, latent_meta says {num_video_rows}.")
+    if target_audio_rows != num_audio_rows:
+        raise ValueError(f"Ref2VA layout has {target_audio_rows} target audio rows, latent_meta says {num_audio_rows}.")
+    return (
+        packed["img_position_ids"][:used],
+        token_tags,
+        video_indices,
+        audio_indices,
+        packed["text_pos"],
+        num_condition_video_rows,
+        num_condition_audio_rows,
+    )
+
+
 def build_row_timesteps(
     video_indices: torch.Tensor,
     audio_indices: torch.Tensor,
@@ -379,7 +484,7 @@ class MiniMaxH3RolloutWeightSyncMixin:
     def encode_prompt(self, *, task: str, prompt: str, image=None, images=None, **kwargs):
         """Encode Agent Loop IDs while letting vLLM-Omni build FL2VA vision spans."""
         prompt_ids = getattr(self, "_h3_prompt_ids", None)
-        if prompt_ids is None or task not in {"t2va", "fl2va"}:
+        if prompt_ids is None or task not in {"t2va", "fl2va", "ref2va"}:
             return super().encode_prompt(task=task, prompt=prompt, image=image, images=images, **kwargs)
 
         from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _broadcast_tensor, _dit_rank_world
@@ -394,13 +499,18 @@ class MiniMaxH3RolloutWeightSyncMixin:
         ids = None
         vision_kwargs: dict[str, torch.Tensor] = {}
         condition_images = list(images) if images is not None else ([image] if image is not None else [])
+        if task == "ref2va":
+            prepared_videos = kwargs.get("prepared_videos")
+            condition_labels = kwargs.get("condition_labels") or []
+            if len(condition_images) != 1 or prepared_videos or condition_labels != [("image", 1)]:
+                raise NotImplementedError("MiniMax H3 Ref2VA DiffusionNFT currently supports one image reference.")
         if rank == 0:
             if task == "t2va":
                 ids = prompt_ids
                 tags = torch.ones(ids.shape[0], dtype=torch.long)
             else:
                 if not condition_images:
-                    raise ValueError("MiniMax H3 FL2VA requires at least one condition image.")
+                    raise ValueError(f"MiniMax H3 {task} requires at least one condition image.")
                 vision = self.processor.image_processor(images=condition_images, return_tensors="pt")
                 image_grid = vision["image_grid_thw"]
                 merge = int(self.processor.image_processor.merge_size) ** 2

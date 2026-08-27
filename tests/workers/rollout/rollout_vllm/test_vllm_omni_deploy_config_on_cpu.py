@@ -27,7 +27,10 @@ from unittest.mock import MagicMock
 import yaml
 from verl.utils.device import get_visible_devices_keyword
 
-from verl_omni.workers.rollout.vllm_rollout.vllm_omni_async_server import vLLMOmniHttpServer
+from verl_omni.workers.rollout.vllm_rollout.vllm_omni_async_server import (
+    _restore_orchestrator_args,
+    vLLMOmniHttpServer,
+)
 
 
 def _run_write_deploy_config(
@@ -49,6 +52,22 @@ def _run_write_deploy_config(
     vLLMOmniHttpServer._write_deploy_config(fake_self, engine_kwargs, "minimax_h3", adapter, "t2av")
     with open(engine_kwargs["deploy_config"]) as f:
         return yaml.safe_load(f)
+
+
+def test_diffusion_engine_restores_orchestrator_only_text_encoder_tp_size():
+    args = types.SimpleNamespace(text_encoder_tp_size=4)
+
+    engine_args = _restore_orchestrator_args({"tensor_parallel_size": 4}, args)
+
+    assert engine_args["text_encoder_tp_size"] == 4
+
+
+def test_diffusion_engine_preserves_existing_engine_arg():
+    args = types.SimpleNamespace(text_encoder_tp_size=4)
+
+    engine_args = _restore_orchestrator_args({"text_encoder_tp_size": 1}, args)
+
+    assert engine_args["text_encoder_tp_size"] == 1
 
 
 def test_deploy_config_stage_carries_sharded_text_encoder_tp_size(monkeypatch):

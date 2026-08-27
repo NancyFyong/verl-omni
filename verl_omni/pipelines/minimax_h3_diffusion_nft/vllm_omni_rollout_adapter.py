@@ -28,7 +28,7 @@ from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_s
 from verl_omni.pipelines.diffusion_rollout_output import with_rollout_data
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 
-from .common import MiniMaxH3RolloutWeightSyncMixin, pack_video_audio_rows
+from .common import AUDIO_ROW_WIDTH, MiniMaxH3RolloutWeightSyncMixin, pack_video_audio_rows, serialize_ref_blocks
 
 __all__ = ["MiniMaxH3DiffusionNFTPipeline"]
 
@@ -47,22 +47,31 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
         self._nft_capture: dict[str, Any] | None = None
 
     def diffuse(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the official T2VA/FL2VA denoiser and retain Actor condition state."""
+        """Run the official H3 denoiser and retain Actor condition state."""
         task = str(kwargs.get("task", "t2va"))
-        if task not in {"t2va", "fl2va"}:
-            raise NotImplementedError(f"MiniMax H3 DiffusionNFT supports t2va and fl2va, got {task!r}.")
+        if task not in {"t2va", "fl2va", "ref2va"}:
+            raise NotImplementedError(f"MiniMax H3 DiffusionNFT does not support task {task!r}.")
+
+        ref_blocks = list(kwargs.get("ref_blocks") or [])
+        if task == "ref2va":
+            if len(ref_blocks) != 1 or ref_blocks[0].get("kind") != "image":
+                raise NotImplementedError("MiniMax H3 Ref2VA DiffusionNFT currently supports one image reference.")
+            if kwargs.get("audio_condition") is not None:
+                raise NotImplementedError("MiniMax H3 Ref2VA DiffusionNFT does not yet support audio references.")
+
         video_latent, audio_latent = super().diffuse(**kwargs)
 
         condition_rows = video_latent.new_zeros((0, 96), dtype=torch.float32)
+        condition_audio_rows = audio_latent.new_zeros((0, AUDIO_ROW_WIDTH), dtype=torch.float32)
         keyframe_indices: list[int] = []
-        if task == "fl2va":
+        if task in {"fl2va", "ref2va"}:
             visual_condition = kwargs.get("visual_condition")
             condition_shapes = kwargs.get("visual_condition_shapes")
             if condition_shapes is None and kwargs.get("visual_condition_shape") is not None:
                 condition_shapes = [kwargs["visual_condition_shape"]]
             keyframe_indices = list(kwargs.get("keyframe_frame_indices") or [])
-            if visual_condition is None or not condition_shapes or not keyframe_indices:
-                raise ValueError("MiniMax H3 FL2VA rollout did not provide complete visual condition metadata.")
+            if visual_condition is None or not condition_shapes or (task == "fl2va" and not keyframe_indices):
+                raise ValueError(f"MiniMax H3 {task} rollout did not provide complete visual condition metadata.")
             condition_rows = minimax_h3_imgvid_cond_noise_aug_rows(
                 visual_condition,
                 condition_shapes=condition_shapes,
@@ -76,7 +85,10 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
             "video_latent": video_latent,
             "audio_latent": audio_latent,
             "condition_video_rows": condition_rows,
+            "condition_audio_rows": condition_audio_rows,
             "keyframe_frame_indices": keyframe_indices,
+            "ref_block_meta": serialize_ref_blocks(ref_blocks) if task == "ref2va" else None,
+            "task": task,
             "text_embeddings": kwargs.get("text_embeddings"),
             "text_tags": kwargs.get("text_tags"),
             "latent_t": int(kwargs.get("latent_t", 0)),
@@ -130,22 +142,33 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
 
         train_timesteps = self._build_train_timesteps(capture).unsqueeze(0)
 
+        rl = {
+            "latents_clean": latents_clean,
+            "train_timesteps": train_timesteps,
+            "latent_meta": latent_meta,
+            "prompt_token_tags": text_tags.unsqueeze(0),
+            "condition_video_rows": capture["condition_video_rows"].unsqueeze(0),
+            "keyframe_frame_indices": torch.tensor(
+                [capture["keyframe_frame_indices"]], dtype=torch.long, device=prompt_embeds.device
+            ),
+        }
+        if capture["task"] == "ref2va":
+            ref_block_meta = capture["ref_block_meta"]
+            rl.update(
+                {
+                    "condition_audio_rows": capture["condition_audio_rows"].unsqueeze(0),
+                    "ref_block_meta": ref_block_meta.unsqueeze(0),
+                    "ref_block_count": torch.tensor([[ref_block_meta.shape[0]]], dtype=torch.long),
+                }
+            )
+
         return with_rollout_data(
             output,
             prompt_embeddings={
                 "prompt_embeds": prompt_embeds,
                 "prompt_embeds_mask": prompt_embeds_mask,
             },
-            rl={
-                "latents_clean": latents_clean,
-                "train_timesteps": train_timesteps,
-                "latent_meta": latent_meta,
-                "prompt_token_tags": text_tags.unsqueeze(0),
-                "condition_video_rows": capture["condition_video_rows"].unsqueeze(0),
-                "keyframe_frame_indices": torch.tensor(
-                    [capture["keyframe_frame_indices"]], dtype=torch.long, device=prompt_embeds.device
-                ),
-            },
+            rl=rl,
             to_cpu=True,
         )
 

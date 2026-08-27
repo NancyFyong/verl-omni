@@ -44,7 +44,7 @@ from verl.workers.rollout.vllm_rollout.utils import (
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer, vLLMReplica
 from vllm import SamplingParams
 from vllm.entrypoints.openai.api_server import build_app
-from vllm_omni.engine.arg_utils import OmniEngineArgs
+from vllm_omni.engine.arg_utils import OmniEngineArgs, orchestrator_field_names
 from vllm_omni.entrypoints import AsyncOmni
 from vllm_omni.entrypoints.openai.api_server import omni_init_app_state
 from vllm_omni.inputs.data import OmniCustomPrompt, OmniDiffusionSamplingParams
@@ -68,6 +68,15 @@ def _drop_none_mapping_values(value: Any) -> Any:
     if isinstance(value, list):
         return [_drop_none_mapping_values(item) for item in value]
     return value
+
+
+def _restore_orchestrator_args(engine_args: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    """Restore vLLM-Omni CLI fields omitted by ``OmniEngineArgs``."""
+    for field_name in orchestrator_field_names():
+        value = getattr(args, field_name, None)
+        if value is not None and engine_args.get(field_name) is None:
+            engine_args[field_name] = value
+    return engine_args
 
 
 def _diffusion_output_type(sampling_params: dict) -> str:
@@ -285,7 +294,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
 
     async def run_server(self, args: argparse.Namespace):
         engine_args = OmniEngineArgs.from_cli_args(args)
-        engine_args = asdict(engine_args)
+        engine_args = _restore_orchestrator_args(asdict(engine_args), args)
 
         # In vLLM 0.27, asdict converts the default FaultToleranceConfig dataclass into a dict.
         # OmniEngineArgs.__post_init__ auto-enables enable_fault_tolerance when fault_tolerance_config
@@ -639,6 +648,8 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         if multi_modal_data:
             custom_prompt["multi_modal_data"] = multi_modal_data
             custom_prompt["extra_args"] = {"multi_modal_data": multi_modal_data}
+        if mm_processor_kwargs:
+            custom_prompt["mm_processor_kwargs"] = mm_processor_kwargs
 
         sampling_kwargs: dict[str, Any] = {}
         extra_args: dict[str, Any] = {}

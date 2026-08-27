@@ -14,6 +14,7 @@
 
 import asyncio
 from types import MethodType, SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import torch
@@ -85,6 +86,40 @@ def test_prompt_cache_routing_affinity_requires_sample_uid():
     second_request_id = agent_loop._get_routing_request_id(None)
 
     assert first_request_id != second_request_id
+
+
+@pytest.mark.asyncio
+async def test_single_turn_agent_forwards_all_multimodal_inputs():
+    agent_loop = object.__new__(DiffusionSingleTurnAgentLoop)
+    agent_loop.rollout_config = SimpleNamespace(
+        enable_prompt_embed_cache=False,
+        enable_prompt_embed_cache_routing_affinity=False,
+    )
+    agent_loop.extra_tokenizer_map = {}
+    agent_loop.mm_processor_kwargs = {"fps": 24}
+    agent_loop.process_multi_modal_info = AsyncMock(
+        return_value={"images": ["image"], "videos": ["video"], "audios": ["audio"]}
+    )
+    agent_loop.ct_build_initial_tokens = AsyncMock(return_value=[1, 2, 3])
+    agent_loop._assert_mm_supported = lambda _: None
+    agent_loop.server_manager = SimpleNamespace(
+        generate=AsyncMock(
+            return_value=SimpleNamespace(
+                diffusion_output=torch.zeros(1),
+                log_probs=None,
+                num_preempted=None,
+                extra_fields={},
+            )
+        )
+    )
+
+    await agent_loop.run({}, raw_prompt=[{"role": "user", "content": "prompt"}])
+
+    call = agent_loop.server_manager.generate.await_args.kwargs
+    assert call["image_data"] == ["image"]
+    assert call["video_data"] == ["video"]
+    assert call["audio_data"] == ["audio"]
+    assert call["mm_processor_kwargs"] == {"fps": 24}
 
 
 @pytest.mark.parametrize(
