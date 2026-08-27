@@ -22,7 +22,7 @@ HEIGHT=${HEIGHT:-288}
 WIDTH=${WIDTH:-448}
 VAL_HEIGHT=${VAL_HEIGHT:-576}
 VAL_WIDTH=${VAL_WIDTH:-928}
-NUM_FRAMES=${NUM_FRAMES:-124}
+NUM_FRAMES=${NUM_FRAMES:-96}
 INFER_STEPS=${INFER_STEPS:-10}
 MAX_PROMPT_EMBEDS=${MAX_PROMPT_EMBEDS:-12288}
 ACTOR_ATTN_BACKEND=${ACTOR_ATTN_BACKEND:-_flash_3_varlen_hub}
@@ -152,6 +152,7 @@ python3 -m verl_omni.trainer.main_diffusion \
   trainer.validation_data_dir="$output_dir/validation_data" \
   trainer.rollout_data_dir="$output_dir/rollout_data" \
   trainer.rollout_data_save_freq=10 \
+  trainer.rollout_data_max_samples=8 \
   trainer.log_val_generations=8 \
   trainer.video_fps=24 \
   trainer.val_before_train=True \
