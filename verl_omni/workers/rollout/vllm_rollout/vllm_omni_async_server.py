@@ -67,9 +67,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         omni_kwargs = engine_kwargs.get("vllm_omni", {}) or {}
         # TODO (mike): drop this once the legacy omni training script is removed.
         # It should be automatically inferred from the model config.
-        strategy_cls = (
-            ARStrategy if omni_kwargs.get("output_mode", "diffusion") == "ar" else DiffusionStrategy
-        )
+        strategy_cls = ARStrategy if omni_kwargs.get("output_mode", "diffusion") == "ar" else DiffusionStrategy
         self._generate_strategy = strategy_cls(self)
         self._rollout_flags: dict[int, dict] = {}
         rollout_config = self._generate_strategy.init_config(config)

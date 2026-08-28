@@ -137,7 +137,7 @@ class OmniStrategyBase(ABC):
         """Return the import path of the worker-extension class for *device_type*.
 
         Args:
-            device_type: The runtime device family, e.g. ``"cuda"`` or ``"npu"``.
+            device_type: The runtime device family, e.g. ``cuda`` or ``npu``.
 
         Returns:
             Fully-qualified class path of the colocate worker extension.
