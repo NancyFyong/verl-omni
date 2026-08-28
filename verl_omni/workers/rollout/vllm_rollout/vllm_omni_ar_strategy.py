@@ -30,7 +30,7 @@ from vllm_omni.lora.request import LoRARequest
 
 from verl_omni.pipelines.model_base import OmniRolloutPipelineBase
 from verl_omni.workers.config import OmniModelConfig
-from verl_omni.workers.rollout.vllm_rollout.vllm_omni_generate_strategy import _OmniGenerateStrategy
+from verl_omni.workers.rollout.vllm_rollout.vllm_omni_strategy_base import _OmniStrategyBase
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
@@ -46,7 +46,7 @@ def _drop_none_mapping_values(value: Any) -> Any:
     return value
 
 
-class _ARGenerateStrategy(_OmniGenerateStrategy):
+class _ARStrategy(_OmniStrategyBase):
     """Concrete AR/thinker strategy.
 
     Token-centric I/O: ``RolloutConfig``/``OmniModelConfig``, deploy-config

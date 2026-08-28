@@ -29,14 +29,14 @@ if TYPE_CHECKING:
     from verl_omni.workers.rollout.vllm_rollout.vllm_omni_async_server import vLLMOmniHttpServer
 
 
-class _OmniGenerateStrategy(ABC):
+class _OmniStrategyBase(ABC):
     """Abstract base for mode-specific vLLM-Omni behavior.
 
     It defines the shared contract (the abstract hooks below), the shared
     ``generate()`` template, and shared helpers (``_build_multi_modal_data``,
     ``_map_stop_reason``). It is never instantiated directly: ``vLLMOmniHttpServer``
-    picks exactly one concrete subclass -- :class:`_ARGenerateStrategy` or
-    :class:`_DiffusionGenerateStrategy` -- once in ``_init_config`` and delegates
+    picks exactly one concrete subclass -- :class:`_ARStrategy` or
+    :class:`_DiffusionStrategy` -- once in ``_init_config`` and delegates
     every mode-specific hook to it, while shared engine lifecycle stays on the server.
     """
 

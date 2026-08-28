@@ -19,14 +19,14 @@ import pytest
 import torch
 
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_async_server import vLLMOmniHttpServer
-from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import _DiffusionGenerateStrategy
+from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import _DiffusionStrategy
 
 
 @pytest.fixture
 def diffusion_strategy():
     server = object.__new__(vLLMOmniHttpServer)
     server.global_steps = 0
-    return _DiffusionGenerateStrategy(server)
+    return _DiffusionStrategy(server)
 
 
 def _request_output(diffusion_output, multimodal_output=None):

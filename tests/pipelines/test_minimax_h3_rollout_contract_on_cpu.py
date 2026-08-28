@@ -177,5 +177,5 @@ class TestH3RolloutOutputContract:
 
 def _run_generate(server, final_res, sampling_params):
     """Run the production diffusion output strategy with a fake engine result."""
-    strategy = server_module._DiffusionGenerateStrategy(server)
+    strategy = server_module._DiffusionStrategy(server)
     return strategy.process_output(final_res, params=None, sampling_params=sampling_params)

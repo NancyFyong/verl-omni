@@ -27,7 +27,7 @@ from vllm_omni.lora.request import LoRARequest
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.workers.config import DiffusionModelConfig, DiffusionRolloutConfig
 from verl_omni.workers.rollout.replica import DiffusionOutput
-from verl_omni.workers.rollout.vllm_rollout.vllm_omni_generate_strategy import _OmniGenerateStrategy
+from verl_omni.workers.rollout.vllm_rollout.vllm_omni_strategy_base import _OmniStrategyBase
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
@@ -80,7 +80,7 @@ def _maybe_unbatch(value: Any) -> Any:
     return value
 
 
-class _DiffusionGenerateStrategy(_OmniGenerateStrategy):
+class _DiffusionStrategy(_OmniStrategyBase):
     """Concrete diffusion strategy.
 
     ``DiffusionRolloutConfig``/``DiffusionModelConfig``, pipeline resolution and

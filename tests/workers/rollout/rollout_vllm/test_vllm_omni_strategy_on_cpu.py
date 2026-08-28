@@ -22,8 +22,8 @@ import torch
 from verl_omni.workers.rollout.vllm_rollout import vllm_omni_ar_strategy as ar_strategy_module
 from verl_omni.workers.rollout.vllm_rollout import vllm_omni_async_server as server_module
 from verl_omni.workers.rollout.vllm_rollout import vllm_omni_diffusion_strategy as diffusion_strategy_module
-from verl_omni.workers.rollout.vllm_rollout.vllm_omni_ar_strategy import _ARGenerateStrategy
-from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import _DiffusionGenerateStrategy
+from verl_omni.workers.rollout.vllm_rollout.vllm_omni_ar_strategy import _ARStrategy
+from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import _DiffusionStrategy
 
 
 @pytest.mark.parametrize(
@@ -42,8 +42,8 @@ def test_server_selects_one_generation_strategy(monkeypatch, output_mode, expect
         def init_model_config(self, model_config):
             return (self.kind, model_config)
 
-    monkeypatch.setattr(server_module, "_ARGenerateStrategy", lambda server: _Strategy(server, "ar"))
-    monkeypatch.setattr(server_module, "_DiffusionGenerateStrategy", lambda server: _Strategy(server, "diffusion"))
+    monkeypatch.setattr(server_module, "_ARStrategy", lambda server: _Strategy(server, "ar"))
+    monkeypatch.setattr(server_module, "_DiffusionStrategy", lambda server: _Strategy(server, "diffusion"))
 
     omni_kwargs = {} if output_mode is None else {"output_mode": output_mode}
     server = object.__new__(server_module.vLLMOmniHttpServer)
@@ -102,16 +102,16 @@ def test_strategies_preserve_mode_specific_quantization(monkeypatch):
     )
     server = SimpleNamespace()
 
-    assert _ARGenerateStrategy(server).apply_quantization() == ("fp8", {"source": server})
-    assert _DiffusionGenerateStrategy(server).apply_quantization() == (None, {})
+    assert _ARStrategy(server).apply_quantization() == ("fp8", {"source": server})
+    assert _DiffusionStrategy(server).apply_quantization() == (None, {})
 
 
 def test_strategies_preserve_platform_worker_extensions():
     server = SimpleNamespace()
 
-    assert _ARGenerateStrategy(server).worker_extension_cls("npu").endswith("vLLMOmniColocateWorkerExtension")
-    assert _DiffusionGenerateStrategy(server).worker_extension_cls("cuda").endswith("vLLMOmniColocateWorkerExtension")
-    assert _DiffusionGenerateStrategy(server).worker_extension_cls("npu").endswith("vLLMOmniNPUColocateWorkerExtension")
+    assert _ARStrategy(server).worker_extension_cls("npu").endswith("vLLMOmniColocateWorkerExtension")
+    assert _DiffusionStrategy(server).worker_extension_cls("cuda").endswith("vLLMOmniColocateWorkerExtension")
+    assert _DiffusionStrategy(server).worker_extension_cls("npu").endswith("vLLMOmniNPUColocateWorkerExtension")
 
 
 def test_ar_strategy_preserves_prompt_and_sampling_preprocessing():
@@ -125,7 +125,7 @@ def test_ar_strategy_preserves_prompt_and_sampling_preprocessing():
         ),
         model_config=SimpleNamespace(processor=processor),
     )
-    strategy = _ARGenerateStrategy(server)
+    strategy = _ARStrategy(server)
     sampling_params = {"max_new_tokens": 10, "logprobs": True}
 
     prompt, params = strategy.preprocess_input(
@@ -149,7 +149,7 @@ def test_ar_strategy_preserves_prompt_and_sampling_preprocessing():
 
 def test_ar_strategy_preserves_output_conversion():
     server = SimpleNamespace(global_steps=12)
-    strategy = _ARGenerateStrategy(server)
+    strategy = _ARStrategy(server)
     completion = SimpleNamespace(
         token_ids=[7, 8],
         logprobs=[
@@ -176,7 +176,7 @@ def test_ar_strategy_preserves_output_conversion():
 
 def test_ar_strategy_preserves_engine_kwarg_normalization(monkeypatch):
     monkeypatch.setattr(ar_strategy_module.OmniRolloutPipelineBase, "get_class", lambda pipeline_name: None)
-    strategy = _ARGenerateStrategy(SimpleNamespace())
+    strategy = _ARStrategy(SimpleNamespace())
     engine_kwargs = {
         "output_mode": "ar",
         "custom_pipeline": "unused",
@@ -196,7 +196,7 @@ def test_ar_strategy_preserves_engine_kwarg_normalization(monkeypatch):
 
 def test_ar_strategy_preserves_engine_argument_normalization():
     server = SimpleNamespace(config=SimpleNamespace(logprobs_mode="raw_logprobs"))
-    strategy = _ARGenerateStrategy(server)
+    strategy = _ARStrategy(server)
     engine_args = {
         "compilation_config": {
             "keep": 1,
@@ -240,7 +240,7 @@ def test_diffusion_strategy_preserves_engine_argument_preparation(monkeypatch):
         ),
         model_config=SimpleNamespace(architecture="Architecture", algorithm="Algorithm"),
     )
-    strategy = _DiffusionGenerateStrategy(server)
+    strategy = _DiffusionStrategy(server)
     engine_args = {"max_num_seqs": 4}
 
     strategy.prepare_engine_args(engine_args, Namespace())
@@ -257,7 +257,7 @@ def test_diffusion_strategy_preserves_engine_argument_preparation(monkeypatch):
 
 def test_diffusion_strategy_preserves_multistage_prompt_shape():
     server = SimpleNamespace(engine=SimpleNamespace(default_sampling_params_list=["ar-stage", "diffusion-stage"]))
-    strategy = _DiffusionGenerateStrategy(server)
+    strategy = _DiffusionStrategy(server)
     prompt_mask = torch.tensor([True, False])
 
     prompt, params = strategy.preprocess_input(
@@ -286,8 +286,8 @@ def test_diffusion_strategy_preserves_multistage_prompt_shape():
 @pytest.mark.parametrize(
     ("strategy_cls", "expected_extra_keys"),
     [
-        (_ARGenerateStrategy, {"lora_request", "priority"}),
-        (_DiffusionGenerateStrategy, set()),
+        (_ARStrategy, {"lora_request", "priority"}),
+        (_DiffusionStrategy, set()),
     ],
 )
 @pytest.mark.asyncio

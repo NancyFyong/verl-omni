@@ -40,8 +40,8 @@ from vllm_omni.lora.request import LoRARequest
 
 from verl_omni.workers.config import DiffusionModelConfig, DiffusionRolloutConfig, OmniModelConfig
 from verl_omni.workers.rollout.replica import DiffusionOutput
-from verl_omni.workers.rollout.vllm_rollout.vllm_omni_ar_strategy import _ARGenerateStrategy
-from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import _DiffusionGenerateStrategy
+from verl_omni.workers.rollout.vllm_rollout.vllm_omni_ar_strategy import _ARStrategy
+from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import _DiffusionStrategy
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
@@ -68,7 +68,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         # TODO (mike): drop this once the legacy omni training script is removed.
         # It should be automatically inferred from the model config.
         strategy_cls = (
-            _ARGenerateStrategy if omni_kwargs.get("output_mode", "diffusion") == "ar" else _DiffusionGenerateStrategy
+            _ARStrategy if omni_kwargs.get("output_mode", "diffusion") == "ar" else _DiffusionStrategy
         )
         self._generate_strategy = strategy_cls(self)
         self._rollout_flags: dict[int, dict] = {}
