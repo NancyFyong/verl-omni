@@ -19,7 +19,6 @@ from typing import Any, Optional
 import numpy as np
 import torch
 import torchvision.transforms as T
-from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.import_utils import import_external_libs
 from vllm_omni.inputs.data import OmniCustomPrompt, OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
@@ -27,7 +26,7 @@ from vllm_omni.lora.request import LoRARequest
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.workers.config import DiffusionModelConfig, DiffusionRolloutConfig
 from verl_omni.workers.rollout.replica import DiffusionOutput
-from verl_omni.workers.rollout.vllm_rollout.vllm_omni_strategy_base import _OmniStrategyBase
+from verl_omni.workers.rollout.vllm_rollout.vllm_omni_strategy_base import OmniStrategyBase
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
@@ -80,19 +79,17 @@ def _maybe_unbatch(value: Any) -> Any:
     return value
 
 
-class _DiffusionStrategy(_OmniStrategyBase):
+class DiffusionStrategy(OmniStrategyBase):
     """Concrete diffusion strategy.
 
-    ``DiffusionRolloutConfig``/``DiffusionModelConfig``, pipeline resolution and
-    diffusion engine-arg preparation, ``OmniCustomPrompt`` input preparation, and
-    ``process_output`` -> ``DiffusionOutput``.
+    Converts configs to ``DiffusionRolloutConfig``/``DiffusionModelConfig``,
+    resolves the diffusion pipeline and prepares its engine args, builds an
+    ``OmniCustomPrompt``, and produces ``DiffusionOutput`` from
+    :meth:`process_output`.
     """
 
-    def init_config(self, config: Any) -> DiffusionRolloutConfig:
-        return omega_conf_to_dataclass(config, dataclass_type=DiffusionRolloutConfig)
-
-    def init_model_config(self, model_config: Any) -> DiffusionModelConfig:
-        return omega_conf_to_dataclass(model_config, dataclass_type=DiffusionModelConfig)
+    rollout_config_cls = DiffusionRolloutConfig
+    model_config_cls = DiffusionModelConfig
 
     def post_init(self, cuda_visible_devices: str) -> None:
         self.server._to_tensor = T.PILToTensor()
@@ -185,15 +182,13 @@ class _DiffusionStrategy(_OmniStrategyBase):
         lora_request: Optional[LoRARequest],
         priority: int,
     ) -> Any:
-        generator = self.server.engine.generate(
-            prompt=prompt,
-            request_id=request_id,
-            sampling_params_list=params,
+        return await self._collect_last_output(
+            self.server.engine.generate(
+                prompt=prompt,
+                request_id=request_id,
+                sampling_params_list=params,
+            )
         )
-        final_res = None
-        async for output in generator:
-            final_res = output
-        return final_res
 
     def process_output(self, final_res: Any, params: Any, sampling_params: dict[str, Any]) -> DiffusionOutput:
         output_type = _diffusion_output_type(sampling_params)
@@ -267,12 +262,7 @@ class _DiffusionStrategy(_OmniStrategyBase):
             finish_reason = "stop"
 
         stop_reason = self._map_stop_reason(finish_reason)
-
-        num_preempted = None
-        if hasattr(req_output, "outputs") and req_output.outputs and hasattr(req_output.outputs[0], "num_preempted"):
-            num_preempted = req_output.outputs[0].num_preempted
-        elif hasattr(req_output, "num_preempted"):
-            num_preempted = req_output.num_preempted
+        num_preempted = self._extract_num_preempted(req_output)
 
         return DiffusionOutput(
             diffusion_output=diffusion_output,

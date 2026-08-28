@@ -20,7 +20,6 @@ from typing import Any, Optional
 
 import torch
 import yaml
-from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_visible_devices_keyword
 from verl.workers.config import RolloutConfig
 from verl.workers.rollout.replica import TokenOutput
@@ -30,7 +29,7 @@ from vllm_omni.lora.request import LoRARequest
 
 from verl_omni.pipelines.model_base import OmniRolloutPipelineBase
 from verl_omni.workers.config import OmniModelConfig
-from verl_omni.workers.rollout.vllm_rollout.vllm_omni_strategy_base import _OmniStrategyBase
+from verl_omni.workers.rollout.vllm_rollout.vllm_omni_strategy_base import OmniStrategyBase
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
@@ -46,18 +45,16 @@ def _drop_none_mapping_values(value: Any) -> Any:
     return value
 
 
-class _ARStrategy(_OmniStrategyBase):
+class ARStrategy(OmniStrategyBase):
     """Concrete AR/thinker strategy.
 
-    Token-centric I/O: ``RolloutConfig``/``OmniModelConfig``, deploy-config
-    writing, token-id input preparation, and ``process_output`` -> ``TokenOutput``.
+    Token-centric I/O: converts configs to ``RolloutConfig``/``OmniModelConfig``,
+    writes the deploy config, prepares token-id prompts, and produces
+    ``TokenOutput`` from :meth:`process_output`.
     """
 
-    def init_config(self, config: Any) -> RolloutConfig:
-        return omega_conf_to_dataclass(config, dataclass_type=RolloutConfig)
-
-    def init_model_config(self, model_config: Any) -> OmniModelConfig:
-        return omega_conf_to_dataclass(model_config, dataclass_type=OmniModelConfig)
+    rollout_config_cls = RolloutConfig
+    model_config_cls = OmniModelConfig
 
     def validate_configs(self) -> None:
         if self.server.config.max_model_len is None:
@@ -221,17 +218,15 @@ class _ARStrategy(_OmniStrategyBase):
         lora_request: Optional[LoRARequest],
         priority: int,
     ) -> Any:
-        generator = self.server.engine.generate(
-            prompt=prompt,
-            sampling_params_list=params,
-            request_id=request_id,
-            lora_request=lora_request,
-            priority=priority,
+        return await self._collect_last_output(
+            self.server.engine.generate(
+                prompt=prompt,
+                sampling_params_list=params,
+                request_id=request_id,
+                lora_request=lora_request,
+                priority=priority,
+            )
         )
-        final_res = None
-        async for output in generator:
-            final_res = output
-        return final_res
 
     def process_output(self, final_res: Any, params: SamplingParams, sampling_params: dict[str, Any]) -> TokenOutput:
         if final_res is None:
@@ -251,12 +246,7 @@ class _ARStrategy(_OmniStrategyBase):
 
         finish_reason = req_output.outputs[0].finish_reason
         stop_reason = self._map_stop_reason(finish_reason)
-
-        num_preempted = None
-        if hasattr(req_output.outputs[0], "num_preempted"):
-            num_preempted = req_output.outputs[0].num_preempted
-        elif hasattr(req_output, "num_preempted"):
-            num_preempted = req_output.num_preempted
+        num_preempted = self._extract_num_preempted(req_output)
 
         return TokenOutput(
             token_ids=token_ids,
