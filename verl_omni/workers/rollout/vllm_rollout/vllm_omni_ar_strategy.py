@@ -47,6 +47,12 @@ def _drop_none_mapping_values(value: Any) -> Any:
 
 
 class _ARGenerateStrategy(_OmniGenerateStrategy):
+    """Concrete AR/thinker strategy.
+
+    Token-centric I/O: ``RolloutConfig``/``OmniModelConfig``, deploy-config
+    writing, token-id input preparation, and ``process_output`` -> ``TokenOutput``.
+    """
+
     def init_config(self, config: Any) -> RolloutConfig:
         return omega_conf_to_dataclass(config, dataclass_type=RolloutConfig)
 

@@ -81,6 +81,13 @@ def _maybe_unbatch(value: Any) -> Any:
 
 
 class _DiffusionGenerateStrategy(_OmniGenerateStrategy):
+    """Concrete diffusion strategy.
+
+    ``DiffusionRolloutConfig``/``DiffusionModelConfig``, pipeline resolution and
+    diffusion engine-arg preparation, ``OmniCustomPrompt`` input preparation, and
+    ``process_output`` -> ``DiffusionOutput``.
+    """
+
     def init_config(self, config: Any) -> DiffusionRolloutConfig:
         return omega_conf_to_dataclass(config, dataclass_type=DiffusionRolloutConfig)
 

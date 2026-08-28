@@ -30,7 +30,15 @@ if TYPE_CHECKING:
 
 
 class _OmniGenerateStrategy(ABC):
-    """Mode-specific vLLM-Omni configuration and generation behavior."""
+    """Abstract base for mode-specific vLLM-Omni behavior.
+
+    It defines the shared contract (the abstract hooks below), the shared
+    ``generate()`` template, and shared helpers (``_build_multi_modal_data``,
+    ``_map_stop_reason``). It is never instantiated directly: ``vLLMOmniHttpServer``
+    picks exactly one concrete subclass -- :class:`_ARGenerateStrategy` or
+    :class:`_DiffusionGenerateStrategy` -- once in ``_init_config`` and delegates
+    every mode-specific hook to it, while shared engine lifecycle stays on the server.
+    """
 
     def __init__(self, server: vLLMOmniHttpServer) -> None:
         self.server = server
