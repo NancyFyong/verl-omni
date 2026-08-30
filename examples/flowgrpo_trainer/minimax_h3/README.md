@@ -216,6 +216,8 @@ after every transition, so only the target video/audio rows are scored.
 MODEL_PATH="$MODEL_ROOT" \
 DATA_DIR="$HOME/data/minimax_h3_ref2va" \
 IMAGEBIND_MODEL_PATH=/path/to/imagebind_huge.pth \
+REF_IMAGE_SHORT_EDGE=512 \
+VAL_REF_IMAGE_SHORT_EDGE=1024 \
 bash examples/flowgrpo_trainer/minimax_h3/run_minimax_h3_ref2va_lora.sh
 ```
 
@@ -224,7 +226,11 @@ reference presentation in rollout. Reference image/video rows use timestep
 `0.999`, reference-audio rows use `1.0`, and all reference rows remain fixed
 through every stochastic reverse-SDE transition. They are transported once and
 reinserted by the Actor; only generated video and audio rows are stored in the
-trajectory and contribute to the FlowGRPO log probability.
+trajectory and contribute to the FlowGRPO log probability. The launcher keeps
+the official reference-image short edge of 2048 by default. Set
+`REF_IMAGE_SHORT_EDGE` for training and `VAL_REF_IMAGE_SHORT_EDGE` for
+validation to multiples of 32 from 256 through 2048. The validation setting
+defaults to the training value.
 
 ### Ascend NPU
 
@@ -291,6 +297,8 @@ Common environment overrides are:
 | `NUM_GPUS` | Devices per node |
 | `ROLLOUT_TP` | vLLM-Omni DiT tensor parallel size |
 | `TEXT_ENCODER_TP` | H3 text-encoder tensor parallel size |
+| `REF_IMAGE_SHORT_EDGE` | Ref2VA training image short edge; defaults to 2048 |
+| `VAL_REF_IMAGE_SHORT_EDGE` | Ref2VA validation image short edge; defaults to the training value |
 | `REWARD_NUM_WORKERS` | Number of reward workers |
 | `REWARD_DEVICE` | Reward device type, such as `cuda` or `npu` |
 | `CLAP_MODEL_PATH` | CLAP model ID or local path |

@@ -25,6 +25,9 @@ INFER_STEPS=${INFER_STEPS:-10}
 SDE_WINDOW_SIZE=${SDE_WINDOW_SIZE:-3}
 SDE_WINDOW_END=${SDE_WINDOW_END:-$((INFER_STEPS - 1))}
 MAX_PROMPT_EMBEDS=${MAX_PROMPT_EMBEDS:-12288}
+REF_IMAGE_SHORT_EDGE=${REF_IMAGE_SHORT_EDGE:-2048}
+VAL_REF_IMAGE_SHORT_EDGE=${VAL_REF_IMAGE_SHORT_EDGE:-$REF_IMAGE_SHORT_EDGE}
+export REF_IMAGE_SHORT_EDGE
 ACTOR_ATTN_BACKEND=${ACTOR_ATTN_BACKEND:-_flash_3_varlen_hub}
 ROLLOUT_ATTN_BACKEND=${ROLLOUT_ATTN_BACKEND:-FLASH_ATTN_3_HUB}
 CLAP_MODEL_PATH=${CLAP_MODEL_PATH:-laion/larger_clap_general}
@@ -116,6 +119,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.rollout.pipeline.num_inference_steps="$INFER_STEPS" \
     actor_rollout_ref.rollout.pipeline.true_cfg_scale=1.0 \
     actor_rollout_ref.rollout.pipeline.max_sequence_length="$MAX_PROMPT_EMBEDS" \
+    actor_rollout_ref.rollout.pipeline.reference_image_short_edge="$REF_IMAGE_SHORT_EDGE" \
     actor_rollout_ref.rollout.pipeline.video_flow_shift=12.0 \
     +actor_rollout_ref.rollout.pipeline.output_type=pt \
     actor_rollout_ref.rollout.val_kwargs.pipeline.height="$VAL_HEIGHT" \
@@ -125,6 +129,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.rollout.val_kwargs.pipeline.num_inference_steps=40 \
     actor_rollout_ref.rollout.val_kwargs.pipeline.true_cfg_scale=1.0 \
     actor_rollout_ref.rollout.val_kwargs.pipeline.max_sequence_length="$MAX_PROMPT_EMBEDS" \
+    actor_rollout_ref.rollout.val_kwargs.pipeline.reference_image_short_edge="$VAL_REF_IMAGE_SHORT_EDGE" \
     +actor_rollout_ref.rollout.val_kwargs.pipeline.output_type=pt \
     actor_rollout_ref.rollout.val_kwargs.algo.noise_level=0.0 \
     actor_rollout_ref.rollout.algo.noise_level=0.8 \

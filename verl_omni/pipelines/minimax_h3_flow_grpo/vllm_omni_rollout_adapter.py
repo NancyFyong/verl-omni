@@ -45,7 +45,11 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from verl_omni.pipelines.diffusion_rollout_output import with_rollout_data
-from verl_omni.pipelines.minimax_h3_diffusion_nft.common import serialize_ref_blocks
+from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
+    ref2va_reference_image_short_edge,
+    serialize_ref_blocks,
+    validate_ref2va_reference_image_short_edge,
+)
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
@@ -92,6 +96,7 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
     )
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
+        self._reference_image_short_edge = validate_ref2va_reference_image_short_edge()
         super().__init__(od_config=od_config, prefix=prefix)
         self.install_h3_lora_layout()
         self._flow_grpo_noise_level = 0.8
@@ -452,7 +457,9 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
                         else:
                             current_video, current_audio = video_rows, audio_rows
                             next_video, next_audio = next_video_rows, next_audio_rows
-                        current_latents.append(flatten_joint_latents(current_video.unsqueeze(0), current_audio.unsqueeze(0)))
+                        current_latents.append(
+                            flatten_joint_latents(current_video.unsqueeze(0), current_audio.unsqueeze(0))
+                        )
                         next_latents.append(flatten_joint_latents(next_video.unsqueeze(0), next_audio.unsqueeze(0)))
                         log_probs.append(combine_log_probs(video_log_prob, audio_log_prob))
                         step_indices.append(step)
@@ -508,12 +515,20 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
         if len(request.requests) != 1:
             raise ValueError(f"MiniMax H3 FlowGRPO expects one request, got {len(request.requests)}.")
         req = request.requests[0]
-        self._ensure_prompt_text(request)
         self._configure_flow_grpo(req)
-        try:
-            output = super().forward(request)
-        finally:
-            self._h3_prompt_ids = None
+        extra_args = req.sampling_params.extra_args or {}
+        short_edge = extra_args.get(
+            "reference_image_short_edge",
+            getattr(req.sampling_params, "reference_image_short_edge", None),
+        )
+        if short_edge is None:
+            short_edge = getattr(self, "_reference_image_short_edge", None)
+        with ref2va_reference_image_short_edge(short_edge):
+            self._ensure_prompt_text(request)
+            try:
+                output = super().forward(request)
+            finally:
+                self._h3_prompt_ids = None
         if not self._flow_grpo_trajectory:
             raise RuntimeError("MiniMax H3 FlowGRPO rollout produced no trajectory.")
         trajectory = {

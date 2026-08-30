@@ -20,7 +20,9 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+from PIL import Image
 from tensordict import TensorDict
+from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 from vllm_omni.diffusion.models.minimax_h3.condition_noise import (
     minimax_h3_audio_cond_noise_aug_rows,
     minimax_h3_imgvid_cond_noise_aug_rows,
@@ -30,7 +32,9 @@ from vllm_omni.diffusion.models.minimax_h3.packed_sequence import minimax_h3_pac
 
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     build_ref2va_layout_from_meta,
+    ref2va_reference_image_short_edge,
     serialize_ref_blocks,
+    validate_ref2va_reference_image_short_edge,
 )
 from verl_omni.pipelines.minimax_h3_flow_grpo.common import (
     H3_AUDIO_WIDTH,
@@ -50,6 +54,64 @@ _REF_BLOCKS = [
     {"kind": "video", "ref_audio_t": 0, "latent_t": 1, "latent_h": 4, "latent_w": 4},
     {"kind": "audio", "ref_audio_t": 3},
 ]
+
+
+def test_reference_image_short_edge_environment_override_is_restored(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _reference_image_shape
+
+    constant = "MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE"
+    monkeypatch.setitem(_reference_image_shape.__globals__, constant, 2048)
+    monkeypatch.setenv("REF_IMAGE_SHORT_EDGE", "1024")
+    image = Image.new("RGB", (640, 400))
+
+    with ref2va_reference_image_short_edge() as short_edge:
+        assert short_edge == 1024
+        assert _reference_image_shape(image) == (1632, 1024)
+    assert min(_reference_image_shape(image)) == 2048
+
+
+def test_request_short_edge_overrides_environment_temporarily(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _reference_image_shape
+
+    constant = "MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE"
+    monkeypatch.setitem(_reference_image_shape.__globals__, constant, 2048)
+    monkeypatch.setenv("REF_IMAGE_SHORT_EDGE", "512")
+    image = Image.new("RGB", (640, 400))
+    seen = []
+
+    def fake_forward(_self, _request):
+        seen.append(min(_reference_image_shape(image)))
+        raise RuntimeError("stop after observing the request-local override")
+
+    monkeypatch.setattr(MiniMaxH3Pipeline, "forward", fake_forward)
+    pipeline = object.__new__(MiniMaxH3PipelineWithLogProb)
+    object.__setattr__(pipeline, "_reference_image_short_edge", 512)
+    object.__setattr__(pipeline, "_ensure_prompt_text", MagicMock())
+    request = SimpleNamespace(
+        requests=[
+            SimpleNamespace(
+                sampling_params=SimpleNamespace(
+                    extra_args={"reference_image_short_edge": 1024},
+                    num_outputs_per_prompt=1,
+                    max_sequence_length=1024,
+                )
+            )
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="request-local override"):
+        pipeline.forward(request)
+
+    assert seen == [1024]
+    assert min(_reference_image_shape(image)) == 2048
+
+
+@pytest.mark.parametrize("value", ["invalid", "255", "1000", "2049"])
+def test_reference_image_short_edge_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("REF_IMAGE_SHORT_EDGE", value)
+
+    with pytest.raises(ValueError, match="REF_IMAGE_SHORT_EDGE"):
+        validate_ref2va_reference_image_short_edge()
 
 
 class _RefBranch:
