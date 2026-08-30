@@ -18,7 +18,7 @@ import math
 import os
 import uuid
 from abc import ABC, abstractmethod
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pprint import pprint
 
@@ -44,7 +44,8 @@ from verl.single_controller.ray import (
 from verl.trainer.ppo.metric_utils import compute_variance_proxy_metrics, process_validation_metrics
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import Role, need_reference_policy, need_reward_model
-from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer
+from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
+from verl.trainer.ppo.v1.utils import MetricsAggregator
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.config import omega_conf_to_dataclass
@@ -61,7 +62,8 @@ from verl_omni.trainer.diffusion.diffusion_metric_utils import (
     compute_throughput_metrics_diffusion,
     compute_timing_metrics_diffusion,
 )
-from verl_omni.trainer.diffusion.ray_diffusion_trainer import compute_advantage
+from verl_omni.trainer.diffusion.diffusion_trainer_utils import worker_group_port_ranges
+from verl_omni.trainer.diffusion.ray_diffusion_trainer import _to_diffusion_worker_tensordict, compute_advantage
 from verl_omni.trainer.diffusion.rollout_correction import (
     apply_bypass_mode_to_diffusion_batch,
     apply_rollout_correction_to_diffusion_batch,
@@ -126,15 +128,26 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
         self.checkpoint_manager = None
         self.global_steps = 0
+        # Local update index within the parameter-sync cycle.
+        self.local_trigger_step = 0
 
     def _build_replay_buffer(self) -> ReplayBuffer:
         sampler_config = self.config.trainer.v1.sampler
-        return ReplayBuffer(
+        if sampler_config.get("drop_incomplete_groups", False):
+            if self.trainer_mode != "sync":
+                raise ValueError("drop_incomplete_groups is only supported with trainer_mode='sync'")
+            max_refill_rounds = sampler_config.get("max_incomplete_group_refill_rounds", 3)
+            if isinstance(max_refill_rounds, bool) or not isinstance(max_refill_rounds, int) or max_refill_rounds <= 0:
+                raise ValueError("max_incomplete_group_refill_rounds must be a positive integer")
+
+        replay_buffer_cls = ReplayBufferAsync if self.trainer_mode == "separate_async" else ReplayBuffer
+        return replay_buffer_cls(
             trainer_mode=self.trainer_mode,
             trainer_config=self.config.trainer.v1.get(self.trainer_mode, {}),
             max_off_policy_threshold=sampler_config.max_off_policy_threshold,
             max_off_policy_strategy=sampler_config.max_off_policy_strategy,
             sampler_kwargs=sampler_config.sampler_kwargs,
+            refill_fn=self._add_prompts_to_generate,
         )
 
     def init(self):
@@ -240,31 +253,58 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         with marked_timer("feed", timing_raw):
             self._add_batch_to_generate()
 
+        metrics_aggregator = MetricsAggregator()
+        metrics_aggregator.aggregation_rules["sum"].extend(
+            [
+                "training/rollout_failure/evicted_groups",
+                "training/rollout_failure/evicted_trajectories",
+                "training/rollout_failure/refilled_prompts",
+                "training/rollout_failure/refill_rounds",
+            ]
+        )
+        prefetched_batches = None
+        if self._should_prefetch_local_batches():
+            prefetched_batches = []
+            with marked_timer("gen", timing_raw, color="red"):
+                self.on_sample_begin()
+                for trigger_idx in range(self.parameter_sync_step):
+                    self.local_trigger_step = trigger_idx
+                    prefetched_batches.append(self._sample_training_batch(sample_batch_size))
+                self.on_sample_end()
+
         combined_keys: list = []
         combined_tags: list = []
         combined_partition_id = "train"
-        for _ in range(self.parameter_sync_step):
+        for trigger_idx in range(self.parameter_sync_step):
+            self.local_trigger_step = trigger_idx
             iter_metrics: dict = {}
-            batch = self._step_once(iter_metrics, timing_raw, sample_batch_size)
-            metrics.update(iter_metrics)
+            if prefetched_batches is None:
+                batch = self._step_once(iter_metrics, timing_raw, sample_batch_size)
+            else:
+                batch_meta, off_policy_metrics = prefetched_batches[trigger_idx]
+                iter_metrics.update(off_policy_metrics)
+                batch = self._train_sampled_batch(iter_metrics, timing_raw, batch_meta)
+            sample_count = sum(not tag.get("is_padding", False) for tag in batch.tags)
+            metrics_aggregator.add_step_metrics(iter_metrics, sample_count=sample_count)
             combined_keys.extend(batch.keys)
             combined_tags.extend(batch.tags)
             combined_partition_id = batch.partition_id
 
+        metrics.update(metrics_aggregator.get_aggregated_metrics())
         return KVBatchMeta(partition_id=combined_partition_id, keys=combined_keys, tags=combined_tags)
 
     def _step_once(self, metrics: dict, timing_raw: dict, sample_batch_size: int) -> KVBatchMeta:
         """Sample one mini-batch from the replay buffer and run the diffusion PG pipeline."""
         with marked_timer("gen", timing_raw, color="red"):
             self.on_sample_begin()
-            batch_meta, off_policy_metrics = self.replay_buffer.sample(
-                global_steps=self.global_steps,
-                partition_id="train",
-                batch_size=sample_batch_size,
-            )
+            batch_meta, off_policy_metrics = self._sample_training_batch(sample_batch_size)
             metrics.update(off_policy_metrics)
             self.on_sample_end()
 
+        return self._train_sampled_batch(metrics, timing_raw, batch_meta)
+
+    def _train_sampled_batch(self, metrics: dict, timing_raw: dict, batch_meta: KVBatchMeta) -> KVBatchMeta:
+        """Run one diffusion policy-gradient update on an already sampled mini-batch."""
         # Convert TQ rows to diffusion DataProto; from here on the driver owns the
         # DataProto compute contract (no KVBatchMeta passed to diffusion workers).
         data = diffusion_tq_batch_to_dataproto(batch_meta, pad_token_id=self.tokenizer.pad_token_id or 0)
@@ -355,6 +395,10 @@ class PolicyGradientDiffusionTrainerV1(ABC):
     def on_step_begin(self):
         """Called at the beginning of each training step."""
         return
+
+    def _should_prefetch_local_batches(self) -> bool:
+        """Whether to collect the full parameter-sync cycle before training."""
+        return False
 
     def on_sample_begin(self):
         """Called at the beginning of sampling from the replay buffer."""
@@ -482,7 +526,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             max_samples=self.config.data.get("val_max_samples", -1),
         )
 
-        gen_batch_size = self.config.data.get("gen_batch_size", None) or self.config.data.train_batch_size
+        gen_batch_size = self._generation_batch_size()
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
             batch_size=gen_batch_size,
@@ -516,8 +560,8 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                     self.config.actor_rollout_ref.actor.optim.total_training_steps = (
                         total_training_steps * self.parameter_sync_step
                     )
-        except Exception as e:
-            logger.warning(f"Could not set total_training_steps in config: {e}")
+        except (KeyError, TypeError, AttributeError, OmegaConf.errors.OmegaConfBaseException) as e:
+            raise RuntimeError("Failed to propagate trainer.total_training_steps to actor optimizer config.") from e
 
     def _init_dump_executor(self):
         self._dump_executor = ThreadPoolExecutor(max_workers=1)
@@ -586,11 +630,12 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
         all_wg = {}
         wg_kwargs = {"device_name": self.config.trainer.device}
-        if OmegaConf.select(self.config.trainer, "ray_master_port_range") is not None:
-            wg_kwargs["master_port_range"] = OmegaConf.to_container(self.config.trainer.ray_master_port_range)
-        for resource_pool, class_dict in self.resource_pool_to_cls.items():
-            if not class_dict:
-                continue
+        pools = [(pool, class_dict) for pool, class_dict in self.resource_pool_to_cls.items() if class_dict]
+        master_port_range = OmegaConf.select(self.config.trainer, "ray_master_port_range")
+        port_ranges = worker_group_port_ranges(master_port_range, len(pools))
+        for (resource_pool, class_dict), port_range in zip(pools, port_ranges, strict=True):
+            if port_range is not None:
+                wg_kwargs["master_port_range"] = port_range
             worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
             wg_dict = RayWorkerGroup(resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls, **wg_kwargs)
             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
@@ -648,11 +693,31 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         batch_dict["index"] = np.arange(len(batch_dict["raw_prompt"]))
         return tu.get_tensordict(batch_dict)
 
+    def _generation_batch_size(self) -> int:
+        cached_batch_size = getattr(self, "_effective_generation_batch_size", None)
+        if cached_batch_size is not None:
+            return cached_batch_size
+
+        sampler_config = self.config.trainer.v1.sampler
+        exact_refill = sampler_config.get("drop_incomplete_groups", False) or self.trainer_mode == "separate_async"
+        if exact_refill:
+            configured_batch_size = self.config.data.get("gen_batch_size", None)
+            if configured_batch_size not in (None, 1):
+                logger.warning(
+                    "data.gen_batch_size=%s is overridden to 1 because exact replay-buffer refill is enabled",
+                    configured_batch_size,
+                )
+            effective_batch_size = 1
+        else:
+            effective_batch_size = self.config.data.get("gen_batch_size", None) or self.config.data.train_batch_size
+        self._effective_generation_batch_size = effective_batch_size
+        return effective_batch_size
+
     def _next_train_batch(self, num_prompts: int | None = None) -> tu.TensorDict:
         train_batch_size = self.config.data.train_batch_size
         if num_prompts is None:
             num_prompts = train_batch_size
-        gen_batch_size = self.config.data.get("gen_batch_size", None) or train_batch_size
+        gen_batch_size = self._generation_batch_size()
         if num_prompts <= 0 or num_prompts % gen_batch_size != 0:
             raise ValueError(
                 f"num_prompts ({num_prompts}) must be a positive multiple of gen_batch_size ({gen_batch_size})"
@@ -664,6 +729,94 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         if rollout_seed_cfg is not None:
             tu.assign_non_tensor_data(batch, "rollout_seed", int(rollout_seed_cfg) + self.global_steps - 1)
         return batch
+
+    @staticmethod
+    def _trajectory_uid(key: str) -> str:
+        parts = key.rsplit("_", 2)
+        return parts[0] if len(parts) == 3 else key
+
+    def _sample_training_batch(self, batch_size: int) -> tuple[KVBatchMeta, dict]:
+        """Use the upstream replay buffer and replace only selected failed groups."""
+        sampler_config = self.config.trainer.v1.sampler
+        if not sampler_config.get("drop_incomplete_groups", False):
+            return self.replay_buffer.sample(
+                global_steps=self.global_steps,
+                partition_id="train",
+                batch_size=batch_size,
+            )
+
+        max_refill_rounds = sampler_config.get("max_incomplete_group_refill_rounds", 3)
+        remaining_batch_size = batch_size
+        refill_rounds = 0
+        keys: list[str] = []
+        tags: list[dict] = []
+        sampling_metrics: dict = {}
+        failure_metrics: Counter = Counter()
+
+        while remaining_batch_size > 0:
+            try:
+                batch, current_metrics = self.replay_buffer.sample(
+                    global_steps=self.global_steps,
+                    partition_id="train",
+                    batch_size=remaining_batch_size,
+                )
+            except RuntimeError as e:
+                if "Sync replay buffer selected terminal groups with no materializable trajectories" in str(
+                    e
+                ) and "sync_refill_failed_groups" in str(e):
+                    batch = KVBatchMeta(partition_id="train", keys=[], tags=[])
+                    current_metrics = {}
+                else:
+                    raise
+            sampling_metrics.update(current_metrics)
+
+            prompt_global_steps = self.replay_buffer.prompt_global_steps["train"]
+            sampleable_uids = sorted(
+                self.replay_buffer.finished_keys["train"] | self.replay_buffer.failure_keys["train"],
+                key=lambda uid: prompt_global_steps.get(uid, 0),
+            )
+            selected_uids = set(sampleable_uids[:remaining_batch_size])
+            failed_uids = selected_uids & self.replay_buffer.failure_keys["train"]
+            if not failed_uids:
+                keys.extend(batch.keys)
+                tags.extend(batch.tags)
+                break
+
+            if refill_rounds >= max_refill_rounds:
+                raise RuntimeError(
+                    f"Exceeded max_incomplete_group_refill_rounds={max_refill_rounds} "
+                    "while replacing failed rollout groups"
+                )
+
+            num_failed = len(failed_uids)
+            for key, tag in zip(batch.keys, batch.tags, strict=False):
+                if self._trajectory_uid(key) not in failed_uids:
+                    keys.append(key)
+                    tags.append(tag)
+
+            failed_trajectory_keys = [
+                key for key in self.replay_buffer.partitions["train"] if self._trajectory_uid(key) in failed_uids
+            ]
+            tq.kv_clear(partition_id="train", keys=[*failed_uids, *failed_trajectory_keys])
+
+            refilled = self._add_prompts_to_generate(num_failed)
+            if refilled != num_failed:
+                raise RuntimeError(f"refill submitted {refilled} prompts, expected {num_failed}")
+
+            refill_rounds += 1
+            remaining_batch_size = num_failed
+            failure_metrics["training/rollout_failure/evicted_groups"] += num_failed
+            failure_metrics["training/rollout_failure/evicted_trajectories"] += len(failed_trajectory_keys)
+            failure_metrics["training/rollout_failure/refilled_prompts"] += refilled
+            failure_metrics["training/rollout_failure/refill_rounds"] += 1
+            logger.warning(
+                "Evicted %d incomplete rollout groups and submitted exact replacements (round %d/%d)",
+                num_failed,
+                refill_rounds,
+                max_refill_rounds,
+            )
+
+        return KVBatchMeta(partition_id="train", keys=keys, tags=tags), {**sampling_metrics, **failure_metrics}
 
     def _submit_batch_to_rollout(self, batch) -> int:
         tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))]
@@ -707,6 +860,19 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 dp_size = int(info) + 1 if info is not None else 1
         actor_global_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         actor_global_mini_batch_size *= self.config.actor_rollout_ref.rollout.n
+        if self.trainer_mode == "separate_async":
+            if len(data) != actor_global_mini_batch_size:
+                raise ValueError(
+                    "separate_async local batch must contain exactly "
+                    f"ppo_mini_batch_size * rollout.n = {actor_global_mini_batch_size} trajectories, "
+                    f"but received {len(data)}; refusing to pad copied trajectories"
+                )
+            if len(data) % dp_size != 0:
+                raise ValueError(
+                    f"separate_async local batch size {len(data)} must be divisible by actor DP size {dp_size}"
+                )
+            return data
+
         batch_multiple = math.lcm(dp_size, actor_global_mini_batch_size)
         if len(data) % batch_multiple != 0:
             data, _ = pad_dataproto_to_divisor(data, size_divisor=batch_multiple)
@@ -714,7 +880,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
     def _compute_old_log_prob(self, data: DataProto) -> DataProto:
         """Recompute old log-probs over diffusion latents with the actor engine."""
-        batch_td = data.to_tensordict()
+        batch_td = _to_diffusion_worker_tensordict(data)
         batch_td = embeds_padding_2_no_padding(batch_td)
         tu.assign_non_tensor(
             batch_td,
@@ -733,7 +899,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
     def _compute_ref_log_prob(self, data: DataProto) -> DataProto:
         """Compute reference log-probs over diffusion latents."""
-        batch_td = data.to_tensordict()
+        batch_td = _to_diffusion_worker_tensordict(data)
         batch_td = embeds_padding_2_no_padding(batch_td)
         metadata = {
             "compute_loss": False,
@@ -779,7 +945,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         """Update the diffusion actor network."""
         rollout_config = self.config.actor_rollout_ref.rollout
         data.meta_info["multi_turn"] = rollout_config.multi_turn.enable
-        batch_td = data.to_tensordict()
+        batch_td = _to_diffusion_worker_tensordict(data)
         batch_td = embeds_padding_2_no_padding(batch_td)
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
@@ -913,9 +1079,12 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         if generations_to_log == 0:
             return
         if "wandb" in self.config.trainer.logger:
+            for image in outputs:
+                if not isinstance(image, torch.Tensor) or image.dtype != torch.uint8:
+                    raise ValueError(f"Expected a uint8 image tensor, got {getattr(image, 'dtype', type(image))}.")
             import wandb
 
-            outputs = [wandb.Image(image.float(), file_type="jpg") for image in outputs]
+            outputs = [wandb.Image(image, file_type="jpg") for image in outputs]
         samples = list(zip(inputs, outputs, scores, strict=True))
         samples.sort(key=lambda x: x[0])
         rng = np.random.RandomState(42)
@@ -925,6 +1094,10 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump validation/rollout samples as images + JSONL (runs in background)."""
+        if not isinstance(outputs, torch.Tensor) or outputs.dtype != torch.uint8:
+            dtype = getattr(outputs, "dtype", type(outputs))
+            raise ValueError(f"Expected generation outputs to be a uint8 tensor, got {dtype}.")
+
         future = self._dump_executor.submit(
             self._write_generations,
             inputs,
@@ -951,13 +1124,12 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         os.makedirs(visual_folder, exist_ok=True)
 
         output_paths = []
-        images_pil = outputs.cpu().float()
+        images_pil = outputs.cpu()
         # images: [N, C, H, W] -> [N, H, W, C]
         if images_pil.dim() == 4:
             images_pil = images_pil.permute(0, 2, 3, 1).numpy()
         else:
             images_pil = images_pil.numpy()
-        images_pil = (images_pil * 255).round().clip(0, 255).astype("uint8")
         for i, image in enumerate(images_pil):
             image_path = os.path.join(visual_folder, f"{i}.jpg")
             Image.fromarray(image).save(image_path)
@@ -1151,8 +1323,10 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             if not os.path.isabs(global_step_folder):
                 global_step_folder = os.path.join(os.getcwd(), global_step_folder)
         else:
-            logger.exception(f"Unknown resume mode {self.config.trainer.resume_mode}")
-            return
+            raise ValueError(
+                f"Unknown trainer.resume_mode={self.config.trainer.resume_mode!r}. "
+                "Available options: ['disable', 'auto', 'resume_path']."
+            )
 
         self.global_steps = int(global_step_folder.split("global_step_")[-1])
         logger.info(f"Resuming diffusion from {global_step_folder}, global_steps={self.global_steps}")

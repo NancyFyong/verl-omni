@@ -1,6 +1,6 @@
 # Installation
 
-Last updated: 07/13/2026
+Last updated: 08/15/2026
 
 ## Requirements
 
@@ -41,7 +41,7 @@ This installs `vllm` for the CUDA PyTorch stack and `kernels` for FA3 backend.
 For Ascend NPU:
 
 ```bash
-uv pip install vllm==0.24.0
+uv pip install vllm==0.27.0
 uv pip install "vllm-ascend @ git+https://github.com/vllm-project/vllm-ascend.git@$(cat .github/vllm_ascend_pin.txt)"
 ```
 
@@ -54,12 +54,21 @@ uv pip install -e ".[train]"
 
 This installs `vllm-omni`, then `verl` and `verl-omni`.
 
+> **Ascend PyTorch version alignment:** VeRL-Omni does not require every NPU
+> environment to use one fixed `torch` version such as 2.10.0. Choose a
+> mutually compatible `torch` / `torch-npu` pair for the installed CANN and
+> vLLM-Ascend versions, and pin that pair before installing the engine and
+> training stack. Packages such as `vllm`, `vllm-ascend`, `vllm-omni`, and
+> `verl` may resolve different PyTorch versions while they are installed.
+> Re-apply the selected pair after all four packages are installed if the
+> resolver changed it, then run the version checks below.
+
 ### Extras
 
 | Extra       | Adds                                                          | When                     |
 | ----------- | ------------------------------------------------------------- | ------------------------ |
-| `gpu`       | `vllm==0.24.0`, `kernels==0.14.1`, `liger-kernel`             | CUDA rollout + actor FA3 |
-| `vllm-omni` | `vllm-omni==0.24.0`                                           | Optional PyPI baseline only; CI/docs use the git pin above |
+| `gpu`       | `vllm==0.27.0`, `kernels==0.14.1`, `liger-kernel`             | CUDA rollout + actor FA3 |
+| `vllm-omni` | `vllm-omni==0.27.0rc1`                                        | Optional PyPI baseline only; CI/docs use the git pin above |
 | `train`     | `verl` @ [`.github/verl_pin.txt`](../../.github/verl_pin.txt) | RL training              |
 | `dev`       | `pytest`, `pre-commit`, `Levenshtein`, …                      | Local development / CI   |
 | `ocr`       | `Levenshtein`                                                 | OCR reward (FlowGRPO)    |
@@ -92,15 +101,15 @@ If FA3 deps are missing at runtime, training falls back to native/SDPA automatic
 
 VeRL-Omni defaults to **FSDP2** as the training engine for the policy and reference models. The diffusion trainer can alternatively be switched to [**VeOmni**](https://github.com/ByteDance-Seed/VeOmni). The engine is selected at the Hydra command line — see [`examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_veomni.sh`](https://github.com/verl-project/verl-omni/blob/main/examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_veomni.sh) for a complete recipe.
 
-### Installing VeOmni alongside vLLM 0.24.0
+### Installing VeOmni alongside vLLM 0.27.0
 
-VeOmni 0.1.11's `gpu` extra pins `torch==2.9.1+cu129`, which may conflict with the torch version pulled in by `vllm==0.24.0`. A plain `uv pip install veomni[gpu,dit]==0.1.11` therefore fails dependency resolution.
+VeOmni 0.1.11's `gpu` extra pins `torch==2.9.1+cu129`, which may conflict with the torch version pulled in by `vllm==0.27.0`. A plain `uv pip install veomni[gpu,dit]==0.1.11` therefore fails dependency resolution.
 
 VeOmni itself runs correctly on torch 2.11 — only the `[gpu]` extra's pin is too strict. Install it without dependency resolution so the existing torch/vllm stack is preserved, and add the small set of runtime extras that the verl-omni VeOmni engine actually needs:
 
 ```bash
 uv pip install veomni==0.1.11 --no-deps
-uv pip install torchcodec librosa soundfile av
+uv pip install torchcodec librosa soundfile av audioread
 ```
 
 Verify the engine is importable:
@@ -110,7 +119,7 @@ python -c "import veomni; print('veomni', veomni.__version__)"
 python -c "from veomni.distributed.offloading import load_model_to_gpu, load_optimizer, offload_model_to_cpu, offload_optimizer; print('VeOmni offloading helpers OK')"
 ```
 
-If you want VeOmni's full `[gpu,dit]` extras (flash-attn variants, liger-kernel, cuda-python, etc.), install them in a separate environment not pinned to vllm 0.24.0; verl-omni does not need them.
+If you want VeOmni's full `[gpu,dit]` extras (flash-attn variants, liger-kernel, cuda-python, etc.), install them in a separate environment not pinned to vllm 0.27.0; verl-omni does not need them.
 
 ## Post-Installation Verification
 
@@ -127,8 +136,10 @@ python -c "import verl_omni; print('VeRL-Omni ready')"
 For Ascend NPU:
 
 ```bash
-python -c "import torch; import torch_npu; print('torch', torch.__version__, '| NPU', torch.npu.is_available())"
+python -c "from importlib.metadata import version; import torch, torch_npu; print('torch', torch.__version__, '| torch-npu', version('torch-npu'), '| NPU', torch.npu.is_available())"
 python -c "import vllm; print('vllm', vllm.__version__)"
+python -c "from importlib.metadata import version; import vllm_ascend; print('vllm-ascend', version('vllm-ascend'))"
+python -c "from importlib.metadata import version; import vllm_omni; print('vllm-omni', version('vllm-omni'))"
 python -c "import verl; print('verl', verl.__version__)"
 python -c "import verl_omni; print('VeRL-Omni ready')"
 ```
@@ -144,6 +155,14 @@ The repository provides Dockerfiles for both NVIDIA GPU and Ascend NPU environme
 The CUDA image is intended for NVIDIA GPU training and rollout. The default CUDA base image uses **CUDA 13.0.2** on Ubuntu 22.04. You can override the CUDA version with `--build-arg CUDA_VERSION=...` if needed.
 
 The NPU images are split by Ascend hardware generation: `Dockerfile.a2.npu` is intended for Ascend 910B / Atlas A2, and `Dockerfile.a3.npu` is intended for Ascend Atlas A3. Both NPU images include CANN, `torch-npu`, `vllm-ascend`, and `vllm-omni`.
+
+The `torch` and `torch-npu` versions in these Dockerfiles are the currently
+validated image defaults, not a universal VeRL-Omni requirement. Each
+Dockerfile installs the selected pair before the engine stack, then re-applies
+the same pair after installing `vllm`, `vllm-ascend`, `vllm-omni`, and `verl`.
+This prevents their dependency resolvers from leaving the final image with a
+mixed PyTorch stack. When changing PyTorch versions, update both alignment
+steps together and keep the pair compatible with the image's CANN version.
 
 Build context is controlled by the repo-root [`.dockerignore`](https://github.com/verl-project/verl-omni/blob/main/.dockerignore); keep large local folders such as `.venv`, `data/`, and `checkpoints/` out of the context.
 
@@ -328,8 +347,10 @@ Inside the container, confirm the NPU environment:
 
 ```bash
 npu-smi info
-python -c "import torch; import torch_npu; print('torch', torch.__version__, '| NPU', torch.npu.is_available())"
+python -c "from importlib.metadata import version; import torch, torch_npu; print('torch', torch.__version__, '| torch-npu', version('torch-npu'), '| NPU', torch.npu.is_available())"
 python -c "import vllm; print('vllm', vllm.__version__)"
+python -c "from importlib.metadata import version; import vllm_ascend; print('vllm-ascend', version('vllm-ascend'))"
+python -c "from importlib.metadata import version; import vllm_omni; print('vllm-omni', version('vllm-omni'))"
 python -c "import verl; print('verl', verl.__version__)"
 python -c "import verl_omni; print('VeRL-Omni ready')"
 ```

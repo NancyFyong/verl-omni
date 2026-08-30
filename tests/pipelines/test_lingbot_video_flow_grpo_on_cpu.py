@@ -226,51 +226,50 @@ def test_custom_pipeline_lora_proxy_routes_worker_lifecycle_calls():
     assert isinstance(worker.lora_manager, _PipelineLoRAProxy)
 
 
-def test_async_server_reads_trajectory_payload_from_multimodal_output():
-    """Read trajectory payloads from ``multimodal_output``."""
+def test_diffusion_strategy_reads_trajectory_payload_from_output():
+    """Read trajectory payloads from the native ``DiffusionOutput`` envelope."""
 
-    from verl_omni.workers.rollout.vllm_rollout.vllm_omni_async_server import vLLMOmniHttpServer
+    from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy
 
-    video = torch.rand(5, 3, 8, 8)
-    trajectory = {
-        "all_latents": torch.randn(1, 3, 4, 2, 1, 1),
-        "all_log_probs": torch.randn(1, 2),
-        "all_timesteps": torch.tensor([[750.0, 500.0]]),
-        "prompt_embeds": torch.randn(1, 7, 16),
-        "prompt_embeds_mask": torch.ones(1, 7, dtype=torch.long),
-        "negative_prompt_embeds": None,
-        "negative_prompt_embeds_mask": None,
-        # Formatter-facing duplicates that the consumer must drop.
-        "latents": torch.randn(1, 3, 4, 2, 1, 1),
-        "log_probs": torch.randn(1, 2),
-        "timesteps": torch.tensor([[750.0, 500.0]]),
-    }
+    video = torch.randint(0, 255, (5, 3, 8, 8), dtype=torch.uint8)
+    promp_embeds = torch.randn(1, 7, 16)
+    prompt_mask = torch.ones(1, 7, dtype=torch.long)
     final_res = SimpleNamespace(
         images=[video],
-        multimodal_output={"trajectory": trajectory, "metadata": {"trajectory": {"type": "denoising"}}},
+        trajectory_latents=torch.randn(1, 3, 4, 2, 1, 1),
+        trajectory_log_probs=torch.randn(1, 2),
+        trajectory_timesteps=torch.tensor([[750.0, 500.0]]),
+        multimodal_output={
+            "metadata": {
+                "prompt_embeddings": {
+                    "prompt_embeds": promp_embeds,
+                    "prompt_embeds_mask": prompt_mask,
+                    "negative_prompt_embeds": None,
+                    "negative_prompt_embeds_mask": None,
+                },
+                "rl": {"condition_image_latents": torch.randn(1, 1, 1)},
+            },
+        },
         request_output=None,
     )
     server = SimpleNamespace(
-        _ar_mode=False,
         global_steps=3,
-        _map_stop_reason=lambda self_reason: "stop",
-        _to_tensor=None,
     )
+    strategy = DiffusionStrategy(server)
 
-    result = vLLMOmniHttpServer._process_output(server, final_res, params=None, sampling_params={"logprobs": True})
+    result = strategy.process_output(final_res, params=None, sampling_params={"logprobs": True, "output_type": "image"})
 
     assert torch.equal(result.diffusion_output, video)
-    assert torch.equal(result.log_probs, trajectory["all_log_probs"][0])
+    assert torch.equal(result.log_probs, final_res.trajectory_log_probs[0])
     extra = result.extra_fields
-    assert torch.equal(extra["all_latents"], trajectory["all_latents"][0])
-    assert torch.equal(extra["all_timesteps"], trajectory["all_timesteps"][0])
-    assert torch.equal(extra["prompt_embeds"], trajectory["prompt_embeds"][0])
+    assert torch.equal(extra["all_latents"], final_res.trajectory_latents[0])
+    assert torch.equal(extra["all_timesteps"], final_res.trajectory_timesteps[0])
+    assert torch.equal(extra["prompt_embeds"], promp_embeds[0])
     assert extra["negative_prompt_embeds"] is None
+    assert torch.equal(extra["condition_image_latents"], final_res.multimodal_output["metadata"]["rl"]["condition_image_latents"][0])
     assert extra["global_steps"] == 3
-    # The formatter-facing duplicate keys must not leak into training data.
-    assert "latents" not in extra and "log_probs" not in extra and "timesteps" not in extra
-    assert "trajectory" not in extra
-    assert extra["metadata"] == {"trajectory": {"type": "denoising"}}
+    # The formatter-facing metadata envelope must not leak into training data.
+    assert "trajectory" not in extra and "metadata" not in extra
 
 
 # --------------------------------------------------------------------------- #

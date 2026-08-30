@@ -132,3 +132,7 @@ outputs
 .history
 # local smoke-test artifacts (contain personal paths)
 .artifacts/
+tensorboard_log
+
+# locally downloaded reward weights (ImageBind / CLAP)
+.checkpoints
