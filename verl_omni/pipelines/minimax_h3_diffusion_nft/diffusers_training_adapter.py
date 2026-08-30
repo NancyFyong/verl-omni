@@ -102,6 +102,10 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
             "audio_rows": audio_rows,
             "condition_video_rows": condition_video_rows,
             "condition_audio_rows": condition_audio_rows,
+            # Per-sample true row counts undo the cross-worker padding that stacks
+            # variable reference layouts; None keeps the pre-multi-reference behavior.
+            "condition_video_row_count": micro_batch.get("condition_video_row_count", None),
+            "condition_audio_row_count": micro_batch.get("condition_audio_row_count", None),
             "keyframe_anchors": keyframe_indices_to_anchors(frame_indices),
             "ref_block_meta": micro_batch.get("ref_block_meta", None),
             "ref_block_count": micro_batch.get("ref_block_count", None),
@@ -127,6 +131,8 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
         audio_rows = model_inputs["audio_rows"]
         condition_video_rows = model_inputs["condition_video_rows"]
         condition_audio_rows = model_inputs["condition_audio_rows"]
+        condition_video_row_count = model_inputs["condition_video_row_count"]
+        condition_audio_row_count = model_inputs["condition_audio_row_count"]
         keyframe_anchors = model_inputs["keyframe_anchors"]
         ref_block_meta = model_inputs["ref_block_meta"]
         ref_block_count = model_inputs["ref_block_count"]
@@ -171,7 +177,11 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
                 layout
             )
             sample_video_condition = condition_video_rows[index]
+            if condition_video_row_count is not None:
+                sample_video_condition = sample_video_condition[: int(condition_video_row_count[index].reshape(-1)[0])]
             sample_audio_condition = condition_audio_rows[index]
+            if condition_audio_row_count is not None:
+                sample_audio_condition = sample_audio_condition[: int(condition_audio_row_count[index].reshape(-1)[0])]
             if sample_video_condition.shape[0] != num_cond_video:
                 raise ValueError(
                     f"MiniMax H3 condition video rows {sample_video_condition.shape[0]} "

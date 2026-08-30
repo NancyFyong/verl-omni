@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import torch
+from tensordict import TensorDict
 from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics
 from verl.protocol import DataProto
 
@@ -26,6 +27,8 @@ from verl_omni.agent_loop.diffusion_agent_loop import (
     DiffusionAgentLoopOutput,
     DiffusionAgentLoopWorker,
     _pad_prompt_extra_field,
+    _pad_reference_rows,
+    _pad_reference_worker_outputs,
 )
 from verl_omni.agent_loop.diffusion_agent_loop_tq import DiffusionAgentLoopWorkerTQ
 from verl_omni.agent_loop.single_turn_agent_loop import DiffusionSingleTurnAgentLoop
@@ -97,6 +100,7 @@ async def test_single_turn_agent_forwards_all_multimodal_inputs():
     )
     agent_loop.extra_tokenizer_map = {}
     agent_loop.mm_processor_kwargs = {"fps": 24}
+    agent_loop.processor = None
     agent_loop.process_multi_modal_info = AsyncMock(
         return_value={"images": ["image"], "videos": ["video"], "audios": ["audio"]}
     )
@@ -149,6 +153,41 @@ def test_pad_prompt_extra_field_pads_without_truncation(key, value, expected_sha
 def test_pad_prompt_extra_field_rejects_truncation(key, value):
     with pytest.raises(ValueError, match="exceeds max_prompt_embed_length=3"):
         _pad_prompt_extra_field(key, value, target_length=3)
+
+
+def test_reference_rows_are_padded_within_and_across_worker_batches():
+    local = _pad_reference_rows([torch.ones(1, 2, 96), torch.ones(1, 5, 96)])
+    assert [value.shape for value in local] == [(1, 5, 96), (1, 5, 96)]
+    assert torch.count_nonzero(local[0][:, 2:]) == 0
+
+    outputs = [
+        DataProto(
+            batch=TensorDict(
+                {
+                    "condition_video_rows": torch.ones(2, 5, 96),
+                    "condition_audio_rows": torch.ones(2, 3, 32),
+                },
+                batch_size=[2],
+            )
+        ),
+        DataProto(
+            batch=TensorDict(
+                {
+                    "condition_video_rows": torch.ones(1, 7, 96),
+                    "condition_audio_rows": torch.ones(1, 4, 32),
+                },
+                batch_size=[1],
+            )
+        ),
+    ]
+
+    _pad_reference_worker_outputs(outputs)
+    combined = DataProto.concat(outputs)
+
+    assert combined.batch["condition_video_rows"].shape == (3, 7, 96)
+    assert combined.batch["condition_audio_rows"].shape == (3, 4, 32)
+    assert torch.count_nonzero(combined.batch["condition_video_rows"][:2, 5:]) == 0
+    assert torch.count_nonzero(combined.batch["condition_audio_rows"][:2, 3:]) == 0
 
 
 @pytest.mark.asyncio

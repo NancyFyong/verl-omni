@@ -297,19 +297,24 @@ commit, a native custom pipeline combined with online FP8 can hit a meta-tensor
 placement failure during custom-pipeline initialization; BF16 TP=4 is the
 validated path.
 
-## Ref2VA (single-image reference) training
+## Ref2VA (multi-reference) training
 
-This first Ref2VA milestone trains against one reference image. The rollout
-uses the official `Ref2VA/` partition and the Actor loads the matching
-Diffusers weights from `transformer_ref/`. Reference rows remain fixed while
-DiffusionNFT noises and trains only the generated video/audio rows.
+Ref2VA trains against any mix of image, video and standalone-audio references
+(up to twelve files per row: at most nine images, three videos and three
+audios). The rollout uses the official `Ref2VA/` partition and the Actor loads
+the matching Diffusers weights from `transformer_ref/`. Reference rows remain
+fixed while DiffusionNFT noises and trains only the generated video/audio rows.
 
 ### Data
 
-Prepare `train.jsonl` and `test.jsonl` with one image per row:
+Prepare `train.jsonl` and `test.jsonl`. Each row needs at least one image or
+video reference; references may be given as the plural `images`/`videos`/`audios`
+lists or the singular `image`/`video`/`audio` keys, and videos accept an
+optional `start_time_seconds`:
 
 ```json
-{"prompt":"Turn the reference character toward the camera.","images":["images/reference.png"]}
+{"prompt":"Turn the reference character toward the camera.","images":["images/a.png","images/b.png"]}
+{"prompt":"Continue the clip with the same voice.","videos":[{"path":"clips/ref.mp4","start_time_seconds":1.5}],"audios":["audio/voice.wav"]}
 ```
 
 Convert the splits to parquet:
@@ -320,9 +325,9 @@ python examples/diffusionnft_trainer/minimax_h3/prepare_ref2va_data.py \
   --output_dir <parquet-directory>
 ```
 
-Reference images in one training batch must use the same aspect ratio in this
-milestone so their packed condition rows can be stacked. Reference videos,
-multiple images, video soundtracks, and standalone audio are not supported yet.
+Reference layouts may vary from row to row: variable per-sample reference rows
+are padded to one length before samples are stacked and sliced back to their
+true length during Actor replay, so a batch can mix different reference counts.
 
 ### Checkpoint and run
 

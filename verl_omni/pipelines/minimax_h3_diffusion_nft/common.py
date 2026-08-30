@@ -26,6 +26,7 @@ VIDEO_ROW_WIDTH = 96
 AUDIO_ROW_WIDTH = 32
 LATENT_META_WIDTH = 6
 REF_BLOCK_META_WIDTH = 5
+MAX_REF_BLOCKS = 12
 VIDEO_TAG, TEXT_TAG, AUDIO_TAG = 0, 1, 2
 
 _REF_BLOCK_KIND_TO_ID = {"image": 1, "audio": 2, "video": 3, "video_audio": 4}
@@ -40,6 +41,7 @@ __all__ = [
     "AUDIO_ROW_WIDTH",
     "LATENT_META_WIDTH",
     "REF_BLOCK_META_WIDTH",
+    "MAX_REF_BLOCKS",
     "VIDEO_TAG",
     "TEXT_TAG",
     "AUDIO_TAG",
@@ -141,31 +143,37 @@ def keyframe_indices_to_anchors(frame_indices: Sequence[int]) -> tuple[str, ...]
     return mapping[signature]
 
 
-def serialize_ref_blocks(ref_blocks: Sequence[Mapping[str, Any]]) -> torch.Tensor:
-    """Encode Ref2VA block dictionaries as integer metadata rows."""
-    if not ref_blocks:
-        raise ValueError("MiniMax H3 Ref2VA requires at least one reference block.")
-    rows = []
+def serialize_ref_blocks(ref_blocks: Sequence[Mapping[str, Any]]) -> tuple[torch.Tensor, int]:
+    """Encode ordered Ref2VA blocks into a fixed-size tensor plus a valid-block count.
+
+    A fixed ``MAX_REF_BLOCKS`` rows keeps the metadata shape uniform so rollout
+    workers with different reference layouts can be batched without ragged tensors.
+    """
+    count = len(ref_blocks)
+    if count <= 0 or count > MAX_REF_BLOCKS:
+        raise ValueError(f"MiniMax H3 Ref2VA requires 1-{MAX_REF_BLOCKS} reference blocks, got {count}.")
+    metadata = torch.zeros(MAX_REF_BLOCKS, REF_BLOCK_META_WIDTH, dtype=torch.long)
     for index, block in enumerate(ref_blocks):
         kind = str(block.get("kind", block.get("type", "")))
         if kind not in _REF_BLOCK_KIND_TO_ID:
             raise ValueError(f"Unsupported Ref2VA block kind at index {index}: {kind!r}.")
-        rows.append(
+        metadata[index] = torch.tensor(
             [
                 _REF_BLOCK_KIND_TO_ID[kind],
                 int(block.get("ref_audio_t", 0)),
                 int(block.get("latent_t", 0)),
                 int(block.get("latent_h", 0)),
                 int(block.get("latent_w", 0)),
-            ]
+            ],
+            dtype=torch.long,
         )
-    return torch.tensor(rows, dtype=torch.long)
+    return metadata, count
 
 
 def _deserialize_ref_blocks(metadata: torch.Tensor, count: int) -> list[dict[str, int | str]]:
     """Decode compact Ref2VA block metadata for the upstream layout helper."""
     rows = metadata.reshape(-1, REF_BLOCK_META_WIDTH)
-    if count <= 0 or count > rows.shape[0]:
+    if count <= 0 or count > min(rows.shape[0], MAX_REF_BLOCKS):
         raise ValueError(f"Ref2VA block count {count} is incompatible with {rows.shape[0]} metadata rows.")
     blocks: list[dict[str, int | str]] = []
     for index, row in enumerate(rows[:count].tolist()):
@@ -500,14 +508,47 @@ def _map_lora_module_to_vllm(module: str) -> str:
     return _diffusers_to_vllm_name(module + ".")[:-1]
 
 
+class _PromptTokenOverride:
+    """Return the Agent Loop token IDs when the upstream pipeline tokenizes the prompt.
+
+    Ref2VA prompts mix images, videos and standalone audio, so the upstream pipeline
+    builds every vision/audio span. Wrapping the tokenizer keeps the exact Agent Loop
+    text token IDs while letting that native path run unchanged.
+    """
+
+    def __init__(self, tokenizer: Any, prompt: str, prompt_ids: torch.Tensor) -> None:
+        self._tokenizer = tokenizer
+        self._prompt = prompt
+        self._prompt_ids = prompt_ids.detach().cpu().reshape(-1).tolist()
+
+    def __call__(self, text: str, *args, **kwargs):
+        if text == self._prompt:
+            return {"input_ids": list(self._prompt_ids)}
+        return self._tokenizer(text, *args, **kwargs)
+
+    def __getattr__(self, name: str):
+        return getattr(self._tokenizer, name)
+
+
 class MiniMaxH3RolloutWeightSyncMixin:
     """Map Diffusers H3 weights and token-id-native prompts to vLLM-Omni."""
 
     def encode_prompt(self, *, task: str, prompt: str, image=None, images=None, **kwargs):
-        """Encode Agent Loop IDs while letting vLLM-Omni build FL2VA vision spans."""
+        """Encode Agent Loop IDs while letting vLLM-Omni build reference vision spans."""
         prompt_ids = getattr(self, "_h3_prompt_ids", None)
         if prompt_ids is None or task not in {"t2va", "fl2va", "ref2va"}:
             return super().encode_prompt(task=task, prompt=prompt, image=image, images=images, **kwargs)
+
+        if task == "ref2va":
+            # Ref2VA references combine images, videos and standalone audio. Let the
+            # upstream pipeline build every reference span while the tokenizer override
+            # preserves the exact Agent Loop text token IDs.
+            tokenizer = self.tokenizer
+            self.tokenizer = _PromptTokenOverride(tokenizer, prompt, prompt_ids)
+            try:
+                return super().encode_prompt(task=task, prompt=prompt, image=image, images=images, **kwargs)
+            finally:
+                self.tokenizer = tokenizer
 
         from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _broadcast_tensor, _dit_rank_world
         from vllm_omni.diffusion.models.minimax_h3.presentation import (
@@ -521,11 +562,6 @@ class MiniMaxH3RolloutWeightSyncMixin:
         ids = None
         vision_kwargs: dict[str, torch.Tensor] = {}
         condition_images = list(images) if images is not None else ([image] if image is not None else [])
-        if task == "ref2va":
-            prepared_videos = kwargs.get("prepared_videos")
-            condition_labels = kwargs.get("condition_labels") or []
-            if len(condition_images) != 1 or prepared_videos or condition_labels != [("image", 1)]:
-                raise NotImplementedError("MiniMax H3 Ref2VA DiffusionNFT currently supports one image reference.")
         if rank == 0:
             if task == "t2va":
                 ids = prompt_ids

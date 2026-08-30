@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# MiniMax H3 Ref2VA (single-image reference) DiffusionNFT LoRA recipe.
+# MiniMax H3 Ref2VA (multi-reference) DiffusionNFT LoRA recipe.
+# References may mix images, videos and standalone audio (up to twelve files).
 set -euo pipefail
 
 export WANDB_MODE=${WANDB_MODE:-offline}
