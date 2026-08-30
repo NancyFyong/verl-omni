@@ -332,14 +332,19 @@ both `Ref2VA/` and `transformer_ref/`:
 ```bash
 MODEL_PATH=<MiniMax-H3-root> \
 DATA_DIR=<parquet-directory> \
+REF_IMAGE_SHORT_EDGE=512 \
+VAL_REF_IMAGE_SHORT_EDGE=1024 \
 bash examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_ref2va_lora.sh
 ```
 
 The H3 Agent Loop keeps the user prompt token-ID-native while vLLM-Omni adds
 the reference-image presentation. The default `MAX_PROMPT_EMBEDS=12288`
 accommodates the visual presentation generated from the official 2048-pixel
-reference preprocessing policy. Reduce it only after checking the final
-prompt-embedding length for the dataset. `TEXT_ENCODER_TP` defaults to
+reference preprocessing policy. `REF_IMAGE_SHORT_EDGE` configures training,
+while `VAL_REF_IMAGE_SHORT_EDGE` configures validation and defaults to the
+training value. Both accept multiples of 32 from 256 through 2048. Reduce
+`MAX_PROMPT_EMBEDS` only after
+checking the final prompt-embedding length for the dataset. `TEXT_ENCODER_TP` defaults to
 `ROLLOUT_TP` so the Qwen3-VL encoder is sharded instead of residing on one DiT
 rank; supported values are `1` and `ROLLOUT_TP`.
 

@@ -28,7 +28,13 @@ from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_s
 from verl_omni.pipelines.diffusion_rollout_output import with_rollout_data
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 
-from .common import AUDIO_ROW_WIDTH, MiniMaxH3RolloutWeightSyncMixin, pack_video_audio_rows, serialize_ref_blocks
+from .common import (
+    AUDIO_ROW_WIDTH,
+    MiniMaxH3RolloutWeightSyncMixin,
+    configure_ref2va_reference_image_short_edge,
+    pack_video_audio_rows,
+    serialize_ref_blocks,
+)
 
 __all__ = ["MiniMaxH3DiffusionNFTPipeline"]
 
@@ -40,6 +46,7 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
     """Rollout pipeline for MiniMax H3 used by DiffusionNFT."""
 
     def __init__(self, *, od_config: Any, prefix: str = "") -> None:
+        configure_ref2va_reference_image_short_edge()
         super().__init__(od_config=od_config, prefix=prefix)
         if hasattr(self, "set_progress_bar_config"):
             self.set_progress_bar_config(disable=True)
@@ -105,6 +112,12 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
         """Generate video+audio and attach DiffusionNFT training tensors."""
         if int(request.sampling_params.num_outputs_per_prompt or 1) != 1:
             raise NotImplementedError("MiniMax H3 DiffusionNFT requires one output per rollout request.")
+        extra_args = request.sampling_params.extra_args or {}
+        short_edge = extra_args.get(
+            "reference_image_short_edge",
+            getattr(request.sampling_params, "reference_image_short_edge", None),
+        )
+        configure_ref2va_reference_image_short_edge(short_edge)
         self._ensure_prompt_text(request)
         try:
             output = super().forward(request)

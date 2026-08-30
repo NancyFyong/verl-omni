@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from PIL import Image
 from tensordict import TensorDict
 
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
@@ -27,10 +28,12 @@ from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     VIDEO_ROW_WIDTH,
     MiniMaxH3RolloutWeightSyncMixin,
     build_ref2va_layout_from_meta,
+    configure_ref2va_reference_image_short_edge,
     pack_video_audio_rows,
     serialize_ref_blocks,
 )
 from verl_omni.pipelines.minimax_h3_diffusion_nft.diffusers_training_adapter import MiniMaxH3DiffusionNFT
+from verl_omni.pipelines.minimax_h3_diffusion_nft.vllm_omni_rollout_adapter import MiniMaxH3DiffusionNFTPipeline
 
 vllm_packed = pytest.importorskip("vllm_omni.diffusion.models.minimax_h3.packed_sequence")
 
@@ -38,6 +41,44 @@ _META = [4, 6, 1, 4, 4, 3]
 _TEXT_LEN = 7
 _TEXT_DIM = 16
 _REF_BLOCKS = [{"kind": "image", "latent_h": 4, "latent_w": 4}]
+
+
+def test_reference_image_short_edge_environment_override(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _reference_image_shape
+
+    constant = "MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE"
+    monkeypatch.setitem(_reference_image_shape.__globals__, constant, 2048)
+    monkeypatch.setenv("REF_IMAGE_SHORT_EDGE", "1024")
+
+    assert configure_ref2va_reference_image_short_edge() == 1024
+    assert _reference_image_shape(Image.new("RGB", (640, 400))) == (1632, 1024)
+
+
+def test_request_short_edge_overrides_environment(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline, _reference_image_shape
+
+    monkeypatch.setenv("REF_IMAGE_SHORT_EDGE", "512")
+    monkeypatch.setattr(MiniMaxH3Pipeline, "forward", lambda _self, _request: "output")
+    pipeline = object.__new__(MiniMaxH3DiffusionNFTPipeline)
+    object.__setattr__(pipeline, "_ensure_prompt_text", MagicMock())
+    object.__setattr__(pipeline, "_nft_capture", None)
+    request = SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            extra_args={"reference_image_short_edge": 1024},
+            num_outputs_per_prompt=1,
+        )
+    )
+
+    assert pipeline.forward(request) == "output"
+    assert _reference_image_shape(Image.new("RGB", (640, 400))) == (1632, 1024)
+
+
+@pytest.mark.parametrize("value", ["invalid", "255", "1000", "2049"])
+def test_reference_image_short_edge_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("REF_IMAGE_SHORT_EDGE", value)
+
+    with pytest.raises(ValueError, match="REF_IMAGE_SHORT_EDGE"):
+        configure_ref2va_reference_image_short_edge()
 
 
 def _identity(**kwargs):
