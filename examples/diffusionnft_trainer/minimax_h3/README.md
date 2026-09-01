@@ -1,6 +1,6 @@
 # MiniMax-H3 text-to-audio-video DiffusionNFT training
 
-Last updated: 08/27/2026
+Last updated: 09/01/2026
 
 This recipe trains a rank-64 MiniMax H3 LoRA with online DiffusionNFT for
 text-to-audio-video (T2VA). A Diffusers transformer is trained with FSDP2 while
@@ -325,9 +325,14 @@ python examples/diffusionnft_trainer/minimax_h3/prepare_ref2va_data.py \
   --output_dir <parquet-directory>
 ```
 
-Reference layouts may vary from row to row: variable per-sample reference rows
-are padded to one length before samples are stacked and sliced back to their
-true length during Actor replay, so a batch can mix different reference counts.
+Reference layouts may vary from row to row. The Agent Loop validates each
+reported row count, pads video and audio condition rows to
+`MAX_PROMPT_EMBEDS`, and emits validity masks so the standard Agent Loop
+manager can concatenate outputs from every rollout worker. Before Actor
+training, the trainer converts the padded rows to jagged tensors; the
+DiffusionNFT engine then restores only the largest row count needed by each
+minibatch. Invalid shapes, inconsistent counts or masks, and rows exceeding the
+configured limit fail instead of being silently truncated.
 
 ### Checkpoint and run
 
@@ -343,15 +348,17 @@ bash examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_ref2va_lora.sh
 ```
 
 The H3 Agent Loop keeps the user prompt token-ID-native while vLLM-Omni adds
-the reference-image presentation. The default `MAX_PROMPT_EMBEDS=12288`
-accommodates the visual presentation generated from the official 2048-pixel
-reference preprocessing policy. `REF_IMAGE_SHORT_EDGE` configures training,
-while `VAL_REF_IMAGE_SHORT_EDGE` configures validation and defaults to the
-training value. Both accept multiples of 32 from 256 through 2048. Reduce
-`MAX_PROMPT_EMBEDS` only after
-checking the final prompt-embedding length for the dataset. `TEXT_ENCODER_TP` defaults to
-`ROLLOUT_TP` so the Qwen3-VL encoder is sharded instead of residing on one DiT
-rank; supported values are `1` and `ROLLOUT_TP`.
+the reference presentation. The default `MAX_PROMPT_EMBEDS=12288` is both the
+prompt-embedding limit and the fixed transport limit for each video/audio
+condition-row tensor; it must cover the largest reference layout in the
+dataset. Global transport padding is removed before Actor minibatching, so it
+does not become the model's effective sequence length. `REF_IMAGE_SHORT_EDGE`
+configures training, while `VAL_REF_IMAGE_SHORT_EDGE` configures validation and
+defaults to the training value. Both accept multiples of 32 from 256 through
+2048. Reduce `MAX_PROMPT_EMBEDS` only after checking both the final prompt
+embedding and condition-row counts for the dataset. `TEXT_ENCODER_TP` defaults
+to `ROLLOUT_TP` so the Qwen3-VL encoder is sharded instead of residing on one
+DiT rank; supported values are `1` and `ROLLOUT_TP`.
 
 The initial recipe reuses CLAP and ImageBind to validate joint audio-video
 training. These rewards do not measure similarity to the reference image, so
