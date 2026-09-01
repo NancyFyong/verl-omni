@@ -28,7 +28,6 @@ from verl_omni.agent_loop.diffusion_agent_loop import (
     DiffusionAgentLoopWorker,
     _pad_prompt_extra_field,
     _pad_reference_rows,
-    _pad_reference_worker_outputs,
 )
 from verl_omni.agent_loop.diffusion_agent_loop_tq import DiffusionAgentLoopWorkerTQ
 from verl_omni.agent_loop.single_turn_agent_loop import DiffusionSingleTurnAgentLoop
@@ -155,39 +154,46 @@ def test_pad_prompt_extra_field_rejects_truncation(key, value):
         _pad_prompt_extra_field(key, value, target_length=3)
 
 
-def test_reference_rows_are_padded_within_and_across_worker_batches():
-    local = _pad_reference_rows([torch.ones(1, 2, 96), torch.ones(1, 5, 96)])
-    assert [value.shape for value in local] == [(1, 5, 96), (1, 5, 96)]
-    assert torch.count_nonzero(local[0][:, 2:]) == 0
+def test_reference_rows_are_padded_to_the_global_limit():
+    values = [torch.ones(1, 2, 96), torch.ones(1, 5, 96)]
+    counts = [torch.tensor([[2]]), torch.tensor([[5]])]
+
+    padded, masks = _pad_reference_rows("condition_video_rows", values, counts, target_length=7)
+
+    assert [value.shape for value in padded] == [(1, 7, 96), (1, 7, 96)]
+    assert [mask.sum().item() for mask in masks] == [2, 5]
+    assert torch.count_nonzero(padded[0][:, 2:]) == 0
+    assert torch.count_nonzero(padded[1][:, 5:]) == 0
 
     outputs = [
         DataProto(
             batch=TensorDict(
                 {
-                    "condition_video_rows": torch.ones(2, 5, 96),
-                    "condition_audio_rows": torch.ones(2, 3, 32),
+                    "condition_video_rows": value,
+                    "condition_video_rows_mask": mask,
+                    "condition_video_row_count": count,
                 },
-                batch_size=[2],
+                batch_size=1,
             )
-        ),
-        DataProto(
-            batch=TensorDict(
-                {
-                    "condition_video_rows": torch.ones(1, 7, 96),
-                    "condition_audio_rows": torch.ones(1, 4, 32),
-                },
-                batch_size=[1],
-            )
-        ),
+        )
+        for value, mask, count in zip(padded, masks, counts, strict=True)
     ]
-
-    _pad_reference_worker_outputs(outputs)
     combined = DataProto.concat(outputs)
+    assert combined.batch["condition_video_rows"].shape == (2, 7, 96)
+    assert combined.batch["condition_video_rows_mask"].sum(dim=1).tolist() == [2, 5]
 
-    assert combined.batch["condition_video_rows"].shape == (3, 7, 96)
-    assert combined.batch["condition_audio_rows"].shape == (3, 4, 32)
-    assert torch.count_nonzero(combined.batch["condition_video_rows"][:2, 5:]) == 0
-    assert torch.count_nonzero(combined.batch["condition_audio_rows"][:2, 3:]) == 0
+
+@pytest.mark.parametrize(
+    ("value", "count", "target_length", "message"),
+    [
+        (torch.ones(1, 2, 96), torch.tensor([[1]]), 4, "row count 1 does not match tensor rows 2"),
+        (torch.ones(1, 5, 96), torch.tensor([[5]]), 4, "exceeding max_prompt_embed_length=4"),
+        (torch.ones(2, 2, 96), torch.tensor([[2]]), 4, "must have shape \\[1, rows, width\\]"),
+    ],
+)
+def test_reference_row_padding_rejects_invalid_inputs(value, count, target_length, message):
+    with pytest.raises(ValueError, match=message):
+        _pad_reference_rows("condition_video_rows", [value], [count], target_length)
 
 
 @pytest.mark.asyncio

@@ -24,21 +24,12 @@ from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from verl.base_config import BaseConfig
-from verl.experimental.agent_loop.agent_loop import (
-    AgentLoopManager as VerlAgentLoopManager,
-)
-from verl.experimental.agent_loop.agent_loop import (
-    AgentLoopMetrics,
-    DictConfigWrap,
-    _agent_loop_registry,
-)
+from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, DictConfigWrap, _agent_loop_registry
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.protocol import DataProto
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import get_dataset_class
 from verl.utils.profiler import simple_timer
-from verl.utils.ray_utils import auto_await
-from verl.utils.skip import SkipManager
 from verl.workers.rollout.llm_server import LLMServerClient
 
 from verl_omni.agent_loop.utils import maybe_per_rollout_seeds
@@ -51,36 +42,37 @@ def _config_to_sampling_dict(config: Optional[BaseConfig]) -> dict:
     return {k: v for k, v in config.items() if not k.startswith("_")}
 
 
-def _pad_reference_rows(values: list[torch.Tensor]) -> list[torch.Tensor]:
-    """Pad reference rows to one batch-local length."""
-    if not values:
-        return values
-    if any(value.ndim != 3 or value.shape[0] != 1 for value in values):
-        raise ValueError("Reference condition fields must have shape [1, rows, width].")
-    width = values[0].shape[2]
-    if any(value.shape[2] != width for value in values):
-        raise ValueError("Reference condition row widths must match within a batch.")
-    max_rows = max(value.shape[1] for value in values)
-    return [F.pad(value, (0, 0, 0, max_rows - value.shape[1])) for value in values]
+def _pad_reference_rows(
+    key: str,
+    values: list[torch.Tensor],
+    counts: list[torch.Tensor],
+    target_length: int,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Pad reference rows to one global length and return validity masks."""
+    if len(values) != len(counts):
+        raise ValueError(f"{key} and its row counts must have the same batch size.")
 
-
-def _pad_reference_worker_outputs(outputs: list[DataProto]) -> None:
-    """Pad reference rows across Agent Loop worker chunks before concatenation."""
-    for key in ("condition_video_rows", "condition_audio_rows"):
-        tensors = [output.batch.get(key) for output in outputs]
-        present = [tensor for tensor in tensors if isinstance(tensor, torch.Tensor)]
-        if not present:
-            continue
-        if len(present) != len(outputs):
-            raise ValueError(f"Diffusion batch mixes samples with and without {key}.")
-        if any(tensor.ndim != 3 for tensor in present):
-            raise ValueError(f"{key} must have shape [batch, rows, width].")
-        width = present[0].shape[2]
-        if any(tensor.shape[2] != width for tensor in present):
-            raise ValueError(f"{key} row widths must match across Agent Loop workers.")
-        max_rows = max(tensor.shape[1] for tensor in present)
-        for output, tensor in zip(outputs, present, strict=True):
-            output.batch[key] = F.pad(tensor, (0, 0, 0, max_rows - tensor.shape[1]))
+    count_key = key.replace("_rows", "_row_count")
+    padded_values, masks = [], []
+    for value, count in zip(values, counts, strict=True):
+        if value.ndim != 3 or value.shape[0] != 1:
+            raise ValueError(f"{key} must have shape [1, rows, width], got {tuple(value.shape)}.")
+        if count.numel() != 1:
+            raise ValueError(f"{count_key} must contain one value per sample, got shape {tuple(count.shape)}.")
+        actual_rows = int(value.shape[1])
+        declared_rows = int(count.reshape(-1)[0])
+        if declared_rows != actual_rows:
+            raise ValueError(f"{key} row count {declared_rows} does not match tensor rows {actual_rows}.")
+        if actual_rows > target_length:
+            raise ValueError(
+                f"{key} has {actual_rows} rows, exceeding max_prompt_embed_length={target_length} "
+                "used for reference-row padding."
+            )
+        padded_values.append(F.pad(value, (0, 0, 0, target_length - actual_rows)))
+        mask = torch.zeros((1, target_length), dtype=torch.bool, device=value.device)
+        mask[:, :actual_rows] = True
+        masks.append(mask)
+    return padded_values, masks
 
 
 def _pad_prompt_extra_field(key: str, value: torch.Tensor, target_length: int) -> torch.Tensor:
@@ -382,11 +374,18 @@ class DiffusionAgentLoopWorker:
         for key in ("condition_video_rows", "condition_audio_rows"):
             values = [item.extra_fields.get(key) for item in inputs]
             present = [value for value in values if isinstance(value, torch.Tensor)]
-            if present:
-                if len(present) != len(inputs):
-                    raise ValueError(f"Diffusion batch mixes samples with and without {key}.")
-                for item, value in zip(inputs, _pad_reference_rows(present), strict=True):
-                    item.extra_fields[key] = value
+            if not present:
+                continue
+            if len(present) != len(inputs):
+                raise ValueError(f"Diffusion batch mixes samples with and without {key}.")
+            count_key = key.replace("_rows", "_row_count")
+            counts = [item.extra_fields.get(count_key) for item in inputs]
+            if not all(isinstance(count, torch.Tensor) for count in counts):
+                raise ValueError(f"{key} requires a tensor {count_key} for every sample.")
+            padded, masks = _pad_reference_rows(key, present, counts, self.max_prompt_embed_length)
+            for item, value, mask in zip(inputs, padded, masks, strict=True):
+                item.extra_fields[key] = value
+                item.extra_fields[f"{key}_mask"] = mask
 
         # Convert lists back to tensors and stack them to create a batch.
         prompt_ids = torch.cat([input.prompt_ids for input in inputs], dim=0)
@@ -451,29 +450,3 @@ class DiffusionAgentLoopWorker:
             non_tensor_batch=non_tensor_batch,
             meta_info=meta_info,
         )
-
-
-class DiffusionAgentLoopManager(VerlAgentLoopManager):
-    """Agent Loop manager that pads variable reference rows across workers."""
-
-    @auto_await
-    @SkipManager.annotate(role="rollout")
-    async def generate_sequences(self, prompts: DataProto) -> DataProto:
-        """Generate diffusion samples and pad variable reference rows before concatenation."""
-        if "priority" not in prompts.non_tensor_batch:
-            prompts.non_tensor_batch["priority"] = np.arange(len(prompts), dtype=np.int64)
-
-        chunks = prompts.chunk(len(self.agent_loop_workers))
-        outputs = await asyncio.gather(
-            *[
-                worker.generate_sequences.remote(chunk)
-                for worker, chunk in zip(self.agent_loop_workers, chunks, strict=True)
-            ]
-        )
-        _pad_reference_worker_outputs(outputs)
-        output = DataProto.concat(outputs)
-
-        metrics = [item.meta_info.pop("metrics") for item in outputs]
-        timing = self._performance_metrics(metrics, output)
-        output.meta_info = {"timing": timing, **outputs[0].meta_info}
-        return output

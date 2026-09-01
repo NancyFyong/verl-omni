@@ -917,7 +917,8 @@ class BaseRayDiffusionTrainer(ABC):
         if manager_class_fqn:
             AgentLoopManager = load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
         else:
-            from verl_omni.agent_loop import DiffusionAgentLoopManager as AgentLoopManager
+            from verl.experimental.agent_loop import AgentLoopManager
+
             from verl_omni.agent_loop import DiffusionAgentLoopWorker
 
             AgentLoopManager.agent_loop_workers_class = ray.remote(DiffusionAgentLoopWorker)

@@ -37,6 +37,8 @@ from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
 )
 from verl_omni.pipelines.minimax_h3_diffusion_nft.diffusers_training_adapter import MiniMaxH3DiffusionNFT
 from verl_omni.pipelines.minimax_h3_diffusion_nft.vllm_omni_rollout_adapter import MiniMaxH3DiffusionNFTPipeline
+from verl_omni.workers.engine.fsdp.diffusers_impl import NFTDiffusersFSDPEngine
+from verl_omni.workers.utils.padding import embeds_padding_2_no_padding
 
 vllm_packed = pytest.importorskip("vllm_omni.diffusion.models.minimax_h3.packed_sequence")
 
@@ -56,6 +58,51 @@ _NUM_COND_VIDEO = 20
 _NUM_COND_AUDIO = 10
 _TEXT_LEN = 7
 _TEXT_DIM = 16
+
+
+def test_reference_rows_are_minimally_padded_per_minibatch():
+    video_rows = torch.randn(2, 8, VIDEO_ROW_WIDTH)
+    video_mask = torch.tensor([[True, True, False, False, False, False, False, False], [True] * 5 + [False] * 3])
+    audio_rows = torch.randn(2, 8, AUDIO_ROW_WIDTH)
+    audio_mask = torch.tensor([[False] * 8, [True] * 3 + [False] * 5])
+    micro_batch = TensorDict(
+        {
+            "condition_video_rows": video_rows,
+            "condition_video_rows_mask": video_mask,
+            "condition_video_row_count": torch.tensor([[2], [5]]),
+            "condition_audio_rows": audio_rows,
+            "condition_audio_rows_mask": audio_mask,
+            "condition_audio_row_count": torch.tensor([[0], [3]]),
+        },
+        batch_size=2,
+    )
+    embeds_padding_2_no_padding(micro_batch)
+    engine = object.__new__(NFTDiffusersFSDPEngine)
+
+    engine._unpad_condition_rows(micro_batch)
+
+    assert micro_batch["condition_video_rows"].shape == (2, 5, VIDEO_ROW_WIDTH)
+    assert micro_batch["condition_audio_rows"].shape == (2, 3, AUDIO_ROW_WIDTH)
+    assert micro_batch["condition_video_rows_mask"].sum(dim=1).tolist() == [2, 5]
+    assert micro_batch["condition_audio_rows_mask"].sum(dim=1).tolist() == [0, 3]
+    torch.testing.assert_close(micro_batch["condition_video_rows"][0, :2], video_rows[0, :2])
+    torch.testing.assert_close(micro_batch["condition_audio_rows"][1, :3], audio_rows[1, :3])
+
+
+def test_reference_row_minibatch_padding_rejects_count_mismatch():
+    micro_batch = TensorDict(
+        {
+            "condition_video_rows": torch.randn(1, 4, VIDEO_ROW_WIDTH),
+            "condition_video_rows_mask": torch.tensor([[True, True, False, False]]),
+            "condition_video_row_count": torch.tensor([[3]]),
+        },
+        batch_size=1,
+    )
+    embeds_padding_2_no_padding(micro_batch)
+    engine = object.__new__(NFTDiffusersFSDPEngine)
+
+    with pytest.raises(ValueError, match="valid rows \\[2\\] do not match condition_video_row_count \\[3\\]"):
+        engine._unpad_condition_rows(micro_batch)
 
 
 def test_reference_image_short_edge_environment_override_is_restored(monkeypatch):
