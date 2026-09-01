@@ -84,7 +84,7 @@ Convert prompt splits to prompt-only parquet (no condition images, and no
 negative prompts, since H3 is CFG-distilled):
 
 ```bash
-python3 examples/diffusionnft_trainer/minimax_h3/prepare_t2av_data.py \
+python3 examples/diffusionnft_trainer/minimax_h3/prepare_t2va_data.py \
     --input_dir /path/to/raw_prompts \
     --output_dir /path/to/h3_t2va_data
 ```
