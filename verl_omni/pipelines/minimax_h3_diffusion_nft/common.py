@@ -15,7 +15,9 @@
 
 import json
 import os
-from collections.abc import Iterable, Mapping, Sequence
+import threading
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +37,7 @@ _REF_BLOCK_ID_TO_KIND = {value: key for key, value in _REF_BLOCK_KIND_TO_ID.item
 _ROPE_FRAME_RESCALE = 5.0 / 3.0
 _ROPE_FRAMES_PER_LATENT = (1, 4, 4, 4, 4)
 _ROPE_SPATIAL_SCALE = 32
+_REF_IMAGE_SHAPE_LOCK = threading.RLock()
 
 __all__ = [
     "VIDEO_ROW_WIDTH",
@@ -51,7 +54,8 @@ __all__ = [
     "h3_dit_timestep",
     "h3_velocity_to_flow_match",
     "prepare_h3_processor_files",
-    "configure_ref2va_reference_image_short_edge",
+    "ref2va_reference_image_short_edge",
+    "validate_ref2va_reference_image_short_edge",
     "keyframe_indices_to_anchors",
     "serialize_ref_blocks",
     "build_packed_sequence",
@@ -65,15 +69,22 @@ __all__ = [
 MINIMAX_H3_TOKEN_ID_NATIVE_KEY = "minimax_h3_token_id_native"
 
 
-def configure_ref2va_reference_image_short_edge(value: int | str | None = None) -> int:
-    """Apply a Ref2VA image size override to vLLM-Omni."""
+def validate_ref2va_reference_image_short_edge(value: int | str | None = None) -> int:
+    """Validate the configured Ref2VA reference-image size."""
     raw_value = os.environ.get("REF_IMAGE_SHORT_EDGE", "2048") if value is None else value
     try:
         short_edge = int(raw_value)
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
         raise ValueError(f"REF_IMAGE_SHORT_EDGE must be an integer, got {raw_value!r}.") from exc
     if not 256 <= short_edge <= 2048 or short_edge % 32 != 0:
         raise ValueError("REF_IMAGE_SHORT_EDGE must be a multiple of 32 between 256 and 2048.")
+    return short_edge
+
+
+@contextmanager
+def ref2va_reference_image_short_edge(value: int | str | None = None) -> Iterator[int]:
+    """Temporarily apply the Ref2VA image size while serializing concurrent requests."""
+    short_edge = validate_ref2va_reference_image_short_edge(value)
 
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _reference_image_shape
 
@@ -81,8 +92,13 @@ def configure_ref2va_reference_image_short_edge(value: int | str | None = None) 
     constant = "MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE"
     if constant not in resize_globals:
         raise RuntimeError("vLLM-Omni no longer exposes the MiniMax H3 reference image size constant.")
-    resize_globals[constant] = short_edge
-    return short_edge
+    with _REF_IMAGE_SHAPE_LOCK:
+        original = resize_globals[constant]
+        resize_globals[constant] = short_edge
+        try:
+            yield short_edge
+        finally:
+            resize_globals[constant] = original
 
 
 def messages_to_text(messages: Any) -> str:

@@ -13,6 +13,7 @@
 # limitations under the License.
 """CPU contracts for MiniMax H3 multi-reference Ref2VA DiffusionNFT."""
 
+from threading import Event, Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -29,9 +30,10 @@ from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     VIDEO_ROW_WIDTH,
     MiniMaxH3RolloutWeightSyncMixin,
     build_ref2va_layout_from_meta,
-    configure_ref2va_reference_image_short_edge,
     pack_video_audio_rows,
+    ref2va_reference_image_short_edge,
     serialize_ref_blocks,
+    validate_ref2va_reference_image_short_edge,
 )
 from verl_omni.pipelines.minimax_h3_diffusion_nft.diffusers_training_adapter import MiniMaxH3DiffusionNFT
 from verl_omni.pipelines.minimax_h3_diffusion_nft.vllm_omni_rollout_adapter import MiniMaxH3DiffusionNFTPipeline
@@ -56,22 +58,28 @@ _TEXT_LEN = 7
 _TEXT_DIM = 16
 
 
-def test_reference_image_short_edge_environment_override(monkeypatch):
+def test_reference_image_short_edge_environment_override_is_restored(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _reference_image_shape
 
     constant = "MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE"
     monkeypatch.setitem(_reference_image_shape.__globals__, constant, 2048)
     monkeypatch.setenv("REF_IMAGE_SHORT_EDGE", "1024")
+    image = Image.new("RGB", (640, 400))
 
-    assert configure_ref2va_reference_image_short_edge() == 1024
-    assert _reference_image_shape(Image.new("RGB", (640, 400))) == (1632, 1024)
+    with ref2va_reference_image_short_edge() as short_edge:
+        assert short_edge == 1024
+        assert min(_reference_image_shape(image)) == 1024
+    assert min(_reference_image_shape(image)) == 2048
 
 
-def test_request_short_edge_overrides_environment(monkeypatch):
+def test_request_short_edge_overrides_environment_temporarily(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline, _reference_image_shape
 
+    constant = "MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE"
+    monkeypatch.setitem(_reference_image_shape.__globals__, constant, 2048)
     monkeypatch.setenv("REF_IMAGE_SHORT_EDGE", "512")
-    monkeypatch.setattr(MiniMaxH3Pipeline, "forward", lambda _self, _request: "output")
+    image = Image.new("RGB", (640, 400))
+    monkeypatch.setattr(MiniMaxH3Pipeline, "forward", lambda _self, _request: min(_reference_image_shape(image)))
     pipeline = object.__new__(MiniMaxH3DiffusionNFTPipeline)
     object.__setattr__(pipeline, "_ensure_prompt_text", MagicMock())
     object.__setattr__(pipeline, "_nft_capture", None)
@@ -82,8 +90,49 @@ def test_request_short_edge_overrides_environment(monkeypatch):
         )
     )
 
-    assert pipeline.forward(request) == "output"
-    assert _reference_image_shape(Image.new("RGB", (640, 400))) == (1632, 1024)
+    assert pipeline.forward(request) == 1024
+    assert min(_reference_image_shape(image)) == 2048
+
+
+def test_reference_image_short_edge_serializes_concurrent_overrides(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _reference_image_shape
+
+    constant = "MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE"
+    monkeypatch.setitem(_reference_image_shape.__globals__, constant, 2048)
+    image = Image.new("RGB", (640, 400))
+    first_entered = Event()
+    release_first = Event()
+    second_started = Event()
+    second_entered = Event()
+    results = []
+
+    def first_request():
+        with ref2va_reference_image_short_edge(512):
+            first_entered.set()
+            release_first.wait(timeout=2)
+            results.append(min(_reference_image_shape(image)))
+
+    def second_request():
+        second_started.set()
+        with ref2va_reference_image_short_edge(1024):
+            second_entered.set()
+            results.append(min(_reference_image_shape(image)))
+
+    first = Thread(target=first_request)
+    second = Thread(target=second_request)
+    first.start()
+    assert first_entered.wait(timeout=2)
+    second.start()
+    assert second_started.wait(timeout=2)
+    try:
+        assert not second_entered.wait(timeout=0.05)
+    finally:
+        release_first.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert results == [512, 1024]
+    assert min(_reference_image_shape(image)) == 2048
 
 
 @pytest.mark.parametrize("value", ["invalid", "255", "1000", "2049"])
@@ -91,7 +140,7 @@ def test_reference_image_short_edge_rejects_invalid_values(monkeypatch, value):
     monkeypatch.setenv("REF_IMAGE_SHORT_EDGE", value)
 
     with pytest.raises(ValueError, match="REF_IMAGE_SHORT_EDGE"):
-        configure_ref2va_reference_image_short_edge()
+        validate_ref2va_reference_image_short_edge()
 
 
 def _identity(**kwargs):

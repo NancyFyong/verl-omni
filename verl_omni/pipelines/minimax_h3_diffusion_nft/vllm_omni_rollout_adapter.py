@@ -37,9 +37,10 @@ from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from .common import (
     AUDIO_ROW_WIDTH,
     MiniMaxH3RolloutWeightSyncMixin,
-    configure_ref2va_reference_image_short_edge,
     pack_video_audio_rows,
+    ref2va_reference_image_short_edge,
     serialize_ref_blocks,
+    validate_ref2va_reference_image_short_edge,
 )
 
 __all__ = ["MiniMaxH3DiffusionNFTPipeline"]
@@ -52,7 +53,7 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
     """Rollout pipeline for MiniMax H3 used by DiffusionNFT."""
 
     def __init__(self, *, od_config: Any, prefix: str = "") -> None:
-        configure_ref2va_reference_image_short_edge()
+        self._reference_image_short_edge = validate_ref2va_reference_image_short_edge()
         super().__init__(od_config=od_config, prefix=prefix)
         if hasattr(self, "set_progress_bar_config"):
             self.set_progress_bar_config(disable=True)
@@ -145,12 +146,14 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
             "reference_image_short_edge",
             getattr(request.sampling_params, "reference_image_short_edge", None),
         )
-        configure_ref2va_reference_image_short_edge(short_edge)
-        self._ensure_prompt_text(request)
-        try:
-            output = super().forward(request)
-        finally:
-            self._h3_prompt_ids = None
+        if short_edge is None:
+            short_edge = getattr(self, "_reference_image_short_edge", None)
+        with ref2va_reference_image_short_edge(short_edge):
+            self._ensure_prompt_text(request)
+            try:
+                output = super().forward(request)
+            finally:
+                self._h3_prompt_ids = None
         capture = self._nft_capture
         self._nft_capture = None
         if capture is None:
