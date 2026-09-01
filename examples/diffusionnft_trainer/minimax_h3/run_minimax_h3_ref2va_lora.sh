@@ -3,7 +3,7 @@
 # References may mix images, videos and standalone audio (up to twelve files).
 set -euo pipefail
 
-export WANDB_MODE=${WANDB_MODE:-offline}
+export WANDB_MODE=${WANDB_MODE:-online}
 export WANDB_RUN_ID=${WANDB_RUN_ID:-minimax_h3_ref2va_lora}
 export WANDB_RESUME=${WANDB_RESUME:-allow}
 export RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
