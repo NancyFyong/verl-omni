@@ -51,10 +51,6 @@ def _config_to_sampling_dict(config: Optional[BaseConfig]) -> dict:
     return {k: v for k, v in config.items() if not k.startswith("_")}
 
 
-# Reference rows vary per sample, so pad them to a common length before stacking.
-_VARIABLE_REFERENCE_FIELDS = ("condition_video_rows", "condition_audio_rows")
-
-
 def _pad_reference_rows(values: list[torch.Tensor]) -> list[torch.Tensor]:
     """Pad reference rows to one batch-local length."""
     if not values:
@@ -70,7 +66,7 @@ def _pad_reference_rows(values: list[torch.Tensor]) -> list[torch.Tensor]:
 
 def _pad_reference_worker_outputs(outputs: list[DataProto]) -> None:
     """Pad reference rows across Agent Loop worker chunks before concatenation."""
-    for key in _VARIABLE_REFERENCE_FIELDS:
+    for key in ("condition_video_rows", "condition_audio_rows"):
         tensors = [output.batch.get(key) for output in outputs]
         present = [tensor for tensor in tensors if isinstance(tensor, torch.Tensor)]
         if not present:
@@ -383,7 +379,7 @@ class DiffusionAgentLoopWorker:
         input_non_tensor_batch: dict | None = None,
     ) -> DataProto:
         """Process the padded outputs from _run_agent_loop and combine them into a batch."""
-        for key in _VARIABLE_REFERENCE_FIELDS:
+        for key in ("condition_video_rows", "condition_audio_rows"):
             values = [item.extra_fields.get(key) for item in inputs]
             present = [value for value in values if isinstance(value, torch.Tensor)]
             if present:

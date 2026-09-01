@@ -46,18 +46,13 @@ class MiniMaxH3DiffusionSingleTurnAgentLoop(DiffusionSingleTurnAgentLoop):
                     continue
                 media_type = item.get("type")
                 if media_type == "image":
-                    value = item.get("image", item.get("image_url"))
-                    if value is not None:
-                        media["images"].append(value)
+                    media["images"].append(item["image"])
                 elif media_type == "video":
-                    value = item.get("video", item.get("video_url", item.get("path")))
-                    if value is not None:
-                        start = item.get("start_time_seconds")
-                        media["videos"].append(value if start is None else {"path": value, "start_time_seconds": start})
+                    video = item["video"]
+                    start = item.get("start_time_seconds")
+                    media["videos"].append(video if start is None else {"path": video, "start_time_seconds": start})
                 elif media_type == "audio":
-                    value = item.get("audio", item.get("audio_url"))
-                    if value is not None:
-                        media["audios"].append(value)
+                    media["audios"].append(item["audio"])
         return {key: values for key, values in media.items() if values}
 
     async def _tokenize_raw_text(self, messages: list[dict]) -> list[int]:
