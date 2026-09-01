@@ -64,6 +64,7 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
 
     def _move_diffusion_lora_stacks_to_device(self) -> None:
         """Move unregistered LoRA stacks to the worker device before execution."""
+        # TODO(@NancyFyong): Move this into vLLM-Omni's DiffusionLoRAManager.
         manager = getattr(self, "lora_manager", None)
         for module in getattr(manager, "_lora_modules", {}).values():
             for name in ("lora_a_stacked", "lora_b_stacked"):
