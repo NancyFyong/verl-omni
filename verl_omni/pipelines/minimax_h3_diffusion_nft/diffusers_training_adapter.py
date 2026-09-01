@@ -102,8 +102,7 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
             "audio_rows": audio_rows,
             "condition_video_rows": condition_video_rows,
             "condition_audio_rows": condition_audio_rows,
-            # Per-sample true row counts undo the cross-worker padding that stacks
-            # variable reference layouts; None keeps the pre-multi-reference behavior.
+            # Per-sample counts undo the cross-worker padding; None keeps the pre-multi-reference behavior.
             "condition_video_row_count": micro_batch.get("condition_video_row_count", None),
             "condition_audio_row_count": micro_batch.get("condition_audio_row_count", None),
             "keyframe_anchors": keyframe_indices_to_anchors(frame_indices),

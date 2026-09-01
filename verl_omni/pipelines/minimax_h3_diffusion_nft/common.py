@@ -540,9 +540,7 @@ class MiniMaxH3RolloutWeightSyncMixin:
             return super().encode_prompt(task=task, prompt=prompt, image=image, images=images, **kwargs)
 
         if task == "ref2va":
-            # Ref2VA references combine images, videos and standalone audio. Let the
-            # upstream pipeline build every reference span while the tokenizer override
-            # preserves the exact Agent Loop text token IDs.
+            # Let the upstream pipeline build every reference span; the override keeps the Agent Loop text token IDs.
             tokenizer = self.tokenizer
             self.tokenizer = _PromptTokenOverride(tokenizer, prompt, prompt_ids)
             try:

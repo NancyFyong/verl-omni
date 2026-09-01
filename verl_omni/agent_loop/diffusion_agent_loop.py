@@ -51,8 +51,7 @@ def _config_to_sampling_dict(config: Optional[BaseConfig]) -> dict:
     return {k: v for k, v in config.items() if not k.startswith("_")}
 
 
-# Reference condition rows vary per sample (different image/video/audio references), so
-# they must be padded to one length before samples are stacked into a batch tensor.
+# Reference rows vary per sample, so pad them to a common length before stacking.
 _VARIABLE_REFERENCE_FIELDS = ("condition_video_rows", "condition_audio_rows")
 
 
@@ -384,7 +383,6 @@ class DiffusionAgentLoopWorker:
         input_non_tensor_batch: dict | None = None,
     ) -> DataProto:
         """Process the padded outputs from _run_agent_loop and combine them into a batch."""
-        # Reference rows vary per sample, so pad them to one length before stacking.
         for key in _VARIABLE_REFERENCE_FIELDS:
             values = [item.extra_fields.get(key) for item in inputs]
             present = [value for value in values if isinstance(value, torch.Tensor)]

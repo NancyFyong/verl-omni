@@ -160,8 +160,7 @@ class DiffusionStrategy(OmniStrategyBase):
             custom_prompt["multi_modal_data"] = multi_modal_data
             custom_prompt["extra_args"] = {"multi_modal_data": multi_modal_data}
         if mm_processor_kwargs:
-            # Reference video fps / audio sampling_rate must reach the diffusion
-            # pipeline (e.g. MiniMax H3 Ref2VA), mirroring the AR strategy.
+            # Reference fps / sampling_rate must reach the pipeline (mirrors ARStrategy).
             custom_prompt["mm_processor_kwargs"] = mm_processor_kwargs
 
         sampling_kwargs: dict[str, Any] = {}

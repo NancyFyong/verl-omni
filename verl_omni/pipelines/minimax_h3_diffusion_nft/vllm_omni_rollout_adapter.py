@@ -84,8 +84,7 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
             keyframe_indices = list(kwargs.get("keyframe_frame_indices") or [])
             if task == "fl2va" and (visual_condition is None or not condition_shapes or not keyframe_indices):
                 raise ValueError("MiniMax H3 fl2va rollout did not provide complete visual condition metadata.")
-            # Ref2VA may reference images and videos together; a whole reference set can also be
-            # audio-only, in which case there are no visual condition rows to aug-noise.
+            # A reference set may be audio-only, so there may be no visual condition rows to aug-noise.
             if visual_condition is not None:
                 if not condition_shapes:
                     raise ValueError(f"MiniMax H3 {task} rollout did not provide visual condition shapes.")
@@ -191,8 +190,7 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
             "latent_meta": latent_meta,
             "prompt_token_tags": text_tags.unsqueeze(0),
             "condition_video_rows": condition_video_rows.unsqueeze(0),
-            # Row counts survive the cross-worker padding that stacks variable reference
-            # layouts, so the Actor can slice each sample back to its true rows.
+            # Row counts survive cross-worker padding so the Actor can slice back to true rows.
             "condition_video_row_count": torch.tensor([[condition_video_rows.shape[0]]], dtype=torch.long),
             "keyframe_frame_indices": torch.tensor(
                 [capture["keyframe_frame_indices"]], dtype=torch.long, device=prompt_embeds.device
