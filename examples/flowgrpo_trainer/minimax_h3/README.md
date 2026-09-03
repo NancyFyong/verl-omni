@@ -142,10 +142,11 @@ media duration must not exceed 15 seconds. A standalone audio reference needs
 at least one visual reference. Video soundtracks are detected and conditioned
 automatically; do not list them again under `audios`.
 
-Reference-condition rows are padded only to the largest visual/audio reference
-inside the current distributed rollout batch, with explicit row counts retained
-for Actor replay. Generated target trajectories remain fixed-size and never
-repeat reference rows across SDE steps.
+Reference-condition rows are padded to `MAX_PROMPT_EMBEDS`, with explicit row
+counts retained for Actor replay. The value must cover the largest per-sample
+condition layout; multiple references at the default 2048-pixel short edge may
+require a larger cap or a smaller `REF_IMAGE_SHORT_EDGE`. Generated target
+trajectories remain fixed-size and never repeat reference rows across SDE steps.
 
 ## Install reward dependencies
 
@@ -297,6 +298,7 @@ Common environment overrides are:
 | `NUM_GPUS` | Devices per node |
 | `ROLLOUT_TP` | vLLM-Omni DiT tensor parallel size |
 | `TEXT_ENCODER_TP` | H3 text-encoder tensor parallel size |
+| `MAX_PROMPT_EMBEDS` | Prompt/reference-row padding cap; defaults to 12288 |
 | `REF_IMAGE_SHORT_EDGE` | Ref2VA training image short edge; defaults to 2048 |
 | `VAL_REF_IMAGE_SHORT_EDGE` | Ref2VA validation image short edge; defaults to the training value |
 | `REWARD_NUM_WORKERS` | Number of reward workers |

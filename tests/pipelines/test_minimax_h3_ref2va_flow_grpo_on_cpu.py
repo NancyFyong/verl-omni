@@ -15,7 +15,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -229,31 +229,6 @@ def _run_ref_rollout(monkeypatch) -> tuple[MiniMaxH3PipelineWithLogProb, dict[st
         "video_inputs": video_inputs,
         "audio_inputs": audio_inputs,
     }
-
-
-def test_standalone_audio_encoding_stages_the_audio_vae():
-    pipeline = object.__new__(MiniMaxH3PipelineWithLogProb)
-    pipeline.audio_vae = object()
-    entered = []
-
-    class _Stage:
-        def __enter__(self):
-            entered.append(pipeline.audio_vae)
-
-        def __exit__(self, *args):
-            return False
-
-    pipeline._component_on_device = lambda component: _Stage()
-    expected = (torch.ones(2, H3_AUDIO_WIDTH), [1])
-    with patch(
-        "vllm_omni.diffusion.models.minimax_h3.MiniMaxH3Pipeline._encode_audio_conditions",
-        return_value=expected,
-    ) as parent:
-        actual = pipeline._encode_audio_conditions([(torch.ones(1, 8), 4)], max_duration_seconds=2.0)
-
-    assert actual is expected
-    assert entered == [pipeline.audio_vae]
-    parent.assert_called_once()
 
 
 def test_ref2va_rollout_keeps_all_reference_rows_fixed(monkeypatch):

@@ -214,18 +214,6 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
             "ref_block_count": torch.tensor([[ref_block_count]], dtype=torch.long),
         }
 
-    def _encode_audio_conditions(
-        self,
-        audios: list[tuple[torch.Tensor, int]],
-        *,
-        max_duration_seconds: float | None = None,
-    ) -> tuple[torch.Tensor | None, list[int]]:
-        """Stage the audio VAE while encoding standalone Ref2VA audio."""
-        if not audios:
-            return None, []
-        with self._component_on_device(self.audio_vae):
-            return super()._encode_audio_conditions(audios, max_duration_seconds=max_duration_seconds)
-
     def diffuse(
         self,
         *,
