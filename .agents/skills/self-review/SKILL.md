@@ -41,6 +41,7 @@ top-level contract; then read the guide for each area you changed:
 | config dataclasses / generated yaml | `.agents/rules/config.md` |
 | code style / `# Copied from` | `.agents/rules/code-style.md` |
 | diffusion pipelines / adapters | `.agents/rules/pipelines.md`, `docs/contributing/integrating_a_diffusion_model.md` |
+| diffusion algorithm (policy-gradient vs direct-preference) | `docs/contributing/integrating_a_new_policy_gradient_algorithm_for_diffusion_model.md`, `docs/contributing/integrating_a_new_direct_preference_algorithm_for_diffusion_model.md` (let [add-pipeline](../add-pipeline/SKILL.md) classify which one) |
 | reward scorers | `.agents/rules/reward.md` |
 | tests | `.agents/rules/testing.md`, `docs/contributing/testing_guide.md` |
 | recurring traps | `docs/contributing/common_pitfalls.md` |
