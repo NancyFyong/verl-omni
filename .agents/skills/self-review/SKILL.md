@@ -89,6 +89,24 @@ alone:
 Be concrete, cite the rule, review the whole diff, and don't invent issues or
 flag pure style the formatter already enforces.
 
+### Evidence rule (mandatory)
+
+Self-review is prone to confident guessing. Every finding and every claim must
+be grounded, or explicitly marked as ungrounded:
+
+- Tag each finding with its evidence basis: **[verified]** (you read the exact
+  `file.py:line` and it shows the problem), **[likely]** (inferred from the diff
+  but not confirmed at the source), or **[unchecked]** (rubric item you did not
+  actually inspect). A `file.py:line` with no matching read is not `[verified]`.
+- **Never claim a check passed that you did not run.** State the exact command
+  and its result, or write "not run". Do not report "CPU tests pass", "ruff
+  clean", or "config regenerated" from assumption.
+- **Separate verified vs unverified in the summary.** List what actually ran
+  (command + outcome) apart from what remains unverified (e.g. GPU end-to-end,
+  untested pipelines). A **READY** verdict must name what it does *not* cover.
+- If you could not open a file or run a check, say so plainly rather than
+  producing a plausible-sounding finding. An honest gap beats a fabricated one.
+
 ## 5. Iterate, then share
 
 Expect several rounds: the contributor fixes findings, you review again. Keep
