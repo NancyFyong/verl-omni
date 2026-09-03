@@ -18,6 +18,19 @@ detached-normalized distribution-matching gradient, the surrogate student loss,
 the fake-score target, canonical x0 conversion, and the CFG forms that the
 reference implementations use. The equations follow RFC §7 and §8.
 
+Why this is a separate module (and not part of ``recipes.py`` or
+``contracts.py``):
+
+- ``contracts.py`` holds *data types* (immutable plan pieces, role layout, the
+  execution state machine). It carries no equations.
+- ``recipes.py`` holds *declarations* (which objective, which rollout strategy,
+  which initialization, how roles map onto groups). It never computes a quantity.
+- ``math.py`` holds the only *executable equations* in the package. Every value
+  is a pure function of its tensors; nothing here reads config, weights, or the
+  prompt. Keeping these functions together means they can be unit-tested as
+  algebraic identities and finite-difference checks without building a plan or an
+  executor (see ``test_distillation_dmd_math_on_cpu.py``).
+
 Boundary conditions (all must match the reviewed reference implementations):
 
 - ``normalizer`` is formed over the **entire** ``x_g - x0_real`` tensor across all

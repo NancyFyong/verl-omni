@@ -18,47 +18,52 @@ execution contracts, the recipe/objective/rollout registries, and the pure DMD
 math. It contains no model pipeline, Ray worker, FSDP model, or GPU runtime.
 """
 
-from verl_omni.trainer.diffusion.distillation import contracts, math, recipes, registry
+from verl_omni.trainer.diffusion.distillation import contracts, control_plane, math, ray_trainer, recipes
 from verl_omni.trainer.diffusion.distillation.contracts import (
     CanonicalPrediction,
     ConditionBundle,
+    DistillationCheckpointState,
     DistillationPlan,
     ExportSpec,
     LatentBundle,
     PhaseRequest,
     PhaseResult,
     RoleBinding,
+    RoleCheckpointManifest,
     RoleGroupSpec,
     RoleLayoutSpec,
     ScoreBatch,
     ScoreTransportSpec,
     StudentRollout,
+    TeacherScoreProvider,
     TrainerCounters,
     UpdateCycle,
     UpdatePhaseSpec,
     UpdateSchedule,
+    describe_role_groups,
+    resolve_export_role,
+    validate_export_role,
+    validate_role_layout,
 )
 from verl_omni.trainer.diffusion.distillation.control_plane import (
     BatchProvider,
+    DistillationPhaseExecutor,
     DistillationTrainerControlPlane,
     DistillationTrainerHooks,
-)
-from verl_omni.trainer.diffusion.distillation.phase_executor import (
-    DistillationPhaseExecutor,
     FakeBatchProvider,
     FakeDistillationHooks,
     FakePhaseExecutor,
 )
 from verl_omni.trainer.diffusion.distillation.ray_trainer import DistillationRayTrainer
 from verl_omni.trainer.diffusion.distillation.recipes import build_plan, recipe_registry
-from verl_omni.trainer.diffusion.distillation.role_runtime import validate_role_layout
 
 __all__ = [
     # submodules
     "contracts",
     "math",
     "recipes",
-    "registry",
+    "control_plane",
+    "ray_trainer",
     # contracts
     "LatentBundle",
     "StudentRollout",
@@ -77,19 +82,25 @@ __all__ = [
     "PhaseResult",
     "TrainerCounters",
     "DistillationPlan",
-    # control plane
+    # role layout validation / export / provider / checkpoint
+    "validate_role_layout",
+    "validate_export_role",
+    "describe_role_groups",
+    "resolve_export_role",
+    "TeacherScoreProvider",
+    "RoleCheckpointManifest",
+    "DistillationCheckpointState",
+    # control plane / executor
     "DistillationTrainerControlPlane",
     "BatchProvider",
     "DistillationTrainerHooks",
-    # executor
     "DistillationPhaseExecutor",
     "FakePhaseExecutor",
     "FakeBatchProvider",
     "FakeDistillationHooks",
     # driver
     "DistillationRayTrainer",
-    # recipes / validation
+    # recipes
     "build_plan",
     "recipe_registry",
-    "validate_role_layout",
 ]

@@ -25,8 +25,8 @@ from verl_omni.trainer.diffusion.distillation.contracts import (
     UpdatePhaseSpec,
     UpdateSchedule,
 )
-from verl_omni.trainer.diffusion.distillation.control_plane import DistillationTrainerControlPlane
-from verl_omni.trainer.diffusion.distillation.phase_executor import (
+from verl_omni.trainer.diffusion.distillation.control_plane import (
+    DistillationTrainerControlPlane,
     FakeBatchProvider,
     FakeDistillationHooks,
     FakePhaseExecutor,

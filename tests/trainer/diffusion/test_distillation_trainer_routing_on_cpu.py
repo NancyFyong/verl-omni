@@ -81,7 +81,7 @@ class TestPR1DataPlaneBoundary:
             trainer.fit(num_cycles=1)
 
     def test_control_plane_binds_when_collaborators_are_supplied(self):
-        from verl_omni.trainer.diffusion.distillation.phase_executor import (
+        from verl_omni.trainer.diffusion.distillation.control_plane import (
             FakeBatchProvider,
             FakePhaseExecutor,
         )

@@ -11,15 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Named distillation recipes.
+"""Named distillation recipes and their composed strategies.
 
-Each recipe is a thin declaration that composes an objective, a rollout strategy,
-an initialization stage, and a role layout into an immutable
-:class:`DistillationPlan`. Recipes never implement their own Ray loop, FSDP
-setup, checkpoint format, or logging loop (RFC §9.2, §9.3).
+A recipe is a thin declaration that composes an objective, a rollout strategy, an
+initialization stage, and a role layout into an immutable :class:`DistillationPlan`.
+Recipes never implement their own Ray loop, FSDP setup, checkpoint format, or
+logging loop (RFC §9.2, §9.3).
+
+This module also holds the registries and the registered objective / rollout
+strategy markers. They are the declarative dispatch surface of the trainer: a plan
+names a recipe, and the plan's objective/rollout/initialization strings resolve
+through these registries.
 """
 
 from __future__ import annotations
+
+import abc
 
 from verl_omni.trainer.diffusion.distillation.contracts import (
     DistillationPlan,
@@ -30,12 +37,8 @@ from verl_omni.trainer.diffusion.distillation.contracts import (
     ScoreTransportSpec,
     UpdatePhaseSpec,
     UpdateSchedule,
+    validate_role_layout,
 )
-from verl_omni.trainer.diffusion.distillation.registry import (
-    DistillationRecipeBase,
-    DistillationRecipeRegistry,
-)
-from verl_omni.trainer.diffusion.distillation.role_runtime import validate_role_layout
 
 __all__ = [
     "recipe_registry",
@@ -44,7 +47,194 @@ __all__ = [
     "CausVidRecipe",
     "SelfForcingRecipe",
     "build_plan",
+    # registries
+    "DistillationRecipeBase",
+    "DistillationRecipeRegistry",
+    "ObjectiveRegistry",
+    "RolloutStrategyRegistry",
+    "InitializationRegistry",
+    "_Registry",
+    "objective_registry",
+    "rollout_registry",
+    "initialization_registry",
+    # objectives
+    "DMDObjective",
+    "DMD2Objective",
+    "ODERegressionObjective",
+    # rollout strategies
+    "OneStepRollout",
+    "EulerRollout",
+    "ConsistencyRenoiseRollout",
+    "TeacherForcedCausalRollout",
+    "SelfForcedRollout",
+    "BackwardSimulatedRollout",
 ]
+
+
+class DistillationRecipeBase(abc.ABC):
+    """Base class for a named distillation recipe."""
+
+    @classmethod
+    @abc.abstractmethod
+    def build_plan(cls, config, capabilities) -> DistillationPlan:
+        """Return a validated immutable :class:`DistillationPlan`."""
+
+
+class _Registry:
+    """A minimal name -> class registry with duplicate-registration rejection."""
+
+    def __init__(self) -> None:
+        self._registry: dict[str, type] = {}
+
+    def register(self, name: str):
+        def decorator(subclass: type) -> type:
+            if name in self._registry:
+                raise ValueError(f"Duplicate registration for {name!r}.")
+            self._registry[name] = subclass
+            return subclass
+
+        return decorator
+
+    def get(self, name: str) -> type:
+        try:
+            return self._registry[name]
+        except KeyError:
+            raise KeyError(f"No {self.kind} registered for {name!r}. Registered: {sorted(self._registry)}") from None
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(sorted(self._registry))
+
+    @property
+    def kind(self) -> str:
+        return self.__class__.__name__
+
+
+class DistillationRecipeRegistry(_Registry):
+    """Registry of named recipes that build a :class:`DistillationPlan`."""
+
+    @property
+    def kind(self) -> str:
+        return "distillation recipe"
+
+    def build(self, name: str, config, capabilities) -> DistillationPlan:
+        """Build a validated plan from the recipe class registered under ``name``."""
+        recipe_cls = self.get(name)
+        return recipe_cls.build_plan(config, capabilities)
+
+
+class ObjectiveRegistry(_Registry):
+    """Registry of composed objective strategies."""
+
+    @property
+    def kind(self) -> str:
+        return "objective"
+
+
+class RolloutStrategyRegistry(_Registry):
+    """Registry of student rollout strategies."""
+
+    @property
+    def kind(self) -> str:
+        return "rollout strategy"
+
+
+class InitializationRegistry(_Registry):
+    """Registry of initialization strategies."""
+
+    @property
+    def kind(self) -> str:
+        return "initialization"
+
+
+objective_registry = ObjectiveRegistry()
+rollout_registry = RolloutStrategyRegistry()
+initialization_registry = InitializationRegistry()
+
+
+class ObjectiveBase:
+    """Interface marker for a composed objective implemented in a phase.
+
+    PR 1 registers the named objectives so plans can reference them by name. The
+    abstract computation methods are added in PR 2+ together with the role-group
+    engine that supplies teacher/fake-score forwards.
+    """
+
+    name: str = ""
+
+
+@objective_registry.register("dmd")
+class DMDObjective(ObjectiveBase):
+    """DMD: detached normalized fake-minus-real gradient + optional regression."""
+
+    name = "dmd"
+
+
+@objective_registry.register("dmd2")
+class DMD2Objective(ObjectiveBase):
+    """DMD2: two-time-scale fake-update distribution separately from the student."""
+
+    name = "dmd2"
+
+
+@objective_registry.register("ode_regression")
+class ODERegressionObjective(ObjectiveBase):
+    """ODE regression pretraining stage: MSE to a precomputed ODE target."""
+
+    name = "ode_regression"
+
+
+class RolloutStrategyBase:
+    """Interface marker for a student rollout strategy.
+
+    PR 1 registers the named strategies so plans can reference them by name. The
+    gradient-bearing student forward is added in PR 2+ with the FSDP engine.
+    """
+
+    name: str = ""
+
+
+@rollout_registry.register("one_step")
+class OneStepRollout(RolloutStrategyBase):
+    """Single-step student rollout."""
+
+    name = "one_step"
+
+
+@rollout_registry.register("ode_euler")
+class EulerRollout(RolloutStrategyBase):
+    """Deterministic Euler backward simulation (LightX2V run_back_simulation)."""
+
+    name = "ode_euler"
+
+
+@rollout_registry.register("consistency_renoise")
+class ConsistencyRenoiseRollout(RolloutStrategyBase):
+    """Consistency re-noising backward simulation (Self-Forcing inference_with_trajectory)."""
+
+    name = "consistency_renoise"
+
+
+@rollout_registry.register("teacher_forced_causal")
+class TeacherForcedCausalRollout(RolloutStrategyBase):
+    """Teacher-forced causal rollout (CausVid)."""
+
+    name = "teacher_forced_causal"
+
+
+@rollout_registry.register("self_forced")
+class SelfForcedRollout(RolloutStrategyBase):
+    """Self-forced autoregressive rollout (Self-Forcing)."""
+
+    name = "self_forced"
+
+
+@rollout_registry.register("backward_simulated")
+class BackwardSimulatedRollout(RolloutStrategyBase):
+    """Inference-time backward-simulated multi-step student inputs (DMD2 §4.5)."""
+
+    name = "backward_simulated"
+
 
 recipe_registry = DistillationRecipeRegistry()
 

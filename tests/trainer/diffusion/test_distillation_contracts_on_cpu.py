@@ -27,11 +27,10 @@ from verl_omni.trainer.diffusion.distillation.contracts import (
     TrainerCounters,
     UpdatePhaseSpec,
     UpdateSchedule,
+    resolve_export_role,
+    validate_role_layout,
 )
-from verl_omni.trainer.diffusion.distillation.export import resolve_export_role
-from verl_omni.trainer.diffusion.distillation.recipes import build_plan, recipe_registry
-from verl_omni.trainer.diffusion.distillation.registry import _Registry
-from verl_omni.trainer.diffusion.distillation.role_runtime import validate_role_layout
+from verl_omni.trainer.diffusion.distillation.recipes import _Registry, build_plan, recipe_registry
 
 ALL_CAPS = frozenset({"distribution_matching", "autoregressive", "adversarial"})
 

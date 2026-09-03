@@ -27,7 +27,7 @@ transport container used across role boundaries.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Protocol, runtime_checkable
 
 from torch import Tensor
 
@@ -53,6 +53,18 @@ __all__ = [
     "UpdateSchedule",
     "TrainerCounters",
     "DistillationPlan",
+    # role layout validation (was role_runtime)
+    "validate_role_layout",
+    "validate_export_role",
+    "describe_role_groups",
+    # semantic export (was export)
+    "resolve_export_role",
+    "EXPORTABLE_ROLES",
+    # teacher score provider (was score_providers)
+    "TeacherScoreProvider",
+    # checkpoint manifest (was checkpoint)
+    "RoleCheckpointManifest",
+    "DistillationCheckpointState",
 ]
 
 # ---------------------------------------------------------------------------
@@ -329,3 +341,112 @@ class DistillationPlan:
     initialization: InitializationSpec = field(default_factory=dict)
     update_schedule: UpdateSchedule = field(default_factory=lambda: UpdateSchedule(UpdatePhaseSpec(kind="student")))
     required_capabilities: frozenset[str] = frozenset()
+
+
+# ---------------------------------------------------------------------------
+# §10.6 role layout validation / semantic export / teacher provider / checkpoint
+# ---------------------------------------------------------------------------
+
+
+# --- merged from role_runtime.py ---
+def validate_role_layout(layout: RoleLayoutSpec) -> None:
+    """Fail-closed validation of a role layout before any model is allocated.
+
+    Checks that every binding references an existing group, that trainable roles
+    carry an optimizer key, that no two bindings share an adapter name in a
+    shared-base group, and that export references a semantic role that exists.
+    """
+    group_names = {g.name for g in layout.groups}
+    if not group_names:
+        raise ValueError("RoleLayoutSpec must contain at least one role group.")
+
+    bindings = list(layout.bindings)
+    if not bindings:
+        raise ValueError("RoleLayoutSpec must contain at least one role binding.")
+
+    binding_roles: set[str] = set()
+    for binding in bindings:
+        if binding.group not in group_names:
+            raise ValueError(f"RoleBinding {binding.role!r} references unknown group {binding.group!r}.")
+        if binding.role in binding_roles:
+            raise ValueError(f"Duplicate role binding for {binding.role!r}.")
+        binding_roles.add(binding.role)
+        if binding.trainable and not binding.optimizer_key:
+            raise ValueError(f"Trainable role {binding.role!r} must set an optimizer_key.")
+
+    # Shared-base group: adapter names must be unique among trainable bindings.
+    for group in layout.groups:
+        if group.storage != "shared_base_adapters":
+            continue
+        adapters = [b.adapter for b in bindings if b.group == group.name and b.adapter is not None]
+        duplicates = {a for a in adapters if adapters.count(a) > 1}
+        if duplicates:
+            raise ValueError(f"Shared-base group {group.name!r} has duplicate adapter names {sorted(duplicates)}.")
+
+    # Export role must be a bound semantic role.
+    validate_export_role(layout.export, binding_roles)
+
+
+def validate_export_role(export: ExportSpec, binding_roles: set[str]) -> None:
+    """Ensure the export role is a semantic, exportable role that is bound."""
+    if export.role not in {"student", "student_ema"}:
+        raise ValueError(f"Export role must be 'student' or 'student_ema', got {export.role!r}.")
+    if export.role not in binding_roles:
+        raise ValueError(f"Export role {export.role!r} is not bound. Bound roles: {sorted(binding_roles)}.")
+
+
+def describe_role_groups(layout: RoleLayoutSpec) -> dict[str, str]:
+    """Return a concise description of the role groups for logging/metrics."""
+    result: dict[str, str] = {}
+    for group in layout.groups:
+        result[group.name] = f"({group.storage}, {group.placement})"
+    return result
+
+
+# --- merged from export.py ---
+EXPORTABLE_ROLES = ("student", "student_ema")
+
+
+def resolve_export_role(export: ExportSpec) -> str:
+    """Return the resolved semantic export role, validated to be exportable."""
+    if export.role not in EXPORTABLE_ROLES:
+        raise ValueError(f"Export role must be one of {EXPORTABLE_ROLES}, got {export.role!r}.")
+    return export.role
+
+
+# --- merged from score_providers.py ---
+@runtime_checkable
+class TeacherScoreProvider(Protocol):
+    """Provides canonical ``x0`` teacher predictions for a score batch."""
+
+    def predict_x0(self, score_batch: ScoreBatch) -> CanonicalPrediction:
+        """Return the teacher's canonical fp32 ``x0`` for ``score_batch``.
+
+        This must not hold a student autograd graph across an unbounded
+        synchronous round trip. A standalone provider is responsible for
+        versioned weight sync, cancellation, and never materializing tensors on
+        the driver via the driver process.
+        """
+        ...
+
+
+# --- merged from checkpoint.py ---
+@dataclass
+class RoleCheckpointManifest:
+    """Metadata describing one role's stored state."""
+
+    role: str
+    model_path: str = ""
+    model_revision: str = ""
+    config_hash: str = ""
+    optimizer_key: str = ""
+
+
+@dataclass
+class DistillationCheckpointState:
+    """Composite multi-role checkpoint state, restored atomically."""
+
+    global_step: int = 0
+    role_manifests: list[RoleCheckpointManifest] = field(default_factory=list)
+    # Arbitrary driver-side state (dataloader position, RNG streams, etc.).
+    rng: dict[str, Any] = field(default_factory=dict)
