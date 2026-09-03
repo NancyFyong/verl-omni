@@ -18,7 +18,7 @@ execution contracts, the recipe/objective/rollout registries, and the pure DMD
 math. It contains no model pipeline, Ray worker, FSDP model, or GPU runtime.
 """
 
-from verl_omni.trainer.diffusion.distillation import contracts, control_plane, math, ray_trainer, recipes
+from verl_omni.trainer.diffusion.distillation import contracts, control_plane, equations, ray_trainer, recipes
 from verl_omni.trainer.diffusion.distillation.contracts import (
     CanonicalPrediction,
     ConditionBundle,
@@ -60,7 +60,7 @@ from verl_omni.trainer.diffusion.distillation.recipes import build_plan, recipe_
 __all__ = [
     # submodules
     "contracts",
-    "math",
+    "equations",
     "recipes",
     "control_plane",
     "ray_trainer",

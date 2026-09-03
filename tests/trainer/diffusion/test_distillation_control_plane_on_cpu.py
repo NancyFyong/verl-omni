@@ -182,9 +182,9 @@ class TestControlPlanePurity:
 
         import verl_omni.trainer.diffusion.distillation.contracts as contracts_mod
         import verl_omni.trainer.diffusion.distillation.control_plane as cp_mod
-        import verl_omni.trainer.diffusion.distillation.math as math_mod
+        import verl_omni.trainer.diffusion.distillation.equations as equations_mod
 
-        for module in (cp_mod, contracts_mod, math_mod):
+        for module in (cp_mod, contracts_mod, equations_mod):
             source = module.__dict__
             assert "ray" not in source, f"{module.__name__} must not import ray"
             assert "diffusers" not in source, f"{module.__name__} must not import diffusers"

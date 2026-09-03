@@ -23,7 +23,7 @@ normalized score difference.
 import pytest
 import torch
 
-from verl_omni.trainer.diffusion.distillation.math import (
+from verl_omni.trainer.diffusion.distillation.equations import (
     dmd_gradient,
     dmd_surrogate_loss,
     fake_score_loss,
