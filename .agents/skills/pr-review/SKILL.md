@@ -9,7 +9,8 @@ Use one evidence-first workflow for two different jobs:
 
 - **Reviewer mode** — inspect another contributor's PR and produce findings.
 - **Author mode** — maintain an authored PR: verify feedback, fix real issues,
-  update tests/description, and prepare replies.
+  update tests/description, and prepare replies. This also covers *pre-PR
+  self-review*, when there is no reviewer feedback yet.
 
 If the user's intent is unclear, ask which mode they want. Reviewer mode is
 read-only unless the user explicitly asks for changes.
@@ -114,6 +115,45 @@ For each active comment, classify it before changing code:
 | Incorrect | Reply with code/test evidence, not assertion. |
 | Ambiguous | Ask the reviewer/user; do not silently choose an interpretation. |
 
+## verl-omni review rubric
+
+Beyond generic correctness, check these project-specific traps — each has bitten
+a real PR and none is obvious from the diff alone:
+
+- **Silent field loss / wire compatibility** — the rollout request/output path
+  threads private engine keys (`prompt_token_ids`, the dual-written
+  `multi_modal_data`, `extra_fields`). A refactor must keep valid requests
+  byte-identical on the wire and fail closed on conflicting/unsupported fields
+  rather than dropping or overwriting them.
+- **Shape guessing** — flag new `ndim==5` / `shape[1]==3`-style modality or
+  layout inference; the declared media contract (`DiffusionIOSpec`, `media_kind`)
+  should drive it instead.
+- **Sanity gates the CPU job skips** — changed `config` dataclasses need the
+  regenerated `_generated_*.yaml` (`scripts/generate_trainer_config.sh`);
+  `check_dataproto_usage.py`, `check_device_api_usage.py` (no literal `cuda` /
+  `nccl` / `.cuda`), `check_docstrings.py`, `check_license.py`, and
+  `validate_structure.py` each run as their own job.
+- **Pin-induced false failures** — a red test may be a local `verl` /
+  `vllm-omni` pin mismatch, not the PR. Confirm the env matches
+  `.github/*_pin.txt` before blaming the diff.
+- **Don't overstate GPU evidence** — "reached engine init" or "reached
+  generate_sequences" is not "end-to-end passed"; claim only what the run
+  actually completed.
+
+## Domain guides to consult
+
+Read the guide for the touched area instead of reviewing from memory:
+
+| Area | Guide |
+| --- | --- |
+| config dataclasses / generated yaml | `.agents/rules/config.md` |
+| code style / `# Copied from` | `.agents/rules/code-style.md` |
+| diffusion pipelines / adapters | `.agents/rules/pipelines.md`, `docs/contributing/integrating_a_diffusion_model.md` |
+| reward scorers | `.agents/rules/reward.md` |
+| tests | `.agents/rules/testing.md`, `docs/contributing/testing_guide.md` |
+| recurring traps | `docs/contributing/common_pitfalls.md` |
+| CI / GPU smoke | `docs/contributing/ci_cd.md`, `docs/contributing/gpu_smoke_tests.md` |
+
 ## 3A. Reviewer mode
 
 Review behavior, not only the patch text:
@@ -169,6 +209,28 @@ remote branch and the reply accurately describes the current head.
 When rewriting an authored branch, create a backup ref and use
 `--force-with-lease`, never bare `--force`. Fork PR workflows may not restart
 after a push; report when a maintainer must approve workflows or re-add `ci`.
+
+### Pre-PR self-review
+
+When no reviewer feedback exists yet, review your own branch before opening or
+updating the PR:
+
+```bash
+git fetch <upstream-remote> main
+git diff <upstream-remote>/main...HEAD   # whole branch, not just the last commit
+```
+
+Apply the rubric and the domain guides, then report without editing files as
+part of the review:
+
+- **Blocking** — must fix before submitting; numbered, each with `file.py:line`
+  and impact.
+- **Non-blocking** — lower-severity items or design calls to raise with the
+  reviewer rather than guess at now.
+- **Verdict** — READY / NEEDS CHANGES.
+
+Iterate until READY, then offer to put the summary in the PR description or a
+comment. Never commit the review notes into the diff.
 
 ## 4. Final verification and report
 
