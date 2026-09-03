@@ -27,7 +27,12 @@ from vllm_omni.diffusion.models.minimax_h3.condition_noise import (
     minimax_h3_audio_cond_noise_aug_rows,
     minimax_h3_imgvid_cond_noise_aug_rows,
 )
-from vllm_omni.diffusion.models.minimax_h3.denoise_loop import MiniMaxH3DenoiseBranch, minimax_h3_denoise_loop
+from vllm_omni.diffusion.models.minimax_h3.denoise_loop import (
+    MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
+    MINIMAX_H3_IMGVID_COND_TIMESTEP,
+    MiniMaxH3DenoiseBranch,
+    minimax_h3_denoise_loop,
+)
 from vllm_omni.diffusion.models.minimax_h3.packed_sequence import minimax_h3_packed_sequence_ref2va_blocks
 
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
@@ -297,7 +302,9 @@ def test_ref2va_actor_replays_full_layout_and_scores_only_targets(monkeypatch):
     assert negative_inputs is None
     assert model_inputs["hidden_states"].shape == (1, 24, H3_VIDEO_WIDTH)
     assert model_inputs["audio_hidden_states"].shape == (1, 16, H3_AUDIO_WIDTH)
-    assert model_inputs["timestep"].tolist() == pytest.approx([0.0, 0.999, 1.0])
+    assert model_inputs["timestep"].tolist() == pytest.approx(
+        [0.0, MINIMAX_H3_IMGVID_COND_TIMESTEP, MINIMAX_H3_AUDIO_REF_COND_TIMESTEP]
+    )
 
     module = MagicMock(
         return_value=(
@@ -488,13 +495,13 @@ def test_ref2va_eta_zero_matches_the_official_denoiser(monkeypatch):
         target_latent_t=1,
         imgvid_cond_num_frames=4,
         seed=seed,
-        noise_aug=0.999,
+        noise_aug=MINIMAX_H3_IMGVID_COND_TIMESTEP,
     )
     audio_anchor = minimax_h3_audio_cond_noise_aug_rows(
         clean_audio,
         condition_audio_t=audio_lengths,
         seed=seed,
-        noise_aug=1.0,
+        noise_aug=MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
     )
     initial_video = torch.zeros(24, H3_VIDEO_WIDTH)
     initial_video[branch.update_mask] = target_video

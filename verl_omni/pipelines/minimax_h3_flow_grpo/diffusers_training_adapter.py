@@ -22,6 +22,10 @@ import torch
 from diffusers import ModelMixin
 from tensordict import TensorDict
 from verl.utils.device import get_device_name
+from vllm_omni.diffusion.models.minimax_h3.denoise_loop import (
+    MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
+    MINIMAX_H3_IMGVID_COND_TIMESTEP,
+)
 
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     build_ref2va_layout_from_meta,
@@ -222,9 +226,11 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
         video_update_mask_device = video_update_mask.to(device)
         audio_update_mask_device = audio_update_mask.to(device)
         row_timesteps = torch.full((seq_len,), video_t, device=device, dtype=torch.float32)
-        row_timesteps[video_indices_device[~video_update_mask_device]] = max(video_t, 0.999)
+        row_timesteps[video_indices_device[~video_update_mask_device]] = max(video_t, MINIMAX_H3_IMGVID_COND_TIMESTEP)
         row_timesteps[audio_indices_device[audio_update_mask_device]] = audio_t
-        row_timesteps[audio_indices_device[~audio_update_mask_device]] = 1.0
+        row_timesteps[audio_indices_device[~audio_update_mask_device]] = max(
+            audio_t, MINIMAX_H3_AUDIO_REF_COND_TIMESTEP
+        )
         unique_t, inverse = torch.unique(row_timesteps, sorted=True, return_inverse=True)
         return (
             {
