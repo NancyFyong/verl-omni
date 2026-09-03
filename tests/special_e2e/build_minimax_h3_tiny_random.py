@@ -83,7 +83,7 @@ _SEED = 42
 _VIDEO_LATENT_CHANNELS = 24
 _AUDIO_LATENT_CHANNELS = 32
 _PATCH_VOLUME = 4  # MiniMax-H3 uses a (1, 2, 2) video patch.
-_CHECKPOINT_FORMAT_VERSION = 2
+_CHECKPOINT_FORMAT_VERSION = 3
 _VLLM_TEXT_HIDDEN_SIZE = 5120
 _VLLM_TEXT_NUM_ATTENTION_HEADS = 64
 _VLLM_TEXT_NUM_KEY_VALUE_HEADS = 8
@@ -153,7 +153,15 @@ class _TinyVideoCore(nn.Module):
         self.latent_channels = latent_channels
         self.scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
         self.parallel_tiling = False
+        # MiniMaxH3VideoVAE computes the decoder tile grid in pixel space
+        # before it calls decode_base. The tiny component deliberately has one
+        # tile, but it must expose the same native VAE contract.
+        self.vae_ratio = 16
         self.processor = _VideoProcessor()
+
+    def split_tiles(self, input_len: int, is_decoder: bool = False):
+        del is_decoder
+        return [0], [input_len], []
 
     def encode_images(self, image, *, use_fp16_latent: bool = True):
         del use_fp16_latent
