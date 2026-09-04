@@ -70,6 +70,9 @@ gpu = [
 train = [
     "verl @ git+https://github.com/verl-project/verl.git@fefb080262e1c015a0ea05f958822a6a512dc795",
 ]
+distillation = [
+    "piq==0.8.0",
+]
 dev = [
     "pytest",
     "pytest-cov",

@@ -59,6 +59,7 @@ algo/flowgrpo.md
 algo/flowdppo.md
 algo/diffusion_dpo.md
 algo/diffusionnft.md
+algo/distribution_matching.md
 algo/grpo_guard.md
 algo/mixgrpo.md
 algo/diffusion_opd.md

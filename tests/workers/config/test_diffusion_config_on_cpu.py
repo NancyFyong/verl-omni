@@ -151,6 +151,11 @@ class TestDiffusionRolloutAlgoConfig:
         assert cfg.sde_window_size is None
         assert cfg.sde_window_range is None
         assert cfg.sde_contiguous is True
+        assert cfg.rollout_timestep_shift is None
+
+    def test_invalid_rollout_timestep_shift_raises(self):
+        with pytest.raises(ValueError, match="rollout_timestep_shift"):
+            DiffusionRolloutAlgoConfig(rollout_timestep_shift=0.5)
 
     def test_invalid_sample_strategy_raises(self):
         with pytest.raises(ValueError, match="Unknown sample_strategy"):
