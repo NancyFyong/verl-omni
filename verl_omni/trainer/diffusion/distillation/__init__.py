@@ -13,12 +13,14 @@
 # limitations under the License.
 """Distribution-matching distillation runtime (DMD, DMD2, CausVid, Self-Forcing).
 
-PR 1 provides the architecture-neutral trainer controller, immutable execution
-contracts, recipe/objective/rollout registries, and pure DMD tensor utilities. It
-defines no model pipeline, Ray worker, FSDP model, or GPU runtime.
+The package separates immutable plans, pure utils, and the control-plane
+state machine from the lazily imported Ray/FSDP data plane. Architecture-owned
+phase runners plug into the generic runtime without adding model branches here.
 """
 
-from verl_omni.trainer.diffusion.distillation import contracts, controller, ray_trainer, recipes, utils
+from importlib import import_module
+
+from verl_omni.trainer.diffusion.distillation import contracts, controller, utils, recipes
 from verl_omni.trainer.diffusion.distillation.contracts import (
     CanonicalPrediction,
     ConditionBundle,
@@ -56,8 +58,18 @@ from verl_omni.trainer.diffusion.distillation.controller import (
     FakeDistillationHooks,
     FakePhaseExecutor,
 )
-from verl_omni.trainer.diffusion.distillation.ray_trainer import DistillationRayTrainer
 from verl_omni.trainer.diffusion.distillation.recipes import build_plan, build_plan_from_config, recipe_registry
+
+
+def __getattr__(name: str):
+    if name == "DistillationRayTrainer":
+        from verl_omni.trainer.diffusion.distillation.ray_trainer import DistillationRayTrainer
+
+        return DistillationRayTrainer
+    if name == "ray_trainer":
+        return import_module("verl_omni.trainer.diffusion.distillation.ray_trainer")
+    raise AttributeError(name)
+
 
 __all__ = [
     # submodules
@@ -94,7 +106,7 @@ __all__ = [
     "TeacherScoreProvider",
     "RoleCheckpointManifest",
     "DistillationCheckpointState",
-    # controller / executor
+    # control plane / executor
     "DistillationTrainerController",
     "BatchProvider",
     "DistillationTrainerHooks",

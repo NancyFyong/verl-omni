@@ -217,9 +217,33 @@ class TestControllerPurity:
         assert controller.counters.optimizer_steps == {}
         assert controller.metrics == {}
 
-    def test_failed_driver_cannot_be_reset(self):
+    def test_state_dict_round_trip_restores_completed_counters(self):
+        controller, _, _ = make_controller(make_plan(fake_repeats=2))
+        controller.run(3)
+        state = controller.state_dict()
+
+        restored, _, _ = make_controller(make_plan(fake_repeats=2))
+        restored.load_state_dict(state)
+        assert restored.counters.global_step == 3
+        assert restored.counters.completed_cycles == 3
+        assert restored.counters.optimizer_steps == {"student": 3, "fake_score": 6}
+
+    def test_invalid_checkpoint_state_is_rejected(self):
+        controller, _, _ = make_controller(make_plan())
+        with pytest.raises(ValueError, match="exactly"):
+            controller.load_state_dict({"global_step": 1})
+        with pytest.raises(ValueError, match="non-negative integer"):
+            controller.load_state_dict({"global_step": -1, "optimizer_steps": {}, "completed_cycles": 0})
+        with pytest.raises(ValueError, match="unknown optimizer roles"):
+            controller.load_state_dict({"global_step": 0, "optimizer_steps": {"unknown": 1}, "completed_cycles": 1})
+        with pytest.raises(ValueError, match="must equal global_step"):
+            controller.load_state_dict({"global_step": 2, "optimizer_steps": {"student": 1}, "completed_cycles": 2})
+
+    def test_failed_driver_cannot_be_checkpointed_or_reset(self):
         controller, _, _ = make_controller(make_plan(), executor=FakePhaseExecutor(fail_on="student"))
         with pytest.raises(RuntimeError):
             controller.run_cycle()
+        with pytest.raises(RuntimeError, match="Cannot checkpoint"):
+            controller.state_dict()
         with pytest.raises(RuntimeError, match="cannot be reset"):
             controller.reset()
