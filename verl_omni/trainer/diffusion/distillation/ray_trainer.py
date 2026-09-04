@@ -188,6 +188,13 @@ class DistillationRayTrainer(BaseRayDiffusionTrainer):
     def validate_runtime_config(self) -> None:
         """Reject unsupported role storage and distributed batch layouts."""
         distribution_matching = self.config.distillation.distribution_matching
+        model_algorithm = OmegaConf.select(self.config, "actor_rollout_ref.model.algorithm")
+        recipe = OmegaConf.select(self.config, "distillation.distribution_matching.recipe")
+        if model_algorithm is not None and recipe is not None and model_algorithm != recipe:
+            raise ValueError(
+                "actor_rollout_ref.model.algorithm must match distillation.distribution_matching.recipe; "
+                f"got {model_algorithm!r} and {recipe!r}."
+            )
         strategy = self.config.actor_rollout_ref.actor.strategy
         if strategy not in {"fsdp", "fsdp2"}:
             raise ValueError(f"Distillation role groups require strategy 'fsdp' or 'fsdp2', got {strategy!r}.")

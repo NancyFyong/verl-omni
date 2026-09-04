@@ -383,6 +383,40 @@ def require_choice(field: str, value: str, valid_values: set[str]) -> str:
     return value
 
 
+def _dmd_data_requirements(config, mode: str) -> dict:
+    return {
+        "mode": mode,
+        "conditioning_provider": get_config_or_default(config, "conditioning_provider", "local_frozen_encoder"),
+        "negative_prompt": get_config_or_default(config, "negative_prompt", " "),
+    }
+
+
+def _dmd_objective(config, *, name: str, profile: str, **extra) -> dict:
+    return {
+        "name": name,
+        "profile": profile,
+        "teacher_guidance_scale": float(get_config_or_default(config, "teacher_guidance_scale", 4.0)),
+        "teacher_cfg_norm": get_config_or_default(config, "teacher_cfg_norm", "layer_norm"),
+        "normalization_epsilon": float(get_config_or_default(config, "normalization_epsilon", 1e-5)),
+        "dmd_loss_weight": float(get_config_or_default(config, "dmd_loss_weight", 1.0)),
+        "regression_type": get_config_or_default(config, "regression_type", "decoded_lpips"),
+        "regression_loss_weight": float(get_config_or_default(config, "regression_loss_weight", 1.0)),
+        **extra,
+    }
+
+
+def _dmd_rollout(config, strategy: str) -> dict:
+    return {
+        "strategy": strategy,
+        "rollout_timestep_shift": float(get_config_or_default(config, "rollout_timestep_shift", 3.0)),
+        "score_sigma_min": float(get_config_or_default(config, "score_sigma_min", 0.02)),
+        "score_sigma_max": float(get_config_or_default(config, "score_sigma_max", 0.98)),
+        "score_timestep_shift": float(get_config_or_default(config, "score_timestep_shift", 3.0)),
+        "score_discrete_steps": int(get_config_or_default(config, "score_discrete_steps", 1000)),
+        "rng_seed": int(get_config_or_default(config, "rng_seed", 0)),
+    }
+
+
 def common_plan_kwargs(
     config,
     *,
@@ -422,9 +456,9 @@ class DMDRecipe(DistillationRecipeBase):
                 shared_base_layout(model_ref),
                 get_config_or_default(config, "role_storage", "shared_base_adapters"),
             ),
-            data_requirements={"mode": data_mode},
-            objective={"name": "dmd", "profile": profile},
-            rollout={"strategy": rollout},
+            data_requirements=_dmd_data_requirements(config, data_mode),
+            objective=_dmd_objective(config, name="dmd", profile=profile),
+            rollout=_dmd_rollout(config, rollout),
             initialization={"stage": "base"},
             required_capabilities=frozenset({"distribution_matching"}),
             **common_plan_kwargs(config, default_fake_repeats=1),
@@ -459,9 +493,14 @@ class DMD2Recipe(DistillationRecipeBase):
                 shared_base_layout(model_ref, with_discriminator=adversarial),
                 get_config_or_default(config, "role_storage", "shared_base_adapters"),
             ),
-            data_requirements={"mode": data_mode},
-            objective={"name": "dmd2", "profile": profile, "adversarial": adversarial},
-            rollout={"strategy": rollout},
+            data_requirements=_dmd_data_requirements(config, data_mode),
+            objective=_dmd_objective(
+                config,
+                name="dmd2",
+                profile=profile,
+                adversarial=adversarial,
+            ),
+            rollout=_dmd_rollout(config, rollout),
             initialization={"stage": "base"},
             required_capabilities=frozenset({"distribution_matching"} | ({"adversarial"} if adversarial else set())),
             **common_plan_kwargs(config, with_discriminator=adversarial),
@@ -576,7 +615,28 @@ def build_plan_from_config(config, capabilities) -> DistillationPlan:
         "fake_warmup_cycles": get_config_value(distribution_matching, "fake_warmup_cycles", 0),
         "export_role": get_config_value(distribution_matching, "export_role", "student_ema"),
     }
-    for optional_key in ("profile", "fake_update_ratio", "rollout_strategy", "data_mode", "role_storage"):
+    optional_keys = (
+        "profile",
+        "fake_update_ratio",
+        "rollout_strategy",
+        "data_mode",
+        "role_storage",
+        "conditioning_provider",
+        "negative_prompt",
+        "teacher_guidance_scale",
+        "teacher_cfg_norm",
+        "rollout_timestep_shift",
+        "score_sigma_min",
+        "score_sigma_max",
+        "score_timestep_shift",
+        "score_discrete_steps",
+        "normalization_epsilon",
+        "dmd_loss_weight",
+        "regression_type",
+        "regression_loss_weight",
+        "rng_seed",
+    )
+    for optional_key in optional_keys:
         value = get_config_value(distribution_matching, optional_key)
         if value is not None:
             recipe_config[optional_key] = value

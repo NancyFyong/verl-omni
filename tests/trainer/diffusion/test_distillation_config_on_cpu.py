@@ -41,6 +41,16 @@ class TestDistributionMatchingConfig:
         assert config.distribution_matching.fake_score_micro_batch_size_per_gpu == 1
         assert config.distribution_matching.ema_decay == pytest.approx(0.999)
         assert config.distribution_matching.ema_start_step == 0
+        assert config.distribution_matching.conditioning_provider == "local_frozen_encoder"
+        assert config.distribution_matching.teacher_guidance_scale == pytest.approx(4.0)
+        assert config.distribution_matching.teacher_cfg_norm == "layer_norm"
+        assert config.distribution_matching.negative_prompt == " "
+        assert config.distribution_matching.rollout_timestep_shift == pytest.approx(3.0)
+        assert config.distribution_matching.score_sigma_min == pytest.approx(0.02)
+        assert config.distribution_matching.score_sigma_max == pytest.approx(0.98)
+        assert config.distribution_matching.score_timestep_shift == pytest.approx(3.0)
+        assert config.distribution_matching.score_discrete_steps == 1000
+        assert config.distribution_matching.regression_type == "decoded_lpips"
         assert config.distribution_matching.fake_score_optim.lr == pytest.approx(2e-5)
 
     @pytest.mark.parametrize(
@@ -59,11 +69,34 @@ class TestDistributionMatchingConfig:
             ({"ema_decay": -0.1}, "ema_decay"),
             ({"ema_decay": 1.1}, "ema_decay"),
             ({"ema_start_step": -1}, "non-negative"),
+            ({"conditioning_provider": "remote"}, "Invalid conditioning_provider"),
+            ({"negative_prompt": None}, "negative_prompt"),
+            ({"teacher_guidance_scale": 1.0}, "teacher_guidance_scale"),
+            ({"teacher_cfg_norm": "batch_norm"}, "teacher_cfg_norm"),
+            ({"rollout_timestep_shift": 0.0}, "rollout_timestep_shift"),
+            ({"score_sigma_min": -0.1}, "score sigma bounds"),
+            ({"score_sigma_max": 1.1}, "score sigma bounds"),
+            ({"score_timestep_shift": 0.0}, "score_timestep_shift"),
+            ({"score_discrete_steps": -1}, "score_discrete_steps"),
+            ({"normalization_epsilon": 0.0}, "normalization_epsilon"),
+            ({"dmd_loss_weight": -1.0}, "dmd_loss_weight"),
+            ({"dmd_loss_weight": 0.0}, "DMD2 requires"),
+            ({"regression_type": "pixel_mse"}, "regression_type"),
+            ({"regression_loss_weight": -1.0}, "regression_loss_weight"),
+            ({"rng_seed": -1}, "rng_seed"),
         ],
     )
     def test_invalid_values_fail_closed(self, kwargs, error):
         with pytest.raises(ValueError, match=error):
             DiffusionDistributionMatchingConfig(**kwargs)
+
+    def test_dmd_requires_at_least_one_objective_weight(self):
+        with pytest.raises(ValueError, match="at least one positive"):
+            DiffusionDistributionMatchingConfig(
+                recipe="dmd",
+                dmd_loss_weight=0.0,
+                regression_loss_weight=0.0,
+            )
 
     def test_null_fields_use_recipe_specific_defaults(self):
         from verl_omni.trainer.diffusion.distillation.recipes import build_plan
@@ -75,6 +108,10 @@ class TestDistributionMatchingConfig:
             frozenset({"distribution_matching"}),
         )
         assert plan.objective["profile"] == "paper"
+        assert plan.objective["teacher_guidance_scale"] == pytest.approx(4.0)
+        assert plan.objective["regression_type"] == "decoded_lpips"
+        assert plan.rollout["score_timestep_shift"] == pytest.approx(3.0)
+        assert plan.data_requirements["conditioning_provider"] == "local_frozen_encoder"
         assert plan.update_schedule.phases[1].repeats == 1
 
 
@@ -227,12 +264,22 @@ class TestDistillationConfigComposition:
                 "algorithm.sample_source=offline",
                 "actor_rollout_ref.model.path=/m",
                 "distillation.distribution_matching.fake_update_ratio=2",
+                "distillation.distribution_matching.conditioning_provider=precomputed",
+                "distillation.distribution_matching.rollout_timestep_shift=2.5",
+                "distillation.distribution_matching.score_timestep_shift=4.0",
+                "distillation.distribution_matching.teacher_guidance_scale=3.5",
+                "distillation.distribution_matching.regression_type=latent_mse",
             ]
         )
         plan = build_plan_from_config(cfg, frozenset({"distribution_matching"}))
         assert plan.name == "dmd2"
         assert plan.role_layout.groups[0].model_ref == "/m"
         assert plan.update_schedule.phases[1].repeats == 2
+        assert plan.data_requirements["conditioning_provider"] == "precomputed"
+        assert plan.rollout["rollout_timestep_shift"] == pytest.approx(2.5)
+        assert plan.rollout["score_timestep_shift"] == pytest.approx(4.0)
+        assert plan.objective["teacher_guidance_scale"] == pytest.approx(3.5)
+        assert plan.objective["regression_type"] == "latent_mse"
 
     def test_null_overrides_use_each_recipe_default(self):
         from verl_omni.trainer.diffusion.distillation.recipes import build_plan_from_config

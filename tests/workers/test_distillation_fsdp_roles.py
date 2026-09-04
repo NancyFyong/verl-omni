@@ -21,10 +21,14 @@ import pytest
 import torch
 import torch.distributed as dist
 from peft import LoraConfig, get_peft_model
+from tensordict import TensorDict
 from torch import nn
 from torch.distributed.tensor import DTensor
+from verl.utils import tensordict_utils as tu
 
-from verl_omni.trainer.diffusion.distillation.contracts import RoleBinding, RoleGroupSpec
+from verl_omni.trainer.diffusion.distillation.contracts import PhaseRequest, RoleBinding, RoleGroupSpec
+from verl_omni.trainer.diffusion.distillation.recipes import build_plan
+from verl_omni.workers.diffusion_distillation_worker import DistillationRoleRuntime
 from verl_omni.workers.engine.fsdp.distillation_impl import DistillationRoleGroupEngine
 
 
@@ -265,5 +269,121 @@ def test_distillation_role_switch_preserves_graph_ema_and_state(strategy):
             assert all(
                 torch.allclose(value.float(), torch.full_like(value.float(), 3.0)) for value in independent_values
             )
+        finally:
+            dist.destroy_process_group()
+
+
+def _wrap_qwen_image_model(strategy, model_path):
+    from diffusers import QwenImageTransformer2DModel
+
+    model = QwenImageTransformer2DModel.from_pretrained(
+        model_path,
+        subfolder="transformer",
+        torch_dtype=torch.float32,
+    ).cuda()
+    adapter_config = LoraConfig(r=2, lora_alpha=2, target_modules=["to_q", "to_k", "to_v", "to_out.0"])
+    model.add_adapter(adapter_config, adapter_name="student")
+    model.add_adapter(adapter_config, adapter_name="fake_score")
+    model.add_adapter(adapter_config, adapter_name="student_ema")
+    model.set_adapter("student")
+    if strategy == "fsdp":
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        return FSDP(model, use_orig_params=True, device_id=torch.cuda.current_device())
+    from torch.distributed.fsdp import fully_shard
+
+    for block in model.transformer_blocks:
+        fully_shard(block)
+    fully_shard(model)
+    return model
+
+
+@pytest.mark.parametrize("strategy", ["fsdp", "fsdp2"])
+def test_qwen_image_dmd2_phase_runner_on_fsdp(strategy):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for Qwen-Image FSDP distillation tests.")
+    if dist.is_initialized():
+        pytest.skip("This isolated one-rank FSDP test requires no existing process group.")
+    model_path = os.environ.get("QWEN_IMAGE_MODEL_PATH", os.path.expanduser("~/models/tiny-random/Qwen-Image"))
+    if not os.path.isfile(os.path.join(model_path, "model_index.json")):
+        pytest.skip(f"Tiny Qwen-Image checkpoint not found at {model_path}.")
+
+    from verl_omni.pipelines.qwen_image_distillation.diffusers_training_adapter import QwenImageDmdPhaseRunner
+
+    with tempfile.TemporaryDirectory(prefix="qwen_image_dmd_fsdp_") as tmp_dir:
+        torch.cuda.set_device(0)
+        dist.init_process_group(
+            backend="nccl",
+            init_method=f"file://{os.path.join(tmp_dir, 'rendezvous')}",
+            rank=0,
+            world_size=1,
+        )
+        try:
+            engine = _engine_shell(_wrap_qwen_image_model(strategy, model_path))
+            engine.scheduler = SimpleNamespace()
+            engine.model_config = SimpleNamespace(fsdp_layer_prefixes=["transformer_blocks."])
+            engine.ulysses_device_mesh = None
+            engine.ulysses_sequence_parallel_size = 1
+            plan = build_plan(
+                "dmd2",
+                {
+                    "model_path": model_path,
+                    "conditioning_provider": "local_frozen_encoder",
+                    "fake_update_ratio": 1,
+                    "rng_seed": 3,
+                },
+                frozenset({"distribution_matching"}),
+            )
+            runtime = DistillationRoleRuntime(plan, {"base": engine}, ema_decay=0.9, ema_start_step=0)
+            model_config = SimpleNamespace(
+                path=model_path,
+                local_path=model_path,
+                transformer_config={"in_channels": 64},
+                pipeline=SimpleNamespace(
+                    height=64,
+                    width=64,
+                    num_inference_steps=2,
+                    max_sequence_length=64,
+                    guidance_scale=None,
+                ),
+            )
+            runner = QwenImageDmdPhaseRunner(model_config, plan)
+            batch = TensorDict({"dummy_tensor": torch.zeros(1, 1, device="cuda")}, batch_size=[1])
+            tu.assign_non_tensor_stack(
+                batch,
+                "raw_prompt",
+                [
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Describe the image by detailing the color, shape, size, texture, quantity, text, "
+                                "spatial relationships of the objects and background:"
+                            ),
+                        },
+                        {"role": "user", "content": "A red square"},
+                    ]
+                ],
+            )
+            for kind, role in (("student", "student"), ("fake_score", "fake_score")):
+                request = PhaseRequest(
+                    kind=kind,
+                    global_step=0,
+                    repeat_index=0,
+                    batch_policy="fresh",
+                    trainable_roles=(role,),
+                    update_ema=kind == "student",
+                )
+                runtime.zero_grad(request.trainable_roles)
+                computation = runner.compute_phase(request, batch, runtime)
+                runtime.backward_micro_batch(request, computation, weight=1.0)
+                optimizer_steps, _ = runtime.step_phase(request)
+                assert optimizer_steps == {role: 1}
+
+            tensors, peft_config = runtime.export_tensors(base_sync_done=True)
+            exported = list(tensors)
+            assert exported
+            assert peft_config["r"] == 2
+            assert all(name.startswith("transformer.") for name, _ in exported)
         finally:
             dist.destroy_process_group()
