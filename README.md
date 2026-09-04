@@ -16,7 +16,7 @@ It originated from the multi-modal generation RL effort in `verl`, and now has a
 
 ## News 🔥
 - **[2026-08]** **[DiffusionOPD](docs/algo/diffusion_opd.md)** (on-policy distillation, including multi-teacher MOPD) is now supported.
-- **[2026-08]** 🔥 **[MiniMax-H3](examples/diffusionnft_trainer/minimax_h3/README.md)** T2VA and FL2VA is now supported with DiffusionNFT. Doc: [MiniMax-H3 DiffusionNFT Training](examples/diffusionnft_trainer/minimax_h3/README.md)
+- **[2026-09]** 🔥 **MiniMax-H3** now supports T2VA, FL2VA, and Ref2VA with both [FlowGRPO](examples/flowgrpo_trainer/minimax_h3/README.md) and [DiffusionNFT](examples/diffusionnft_trainer/minimax_h3/README.md).
 - **[2026-08]** 🎉 We have released [v0.2.0](https://github.com/verl-project/verl-omni/releases/tag/v0.2.0) for faster diffusion rl and more stable Qwen3-Omni multimodal training. Blog: [VeRL-Omni v0.2.0](https://verl-project.github.io/posts/2026-08-17-verl-omni-v0-2-0/)
 - **[2026-08]** [LTX2.3](examples/flowgrpo_trainer/ltx2/README.md) text-to-video+audio model is now supported with FlowGRPO.
 - **[2026-07]** Team-proposed algorithm [FlowGRPO with DiNa-LRM](https://verl-omni.readthedocs.io/en/latest/examples/flowgrpo_trainer_sd35_drm.html) is available. Training skips VAE decoding by scoring clean diffusion latents directly for faster and more resource-efficient model alignment.
@@ -131,13 +131,13 @@ Visit our [documentation](https://verl-omni.readthedocs.io/en/latest/index.html)
   <tr>
     <td rowspan="2"><b>MiniMax-H3</b></td>
     <td rowspan="2">Diffusion generator</td>
-    <td rowspan="2">Any → Video + Audio</td>
+    <td rowspan="2">Text / Image / Multimodal references → Video + Audio<br>(T2VA / FL2VA / Ref2VA)</td>
     <td>DiffusionNFT</td>
     <td>✅</td>
   </tr>
   <tr>
     <td>FlowGRPO</td>
-    <td>WIP</td>
+    <td>✅</td>
   </tr>
   <tr>
     <td><b>Boogu-Image</b></td>
