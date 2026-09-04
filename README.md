@@ -131,7 +131,7 @@ Visit our [documentation](https://verl-omni.readthedocs.io/en/latest/index.html)
   <tr>
     <td rowspan="2"><b>MiniMax-H3</b></td>
     <td rowspan="2">Diffusion generator</td>
-    <td rowspan="2">Any → Video + Audio<br>(T2VA / FL2VA / Ref2VA)</td>
+    <td rowspan="2">Any → Video + Audio</td>
     <td>DiffusionNFT</td>
     <td>✅</td>
   </tr>
