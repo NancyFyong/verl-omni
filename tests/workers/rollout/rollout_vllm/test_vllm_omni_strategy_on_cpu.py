@@ -351,6 +351,9 @@ def test_diffusion_strategy_uses_declared_audio_sample_rate(monkeypatch):
     assert processed.extra_fields["audio_sample_rate"] == 48000
     # process_output unbatches the leading dimension of auxiliary media.
     torch.testing.assert_close(processed.extra_fields["audio"], audio[0])
+    # The declared primary modality rides to downstream consumers so they read
+    # the media kind instead of inferring it from the tensor rank.
+    assert processed.extra_fields["media_kind"] == "video"
 
 
 def test_diffusion_strategy_omits_audio_sample_rate_without_declared_spec(monkeypatch):
@@ -371,6 +374,8 @@ def test_diffusion_strategy_omits_audio_sample_rate_without_declared_spec(monkey
 
     torch.testing.assert_close(processed.extra_fields["audio"], audio[0])
     assert "audio_sample_rate" not in processed.extra_fields
+    # No declared spec => no declared media kind is surfaced either.
+    assert "media_kind" not in processed.extra_fields
 
 
 @pytest.mark.parametrize(
