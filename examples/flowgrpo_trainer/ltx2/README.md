@@ -84,9 +84,10 @@ bash examples/flowgrpo_trainer/ltx2/run_ltx2_5_t2av_lora.sh
 
 The LTX-2.5 recipe uses `transformer_full`, the official Full/SFT sigma
 schedule, and the Diffusion VAE decoder. It defaults to 8 GPUs with rollout
-tensor parallel size 8, 512x384 training rollouts, and 960x544 validation.
-Only the Full/SFT one-stage T2AV path is supported. Distilled and two-stage
-pipelines use different sampling and adapter contracts and are rejected.
+tensor parallel size 1, 10-step 512x384 training rollouts, and 30-step 960x544
+validation. Only the Full/SFT one-stage T2AV path is supported. Distilled and
+two-stage pipelines use different sampling and adapter contracts and are
+rejected.
 
 FlowGRPO currently supports standard classifier-free guidance for this model.
 The rollout disables spatiotemporal, cross-modality, and guidance-rescale terms
@@ -118,11 +119,11 @@ The current scripts use a training batch size of 32, eight rollouts per prompt,
 a PPO mini-batch size of 16, and 100 total training steps by default. Outputs
 are written below `OUTPUT_DIR`, including checkpoints and timestamped logs.
 
-For each rollout, the recipe samples three non-contiguous SDE transitions from
-the step range `[0, 10)`. This is configured with `sde_window_size=3`,
-`sde_window_range=[0,10]`, and `sde_contiguous=False`. The default
-`sde_contiguous=True` retains the consecutive-window behavior used by existing
-diffusion recipes.
+For each rollout, the recipes sample three non-contiguous SDE transitions. The
+LTX-2.3 recipe selects from `[0, 10)`, while LTX-2.5 selects from `[0, 8)` of
+its 10 training steps. This is configured with `sde_window_size=3` and
+`sde_contiguous=False`. The default `sde_contiguous=True` retains the
+consecutive-window behavior used by existing diffusion recipes.
 
 The reference training recipe maintains a separate EMA evaluation copy.
 The current verl-omni FlowGRPO trainer evaluates and checkpoints the live LoRA
