@@ -58,6 +58,16 @@ __all__ = [
 ]
 
 
+def _resolve_profiler_configs(omega_profiler_config):
+    profiler_config = omega_conf_to_dataclass(omega_profiler_config, dataclass_type=ProfilerConfig)
+    tool = omega_profiler_config.get("tool", None)
+    if tool in {"npu", "nsys", "torch", "torch_memory", "precision_debugger"}:
+        tool_config = omega_conf_to_dataclass(omega_profiler_config.get("tool_config", {}).get(tool))
+    else:
+        tool_config = None
+    return profiler_config, tool_config
+
+
 @dataclass
 class DistillationPhaseComputation:
     """Scalar role losses and detached metrics produced by an architecture runner."""
@@ -293,12 +303,7 @@ class DiffusionDistillationWorker(Worker, DistProfilerExtension):
         self.config = config
         self.plan = plan
         self.device_name = get_device_name()
-        profiler_config = omega_conf_to_dataclass(
-            config.actor_rollout_ref.actor.get("profiler", {}), dataclass_type=ProfilerConfig
-        )
-        tool_config = None
-        if profiler_config is not None:
-            tool_config = profiler_config.tool_config.get(profiler_config.tool, {})
+        profiler_config, tool_config = _resolve_profiler_configs(config.actor_rollout_ref.actor.get("profiler", {}))
         DistProfilerExtension.__init__(
             self,
             DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config),
