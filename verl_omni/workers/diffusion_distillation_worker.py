@@ -27,6 +27,7 @@ from typing import Optional, Protocol, runtime_checkable
 import torch
 from omegaconf import DictConfig
 from tensordict import TensorDict
+from verl.protocol import DataProtoFuture
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.utils import tensordict_utils as tu
@@ -532,6 +533,8 @@ class DiffusionDistillationWorkerGroup:
         batch = batch.copy()
         tu.assign_non_tensor(batch, phase_request=request)
         output = self.worker_group.execute_phase(batch)
+        if isinstance(output, DataProtoFuture):
+            output = output.get()
         metrics = dict(tu.get(output, "metrics"))
         optimizer_steps = dict(tu.get(output, "optimizer_steps"))
         return PhaseResult(metrics=metrics, optimizer_steps=optimizer_steps)

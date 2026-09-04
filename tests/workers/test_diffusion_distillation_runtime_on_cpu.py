@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from omegaconf import OmegaConf
+from verl.protocol import DataProtoFuture
 from verl.utils import tensordict_utils as tu
 
 from verl_omni.trainer.diffusion.distillation.contracts import PhaseRequest
@@ -393,3 +394,22 @@ class TestWorkerGroupFacade:
         result = facade.execute_phase(request, tu.get_tensordict({}, {}))
         assert result.metrics == {"loss": 1.25}
         assert result.optimizer_steps == {"student": 1}
+
+    def test_future_result_is_resolved_before_conversion(self, monkeypatch):
+        output = tu.get_tensordict(
+            tensor_dict={},
+            non_tensor_dict={"metrics": {"loss": 2.5}, "optimizer_steps": {"fake_score": 1}},
+        )
+        monkeypatch.setattr(DataProtoFuture, "get", lambda self: output)
+
+        class _WorkerGroup:
+            def execute_phase(self, batch):
+                del batch
+                return DataProtoFuture(collect_fn=None, futures=[])
+
+        facade = DiffusionDistillationWorkerGroup(_WorkerGroup())
+        request = PhaseRequest("fake_score", 0, 0, "fresh", ("fake_score",), False)
+        result = facade.execute_phase(request, tu.get_tensordict({}, {}))
+
+        assert result.metrics == {"loss": 2.5}
+        assert result.optimizer_steps == {"fake_score": 1}
