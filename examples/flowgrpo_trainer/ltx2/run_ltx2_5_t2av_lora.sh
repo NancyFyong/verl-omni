@@ -2,7 +2,7 @@
 # LTX-2.5 Full/SFT one-stage text-to-audio-video LoRA FlowGRPO recipe.
 set -x
 
-export WANDB_MODE=${WANDB_MODE:-offline}
+export WANDB_MODE=${WANDB_MODE:-online}
 
 WORKSPACE=${WORKSPACE:-$HOME}
 MODEL_PATH=${MODEL_PATH:-Lightricks/LTX-2.5-Diffusers}
