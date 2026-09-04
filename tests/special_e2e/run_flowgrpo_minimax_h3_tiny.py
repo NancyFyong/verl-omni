@@ -12,14 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MiniMax-H3 T2VA and FL2VA FlowGRPO GPU smoke runner.
+"""MiniMax-H3 T2VA, FL2VA, and Ref2VA FlowGRPO GPU smoke runner.
 
 Assembles one minimal ``verl_omni.trainer.main_diffusion`` invocation per task
 with a self-contained tiny random-weight MiniMax-H3 checkpoint, synthetic
 parquet data, a deterministic test-local joint video/audio reward, CPS
 reverse-SDE rollout transitions and log-probabilities, and a one-step
 policy-gradient actor update. FL2VA uses an embedded PNG first-frame condition
-and ``frame_indices=[0]`` to exercise its fixed-row replay mask.
+and ``frame_indices=[0]`` to exercise its fixed-row replay mask. Ref2VA uses a
+single embedded PNG reference image and ``pipeline.task=ref2va`` to exercise the
+reference-block layout, condition-anchor replay, and target-only scoring path.
 
 Usage:
     python tests/special_e2e/run_flowgrpo_minimax_h3_tiny.py \
@@ -48,6 +50,7 @@ from tests.special_e2e.build_minimax_h3_tiny_random import (  # noqa: E402
 )
 from tests.special_e2e.build_minimax_h3_tiny_random import ensure_tiny_minimax_h3_checkpoint  # noqa: E402
 from tests.special_e2e.create_dummy_h3_fl2va_data import build_dummy_h3_fl2va_data  # noqa: E402
+from tests.special_e2e.create_dummy_h3_ref2va_data import build_dummy_h3_ref2va_data  # noqa: E402
 from tests.special_e2e.create_dummy_h3_t2av_data import build_dummy_h3_data  # noqa: E402
 
 _DEFAULT_DATA_DIR = os.path.expanduser("~/data/dummy_h3_flowgrpo")
@@ -96,10 +99,13 @@ def _hydra_overrides(
 ) -> list[str]:
     """Build a minimal task-specific MiniMax H3 FlowGRPO Hydra invocation."""
     micro_bsz_per_gpu = 1
-    n_resp_per_prompt = 2
+    # MiniMax H3 FlowGRPO supports one output per request, so Ref2VA (which
+    # runs through the same rollout adapter) uses a single prompt response.
+    n_resp_per_prompt = 1 if task == "ref2va" else 2
     mini_bsz = max(1, num_gpus * micro_bsz_per_gpu)
     train_batch_size = mini_bsz * n_resp_per_prompt
-    fl2va = f"{tiny_model_dir}/FL2VA"
+    partition_dir = "Ref2VA" if task == "ref2va" else "FL2VA"
+    fl2va = f"{tiny_model_dir}/{partition_dir}"
     actor_transformer = f"{tiny_model_dir}/transformer"
     h3_lora_targets = "['to_q','to_k','to_v','to_out.0','ff.net.0.proj','ff.net.2']"
 
@@ -224,6 +230,8 @@ def _hydra_overrides(
                 "actor_rollout_ref.rollout.val_kwargs.pipeline.frame_indices=[0]",
             ]
         )
+    elif task == "ref2va":
+        overrides.append("actor_rollout_ref.rollout.pipeline.reference_image_short_edge=256")
     return overrides
 
 
@@ -245,7 +253,7 @@ def run_smoke(
     force_rebuild: bool,
 ) -> int:
     """Run one task-specific MiniMax H3 FlowGRPO training step."""
-    if task not in {"t2va", "fl2va"}:
+    if task not in {"t2va", "fl2va", "ref2va"}:
         raise ValueError(f"unsupported MiniMax H3 FlowGRPO smoke task: {task!r}")
 
     tiny_model_dir = os.path.expanduser(tiny_model_dir)
@@ -257,7 +265,9 @@ def run_smoke(
     ensure_tiny_minimax_h3_checkpoint(tiny_model_dir, skip_if_exists=not force_rebuild)
 
     micro_bsz_per_gpu = 1
-    n_resp_per_prompt = 2
+    # Match the rollout n in ``_hydra_overrides``: Ref2VA supports one output per
+    # request, while T2VA and FL2VA sample two responses per prompt.
+    n_resp_per_prompt = 1 if task == "ref2va" else 2
     train_batch_size = max(1, num_gpus * micro_bsz_per_gpu) * n_resp_per_prompt
     print(f"[2/3] ensuring dummy {task} parquet at {data_dir}", flush=True)
     if task == "t2va":
@@ -266,12 +276,22 @@ def run_smoke(
             train_size=train_batch_size,
             val_size=2,
         )
-    else:
+    elif task == "fl2va":
         train_parquet, val_parquet = build_dummy_h3_fl2va_data(
             data_dir,
             train_size=train_batch_size,
             val_size=2,
             # vLLM-Omni requires each source condition-image side to be >=256.
+            image_width=max(width, 256),
+            image_height=max(height, 256),
+        )
+    else:
+        # Ref2VA reference images must be >=256 per side and have a short edge
+        # of 256, the smallest value vLLM-Omni accepts.
+        train_parquet, val_parquet = build_dummy_h3_ref2va_data(
+            data_dir,
+            train_size=train_batch_size,
+            val_size=2,
             image_width=max(width, 256),
             image_height=max(height, 256),
         )
@@ -311,14 +331,16 @@ def run_smoke(
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run tiny MiniMax-H3 T2VA and FL2VA FlowGRPO GPU smoke coverage.")
+    parser = argparse.ArgumentParser(
+        description="Run tiny MiniMax-H3 T2VA, FL2VA, and Ref2VA FlowGRPO GPU smoke coverage."
+    )
     parser.add_argument("--tiny-model-dir", default=os.environ.get("MODEL_PATH", _DEFAULT_TINY_MODEL_DIR))
     parser.add_argument("--data-dir", default=os.environ.get("DATA_DIR", _DEFAULT_DATA_DIR))
     parser.add_argument(
         "--task",
-        choices=("all", "t2va", "fl2va"),
+        choices=("all", "t2va", "fl2va", "ref2va"),
         default=os.environ.get("TASK", "all"),
-        help="Run both coverage paths (default) or one task while debugging.",
+        help="Run all coverage paths (default) or one task while debugging.",
     )
     parser.add_argument(
         "--output-dir",
@@ -341,7 +363,7 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     _require_minimax_h3_diffusers()
-    tasks = ("t2va", "fl2va") if args.task == "all" else (args.task,)
+    tasks = ("t2va", "fl2va", "ref2va") if args.task == "all" else (args.task,)
     for index, task in enumerate(tasks, start=1):
         print(f"===== MiniMax-H3 FlowGRPO {task.upper()} smoke ({index}/{len(tasks)}) =====", flush=True)
         rc = run_smoke(
@@ -362,7 +384,7 @@ def main() -> None:
         )
         if rc != 0:
             sys.exit(rc)
-    print("MiniMax-H3 tiny FlowGRPO T2VA + FL2VA smoke PASSED.")
+    print("MiniMax-H3 tiny FlowGRPO T2VA + FL2VA + Ref2VA smoke PASSED.")
 
 
 if __name__ == "__main__":

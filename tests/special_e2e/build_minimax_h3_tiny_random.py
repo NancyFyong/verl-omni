@@ -32,8 +32,9 @@ The builder expands the affected DiT projections with deterministic random
 weights, creates a compact one-layer Qwen3-VL with a 5120-wide output and a
 512-token vocabulary, and writes tiny local remote-code VAE stubs that
 implement vLLM-Omni's native VAE contract. The stubs preserve H3 latent
-geometry for T2VA, FL2VA image encoding, and video/audio decoding; they are
-intentionally not suitable for image or audio quality evaluation.
+geometry for T2VA, FL2VA image encoding, Ref2VA reference encoding, and
+video/audio decoding; they are intentionally not suitable for image or audio
+quality evaluation.
 
 Layout produced under ``<output-dir>``::
 
@@ -41,6 +42,14 @@ Layout produced under ``<output-dir>``::
       FL2VA/                         # vLLM-Omni rollout model path
         model_index.json
         transformer/                 # fused-config DiT + Diffusers weights
+        text_encoder/
+        tokenizer/
+        processor/
+        video_vae/                   # local tiny remote-code stub
+        audio_vae/                   # local tiny remote-code stub
+      Ref2VA/                        # vLLM-Omni Ref2VA rollout model path
+        model_index.json
+        transformer/
         text_encoder/
         tokenizer/
         processor/
@@ -83,7 +92,7 @@ _SEED = 42
 _VIDEO_LATENT_CHANNELS = 24
 _AUDIO_LATENT_CHANNELS = 32
 _PATCH_VOLUME = 4  # MiniMax-H3 uses a (1, 2, 2) video patch.
-_CHECKPOINT_FORMAT_VERSION = 3
+_CHECKPOINT_FORMAT_VERSION = 4
 _VLLM_TEXT_HIDDEN_SIZE = 5120
 _VLLM_TEXT_NUM_ATTENTION_HEADS = 64
 _VLLM_TEXT_NUM_KEY_VALUE_HEADS = 8
@@ -534,19 +543,64 @@ def _write_audio_vae(component_dir: Path) -> None:
     torch.save(namespace["TinyH3AudioVAE"](config).state_dict(), component_dir / "tiny_audio_vae.pt")
 
 
-def _write_model_index(path: Path) -> None:
+def _write_model_index(path: Path, *, partition: str, tasks: list[str]) -> None:
     # vLLM-Omni reads this release metadata and uses fixed subfolder names for
     # all components, so a full Diffusers component index is intentionally not
     # needed here.
     index = {
         "_class_name": "MiniMaxH3Pipeline",
         "_minimax_h3": {
-            "partition": "fl2va",
-            "tasks": ["t2va", "fl2va"],
+            "partition": partition,
+            "tasks": tasks,
             "sigma_shift_scales": {"video": 12.0, "audio": 3.0},
         },
     }
     path.write_text(json.dumps(index, indent=2) + "\n")
+
+
+def _write_partition(
+    output: Path,
+    name: str,
+    *,
+    partition: str,
+    tasks: list[str],
+    hf_root: Path,
+) -> Path:
+    """Write one self-contained MiniMax-H3 partition (FL2VA or Ref2VA).
+
+    The two partitions share the same component geometry; they differ only in
+    the partition directory name and the ``model_index.json`` release metadata
+    that tells vLLM-Omni which task set and base schedule to use.
+    """
+    component_dir = output / name
+    component_dir.mkdir()
+    _write_model_index(
+        component_dir / "model_index.json",
+        partition=partition,
+        tasks=tasks,
+    )
+    # vLLM-Omni needs the fused-arch schema while the actor needs the same
+    # expanded weights under Diffusers' schema.
+    diffusers_config = _expanded_transformer_config(hf_root / "transformer" / "config.json")
+    _write_expanded_transformer(
+        hf_root / "transformer",
+        component_dir / "transformer",
+        config=_make_fused_transformer_config(diffusers_config),
+        seed=_SEED,
+    )
+    special_token_ids = _write_vllm_tokenizer(
+        component_dir / "tokenizer",
+        hf_root / "tokenizer" / "chat_template.jinja",
+    )
+    _write_vllm_text_encoder(component_dir / "text_encoder", special_token_ids)
+    _copy_tree(hf_root / "processor", component_dir / "processor")
+    _copy_tokenizer_to_processor(component_dir / "tokenizer", component_dir / "processor")
+    # Qwen3VLProcessor requires this key even though the HF tiny processor
+    # snapshot only supplies the generic preprocessor metadata.
+    (component_dir / "processor" / "config.json").write_text(json.dumps({"model_type": "qwen3_vl"}) + "\n")
+    _write_video_vae(component_dir / "video_vae")
+    _write_audio_vae(component_dir / "audio_vae")
+    return component_dir
 
 
 def _checkpoint_is_complete(output_dir: Path) -> bool:
@@ -563,6 +617,15 @@ def _checkpoint_is_complete(output_dir: Path) -> bool:
         output_dir / "FL2VA" / "audio_vae" / "config.json",
         output_dir / "transformer" / "config.json",
         output_dir / "transformer" / "diffusion_pytorch_model.safetensors",
+        output_dir / "Ref2VA" / "model_index.json",
+        output_dir / "Ref2VA" / "transformer" / "config.json",
+        output_dir / "Ref2VA" / "transformer" / "diffusion_pytorch_model.safetensors",
+        output_dir / "Ref2VA" / "text_encoder" / "config.json",
+        output_dir / "Ref2VA" / "text_encoder" / "model.safetensors",
+        output_dir / "Ref2VA" / "tokenizer" / "tokenizer.json",
+        output_dir / "Ref2VA" / "processor" / "tokenizer.json",
+        output_dir / "Ref2VA" / "video_vae" / "config.json",
+        output_dir / "Ref2VA" / "audio_vae" / "config.json",
     )
     if not all(path.is_file() for path in required):
         return False
@@ -596,19 +659,22 @@ def ensure_tiny_minimax_h3_checkpoint(
         shutil.rmtree(output)
     output.mkdir(parents=True)
 
-    fl2va = output / "FL2VA"
-    fl2va.mkdir()
-    _write_model_index(fl2va / "model_index.json")
-
+    _write_partition(
+        output,
+        "FL2VA",
+        partition="fl2va",
+        tasks=["t2va", "fl2va"],
+        hf_root=hf_root,
+    )
+    _write_partition(
+        output,
+        "Ref2VA",
+        partition="ref2va",
+        tasks=["ref2va"],
+        hf_root=hf_root,
+    )
     # Both vLLM-Omni and the actor need the exact same expanded weight geometry,
     # but they consume different config schemas.
-    diffusers_config = _expanded_transformer_config(hf_root / "transformer" / "config.json")
-    _write_expanded_transformer(
-        hf_root / "transformer",
-        fl2va / "transformer",
-        config=_make_fused_transformer_config(diffusers_config),
-        seed=_SEED,
-    )
     actor_config = _expanded_transformer_config(hf_root / "transformer_ref" / "config.json")
     _write_expanded_transformer(
         hf_root / "transformer_ref",
@@ -616,20 +682,6 @@ def ensure_tiny_minimax_h3_checkpoint(
         config=actor_config,
         seed=_SEED + 1,
     )
-
-    special_token_ids = _write_vllm_tokenizer(
-        fl2va / "tokenizer",
-        hf_root / "tokenizer" / "chat_template.jinja",
-    )
-    _write_vllm_text_encoder(fl2va / "text_encoder", special_token_ids)
-    _copy_tree(hf_root / "processor", fl2va / "processor")
-    _copy_tokenizer_to_processor(fl2va / "tokenizer", fl2va / "processor")
-    # Qwen3VLProcessor requires this key even though the HF tiny processor
-    # snapshot only supplies the generic preprocessor metadata.
-    (fl2va / "processor" / "config.json").write_text(json.dumps({"model_type": "qwen3_vl"}) + "\n")
-
-    _write_video_vae(fl2va / "video_vae")
-    _write_audio_vae(fl2va / "audio_vae")
     (output / "tiny_checkpoint.json").write_text(
         json.dumps(
             {
