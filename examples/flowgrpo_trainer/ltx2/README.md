@@ -1,13 +1,12 @@
-# LTX-2.3 text-to-audio-video FlowGRPO
+# LTX-2.x text-to-audio-video FlowGRPO
 
-Last updated: 08/21/2026
+Last updated: 09/04/2026
 
-This recipe trains `dg845/LTX-2.3-Diffusers` LoRA adapters with a diffusers +
-FSDP actor, vLLM-Omni rollout, joint audio-video CPS transitions, and the CLAP
-plus ImageBind rewards.
-The checkpoint advertises `_class_name: LTX2Pipeline`; the registered rollout
-adapter uses vLLM-Omni's LTX-2.3-specific `LTX23Pipeline` implementation behind
-that checkpoint architecture key.
+These recipes train LoRA adapters with a Diffusers actor, vLLM-Omni rollout,
+joint audio-video CPS transitions, and the CLAP plus ImageBind rewards. They
+support `dg845/LTX-2.3-Diffusers` and the Full/SFT one-stage
+`Lightricks/LTX-2.5-Diffusers` checkpoint. Both checkpoints advertise
+`_class_name: LTX2Pipeline`, so they share a version-aware adapter pair.
 
 ## Prepare data
 
@@ -64,14 +63,37 @@ Review the ImageBind license before enabling this reward in your environment.
 
 ## Launch
 
-### GPU
+### LTX-2.3 GPU
 
 ```bash
 bash examples/flowgrpo_trainer/ltx2/run_ltx2_3_t2av_lora.sh
 ```
 
-The GPU recipe defaults to 8 GPUs, vLLM-Omni tensor parallel size 2, and one
-reward worker. CLAP and ImageBind run on `cuda:0` and `cuda:1`, respectively.
+The LTX-2.3 GPU recipe defaults to 8 GPUs, vLLM-Omni tensor parallel size 2,
+and one reward worker. CLAP and ImageBind run on `cuda:0` and `cuda:1`,
+respectively.
+
+### LTX-2.5 Full/SFT GPU
+
+Accept the gated model license before launching:
+
+```bash
+hf auth login
+bash examples/flowgrpo_trainer/ltx2/run_ltx2_5_t2av_lora.sh
+```
+
+The LTX-2.5 recipe uses `transformer_full`, the official Full/SFT sigma
+schedule, and the Diffusion VAE decoder. It defaults to 8 GPUs with rollout
+tensor parallel size 8, 512x384 training rollouts, and 960x544 validation.
+Only the Full/SFT one-stage T2AV path is supported. Distilled and two-stage
+pipelines use different sampling and adapter contracts and are rejected.
+
+FlowGRPO currently supports standard classifier-free guidance for this model.
+The rollout disables spatiotemporal, cross-modality, and guidance-rescale terms
+so actor replay computes the same policy density as generation.
+
+LTX-2.5 weights use the LTX-2.x Community License rather than the repository's
+Apache-2.0 license. Review and accept that license before use.
 
 ### Ascend NPU
 
@@ -84,11 +106,13 @@ worker, and reward devices `npu:0` and `npu:1`. It sources the Ascend toolkit
 and ATB environment from `ASCEND_HOME_PATH`, which defaults to
 `/usr/local/Ascend/ascend-toolkit`.
 
-Both launch scripts accept `WORKSPACE`, `MODEL_PATH`, `DATA_DIR`, `OUTPUT_DIR`,
+All launch scripts accept `WORKSPACE`, `MODEL_PATH`, `DATA_DIR`, `OUTPUT_DIR`,
 `NUM_GPUS`, `ROLLOUT_TP`, `TOTAL_TRAINING_STEPS`, and `WANDB_MODE` through
-environment variables. The NPU script additionally accepts `ASCEND_HOME_PATH`,
+environment variables. The LTX-2.5 script additionally accepts
+`CLAP_MODEL_PATH`, `IMAGEBIND_MODEL_PATH`, `CLAP_DEVICE`, and
+`IMAGEBIND_DEVICE`. The NPU script accepts `ASCEND_HOME_PATH`,
 `CLAP_MODEL_PATH`, `IMAGEBIND_MODEL_PATH`, `REWARD_DEVICE`, and
-`REWARD_NUM_WORKERS`. Extra Hydra overrides can be appended to either command.
+`REWARD_NUM_WORKERS`. Extra Hydra overrides can be appended to any command.
 
 The current scripts use a training batch size of 32, eight rollouts per prompt,
 a PPO mini-batch size of 16, and 100 total training steps by default. Outputs

@@ -20,18 +20,27 @@ import torch
 from tensordict import TensorDict
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.ltx2.ltx2_conditioning import LTXPromptContext
+from vllm_omni.diffusion.models.ltx2.ltx2_guidance import LTX_GUIDANCE_EXECUTOR
 from vllm_omni.diffusion.models.ltx2.ltx2_latents import LTXAVState
+from vllm_omni.diffusion.models.ltx2.ltx2_recipes import LTX25_FULL_RECIPE
+from vllm_omni.diffusion.models.ltx2.ltx2_request import _resolve_guidance_spec
+from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 from verl_omni.pipelines.ltx2_flow_grpo.agent_loop import _messages_to_text
 from verl_omni.pipelines.ltx2_flow_grpo.common import (
     LTX2_LORA_TARGET_MODULES,
     apply_x0_cfg,
     calculate_shift,
+    forward_ltx_transformer,
+    is_ltx25_transformer_config,
+    set_ltx25_timesteps,
 )
 from verl_omni.pipelines.ltx2_flow_grpo.diffusers_training_adapter import LTX23FlowGRPO
 from verl_omni.pipelines.ltx2_flow_grpo.vllm_omni_rollout_adapter import LTX23PipelineWithLogProb
 from verl_omni.pipelines.model_base import DiffusionModelBase, VllmOmniPipelineBase
+from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 
 
 def test_ltx2_reference_lora_targets_are_complete() -> None:
@@ -53,6 +62,125 @@ def test_ltx2_x0_cfg_and_resolution_dependent_shift() -> None:
     sigma = torch.tensor([[[0.5]]])
     assert torch.equal(apply_x0_cfg(sample, positive, negative, sigma, 4.0), torch.tensor([[[5.0]]]))
     assert calculate_shift(6144, 1024, 4096, 0.95, 2.05) > 2.05
+
+
+def test_ltx25_lora_requires_full_transformer() -> None:
+    config = SimpleNamespace(
+        transformer_config={"ff_bias": False},
+        config_path=None,
+        transformer_subfolder="transformer",
+    )
+
+    with pytest.raises(ValueError, match="transformer_full"):
+        LTX23FlowGRPO.validate_lora_config(config)
+
+    config.transformer_subfolder = "transformer_full"
+    LTX23FlowGRPO.validate_lora_config(config)
+
+
+def test_ltx25_simple_cfg_matches_vllm_omni() -> None:
+    sample = torch.randn(1, 5, 4)
+    positive = torch.randn_like(sample)
+    negative = torch.randn_like(sample)
+    sigma = torch.tensor(0.8)
+
+    actual = apply_x0_cfg(sample, positive, negative, sigma, 3.0)
+    expected = LTX_GUIDANCE_EXECUTOR.combine_cfg_velocity(sample, positive, negative, sigma, 3.0)
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_ltx25_transformer_config_and_official_sigmas() -> None:
+    from vllm_omni.diffusion.models.ltx2.ltx2_denoise import _official_ltx_sigmas
+
+    config = {
+        "base_image_seq_len": 1024,
+        "max_image_seq_len": 4096,
+        "base_shift": 0.95,
+        "max_shift": 2.05,
+        "shift_terminal": 0.1,
+        "num_train_timesteps": 1000,
+    }
+    scheduler = SimpleNamespace(config=config, sigmas=None, timesteps=None)
+
+    assert is_ltx25_transformer_config({"ff_bias": False})
+    assert not is_ltx25_transformer_config({"ff_bias": True})
+    set_ltx25_timesteps(scheduler, 4, torch.device("cpu"))
+
+    expected = _official_ltx_sigmas(SimpleNamespace(config=config), 4, torch.device("cpu"))
+    torch.testing.assert_close(scheduler.sigmas, expected)
+    torch.testing.assert_close(scheduler.timesteps, expected[:-1] * 1000)
+    assert scheduler.num_inference_steps == 4
+    assert scheduler._step_index is None
+    assert scheduler._begin_index is None
+
+
+def test_ltx25_rollout_and_actor_log_probs_match() -> None:
+    config = {
+        "base_image_seq_len": 1024,
+        "max_image_seq_len": 4096,
+        "base_shift": 0.95,
+        "max_shift": 2.05,
+        "shift_terminal": 0.1,
+        "num_train_timesteps": 1000,
+    }
+    rollout_scheduler = FlowMatchSDEDiscreteScheduler.from_config(config)
+    actor_scheduler = FlowMatchSDEDiscreteScheduler.from_config(config)
+    set_ltx25_timesteps(rollout_scheduler, 4, torch.device("cpu"))
+    set_ltx25_timesteps(actor_scheduler, 4, torch.device("cpu"))
+    sample = torch.randn(2, 8, 4)
+    model_output = torch.randn_like(sample)
+    timestep = rollout_scheduler.timesteps[:1].expand(2)
+
+    next_sample, rollout_log_prob, _, _ = rollout_scheduler.step(
+        model_output,
+        timestep[0],
+        sample,
+        generator=torch.Generator().manual_seed(42),
+        noise_level=0.8,
+        sde_type="cps",
+        return_logprobs=True,
+        return_dict=False,
+    )
+    _, actor_log_prob, _, _ = actor_scheduler.sample_previous_step(
+        sample=sample,
+        model_output=model_output,
+        timestep=timestep,
+        prev_sample=next_sample,
+        noise_level=0.8,
+        sde_type="cps",
+        return_logprobs=True,
+    )
+
+    torch.testing.assert_close(actor_log_prob, rollout_log_prob)
+
+
+def test_ltx25_actor_applies_first_frame_embedding() -> None:
+    class Transformer(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(use_keyframes_abs_pos_embedding=True)
+            self.proj_in = torch.nn.Linear(2, 2, bias=False)
+            self.keyframes_abs_pos_embedding = torch.nn.Parameter(torch.tensor([[2.0, 3.0]]))
+            with torch.no_grad():
+                self.proj_in.weight.copy_(torch.eye(2))
+
+        def forward(self, hidden_states, audio_hidden_states, **_kwargs):
+            return self.proj_in(hidden_states), audio_hidden_states
+
+    module = Transformer()
+    model_inputs = {
+        "hidden_states": torch.zeros(1, 6, 2),
+        "audio_hidden_states": torch.ones(1, 2, 2),
+        "num_frames": 3,
+    }
+
+    video, audio = forward_ltx_transformer(module, model_inputs)
+
+    torch.testing.assert_close(video[:, :2], torch.tensor([[[2.0, 3.0], [2.0, 3.0]]]))
+    torch.testing.assert_close(video[:, 2:], torch.zeros(1, 4, 2))
+    torch.testing.assert_close(audio, torch.ones(1, 2, 2))
+    assert not module.proj_in._forward_hooks
 
 
 def test_ltx2_raw_prompt_normalization() -> None:
@@ -98,8 +226,62 @@ def test_ltx2_training_adapter_splits_joint_latents() -> None:
     )
     assert positive["hidden_states"].shape == (batch_size, 5, 128)
     assert positive["audio_hidden_states"].shape == (batch_size, 7, 128)
-    assert positive["timestep"].tolist() == [700.0, 700.0]
+    assert positive["timestep"].shape == (batch_size, 5)
+    assert positive["audio_timestep"].shape == (batch_size, 7)
+    torch.testing.assert_close(positive["sigma"], torch.full((batch_size,), 700.0))
+    torch.testing.assert_close(positive["audio_sigma"], torch.full((batch_size,), 700.0))
+    assert positive["encoder_attention_mask"] is None
+    assert positive["audio_encoder_attention_mask"] is None
     assert negative is None
+
+
+def test_ltx2_training_cfg_keeps_the_request_batch_dimension(monkeypatch) -> None:
+    video_latents = torch.randn(1, 3, 2)
+    audio_latents = torch.randn(1, 2, 2)
+    model_inputs = {
+        "hidden_states": video_latents,
+        "audio_hidden_states": audio_latents,
+        "timestep": torch.full((1, 3), 700.0),
+        "sigma": torch.tensor([700.0]),
+    }
+    negative_model_inputs = dict(model_inputs)
+    predictions = iter(
+        [
+            (torch.ones_like(video_latents), torch.ones_like(audio_latents)),
+            (torch.zeros_like(video_latents), torch.zeros_like(audio_latents)),
+        ]
+    )
+    monkeypatch.setattr(LTX23FlowGRPO, "_predict", lambda *_args: next(predictions))
+    scheduler = MagicMock()
+    scheduler.sample_previous_step.return_value = (
+        torch.zeros(1, 5, 2),
+        torch.zeros(1),
+        torch.zeros(1, 5, 2),
+        torch.zeros(1, 1, 1),
+        torch.zeros(1),
+    )
+    config = SimpleNamespace(
+        pipeline=SimpleNamespace(guidance_scale=3.0),
+        algo=SimpleNamespace(noise_level=0.8, sde_type="cps"),
+    )
+    scheduler_inputs = {
+        "all_next_latents": torch.zeros(1, 1, 5, 2),
+        "all_timesteps": torch.tensor([[700.0]]),
+    }
+
+    LTX23FlowGRPO.forward_and_sample_previous_step(
+        module=None,
+        scheduler=scheduler,
+        model_config=config,
+        model_inputs=model_inputs,
+        negative_model_inputs=negative_model_inputs,
+        scheduler_inputs=scheduler_inputs,
+        step=0,
+    )
+
+    scheduler_kwargs = scheduler.sample_previous_step.call_args.kwargs
+    assert scheduler_kwargs["sample"].shape == (1, 5, 2)
+    assert scheduler_kwargs["model_output"].shape == (1, 5, 2)
 
 
 def test_ltx2_non_contiguous_sde_step_selection_is_seeded() -> None:
@@ -123,6 +305,7 @@ def test_ltx2_rollout_adapter_configure_flow_grpo() -> None:
     req = SimpleNamespace(
         sampling_params=SimpleNamespace(
             output_type="image",
+            guidance_scale=4.0,
             extra_args={
                 "noise_level": 0.5,
                 "sde_type": "cps",
@@ -144,6 +327,46 @@ def test_ltx2_rollout_adapter_configure_flow_grpo() -> None:
     assert pipeline._flow_grpo_sde_contiguous is True
     assert pipeline._flow_grpo_logprobs is True
     assert pipeline._flow_grpo_seed == 104
+    assert req.sampling_params.extra_args["video_cfg_scale"] == 4.0
+    assert req.sampling_params.extra_args["audio_cfg_scale"] == 4.0
+    assert req.sampling_params.extra_args["video_stg_scale"] == 0.0
+    assert req.sampling_params.extra_args["audio_modality_scale"] == 1.0
+
+
+def test_ltx25_rollout_uses_replayable_cfg() -> None:
+    pipeline = object.__new__(LTX23PipelineWithLogProb)
+    sampling_params = OmniDiffusionSamplingParams(
+        output_type="image",
+        guidance_scale=3.0,
+        guidance_scale_provided=True,
+    )
+
+    pipeline._configure_flow_grpo(SimpleNamespace(sampling_params=sampling_params))
+    guidance = _resolve_guidance_spec(
+        sampling_params,
+        LTX25_FULL_RECIPE.request_guidance,
+        guidance_scale=None,
+    )
+
+    assert guidance.video.cfg_scale == 3.0
+    assert guidance.audio.cfg_scale == 3.0
+    assert not guidance.do_stg
+    assert not guidance.do_modality_guidance
+    assert not guidance.do_rescale
+
+
+def test_ltx2_rollout_rejects_guidance_the_actor_cannot_replay() -> None:
+    pipeline = object.__new__(LTX23PipelineWithLogProb)
+    req = SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            output_type="pt",
+            guidance_scale=3.0,
+            extra_args={"video_stg_scale": 1.0},
+        )
+    )
+
+    with pytest.raises(NotImplementedError, match="video_stg_scale"):
+        pipeline._configure_flow_grpo(req)
 
 
 def test_ltx2_rollout_adapter_inject_precomputed_prompt_embeds() -> None:
@@ -177,6 +400,55 @@ def test_ltx2_rollout_adapter_inject_precomputed_prompt_embeds() -> None:
     assert req.prompt["negative_prompt_embeds"].shape == (128, 64)
 
 
+def test_ltx2_rollout_run_phase_delegates_to_current_runtime(monkeypatch) -> None:
+    pipeline = object.__new__(LTX23PipelineWithLogProb)
+    pipeline.device = torch.device("cpu")
+    pipeline._flow_grpo_window_size = 1
+    pipeline._flow_grpo_window_range = [0, 2]
+    pipeline._flow_grpo_sde_contiguous = True
+    pipeline._flow_grpo_seed = 42
+    expected = object()
+
+    def fake_run_phase(self, *_args, **kwargs):
+        assert kwargs["phase_recipe"].sampler == "euler"
+        self._current_latents = [torch.zeros(1, 4, 2)]
+        self._next_latents = [torch.ones(1, 4, 2)]
+        self._selected_timesteps = [torch.tensor(500.0)]
+        self._log_probs = [torch.tensor([0.25])]
+        self._flow_grpo_video_seq_len = 3
+        return expected
+
+    monkeypatch.setattr(LTX2Pipeline, "run_phase", fake_run_phase)
+    result = pipeline.run_phase(
+        MagicMock(),
+        SimpleNamespace(num_inference_steps=2),
+        noise_scale=1.0,
+        sigmas=None,
+        timesteps=None,
+        attention_kwargs=None,
+        phase_recipe=SimpleNamespace(sampler="euler", adapter_slot=None),
+    )
+
+    assert result is expected
+    assert pipeline._flow_grpo_trajectory["video_seq_len"].item() == 3
+    assert pipeline._flow_grpo_trajectory["all_latents"].shape == (1, 1, 4, 2)
+
+
+def test_ltx2_rollout_rejects_distilled_phase() -> None:
+    pipeline = object.__new__(LTX23PipelineWithLogProb)
+
+    with pytest.raises(NotImplementedError, match="Full/SFT one-stage"):
+        pipeline.run_phase(
+            MagicMock(),
+            SimpleNamespace(num_inference_steps=8),
+            noise_scale=1.0,
+            sigmas=None,
+            timesteps=None,
+            attention_kwargs=None,
+            phase_recipe=SimpleNamespace(sampler="euler_ancestral", adapter_slot=None),
+        )
+
+
 def test_ltx2_rollout_denoise_step_collects_sde_trajectory() -> None:
     pipeline = object.__new__(LTX23PipelineWithLogProb)
     pipeline._flow_grpo_noise_level = 0.8
@@ -206,6 +478,7 @@ def test_ltx2_rollout_denoise_step_collects_sde_trajectory() -> None:
     forward_ctx = SimpleNamespace(
         request_inputs=SimpleNamespace(generator=None),
         guidance_parallel_ready=False,
+        original_audio_num_frames=7,
     )
     denoise_ctx = SimpleNamespace(latents=None, audio_latents=None)
 

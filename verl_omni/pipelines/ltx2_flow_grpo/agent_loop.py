@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""LTX-2.3 agent loop that matches the upstream raw-text tokenizer path."""
+"""LTX-2.x agent loop that matches the upstream raw-text tokenizer path."""
 
 from typing import Any
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Diffusers + FSDP2 training adapter for LTX-2.3 FlowGRPO."""
+"""Diffusers training adapter for LTX-2.3 and LTX-2.5 FlowGRPO."""
 
 from typing import Optional
 
@@ -26,7 +26,13 @@ from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 from verl_omni.workers.config import DiffusionModelConfig
 
-from .common import apply_x0_cfg, calculate_shift
+from .common import (
+    apply_x0_cfg,
+    calculate_shift,
+    forward_ltx_transformer,
+    is_ltx25_transformer_config,
+    set_ltx25_timesteps,
+)
 
 __all__ = ["LTX23FlowGRPO"]
 
@@ -34,18 +40,34 @@ __all__ = ["LTX23FlowGRPO"]
 def _single_int(value: torch.Tensor, name: str) -> int:
     values = value.reshape(-1)
     if values.numel() == 0 or not torch.all(values == values[0]):
-        raise ValueError(f"LTX-2.3 requires one shared {name} per micro-batch, got {values.tolist()}.")
+        raise ValueError(f"LTX requires one shared {name} per micro-batch, got {values.tolist()}.")
     return int(values[0].item())
 
 
 @DiffusionModelBase.register("LTX2Pipeline", algorithm="flow_grpo")
 class LTX23FlowGRPO(DiffusionModelBase):
-    """Recompute joint audio-video transition probabilities with diffusers."""
+    """Recompute joint LTX-2.3/2.5 audio-video transition probabilities."""
+
+    @classmethod
+    def validate_lora_config(cls, model_config: DiffusionModelConfig) -> None:
+        """Require the Full/SFT transformer for LTX-2.5 policy training."""
+        if (
+            is_ltx25_transformer_config(getattr(model_config, "transformer_config", None))
+            and not model_config.config_path
+            and model_config.transformer_subfolder != "transformer_full"
+        ):
+            raise ValueError("LTX-2.5 FlowGRPO requires model.transformer_subfolder=transformer_full.")
 
     @classmethod
     def build_scheduler(cls, model_config: DiffusionModelConfig) -> FlowMatchSDEDiscreteScheduler:
         """Load and configure the LTX flow-matching SDE scheduler."""
         scheduler = FlowMatchSDEDiscreteScheduler.from_pretrained(model_config.local_path, subfolder="scheduler")
+        if is_ltx25_transformer_config(getattr(model_config, "transformer_config", None)):
+            scheduler = FlowMatchSDEDiscreteScheduler.from_config(
+                scheduler.config,
+                use_dynamic_shifting=True,
+                shift_terminal=0.1,
+            )
         cls.set_timesteps(scheduler, model_config, get_device_name())
         return scheduler
 
@@ -56,8 +78,12 @@ class LTX23FlowGRPO(DiffusionModelBase):
         model_config: DiffusionModelConfig,
         device: str,
     ) -> None:
-        """Match the LTX-2.3 diffusers/vLLM-Omni sigma schedule."""
+        """Match the version-specific diffusers/vLLM-Omni sigma schedule."""
         num_steps = model_config.pipeline.num_inference_steps
+        if is_ltx25_transformer_config(getattr(model_config, "transformer_config", None)):
+            set_ltx25_timesteps(scheduler, num_steps, device)
+            return
+
         sigmas = np.linspace(1.0, 1.0 / num_steps, num_steps)
         latent_frames = (model_config.pipeline.num_frames - 1) // 8 + 1
         latent_height = model_config.pipeline.height // 32
@@ -90,7 +116,7 @@ class LTX23FlowGRPO(DiffusionModelBase):
         required = ["audio_prompt_embeds", "video_seq_len", "all_next_latents"]
         missing = [key for key in required if key not in micro_batch]
         if missing:
-            raise KeyError(f"LTX-2.3 FlowGRPO rollout is missing required fields: {missing}.")
+            raise KeyError(f"LTX FlowGRPO rollout is missing required fields: {missing}.")
 
         current = latents[:, step]
         timestep = timesteps[:, step]
@@ -106,8 +132,10 @@ class LTX23FlowGRPO(DiffusionModelBase):
         common = {
             "hidden_states": video_latents,
             "audio_hidden_states": audio_latents,
-            "timestep": timestep,
+            "timestep": timestep[:, None].expand(-1, video_latents.shape[1]),
+            "audio_timestep": timestep[:, None].expand(-1, audio_latents.shape[1]),
             "sigma": timestep,
+            "audio_sigma": timestep,
             "num_frames": latent_frames,
             "height": latent_height,
             "width": latent_width,
@@ -119,30 +147,30 @@ class LTX23FlowGRPO(DiffusionModelBase):
             **common,
             "encoder_hidden_states": prompt_embeds,
             "audio_encoder_hidden_states": micro_batch["audio_prompt_embeds"],
-            "encoder_attention_mask": prompt_embeds_mask,
-            "audio_encoder_attention_mask": prompt_embeds_mask,
+            "encoder_attention_mask": None,
+            "audio_encoder_attention_mask": None,
         }
 
         guidance_scale = model_config.pipeline.guidance_scale or 1.0
         if guidance_scale <= 1.0:
             return model_inputs, None
         if negative_prompt_embeds is None or negative_prompt_embeds_mask is None:
-            raise ValueError("LTX-2.3 CFG requires negative prompt embeddings and attention masks.")
+            raise ValueError("LTX CFG requires negative prompt embeddings and attention masks.")
         if "negative_audio_prompt_embeds" not in micro_batch:
-            raise KeyError("LTX-2.3 CFG requires `negative_audio_prompt_embeds` from rollout.")
+            raise KeyError("LTX CFG requires `negative_audio_prompt_embeds` from rollout.")
         negative_model_inputs = {
             **common,
             "encoder_hidden_states": negative_prompt_embeds,
             "audio_encoder_hidden_states": micro_batch["negative_audio_prompt_embeds"],
-            "encoder_attention_mask": negative_prompt_embeds_mask,
-            "audio_encoder_attention_mask": negative_prompt_embeds_mask,
+            "encoder_attention_mask": None,
+            "audio_encoder_attention_mask": None,
         }
         return model_inputs, negative_model_inputs
 
     @staticmethod
     def _predict(module: ModelMixin, model_inputs: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Run the LTX transformer and return float32 video/audio velocities."""
-        video_pred, audio_pred = module(**model_inputs)
+        video_pred, audio_pred = forward_ltx_transformer(module, model_inputs)
         return video_pred.float(), audio_pred.float()
 
     @classmethod
@@ -158,7 +186,7 @@ class LTX23FlowGRPO(DiffusionModelBase):
     ):
         """Recompute one selected CPS/SDE transition and its joint log-probability."""
         if scheduler_inputs is None:
-            raise ValueError("LTX-2.3 FlowGRPO requires rollout scheduler inputs.")
+            raise ValueError("LTX FlowGRPO requires rollout scheduler inputs.")
 
         video_latents = model_inputs["hidden_states"].float()
         audio_latents = model_inputs["audio_hidden_states"].float()
@@ -167,9 +195,9 @@ class LTX23FlowGRPO(DiffusionModelBase):
         guidance_scale = model_config.pipeline.guidance_scale or 1.0
         if guidance_scale > 1.0:
             if negative_model_inputs is None:
-                raise ValueError("LTX-2.3 CFG requires negative model inputs.")
+                raise ValueError("LTX CFG requires negative model inputs.")
             negative_video_pred, negative_audio_pred = cls._predict(module, negative_model_inputs)
-            sigma = (model_inputs["timestep"].float() / 1000.0).view(-1, 1, 1)
+            sigma = (model_inputs["sigma"].float() / 1000.0).view(-1, 1, 1)
             video_pred = apply_x0_cfg(video_latents, video_pred, negative_video_pred, sigma, guidance_scale)
             audio_pred = apply_x0_cfg(audio_latents, audio_pred, negative_audio_pred, sigma, guidance_scale)
 

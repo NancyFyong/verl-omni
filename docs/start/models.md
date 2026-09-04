@@ -1,6 +1,6 @@
 # Supported Models
 
-Last updated: 08/27/2026.
+Last updated: 09/04/2026.
 
 VeRL-Omni supports RL post-training for generative models across image, video,
 audio, and omni modalities. This page catalogues every model with a ready-to-run
@@ -127,25 +127,26 @@ The HPSv3 reward is the only validated configuration. Other reward functions
 (e.g. OCR, aesthetic score) can be plugged in by changing
 `reward.custom_reward_function`.
 
-### LTX-2.3
+### LTX-2.3 and LTX-2.5
 
 | Property | Detail |
 |----------|--------|
-| **Hugging Face ID** | `dg845/LTX-2.3-Diffusers` |
-| **Architecture** | LTX-2 DiT; checkpoint `_class_name` is `LTX2Pipeline` (rollout uses vLLM-Omni `LTX23Pipeline`) |
+| **Hugging Face IDs** | `dg845/LTX-2.3-Diffusers`, `Lightricks/LTX-2.5-Diffusers` |
+| **Architecture** | LTX-2 DiT; both checkpoints use `_class_name: LTX2Pipeline` |
 | **Modality** | Text → Video + Audio |
 | **Pipeline** | Flow-matching with joint audio-video CPS transitions |
 | **Default recipe** | `sde_window_size=3`, `sde_window_range=[0,10]`, `sde_contiguous=False` |
 
-For dataset layout and launch overrides, see
-[Examples - LTX-2.3 FlowGRPO](../../examples/flowgrpo_trainer/ltx2/README.md).
+For dataset layout, supported checkpoint variants, and launch overrides, see
+[Examples - LTX-2.x FlowGRPO](../../examples/flowgrpo_trainer/ltx2/README.md).
 
 **Supported trainers:**
 
 | Trainer | Example script | GPU config |
 |---------|---------------|------------|
-| Flow-GRPO (LoRA) | `examples/flowgrpo_trainer/ltx2/run_ltx2_3_t2av_lora.sh` | 8×GPU (TP=2) |
-| Flow-GRPO (LoRA, NPU) | `examples/flowgrpo_trainer/ltx2/run_ltx2_3_t2av_lora_npu.sh` | 16×NPU (TP=4) |
+| LTX-2.3 Flow-GRPO (LoRA) | `examples/flowgrpo_trainer/ltx2/run_ltx2_3_t2av_lora.sh` | 8×GPU (TP=2) |
+| LTX-2.3 Flow-GRPO (LoRA, NPU) | `examples/flowgrpo_trainer/ltx2/run_ltx2_3_t2av_lora_npu.sh` | 16×NPU (TP=4) |
+| LTX-2.5 Full/SFT Flow-GRPO (LoRA) | `examples/flowgrpo_trainer/ltx2/run_ltx2_5_t2av_lora.sh` | 8×GPU (TP=8) |
 
 **Reward models:** CLAP (`laion/larger_clap_general`) and ImageBind (local
 `.pth`, CC-BY-NC-SA 4.0) for audio-video alignment.

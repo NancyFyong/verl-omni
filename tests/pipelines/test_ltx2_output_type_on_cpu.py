@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU tests for the LTX-2.3 rollout output contract."""
+"""CPU tests for the LTX-2.x rollout output contract."""
 
 import importlib.util
 from pathlib import Path
