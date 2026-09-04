@@ -11,65 +11,91 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Ray driver shell for distribution-matching distillation.
+"""Ray-entrypoint-compatible shell around the pure distillation control plane.
 
-``DistillationRayTrainer`` is a sibling of the existing policy-gradient and
-direct-preference trainers and a thin shell over the pure
-:class:`DistillationTrainerControlPlane` (RFC §13.1).
-
-It reuses stateful dataloaders, tracking/validation logging, resource-pool
-creation, ``DistProfiler`` stage timers, checkpoint directory conventions, and
-optional rollout/``CheckpointEngineManager`` creation from the base trainer. It
-overrides worker construction from the validated role layout, the fit state
-machine, composite save/load, training metrics, and validation/semantic-role
-export.
-
-PR 1 delivers the control-plane wiring only. The multi-role data plane
-(``DiffusionDistillationWorkerGroup``, role-group engines, shared-base adapters,
-EMA, and composite checkpointing) lands in PR 2, at which point ``fit`` binds a
-real :class:`DistillationPhaseExecutor` instead of raising.
+PR 1 deliberately stops before model allocation. The shell accepts the same
+constructor protocol and lifecycle calls as the existing diffusion trainers so
+``algorithm.trainer_type=distillation`` reaches an explicit PR 2 boundary rather
+than failing with a Python signature error.
 """
 
 from __future__ import annotations
 
 from typing import Any, Optional
 
+from verl_omni.trainer.diffusion.diffusion_trainer_utils import validate_distillation_config
 from verl_omni.trainer.diffusion.distillation.contracts import DistillationPlan
 from verl_omni.trainer.diffusion.distillation.control_plane import DistillationTrainerControlPlane
+from verl_omni.trainer.diffusion.distillation.recipes import build_plan_from_config
 
 __all__ = ["DistillationRayTrainer"]
 
 
 class DistillationRayTrainer:
-    """Driver shell that owns a validated plan and drives the control plane.
-
-    PR 1 intentionally does not subclass ``BaseRayDiffusionTrainer`` at runtime,
-    because the base class constructs dataloaders, resource pools, and worker
-    groups that the PR 1 scope explicitly excludes. PR 2 promotes this shell to a
-    ``BaseRayDiffusionTrainer`` subclass once the multi-role data plane exists.
-    """
+    """Production-compatible driver shell for a validated distillation plan."""
 
     def __init__(
         self,
-        plan: DistillationPlan,
+        config=None,
+        tokenizer=None,
+        role_worker_mapping=None,
+        resource_pool_manager=None,
+        ray_worker_group_cls=None,
+        processor=None,
+        train_dataset=None,
+        val_dataset=None,
+        collate_fn=None,
+        train_sampler=None,
+        device_name=None,
+        *,
+        plan: Optional[DistillationPlan] = None,
+        capabilities: Optional[frozenset[str]] = None,
         executor: Optional[Any] = None,
         batch_provider: Optional[Any] = None,
         hooks: Optional[Any] = None,
     ) -> None:
+        if isinstance(config, DistillationPlan) and plan is None:
+            plan = config
+            config = None
+        if config is not None:
+            validate_distillation_config(config)
+        if plan is not None and config is not None and capabilities is not None:
+            raise ValueError("Pass either an explicit plan or config+capabilities, not both.")
+        if plan is None and config is not None and capabilities is not None:
+            plan = build_plan_from_config(config, capabilities)
+
+        self.config = config
+        self.tokenizer = tokenizer
+        self.processor = processor
+        self.role_worker_mapping = role_worker_mapping
+        self.resource_pool_manager = resource_pool_manager
+        self.ray_worker_group_cls = ray_worker_group_cls
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
+        self.collate_fn = collate_fn
+        self.train_sampler = train_sampler
+        self.device_name = device_name
         self.plan = plan
+        self.capabilities = capabilities
         self.executor = executor
         self.batch_provider = batch_provider
         self.hooks = hooks
         self._control_plane: Optional[DistillationTrainerControlPlane] = None
 
-    def build_control_plane(self) -> DistillationTrainerControlPlane:
-        """Construct the pure control plane from the plan and bound collaborators."""
+    def init_workers(self) -> None:
+        """Validate the PR 1 boundary before PR 2 supplies role-group workers."""
         if self.executor is None or self.batch_provider is None:
             raise NotImplementedError(
-                "The multi-role data plane (executor and batch provider) lands in PR 2. "
-                "PR 1 provides the control-plane contract; bind a DistillationPhaseExecutor "
-                "and a BatchProvider to drive real training."
+                "The multi-role distillation workers and architecture capability binding land in PR 2. "
+                "PR 1 accepts the production trainer interface but does not allocate model workers."
             )
+        if self.plan is None:
+            raise ValueError("A validated DistillationPlan is required when an executor is bound.")
+
+    def build_control_plane(self) -> DistillationTrainerControlPlane:
+        """Construct the pure control plane from a plan and bound collaborators."""
+        self.init_workers()
+        assert self.plan is not None
         self._control_plane = DistillationTrainerControlPlane(
             plan=self.plan,
             executor=self.executor,
@@ -85,10 +111,5 @@ class DistillationRayTrainer:
         return self._control_plane
 
     def fit(self, num_cycles: int = 0) -> None:
-        """Drive the training state machine.
-
-        PR 1 raises unless an executor and batch provider are bound, because the
-        multi-role data plane does not exist yet. There is no user-visible claim
-        of runnable DMD training in PR 1.
-        """
+        """Drive the injected CPU control plane; production data plane arrives in PR 2."""
         self.control_plane.run(num_cycles)

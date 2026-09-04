@@ -11,20 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests for the generic distillation trainer control plane.
+"""CPU tests for the generic distillation trainer control plane."""
 
-These tests use only the in-process fake executor: no model pipeline, Ray
-worker, FSDP model, or GPU runtime is imported (RFC §22.1, PR 1 acceptance).
-"""
+import ast
+from pathlib import Path
 
 import pytest
 
-from verl_omni.trainer.diffusion.distillation.contracts import (
-    DistillationPlan,
-    PhaseResult,
-    UpdatePhaseSpec,
-    UpdateSchedule,
-)
+from verl_omni.trainer.diffusion.distillation.contracts import PhaseResult, UpdatePhaseSpec, UpdateSchedule
 from verl_omni.trainer.diffusion.distillation.control_plane import (
     DistillationTrainerControlPlane,
     FakeBatchProvider,
@@ -36,8 +30,8 @@ from verl_omni.trainer.diffusion.distillation.recipes import build_plan
 CAPS = frozenset({"distribution_matching", "autoregressive", "adversarial"})
 
 
-def _plan(fake_repeats: int = 2, name: str = "dmd2") -> DistillationPlan:
-    return build_plan(name, {"fake_update_ratio": fake_repeats, "model_path": "/m"}, CAPS)
+def _plan(fake_repeats: int = 2, name: str = "dmd2", **config):
+    return build_plan(name, {"fake_update_ratio": fake_repeats, "model_path": "/m", **config}, CAPS)
 
 
 def _control_plane(plan=None, executor=None, hooks=None, batches: int = 1000):
@@ -53,149 +47,176 @@ def _control_plane(plan=None, executor=None, hooks=None, batches: int = 1000):
 
 class TestPhaseExpansion:
     def test_normal_cycle_is_student_then_k_fake(self):
-        cp, executor, _ = _control_plane(_plan(fake_repeats=3))
-        cp.run_cycle()
-        assert [r.kind for r in executor.executed] == ["student", "fake_score", "fake_score", "fake_score"]
+        control_plane, executor, _ = _control_plane(_plan(fake_repeats=3))
+        control_plane.run_cycle()
+        assert [request.kind for request in executor.executed] == [
+            "student",
+            "fake_score",
+            "fake_score",
+            "fake_score",
+        ]
 
     def test_deterministic_ordering_across_cycles(self):
-        cp, executor, _ = _control_plane(_plan(fake_repeats=2))
-        cp.run(3)
-        assert [r.kind for r in executor.executed] == ["student", "fake_score", "fake_score"] * 3
+        control_plane, executor, _ = _control_plane(_plan(fake_repeats=2))
+        control_plane.run(3)
+        assert [request.kind for request in executor.executed] == ["student", "fake_score", "fake_score"] * 3
 
     def test_repeat_index_is_per_phase(self):
-        cp, executor, _ = _control_plane(_plan(fake_repeats=3))
-        cp.run_cycle()
-        fake_repeats = [r.repeat_index for r in executor.executed if r.kind == "fake_score"]
+        control_plane, executor, _ = _control_plane(_plan(fake_repeats=3))
+        control_plane.run_cycle()
+        fake_repeats = [request.repeat_index for request in executor.executed if request.kind == "fake_score"]
         assert fake_repeats == [0, 1, 2]
 
-    def test_empty_schedule_raises(self):
-        plan = DistillationPlan(name="empty", update_schedule=UpdateSchedule(phases=()))
-        cp, _, _ = _control_plane(plan)
-        with pytest.raises(ValueError, match="empty cycle"):
-            cp.run_cycle()
+    def test_warmup_transitions_to_normal_cycle(self):
+        control_plane, executor, hooks = _control_plane(_plan(fake_repeats=2, fake_warmup_cycles=2))
+        first = control_plane.run_cycle()
+        second = control_plane.run_cycle()
+        third = control_plane.run_cycle()
+        assert first.is_warmup is True
+        assert second.is_warmup is True
+        assert third.is_warmup is False
+        assert [request.kind for request in executor.executed] == [
+            "fake_score",
+            "fake_score",
+            "fake_score",
+            "fake_score",
+            "student",
+            "fake_score",
+            "fake_score",
+        ]
+        assert [call["global_step"] for call in hooks.calls] == [1]
 
 
 class TestCounters:
-    def test_global_step_advances_once_per_student_update(self):
-        cp, _, _ = _control_plane(_plan(fake_repeats=2))
-        cp.run(4)
-        assert cp.counters.global_step == 4
+    def test_global_step_and_completed_cycles_advance(self):
+        control_plane, _, _ = _control_plane(_plan(fake_repeats=2))
+        control_plane.run(4)
+        assert control_plane.counters.global_step == 4
+        assert control_plane.counters.completed_cycles == 4
 
-    def test_role_optimizer_counters_accumulate(self):
-        cp, _, _ = _control_plane(_plan(fake_repeats=3))
-        cp.run(2)
-        assert cp.counters.optimizer_steps["student"] == 2
-        assert cp.counters.optimizer_steps["fake_score"] == 6
+    def test_distribution_only_counts_only_bound_trainable_roles(self):
+        control_plane, _, _ = _control_plane(_plan(fake_repeats=3))
+        control_plane.run(2)
+        assert control_plane.counters.optimizer_steps == {"student": 2, "fake_score": 6}
 
-    def test_phase_request_carries_current_global_step(self):
-        cp, executor, _ = _control_plane(_plan(fake_repeats=1))
-        cp.run(2)
-        student_steps = [r.global_step for r in executor.executed if r.kind == "student"]
-        # The request is emitted before the increment, so it observes the old value.
-        assert student_steps == [0, 1]
+    def test_paper_profile_counts_discriminator_steps(self):
+        control_plane, _, _ = _control_plane(_plan(fake_repeats=2, profile="paper"))
+        control_plane.run_cycle()
+        assert control_plane.counters.optimizer_steps == {"student": 1, "fake_score": 2, "discriminator": 2}
+
+    def test_phase_request_carries_current_global_step_and_roles(self):
+        control_plane, executor, _ = _control_plane(_plan(fake_repeats=1))
+        control_plane.run(2)
+        student_requests = [request for request in executor.executed if request.kind == "student"]
+        assert [request.global_step for request in student_requests] == [0, 1]
+        assert all(request.trainable_roles == ("student",) for request in student_requests)
 
 
-class TestStudentPhaseInvariants:
-    def test_skipped_student_phase_cannot_advance_global_step(self):
-        executor = FakePhaseExecutor(skip_student=True)
-        cp, _, _ = _control_plane(_plan(), executor=executor)
+class TestPhaseInvariants:
+    def test_skipped_student_phase_rolls_back_and_marks_driver_failed(self):
+        control_plane, _, _ = _control_plane(_plan(), executor=FakePhaseExecutor(skip_student=True))
         with pytest.raises(ValueError, match="no student optimizer step"):
-            cp.run_cycle()
-        assert cp.counters.global_step == 0
+            control_plane.run_cycle()
+        assert control_plane.counters.global_step == 0
+        assert control_plane.counters.optimizer_steps == {}
+        with pytest.raises(RuntimeError, match="cannot be retried"):
+            control_plane.run_cycle()
 
-    def test_failed_phase_is_fail_fast_without_retry(self):
-        executor = FakePhaseExecutor(fail_on="fake_score")
-        cp, _, _ = _control_plane(_plan(), executor=executor)
+    def test_failed_fake_phase_rolls_back_and_cannot_retry(self):
+        control_plane, _, _ = _control_plane(_plan(), executor=FakePhaseExecutor(fail_on="fake_score"))
         with pytest.raises(RuntimeError, match="failed on phase fake_score"):
-            cp.run_cycle()
-        # global_step is not advanced by a partially completed cycle.
-        assert cp.counters.global_step == 0
+            control_plane.run_cycle()
+        assert control_plane.counters.global_step == 0
+        assert control_plane.counters.optimizer_steps == {}
+        with pytest.raises(RuntimeError, match="cannot be retried"):
+            control_plane.run_cycle()
 
-    def test_completed_student_phase_reports_exactly_one_step(self):
+    def test_completed_role_must_report_exactly_one_step(self):
         class TwoStepExecutor(FakePhaseExecutor):
             def execute_phase(self, request, batch):
                 if request.kind == "student":
-                    return PhaseResult(metrics={}, optimizer_steps={"student": 2})
+                    return PhaseResult(optimizer_steps={"student": 2})
                 return super().execute_phase(request, batch)
 
-        cp, _, _ = _control_plane(_plan(), executor=TwoStepExecutor())
-        with pytest.raises(ValueError, match="exactly one student optimizer step"):
-            cp.run_cycle()
+        control_plane, _, _ = _control_plane(_plan(), executor=TwoStepExecutor())
+        with pytest.raises(ValueError, match="exactly one optimizer step"):
+            control_plane.run_cycle()
+
+    def test_unexpected_optimizer_role_is_rejected(self):
+        class WrongRoleExecutor(FakePhaseExecutor):
+            def execute_phase(self, request, batch):
+                if request.kind == "fake_score":
+                    return PhaseResult(optimizer_steps={"fake_score": 1, "discriminator": 1})
+                return super().execute_phase(request, batch)
+
+        control_plane, _, _ = _control_plane(_plan(), executor=WrongRoleExecutor())
+        with pytest.raises(ValueError, match="must report optimizer steps for exactly"):
+            control_plane.run_cycle()
+        assert control_plane.counters.optimizer_steps == {}
+
+    def test_zero_progress_warmup_cycle_raises(self):
+        class NoStepExecutor(FakePhaseExecutor):
+            def execute_phase(self, request, batch):
+                return PhaseResult()
+
+        plan = _plan(fake_repeats=1, fake_warmup_cycles=1)
+        control_plane, _, _ = _control_plane(plan, executor=NoStepExecutor())
+        with pytest.raises(ValueError, match="must report optimizer steps"):
+            control_plane.run_cycle()
+
+    def test_two_student_phases_are_rejected_before_execution(self):
+        student = UpdatePhaseSpec(kind="student", trainable_roles=("student",))
+        with pytest.raises(ValueError, match="exactly one student"):
+            UpdateSchedule(phases=(student, student))
 
 
 class TestHookScheduling:
     def test_hook_observes_incremented_global_step(self):
-        cp, _, hooks = _control_plane(_plan(fake_repeats=1))
-        cp.run(3)
-        assert [c["global_step"] for c in hooks.calls] == [1, 2, 3]
+        control_plane, _, hooks = _control_plane(_plan(fake_repeats=1))
+        control_plane.run(3)
+        assert [call["global_step"] for call in hooks.calls] == [1, 2, 3]
 
     def test_hook_receives_executor_and_metrics(self):
-        cp, executor, hooks = _control_plane(_plan(fake_repeats=1))
-        cp.run_cycle()
+        control_plane, executor, hooks = _control_plane(_plan(fake_repeats=1))
+        control_plane.run_cycle()
         assert hooks.calls[0]["executor"] is executor
         assert "student" in hooks.calls[0]["metrics"]
 
-    def test_hook_not_called_without_completed_student_update(self):
-        plan = DistillationPlan(
-            name="warmup_only",
-            update_schedule=UpdateSchedule(
-                phases=(UpdatePhaseSpec(kind="fake_score", repeats=2, trainable_roles=("fake_score",)),)
-            ),
-        )
-        cp, _, hooks = _control_plane(plan)
-        cp.run_cycle()
+    def test_hook_not_called_during_warmup(self):
+        control_plane, _, hooks = _control_plane(_plan(fake_warmup_cycles=1))
+        control_plane.run_cycle()
         assert hooks.calls == []
 
 
-class TestWarmupCycles:
-    def test_fake_only_cycle_advances_role_counters_but_not_global_step(self):
-        plan = DistillationPlan(
-            name="warmup",
-            update_schedule=UpdateSchedule(
-                phases=(UpdatePhaseSpec(kind="fake_score", repeats=3, trainable_roles=("fake_score",)),)
-            ),
-        )
-        cp, _, _ = _control_plane(plan)
-        cp.run_cycle()
-        assert cp.counters.global_step == 0
-        assert cp.counters.optimizer_steps["fake_score"] == 3
-
-    def test_zero_progress_cycle_raises(self):
-        class NoStepExecutor(FakePhaseExecutor):
-            def execute_phase(self, request, batch):
-                return PhaseResult(metrics={}, optimizer_steps={})
-
-        plan = DistillationPlan(
-            name="warmup",
-            update_schedule=UpdateSchedule(
-                phases=(UpdatePhaseSpec(kind="fake_score", repeats=1, trainable_roles=("fake_score",)),)
-            ),
-        )
-        cp, _, _ = _control_plane(plan, executor=NoStepExecutor())
-        with pytest.raises(ValueError, match="Zero-progress cycle"):
-            cp.run_cycle()
-
-
 class TestControlPlanePurity:
-    def test_control_plane_module_imports_no_model_or_ray_runtime(self):
-        import sys
-
+    def test_core_modules_have_no_direct_model_or_ray_imports(self):
         import verl_omni.trainer.diffusion.distillation.contracts as contracts_mod
-        import verl_omni.trainer.diffusion.distillation.control_plane as cp_mod
+        import verl_omni.trainer.diffusion.distillation.control_plane as control_plane_mod
         import verl_omni.trainer.diffusion.distillation.equations as equations_mod
 
-        for module in (cp_mod, contracts_mod, equations_mod):
-            source = module.__dict__
-            assert "ray" not in source, f"{module.__name__} must not import ray"
-            assert "diffusers" not in source, f"{module.__name__} must not import diffusers"
+        forbidden_roots = {"diffusers", "ray", "transformers", "vllm"}
+        for module in (contracts_mod, control_plane_mod, equations_mod):
+            tree = ast.parse(Path(module.__file__).read_text())
+            imported_roots = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported_roots.update(alias.name.split(".", 1)[0] for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    imported_roots.add(node.module.split(".", 1)[0])
+            assert imported_roots.isdisjoint(forbidden_roots)
 
-        # The control plane itself must not have pulled Ray into the process.
-        assert "ray" not in sys.modules or True  # ray may be imported by other tests; module-level check above
+    def test_reset_clears_healthy_driver_state(self):
+        control_plane, _, _ = _control_plane(_plan())
+        control_plane.run(2)
+        control_plane.reset()
+        assert control_plane.counters.global_step == 0
+        assert control_plane.counters.completed_cycles == 0
+        assert control_plane.counters.optimizer_steps == {}
+        assert control_plane.metrics == {}
 
-    def test_reset_clears_counters_and_metrics(self):
-        cp, _, _ = _control_plane(_plan())
-        cp.run(2)
-        cp.reset()
-        assert cp.counters.global_step == 0
-        assert cp.counters.optimizer_steps == {}
-        assert cp.metrics == {}
+    def test_failed_driver_cannot_be_reset(self):
+        control_plane, _, _ = _control_plane(_plan(), executor=FakePhaseExecutor(fail_on="student"))
+        with pytest.raises(RuntimeError):
+            control_plane.run_cycle()
+        with pytest.raises(RuntimeError, match="cannot be reset"):
+            control_plane.reset()

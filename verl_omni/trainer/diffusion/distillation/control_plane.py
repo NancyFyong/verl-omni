@@ -19,11 +19,10 @@ manipulates latents, selects a PEFT adapter, or computes a DMD loss. Keeping the
 controller free of Ray types makes its state machine testable in a CPU process
 (RFC §13.1).
 
-The state machine follows RFC §14:
+The cycle state machine follows RFC §14. Worker allocation, role binding, and
+checkpoint restore are deliberately delegated to the PR 2 executor; this module
+only controls validated phase execution:
 
-- ``INITIALIZE``: validate capabilities, role bindings, and model fingerprints;
-  allocate every physical role group exactly once; load each immutable base once
-  per group; bind roles; restore state if resuming.
 - Optional fake/discriminator warmup cycles: emit fake-only ``UpdateCycle``
   requests, advance fake/discriminator optimizer counters, never ``global_step``.
 - For each ``global_step``: one student phase then ``K`` fake phases; increment
@@ -56,7 +55,7 @@ __all__ = [
     "DistillationTrainerControlPlane",
     "BatchProvider",
     "DistillationTrainerHooks",
-    # phase executor protocol + CPU fakes (was phase_executor)
+    # phase executor protocol + CPU fakes
     "DistillationPhaseExecutor",
     "FakePhaseExecutor",
     "FakeBatchProvider",
@@ -90,7 +89,7 @@ class DistillationTrainerControlPlane:
     def __init__(
         self,
         plan: DistillationPlan,
-        executor: Any,
+        executor: DistillationPhaseExecutor,
         batch_provider: BatchProvider,
         hooks: Optional[DistillationTrainerHooks] = None,
     ) -> None:
@@ -100,6 +99,7 @@ class DistillationTrainerControlPlane:
         self.hooks = hooks
         self.counters = TrainerCounters()
         self._metrics: dict[str, dict] = {}
+        self._failed = False
 
     # -- public driver ----------------------------------------------------
 
@@ -109,64 +109,91 @@ class DistillationTrainerControlPlane:
             self.run_cycle()
 
     def run_cycle(self) -> UpdateCycle:
-        """Run one update cycle: expand the schedule and drive each phase.
+        """Run one cycle transactionally and become terminal after a failure."""
+        if self._failed:
+            raise RuntimeError(
+                "This control plane previously failed during a cycle and cannot be retried in-process; "
+                "restore the last completed-cycle checkpoint into a new driver."
+            )
 
-        Fail-fast on a partially completed cycle: if a phase raises, the error
-        propagates and no in-process retry is attempted. Recovery is expected to
-        reload the last atomic completed-cycle checkpoint.
-        """
-        cycle = self.plan.update_schedule.next_cycle(self.counters)
-        before_global = self.counters.global_step
-        before_steps = dict(self.counters.optimizer_steps)
+        before_counters = TrainerCounters(
+            global_step=self.counters.global_step,
+            optimizer_steps=dict(self.counters.optimizer_steps),
+            completed_cycles=self.counters.completed_cycles,
+        )
+        before_metrics = dict(self._metrics)
+        try:
+            cycle = self.plan.update_schedule.next_cycle(self.counters)
+            student_step_reported = self._drive_requests(cycle.requests)
 
-        student_step_reported = self._drive_requests(cycle.requests)
+            if cycle.requires_student_update:
+                if not student_step_reported:
+                    raise ValueError(
+                        "Cycle requires a student update but no student optimizer step was reported; "
+                        "global_step must not advance."
+                    )
+                self.counters.increment_global()
 
-        if cycle.requires_student_update:
-            if not student_step_reported:
-                # A skipped student phase cannot advance global_step.
-                raise ValueError(
-                    "Cycle requires a student update but no student optimizer step was reported; "
-                    "global_step must not advance."
-                )
-            self.counters.increment_global()
+            self._assert_progress(before_counters)
+            self.counters.completed_cycles += 1
 
-        self._assert_progress(before_global, before_steps)
-
-        # Completed-step hooks observe the incremented counter, and only run for
-        # cycles that actually completed a student update.
-        if cycle.requires_student_update and self.hooks is not None:
-            self.hooks.after_completed_step(self.counters, self.metrics, self.executor)
-
-        return cycle
+            if cycle.requires_student_update and self.hooks is not None:
+                self.hooks.after_completed_step(self.counters, self.metrics, self.executor)
+            return cycle
+        except Exception:
+            self.counters = before_counters
+            self._metrics = before_metrics
+            self._failed = True
+            raise
 
     # -- internals --------------------------------------------------------
 
     def _drive_requests(self, requests: tuple[PhaseRequest, ...]) -> bool:
-        """Execute each phase in order. Returns whether a student step was reported."""
+        """Execute phases in order and validate each executor result fail closed."""
         student_step_reported = False
         for request in requests:
             batch = self.batch_provider.next(request)
             result = self.executor.execute_phase(request, batch)
+            self._validate_result(result, request)
+            if request.kind == "student" and not result.optimizer_steps:
+                return False
             self._accumulate(result, request)
-            if request.kind == "student" and result.optimizer_steps.get("student", 0) > 0:
-                if result.optimizer_steps["student"] != 1:
-                    raise ValueError(
-                        "A completed student phase must report exactly one student optimizer step, "
-                        f"got {result.optimizer_steps['student']}."
-                    )
+            if request.kind == "student":
                 student_step_reported = True
         return student_step_reported
+
+    @staticmethod
+    def _validate_result(result: PhaseResult, request: PhaseRequest) -> None:
+        """Require exactly one step for every role declared by a completed phase."""
+        if not isinstance(result, PhaseResult):
+            raise TypeError(f"execute_phase must return PhaseResult, got {type(result)}.")
+        if not result.optimizer_steps and request.kind == "student":
+            return
+        expected_roles = set(request.trainable_roles)
+        reported_roles = set(result.optimizer_steps)
+        if reported_roles != expected_roles:
+            raise ValueError(
+                f"Phase {request.kind!r} must report optimizer steps for exactly {sorted(expected_roles)}, "
+                f"got {sorted(reported_roles)}."
+            )
+        invalid_steps = {
+            role: steps
+            for role, steps in result.optimizer_steps.items()
+            if isinstance(steps, bool) or not isinstance(steps, int) or steps != 1
+        }
+        if invalid_steps:
+            raise ValueError(f"Each completed phase role must report exactly one optimizer step, got {invalid_steps}.")
 
     def _accumulate(self, result: PhaseResult, request: PhaseRequest) -> None:
         for role, steps in result.optimizer_steps.items():
             self.counters.optimizer_steps[role] = self.counters.optimizer_steps.get(role, 0) + steps
         self._metrics[request.kind] = dict(result.metrics)
 
-    def _assert_progress(self, before_global: int, before_steps: dict[str, int]) -> None:
+    def _assert_progress(self, before: TrainerCounters) -> None:
         """A cycle must advance global_step or at least one role optimizer counter."""
-        if self.counters.global_step != before_global:
+        if self.counters.global_step != before.global_step:
             return
-        if self.counters.optimizer_steps != before_steps:
+        if self.counters.optimizer_steps != before.optimizer_steps:
             return
         raise ValueError("Zero-progress cycle: it advanced neither global_step nor any role optimizer counter.")
 
@@ -176,13 +203,15 @@ class DistillationTrainerControlPlane:
         return self._metrics
 
     def reset(self) -> None:
-        """Reset counters and metrics for a fresh driver instance."""
+        """Reset a healthy driver; failed drivers must be reconstructed from checkpoint."""
+        if self._failed:
+            raise RuntimeError("A failed control plane cannot be reset in-process; construct a new driver.")
         self.counters = TrainerCounters()
         self._metrics = {}
 
 
 # ---------------------------------------------------------------------------
-# §13.1 phase executor protocol and CPU fakes (merged from phase_executor.py)
+# §13.1 phase executor protocol and CPU fakes
 # ---------------------------------------------------------------------------
 
 
@@ -225,16 +254,15 @@ class FakePhaseExecutor:
         self.executed: list[PhaseRequest] = []
 
     def execute_phase(self, request: PhaseRequest, batch: Any) -> PhaseResult:
+        if batch.get("phase_kind") != request.kind:
+            raise ValueError(f"Batch phase {batch.get('phase_kind')!r} does not match request {request.kind!r}.")
         self.executed.append(request)
         if request.kind == self._fail_on:
             raise RuntimeError(f"FakePhaseExecutor failed on phase {request.kind} (global_step={request.global_step}).")
         if request.kind == "student" and self._skip_student:
             return PhaseResult(metrics={"fake/student": float(request.global_step)}, optimizer_steps={})
         metrics = {f"fake/{request.kind}": float(request.global_step)}
-        optimizer_steps = {request.kind: 1}
-        if request.kind == "fake_score":
-            # A fake score phase may also step the discriminator when adversarial.
-            optimizer_steps.setdefault("discriminator", 1)
+        optimizer_steps = {role: 1 for role in request.trainable_roles}
         return PhaseResult(metrics=metrics, optimizer_steps=optimizer_steps)
 
 

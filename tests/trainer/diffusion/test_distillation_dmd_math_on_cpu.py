@@ -24,11 +24,15 @@ import pytest
 import torch
 
 from verl_omni.trainer.diffusion.distillation.equations import (
+    consistency_renoise_step,
     dmd_gradient,
     dmd_surrogate_loss,
+    epsilon_to_x0,
     fake_score_loss,
     fake_score_target,
     legacy_cfg,
+    ode_euler_step,
+    ode_regression_loss,
     standard_cfg,
     timestep_shift,
     velocity_to_x0,
@@ -38,18 +42,37 @@ from verl_omni.trainer.diffusion.distillation.equations import (
 class TestCanonicalConversion:
     def test_velocity_to_x0_matches_flow_definition(self):
         x_sigma = torch.randn(2, 3, 4, 4)
-        v = torch.randn(2, 3, 4, 4)
+        velocity = torch.randn(2, 3, 4, 4)
         sigma = torch.rand(2, 1, 1, 1)
-        # x_sigma = (1 - sigma) x0 + sigma eps and v = eps - x0 => x0 = x_sigma - sigma v
-        assert torch.allclose(velocity_to_x0(x_sigma, v, sigma), x_sigma - sigma * v)
+        expected = x_sigma - sigma * velocity
+        torch.testing.assert_close(velocity_to_x0(x_sigma, velocity, sigma), expected)
 
     def test_velocity_to_x0_roundtrip(self):
         x0 = torch.randn(2, 3, 4, 4)
-        eps = torch.randn(2, 3, 4, 4)
+        noise = torch.randn(2, 3, 4, 4)
         sigma = torch.rand(2, 1, 1, 1)
-        x_sigma = (1 - sigma) * x0 + sigma * eps
-        v = eps - x0
-        assert torch.allclose(velocity_to_x0(x_sigma, v, sigma), x0, atol=1e-5)
+        x_sigma = (1 - sigma) * x0 + sigma * noise
+        velocity = noise - x0
+        torch.testing.assert_close(velocity_to_x0(x_sigma, velocity, sigma), x0, atol=1e-5, rtol=1e-5)
+
+    def test_epsilon_to_x0_roundtrip(self):
+        x0 = torch.randn(2, 3, 4, 4)
+        noise = torch.randn(2, 3, 4, 4)
+        sigma = torch.rand(2, 1, 1, 1) * 0.9
+        x_sigma = (1 - sigma) * x0 + sigma * noise
+        converted = epsilon_to_x0(x_sigma, noise, sigma, lambda value: 1 - value, lambda value: value)
+        torch.testing.assert_close(converted, x0, atol=1e-5, rtol=1e-5)
+
+    def test_canonical_conversions_return_fp32(self):
+        value = torch.randn(1, 2, dtype=torch.float16)
+        sigma = torch.full((1, 1), 0.5, dtype=torch.float16)
+        assert velocity_to_x0(value, value, sigma).dtype == torch.float32
+        assert epsilon_to_x0(value, value, sigma, lambda item: 1 - item, lambda item: item).dtype == torch.float32
+
+    def test_epsilon_conversion_rejects_zero_signal_coefficient(self):
+        value = torch.randn(1, 2)
+        with pytest.raises(ValueError, match="a\\(sigma\\) is zero"):
+            epsilon_to_x0(value, value, torch.ones(1, 1), lambda sigma: 1 - sigma, lambda sigma: sigma)
 
 
 class TestDMDGradient:
@@ -95,6 +118,15 @@ class TestDMDGradient:
         g_norm, _, nonfinite = dmd_gradient(x0_fake, x0_real, x_g, normalization_epsilon=1e-8)
         assert nonfinite > 0
         assert torch.isfinite(g_norm).all()
+
+    def test_invalid_normalization_epsilon_raises(self):
+        tensor = torch.zeros(1, 2)
+        with pytest.raises(ValueError, match="greater than zero"):
+            dmd_gradient(tensor, tensor, tensor, normalization_epsilon=0)
+
+    def test_mismatched_shapes_raise(self):
+        with pytest.raises(ValueError, match="identical shapes"):
+            dmd_gradient(torch.zeros(1, 2), torch.zeros(1, 3), torch.zeros(1, 2))
 
 
 class TestSurrogate:
@@ -196,10 +228,75 @@ class TestFakeScore:
         assert torch.allclose(loss, torch.tensor(1.0))
 
     def test_all_masked_fake_loss_raises(self):
-        z = torch.zeros(2, 1, 2, 2)
+        zero = torch.zeros(2, 1, 2, 2)
         mask = torch.zeros(2, 1, 2, 2, dtype=torch.bool)
         with pytest.raises(ValueError, match="all-masked"):
-            fake_score_loss(z, z, z, gradient_mask=mask)
+            fake_score_loss(zero, zero, zero, gradient_mask=mask)
+
+    def test_fake_score_target_is_fully_detached(self):
+        generated = torch.randn(1, 2, requires_grad=True)
+        noise = torch.randn(1, 2, requires_grad=True)
+        output = torch.randn(1, 2, requires_grad=True)
+        loss, _ = fake_score_loss(output, noise, generated)
+        loss.backward()
+        assert generated.grad is None
+        assert noise.grad is None
+        assert output.grad is not None
+
+
+class TestODERegression:
+    def test_masked_mse_uses_only_nonzero_timestep_positions(self):
+        prediction = torch.tensor([[1.0, 3.0], [5.0, 7.0]], requires_grad=True)
+        target = torch.zeros_like(prediction)
+        valid_mask = torch.tensor([[True, False], [True, False]])
+        loss, active = ode_regression_loss(prediction, target, valid_mask)
+        assert active == 2
+        assert loss.item() == pytest.approx(13.0)
+        loss.backward()
+        torch.testing.assert_close(prediction.grad, torch.tensor([[1.0, 0.0], [5.0, 0.0]]))
+
+    def test_frame_mask_broadcasts_over_latent_dimensions(self):
+        prediction = torch.ones(1, 2, 1, 2, 2)
+        target = torch.zeros_like(prediction)
+        loss, active = ode_regression_loss(prediction, target, torch.tensor([[True, False]]))
+        assert active == 4
+        assert loss.item() == pytest.approx(1.0)
+
+    def test_target_is_detached(self):
+        prediction = torch.ones(1, 2, requires_grad=True)
+        target = torch.zeros(1, 2, requires_grad=True)
+        loss, _ = ode_regression_loss(prediction, target)
+        loss.backward()
+        assert prediction.grad is not None
+        assert target.grad is None
+
+    def test_all_masked_ode_loss_raises(self):
+        tensor = torch.zeros(1, 2)
+        with pytest.raises(ValueError, match="all-masked"):
+            ode_regression_loss(tensor, tensor, torch.zeros_like(tensor, dtype=torch.bool))
+
+
+class TestRolloutTransitions:
+    def test_ode_euler_uses_deterministic_velocity_transition(self):
+        latents = torch.tensor([[1.0, 2.0]])
+        velocity = torch.tensor([[2.0, -1.0]])
+        result = ode_euler_step(latents, velocity, torch.tensor(0.8), torch.tensor(0.3))
+        torch.testing.assert_close(result, torch.tensor([[0.0, 2.5]]))
+
+    def test_consistency_transition_renoises_clean_prediction(self):
+        x0 = torch.tensor([[2.0, 4.0]])
+        noise = torch.tensor([[0.0, 2.0]])
+        result = consistency_renoise_step(x0, noise, torch.tensor(0.25))
+        torch.testing.assert_close(result, torch.tensor([[1.5, 3.5]]))
+
+    def test_euler_and_consistency_transitions_are_not_interchangeable(self):
+        latents = torch.randn(2, 3)
+        velocity = torch.randn(2, 3)
+        x0 = torch.randn(2, 3)
+        noise = torch.randn(2, 3)
+        euler = ode_euler_step(latents, velocity, torch.tensor(0.8), torch.tensor(0.3))
+        renoised = consistency_renoise_step(x0, noise, torch.tensor(0.3))
+        assert not torch.allclose(euler, renoised)
 
 
 class TestCFG:
@@ -231,11 +328,25 @@ class TestCFG:
         with pytest.raises(ValueError, match="Unknown cfg_norm"):
             standard_cfg(cond, cond, 1.0, cfg_norm="bogus")
 
-    @pytest.mark.parametrize("norm", ["none", "layer_norm", "scalar"])
+    @pytest.mark.parametrize("norm", [None, "none", "layer_norm", "scalar"])
     def test_cfg_norm_modes_are_finite(self, norm):
         cond = torch.randn(2, 8)
         uncond = torch.randn(2, 8)
         assert torch.isfinite(standard_cfg(cond, uncond, 3.0, cfg_norm=norm)).all()
+
+    def test_scalar_norm_matches_lightx2v_global_ratio(self):
+        cond = torch.tensor([[1.0, 0.0], [10.0, 0.0]])
+        uncond = torch.tensor([[0.0, 2.0], [0.0, 20.0]])
+        guided = uncond + 3.0 * (cond - uncond)
+        ratio = torch.norm(cond) / torch.norm(guided).clamp_min(1e-12)
+        expected = guided * min(1.0, ratio.item())
+        torch.testing.assert_close(standard_cfg(cond, uncond, 3.0, cfg_norm="scalar"), expected)
+
+    def test_layer_norm_zero_conditional_prediction_returns_zero(self):
+        cond = torch.zeros(2, 4)
+        uncond = torch.ones(2, 4)
+        output = standard_cfg(cond, uncond, 2.0, cfg_norm="layer_norm")
+        torch.testing.assert_close(output, torch.zeros_like(output))
 
 
 class TestTimestepShift:

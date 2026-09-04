@@ -19,6 +19,7 @@ orthogonal to the existing on-policy distillation (OPD) path. OPD keeps using
 """
 
 import pytest
+from omegaconf import OmegaConf
 
 from verl_omni.trainer.config.algorithm import DiffusionAlgoConfig
 from verl_omni.trainer.diffusion.distillation.ray_trainer import DistillationRayTrainer
@@ -71,7 +72,65 @@ class TestAlgorithmConfig:
             DiffusionAlgoConfig(trainer_type="bogus")
 
 
+def _runtime_config():
+    return OmegaConf.create(
+        {
+            "algorithm": {"trainer_type": "distillation"},
+            "actor_rollout_ref": {
+                "actor": {
+                    "diffusion_loss": {"loss_mode": "flow_grpo"},
+                    "use_distill_loss": False,
+                },
+                "model": {"path": "/m"},
+            },
+            "distillation": {
+                "enabled": False,
+                "distribution_matching": {
+                    "recipe": "dmd2",
+                    "profile": "distribution_only",
+                    "fake_update_ratio": 2,
+                    "fake_warmup_cycles": 0,
+                    "rollout_strategy": None,
+                    "data_mode": None,
+                    "export_role": "student_ema",
+                },
+            },
+        }
+    )
+
+
 class TestPR1DataPlaneBoundary:
+    def test_production_constructor_reaches_explicit_pr2_boundary(self):
+        config = _runtime_config()
+        trainer = DistillationRayTrainer(
+            config=config,
+            tokenizer=object(),
+            processor=object(),
+            role_worker_mapping={},
+            resource_pool_manager=object(),
+            ray_worker_group_cls=object,
+            train_dataset=object(),
+            val_dataset=object(),
+            collate_fn=object(),
+            train_sampler=object(),
+        )
+        assert trainer.config is config
+        with pytest.raises(NotImplementedError, match="PR 2"):
+            trainer.init_workers()
+
+    def test_constructor_rejects_opd_switch(self):
+        config = _runtime_config()
+        config.distillation.enabled = True
+        with pytest.raises(ValueError, match="must keep the OPD"):
+            DistillationRayTrainer(config=config)
+
+    def test_config_and_capabilities_build_a_plan(self):
+        config = _runtime_config()
+        trainer = DistillationRayTrainer(config=config, capabilities=frozenset({"distribution_matching"}))
+        assert trainer.plan is not None
+        assert trainer.plan.name == "dmd2"
+        assert trainer.plan.role_layout.groups[0].model_ref == "/m"
+
     def test_fit_without_executor_reports_pr2_boundary(self):
         from verl_omni.trainer.diffusion.distillation.recipes import build_plan
 

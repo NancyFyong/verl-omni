@@ -14,8 +14,8 @@
 """Distribution-matching distillation runtime (DMD, DMD2, CausVid, Self-Forcing).
 
 PR 1 provides the architecture-neutral trainer control plane, the immutable
-execution contracts, the recipe/objective/rollout registries, and the pure DMD
-math. It contains no model pipeline, Ray worker, FSDP model, or GPU runtime.
+execution contracts, the recipe/objective/rollout registries, and pure DMD
+equations. It defines no model pipeline, Ray worker, FSDP model, or GPU runtime.
 """
 
 from verl_omni.trainer.diffusion.distillation import contracts, control_plane, equations, ray_trainer, recipes
@@ -25,6 +25,7 @@ from verl_omni.trainer.diffusion.distillation.contracts import (
     DistillationCheckpointState,
     DistillationPlan,
     ExportSpec,
+    FrozenDict,
     LatentBundle,
     PhaseRequest,
     PhaseResult,
@@ -42,6 +43,7 @@ from verl_omni.trainer.diffusion.distillation.contracts import (
     UpdateSchedule,
     describe_role_groups,
     resolve_export_role,
+    validate_distillation_plan,
     validate_export_role,
     validate_role_layout,
 )
@@ -55,7 +57,7 @@ from verl_omni.trainer.diffusion.distillation.control_plane import (
     FakePhaseExecutor,
 )
 from verl_omni.trainer.diffusion.distillation.ray_trainer import DistillationRayTrainer
-from verl_omni.trainer.diffusion.distillation.recipes import build_plan, recipe_registry
+from verl_omni.trainer.diffusion.distillation.recipes import build_plan, build_plan_from_config, recipe_registry
 
 __all__ = [
     # submodules
@@ -65,6 +67,7 @@ __all__ = [
     "control_plane",
     "ray_trainer",
     # contracts
+    "FrozenDict",
     "LatentBundle",
     "StudentRollout",
     "ScoreBatch",
@@ -85,6 +88,7 @@ __all__ = [
     # role layout validation / export / provider / checkpoint
     "validate_role_layout",
     "validate_export_role",
+    "validate_distillation_plan",
     "describe_role_groups",
     "resolve_export_role",
     "TeacherScoreProvider",
@@ -102,5 +106,6 @@ __all__ = [
     "DistillationRayTrainer",
     # recipes
     "build_plan",
+    "build_plan_from_config",
     "recipe_registry",
 ]

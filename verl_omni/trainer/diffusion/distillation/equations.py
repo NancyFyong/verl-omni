@@ -55,9 +55,11 @@ __all__ = [
     "velocity_to_x0",
     "dmd_gradient",
     "dmd_surrogate_loss",
-    "runaway_gradient",
     "fake_score_target",
     "fake_score_loss",
+    "ode_regression_loss",
+    "ode_euler_step",
+    "consistency_renoise_step",
     "standard_cfg",
     "legacy_cfg",
     "timestep_shift",
@@ -71,8 +73,13 @@ def epsilon_to_x0(noisy: Tensor, epsilon: Tensor, sigma: Tensor, a_fn, b_fn) -> 
     epsilon-prediction model, ``x_sigma = a*x0 + b*epsilon`` so
     ``x0 = (x_sigma - b*epsilon) / a``.
     """
-    a = a_fn(sigma)
-    b = b_fn(sigma)
+    noisy = noisy.float()
+    epsilon = epsilon.float()
+    sigma = sigma.float()
+    a = a_fn(sigma).float()
+    b = b_fn(sigma).float()
+    if torch.any(a == 0):
+        raise ValueError("epsilon_to_x0 is undefined where a(sigma) is zero.")
     return (noisy - b * epsilon) / a
 
 
@@ -82,7 +89,7 @@ def velocity_to_x0(noisy: Tensor, velocity: Tensor, sigma: Tensor) -> Tensor:
     ``x_sigma = (1 - sigma) * x0 + sigma * epsilon`` and ``v = epsilon - x0``, so
     ``x0 = x_sigma - sigma * v``.
     """
-    return noisy - sigma * velocity
+    return noisy.float() - sigma.float() * velocity.float()
 
 
 def dmd_gradient(
@@ -104,6 +111,16 @@ def dmd_gradient(
     dimensions of one sample, ``keepdim`` per sample, and is **not** restricted by
     ``gradient_mask``.
     """
+    if normalization_epsilon <= 0:
+        raise ValueError(f"normalization_epsilon must be greater than zero, got {normalization_epsilon}.")
+    if x_g.shape != x0_fake.shape or x_g.shape != x0_real.shape:
+        raise ValueError(
+            f"x_g, x0_fake, and x0_real must have identical shapes, got "
+            f"{tuple(x_g.shape)}, {tuple(x0_fake.shape)}, and {tuple(x0_real.shape)}."
+        )
+    if x_g.ndim < 2:
+        raise ValueError("DMD tensors must include a batch dimension and at least one non-batch dimension.")
+
     x_g = x_g.float()
     x0_fake = x0_fake.float()
     x0_real = x0_real.float()
@@ -145,35 +162,13 @@ def dmd_surrogate_loss(
     return loss, active
 
 
-def runaway_gradient(
-    x_g: Tensor,
-    g_normalized: Tensor,
-    gradient_mask: Optional[Tensor] = None,
-) -> tuple[Tensor, int]:
-    """The gradient of the surrogate loss w.r.t. ``x_g`` (used for finite-difference
-    checks). Algebraically ``0.5 * mean((x_g - stop_gradient(x_g - g_norm))^2)`` has
-    gradient equal to ``g_normalized``.
-    """
-    x_g = x_g.float()
-    g_normalized = g_normalized.float()
-    if gradient_mask is None:
-        return g_normalized, x_g.numel()
-    mask = gradient_mask.bool()
-    active = int(mask.sum().item())
-    if active == 0:
-        raise ValueError("all-masked DMD loss is an error, not zero.")
-    grad = torch.zeros_like(x_g)
-    grad[mask] = g_normalized[mask]
-    return grad, active
-
-
 def fake_score_target(noise: Tensor, x_g: Tensor) -> Tensor:
     """Fake-score epsilon-prediction target ``v_target = epsilon - x_g``.
 
     The fake score is trained to denoise the generated clean latent with
     ``x_sigma = (1 - sigma) * x_g + sigma * epsilon``.
     """
-    return noise.float() - x_g.float()
+    return noise.detach().float() - x_g.detach().float()
 
 
 def fake_score_loss(
@@ -202,33 +197,71 @@ def fake_score_loss(
     return loss, active
 
 
-def standard_cfg(cond: Tensor, uncond: Tensor, guidance_scale: float, cfg_norm: str = "none") -> Tensor:
-    """Classifier-free guidance in the ``pred_cond + scale*(pred_cond - pred_uncond)`` form.
+def ode_regression_loss(
+    prediction: Tensor,
+    target: Tensor,
+    valid_mask: Optional[Tensor] = None,
+) -> tuple[Tensor, int]:
+    """Compute fp32 ODE-target MSE over nonzero-timestep positions."""
+    prediction = prediction.float()
+    target = target.detach().float()
+    if prediction.shape != target.shape:
+        raise ValueError(
+            f"ODE prediction and target must have identical shapes, got {tuple(prediction.shape)} and "
+            f"{tuple(target.shape)}."
+        )
+    if valid_mask is None:
+        return torch.mean((prediction - target) ** 2), prediction.numel()
+    mask = valid_mask.bool()
+    if mask.shape != prediction.shape:
+        if prediction.shape[: mask.ndim] == mask.shape:
+            mask = mask.reshape(*mask.shape, *((1,) * (prediction.ndim - mask.ndim)))
+        try:
+            mask = torch.broadcast_to(mask, prediction.shape)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"ODE valid_mask shape {tuple(valid_mask.shape)} is not broadcastable to {tuple(prediction.shape)}."
+            ) from exc
+    active = int(mask.sum().item())
+    if active == 0:
+        raise ValueError("all-masked ODE regression loss is an error, not zero.")
+    return torch.sum((prediction - target)[mask] ** 2) / active, active
 
-    ``cfg_norm`` is one of ``none``, ``layer_norm``, or ``scalar``. For
-    ``layer_norm`` the guided output is rescaled to the L2 norm of the conditional
-    prediction along the last dim; for ``scalar`` it is multiplied by
-    ``min(1.0, ||cond|| / ||guided||)``.
+
+def ode_euler_step(latents: Tensor, velocity: Tensor, sigma_from: Tensor, sigma_to: Tensor) -> Tensor:
+    """Apply one deterministic Euler transition used by backward simulation."""
+    return latents.float() + (sigma_to.float() - sigma_from.float()) * velocity.float()
+
+
+def consistency_renoise_step(x0: Tensor, noise: Tensor, sigma_to: Tensor) -> Tensor:
+    """Re-noise a clean prediction with fresh noise for a consistency transition."""
+    return (1.0 - sigma_to.float()) * x0.float() + sigma_to.float() * noise.float()
+
+
+def standard_cfg(
+    cond: Tensor,
+    uncond: Tensor,
+    guidance_scale: float,
+    cfg_norm: Optional[str] = "none",
+) -> Tensor:
+    """Apply ``uncond + scale * (cond - uncond)`` classifier-free guidance.
+
+    ``cfg_norm`` follows the LightX2V reference: ``layer_norm`` rescales each
+    last-dimension vector, while ``scalar`` uses one norm ratio for the entire
+    tensor.
     """
     cond = cond.float()
     uncond = uncond.float()
     guided = uncond + guidance_scale * (cond - uncond)
-    if cfg_norm == "none":
+    if cfg_norm in (None, "none"):
         return guided
     if cfg_norm == "layer_norm":
-        cond_norm = cond.norm(p=2, dim=-1, keepdim=True)
-        guided_norm = guided.norm(p=2, dim=-1, keepdim=True)
-        scale = torch.where(
-            cond_norm > 0,
-            cond_norm / torch.clamp(guided_norm, min=1e-8),
-            torch.ones_like(cond_norm),
-        )
-        return guided * scale
+        cond_norm = torch.norm(cond, dim=-1, keepdim=True)
+        guided_norm = torch.norm(guided, dim=-1, keepdim=True)
+        return guided * (cond_norm / guided_norm.clamp_min(1e-12))
     if cfg_norm == "scalar":
-        cond_norm = cond.norm(p=2, dim=-1, keepdim=True)
-        guided_norm = guided.norm(p=2, dim=-1, keepdim=True)
-        scale = torch.clamp(cond_norm / torch.clamp(guided_norm, min=1e-8), max=1.0)
-        return guided * scale
+        ratio = torch.norm(cond) / torch.norm(guided).clamp_min(1e-12)
+        return guided * min(1.0, ratio.item())
     raise ValueError(f"Unknown cfg_norm {cfg_norm!r}; expected one of {{'none', 'layer_norm', 'scalar'}}.")
 
 
