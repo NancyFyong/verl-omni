@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 from verl.utils import tensordict_utils as tu
 
 from verl_omni.trainer.diffusion.distillation.contracts import PhaseRequest
@@ -26,10 +27,38 @@ from verl_omni.workers.diffusion_distillation_worker import (
     DiffusionDistillationWorkerGroup,
     DistillationPhaseComputation,
     DistillationRoleRuntime,
+    _resolve_profiler_configs,
 )
 from verl_omni.workers.engine.fsdp.distillation_impl import DistillationRoleGroupEngine
 
 _CAPABILITIES = frozenset({"distribution_matching"})
+
+
+def test_distillation_worker_instantiates_nested_profiler_tool_config():
+    config = OmegaConf.create(
+        {
+            "_target_": "verl.utils.profiler.ProfilerConfig",
+            "tool": "torch",
+            "enable": False,
+            "all_ranks": False,
+            "ranks": [],
+            "save_path": "outputs/profile",
+            "tool_config": {
+                "torch": {
+                    "_target_": "verl.utils.profiler.config.TorchProfilerToolConfig",
+                    "contents": [],
+                    "discrete": False,
+                    "name": "torch",
+                }
+            },
+        }
+    )
+
+    profiler_config, tool_config = _resolve_profiler_configs(config)
+
+    assert profiler_config.tool == "torch"
+    assert tool_config.name == "torch"
+    assert tool_config.contents == []
 
 
 class _ToyRoleEngine:
