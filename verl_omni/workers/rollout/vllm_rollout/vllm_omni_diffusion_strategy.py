@@ -288,6 +288,10 @@ class DiffusionStrategy(OmniStrategyBase):
             # default lives in this shared strategy.
             if audio_sample_rate is not None:
                 extra_fields.setdefault("audio_sample_rate", audio_sample_rate)
+        # Surface the adapter-declared primary media kind so downstream consumers
+        # read the modality instead of inferring it from the response tensor rank.
+        if io_spec is not None:
+            extra_fields.setdefault("media_kind", io_spec.primary.modality)
 
         req_output = getattr(final_res, "request_output", None) or final_res
         if hasattr(req_output, "outputs") and req_output.outputs:
