@@ -219,6 +219,7 @@ class QwenImageConditionProvider:
             raise ValueError("Qwen prompt encoding produced no tokens after removing the template prefix.")
         return self.make_condition(prompt_embeds.detach(), prompt_mask.detach() if prompt_mask is not None else None)
 
+    @torch.profiler.record_function("distillation/condition_encode")
     def encode(
         self,
         batch: TensorDict,
@@ -270,10 +271,12 @@ class QwenImageConditionProvider:
                 negative = self.encode_ids(pipeline, negative_ids, negative_mask)
             else:
                 if self._negative_condition is None:
-                    negative_rows = [self.negative_prompt] * batch.batch_size[0]
-                    negative_ids, negative_mask = self.tokenize_rows(pipeline, negative_rows, device)
+                    negative_ids, negative_mask = self.tokenize_rows(pipeline, [self.negative_prompt], device)
                     self._negative_condition = self.encode_ids(pipeline, negative_ids, negative_mask)
-                negative = self._negative_condition
+                negative = self.make_condition(
+                    self._negative_condition.tensors["prompt_embeds"].expand(batch.batch_size[0], -1, -1),
+                    self._negative_condition.masks["prompt_embeds"].expand(batch.batch_size[0], -1),
+                )
         else:
             if negative_mask is None:
                 raise ValueError("Pre-tokenized negative Qwen prompts require negative_prompt_attention_mask.")
@@ -446,8 +449,8 @@ class QwenImageDMDPhaseRunner:
 
     def latent_geometry(self, batch: TensorDict, module: torch.nn.Module) -> tuple[int, int, int, tuple[int, ...]]:
         """Resolve the declared Qwen packed-token and VAE latent dimensions."""
-        if batch.batch_size[0] != 1:
-            raise ValueError("Qwen DMD currently requires physical micro-batch size 1 per data-parallel rank.")
+        if len(batch.batch_size) != 1 or batch.batch_size[0] <= 0:
+            raise ValueError("Qwen DMD requires a nonempty leading batch dimension.")
         height = self.batch_int(batch, "height", self.height)
         width = self.batch_int(batch, "width", self.width)
         divisor = QWEN_IMAGE_VAE_SCALE_FACTOR * 2
@@ -464,7 +467,7 @@ class QwenImageDMDPhaseRunner:
         latent_channels = in_channels // 4
         latent_height = height // QWEN_IMAGE_VAE_SCALE_FACTOR
         latent_width = width // QWEN_IMAGE_VAE_SCALE_FACTOR
-        return height, width, in_channels, (1, latent_channels, 1, latent_height, latent_width)
+        return height, width, in_channels, (batch.batch_size[0], latent_channels, 1, latent_height, latent_width)
 
     @staticmethod
     def pack_latents(latents: torch.Tensor) -> torch.Tensor:
@@ -498,7 +501,10 @@ class QwenImageDMDPhaseRunner:
         grad_enabled: bool,
     ) -> torch.Tensor:
         """Predict Qwen flow velocity with explicit role and gradient ownership."""
-        with runtime.use_role(role, grad_enabled=grad_enabled) as module:
+        with (
+            torch.profiler.record_function(f"distillation/{role}_forward"),
+            runtime.use_role(role, grad_enabled=grad_enabled) as module,
+        ):
             module.eval()
             timestep = sigma.reshape(-1)
             if timestep.shape[0] == 1 and latents.shape[0] != 1:
@@ -534,6 +540,7 @@ class QwenImageDMDPhaseRunner:
         steps = 1 if self.strategy == "one_step" else self.num_inference_steps
         return build_qwen_dmd_sigmas(steps, self.rollout_timestep_shift, device=device)
 
+    @torch.profiler.record_function("distillation/student_rollout")
     def rollout(
         self,
         runtime: DistillationRoleRuntime,
@@ -807,6 +814,7 @@ class QwenImageDMDPhaseRunner:
             )
         return value
 
+    @torch.profiler.record_function("distillation/regression")
     def regression_loss(
         self,
         batch: TensorDict,
@@ -818,10 +826,13 @@ class QwenImageDMDPhaseRunner:
     ) -> torch.Tensor:
         """Regress a paired student sample against its teacher target."""
         manifest = tu.get(batch, "teacher_sampling_manifest")
-        if isinstance(manifest, list) and len(manifest) == 1:
-            manifest = manifest[0]
-        if not isinstance(manifest, Mapping) or not manifest:
-            raise ValueError("Original DMD regression batches require teacher_sampling_manifest provenance.")
+        manifests = [manifest] if isinstance(manifest, Mapping) and batch.batch_size[0] == 1 else manifest
+        if (
+            not isinstance(manifests, list)
+            or len(manifests) != batch.batch_size[0]
+            or any(not isinstance(item, Mapping) or not item for item in manifests)
+        ):
+            raise ValueError("Original DMD regression requires teacher_sampling_manifest provenance for every sample.")
         reference_noise = tu.get(batch, "reference_noise")
         target_latents = tu.get(batch, "teacher_target_latents")
         target_pixels = tu.get(batch, "teacher_target_pixels")

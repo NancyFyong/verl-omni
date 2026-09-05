@@ -797,11 +797,12 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
         max_sequence_length = sampling_params.max_sequence_length or max_sequence_length
         output_type = sampling_params.output_type or output_type
 
-        noise_level = coalesce_not_none(sampling_params.extra_args.get("noise_level", None), noise_level)
-        sde_window_size = coalesce_not_none(sampling_params.extra_args.get("sde_window_size", None), sde_window_size)
-        sde_window_range = coalesce_not_none(sampling_params.extra_args.get("sde_window_range", None), sde_window_range)
-        sde_type = coalesce_not_none(sampling_params.extra_args.get("sde_type", None), sde_type)
-        logprobs = coalesce_not_none(sampling_params.extra_args.get("logprobs", None), logprobs)
+        extra_args = sampling_params.extra_args or {}
+        noise_level = coalesce_not_none(extra_args.get("noise_level", None), noise_level)
+        sde_window_size = coalesce_not_none(extra_args.get("sde_window_size", None), sde_window_size)
+        sde_window_range = coalesce_not_none(extra_args.get("sde_window_range", None), sde_window_range)
+        sde_type = coalesce_not_none(extra_args.get("sde_type", None), sde_type)
+        logprobs = coalesce_not_none(extra_args.get("logprobs", None), logprobs)
 
         for request in request_batch.requests:
             request_sampling_params = request.sampling_params
@@ -870,7 +871,7 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
             generator,
             latents,
         )
-        img_shapes = build_img_shapes(height, width, batch_size, self.vae_scale_factor)
+        img_shapes = build_img_shapes(height, width, latents.shape[0], self.vae_scale_factor)
 
         timesteps, num_inference_steps = self.prepare_timesteps(num_inference_steps, sigmas, latents.shape[1])
         self._num_timesteps = len(timesteps)
