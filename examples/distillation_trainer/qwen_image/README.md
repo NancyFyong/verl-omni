@@ -15,7 +15,17 @@ The `distillation` extra installs `piq`, which is required only by the paper-ori
 
 ## Data
 
-The DMD2 distribution-only recipe accepts the normal prompt parquet contract. Each row needs a `prompt` chat-message list. The standard `RLHFDataset` passes the messages as `raw_prompt`; the Qwen adapter renders and encodes them once per micro-batch with the frozen checkpoint text encoder.
+The DMD2 distribution-only recipe accepts the normal prompt parquet contract. Each row needs `prompt=[{"role": "user", "content": "..."}]`. The standard `RLHFDataset` passes this as `raw_prompt`; the Qwen adapter applies the checkpoint pipeline's fixed template before encoding and removing its 34-token prefix. Plain strings are also supported; custom system messages and multi-turn chats require precomputed conditioning.
+
+For PickScore / Pick-a-Pic prompts, use the existing SFW converter:
+
+```bash
+python examples/flowgrpo_trainer/data_process/sd3_pickscore_sfw.py \
+    --dataset CarperAI/pickapic_v1_no_images_training_sfw \
+    --output-dir ~/data/pickscore_sfw/qwen_image
+```
+
+To preserve the upstream Flow-GRPO split, download its `dataset/pickscore_sfw/train.txt` and `test.txt`, then pass their directory with `--input-dir`. The converter records source and split metadata. Set `TRAIN_FILES` and `VAL_FILES` to the resulting parquet files. DMD2 uses only these prompts, **not a PickScore reward model**; prompt-only data does not satisfy original DMD's paired-regression requirements.
 
 Precomputed conditioning is also supported. Set:
 
@@ -39,6 +49,6 @@ bash examples/distillation_trainer/qwen_image/run_qwen_image_dmd2_lora.sh
 
 The reference-aligned defaults are four student denoising steps, rollout and score-noise time shifts of `3.0`, score sigma range `[0.02, 0.98]`, teacher CFG `4.0` with per-token norm preservation, student LR `1e-4`, fake-score LR `2e-5`, and two fake-score updates after each student update.
 
-The initial implementation requires physical micro-batch size one per data-parallel rank. Gradient accumulation still provides a larger global batch. Shared-base FSDP1 additionally requires `use_orig_params=true`; the script uses FSDP2.
+The initial implementation requires physical micro-batch size one per data-parallel rank. Gradient accumulation still provides a larger global batch. Rollout exit decisions are broadcast across the training group: FSDP shards must execute identical forward counts and gradient exits, even though their prompts and sample noise differ. Shared-base FSDP1 additionally requires `use_orig_params=true`; the script uses FSDP2.
 
 Only `student` or `student_ema` is exportable. Teacher and fake-score parameters remain training-only state. The registered vLLM-Omni `dmd`/`dmd2` rollout adapter uses the same fixed-shift sigma schedule, defaults to deterministic sampling (`noise_level=0`) and no inference CFG, and accepts `rollout_timestep_shift` through request `extra_args` when a non-default training shift is used.

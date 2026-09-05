@@ -48,7 +48,7 @@ if TYPE_CHECKING:
         DistillationRoleRuntime,
     )
 
-__all__ = ["QwenImageDmdPhaseRunner", "build_qwen_dmd_sigmas"]
+__all__ = ["QwenImageDMDPhaseRunner", "build_qwen_dmd_sigmas"]
 
 
 def build_qwen_dmd_sigmas(
@@ -73,7 +73,9 @@ def build_qwen_dmd_sigmas(
     return torch.cat((shifted, shifted.new_zeros(1)))
 
 
-class _QwenImageConditionProvider:
+class QwenImageConditionProvider:
+    """Encode frozen local or precomputed Qwen prompt conditioning."""
+
     def __init__(
         self,
         model_path: str,
@@ -89,7 +91,8 @@ class _QwenImageConditionProvider:
         self._negative_condition: Optional[ConditionBundle] = None
 
     @staticmethod
-    def _condition(prompt_embeds: torch.Tensor, prompt_mask: Optional[torch.Tensor]) -> ConditionBundle:
+    def make_condition(prompt_embeds: torch.Tensor, prompt_mask: Optional[torch.Tensor]) -> ConditionBundle:
+        """Build a detached [B, L, D] condition with a matching [B, L] mask."""
         if prompt_embeds.ndim != 3:
             raise ValueError(f"Qwen prompt embeddings must have shape [B, L, D], got {tuple(prompt_embeds.shape)}.")
         prompt_embeds = prompt_embeds.detach()
@@ -105,24 +108,26 @@ class _QwenImageConditionProvider:
         )
 
     @staticmethod
-    def _require_tensor(batch: TensorDict, key: str) -> torch.Tensor:
+    def require_tensor(batch: TensorDict, key: str) -> torch.Tensor:
+        """Require a tensor-valued precomputed conditioning field."""
         value = tu.get(batch, key)
         if not isinstance(value, torch.Tensor):
             raise ValueError(f"Precomputed Qwen conditioning requires tensor batch field {key!r}.")
         return value
 
-    def _encode_precomputed(
+    def encode_precomputed(
         self,
         batch: TensorDict,
         *,
         require_negative: bool,
     ) -> tuple[ConditionBundle, Optional[ConditionBundle]]:
-        prompt_embeds = self._require_tensor(batch, "prompt_embeds")[:, : self.max_sequence_length]
+        """Validate and truncate cached positive and negative conditioning."""
+        prompt_embeds = self.require_tensor(batch, "prompt_embeds")[:, : self.max_sequence_length]
         prompt_mask = tu.get(batch, "prompt_embeds_mask")
         if isinstance(prompt_mask, torch.Tensor):
             prompt_mask = prompt_mask[:, : self.max_sequence_length]
         negative_embeds = (
-            self._require_tensor(batch, "negative_prompt_embeds")[:, : self.max_sequence_length]
+            self.require_tensor(batch, "negative_prompt_embeds")[:, : self.max_sequence_length]
             if require_negative
             else None
         )
@@ -133,24 +138,22 @@ class _QwenImageConditionProvider:
             raise TypeError("prompt_embeds_mask must be a tensor when supplied.")
         if negative_mask is not None and not isinstance(negative_mask, torch.Tensor):
             raise TypeError("negative_prompt_embeds_mask must be a tensor when supplied.")
-        positive = self._condition(prompt_embeds, prompt_mask)
-        negative = self._condition(negative_embeds, negative_mask) if negative_embeds is not None else None
+        positive = self.make_condition(prompt_embeds, prompt_mask)
+        negative = self.make_condition(negative_embeds, negative_mask) if negative_embeds is not None else None
         if positive.tensors["prompt_embeds"].shape[0] != batch.batch_size[0]:
             raise ValueError("Precomputed Qwen conditioning batch size does not match the phase batch.")
         if negative is not None and negative.tensors["prompt_embeds"].shape[0] != batch.batch_size[0]:
             raise ValueError("Precomputed Qwen negative conditioning batch size does not match the phase batch.")
         return positive, negative
 
-    def _ensure_pipeline(self, device: torch.device, dtype: torch.dtype):
+    def ensure_pipeline(self, device: torch.device, dtype: torch.dtype):
+        """Load the frozen checkpoint text encoder once on the execution device."""
         if self.pipeline is not None:
             return self.pipeline
 
         from diffusers import QwenImagePipeline
 
-        class TokenIdQwenImagePipeline(QwenImageTokenIdPromptMixin, QwenImagePipeline):
-            pass
-
-        pipeline = TokenIdQwenImagePipeline.from_pretrained(
+        pipeline = QwenImagePipeline.from_pretrained(
             self.model_path,
             transformer=None,
             vae=None,
@@ -163,7 +166,8 @@ class _QwenImageConditionProvider:
         return pipeline
 
     @staticmethod
-    def _rows(value: Any, batch_size: int, key: str) -> list[Any]:
+    def prompt_rows(value: Any, batch_size: int, key: str) -> list[Any]:
+        """Unwrap one text or chat-message row per phase sample."""
         if hasattr(value, "tolist") and not isinstance(value, torch.Tensor):
             value = value.tolist()
         if batch_size == 1 and (
@@ -174,15 +178,20 @@ class _QwenImageConditionProvider:
             raise ValueError(f"{key} must contain exactly {batch_size} prompt row(s).")
         return value
 
-    def _tokenize_rows(self, pipeline, rows: list[Any], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    def tokenize_rows(self, pipeline, rows: list[Any], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply the fixed Qwen template before tokenization and prefix removal."""
         rendered = []
         for row in rows:
-            if isinstance(row, str):
-                rendered.append(pipeline.prompt_template_encode.format(row))
-            elif isinstance(row, list) and all(isinstance(message, dict) for message in row):
-                rendered.append(pipeline.tokenizer.apply_chat_template(row, add_generation_prompt=True, tokenize=False))
-            else:
-                raise TypeError("Qwen prompts must be strings or chat-message lists.")
+            if isinstance(row, list):
+                if len(row) != 1 or not isinstance(row[0], dict) or row[0].get("role") != "user":
+                    raise ValueError(
+                        "Qwen DMD raw prompts require a single user message; use precomputed conditioning otherwise."
+                    )
+                row = row[0].get("content")
+            if not isinstance(row, str):
+                raise TypeError("Qwen DMD prompts must be strings or single text-only user messages.")
+            # The encoder removes this template's fixed prefix, not a generic chat prefix.
+            rendered.append(pipeline.prompt_template_encode.format(row))
         tokens = pipeline.tokenizer(
             rendered,
             max_length=self.max_sequence_length + pipeline.prompt_template_encode_start_idx,
@@ -192,21 +201,23 @@ class _QwenImageConditionProvider:
         )
         return tokens.input_ids.to(device), tokens.attention_mask.to(device)
 
-    def _encode_ids(
+    def encode_ids(
         self,
         pipeline,
         prompt_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
     ) -> ConditionBundle:
+        """Reuse Qwen token-ID encoding under no-grad and truncate the result."""
         with torch.no_grad():
-            prompt_embeds, prompt_mask = pipeline.encode_prompt(
-                prompt_ids=prompt_ids,
-                attention_mask=attention_mask,
-                max_sequence_length=self.max_sequence_length,
+            prompt_embeds, prompt_mask = QwenImageTokenIdPromptMixin._get_qwen_prompt_embeds(
+                pipeline, prompt_ids, attention_mask=attention_mask
             )
+        prompt_embeds = prompt_embeds[:, : self.max_sequence_length]
+        if prompt_mask is not None:
+            prompt_mask = prompt_mask[:, : self.max_sequence_length]
         if prompt_embeds.shape[1] == 0:
             raise ValueError("Qwen prompt encoding produced no tokens after removing the template prefix.")
-        return self._condition(prompt_embeds.detach(), prompt_mask.detach() if prompt_mask is not None else None)
+        return self.make_condition(prompt_embeds.detach(), prompt_mask.detach() if prompt_mask is not None else None)
 
     def encode(
         self,
@@ -216,12 +227,13 @@ class _QwenImageConditionProvider:
         dtype: torch.dtype,
         require_negative: bool,
     ) -> tuple[ConditionBundle, Optional[ConditionBundle]]:
+        """Encode the positive prompt and optional teacher negative condition."""
         if self.provider == "precomputed":
-            return self._encode_precomputed(batch, require_negative=require_negative)
+            return self.encode_precomputed(batch, require_negative=require_negative)
         if self.provider != "local_frozen_encoder":
             raise ValueError(f"Unsupported Qwen conditioning provider {self.provider!r}.")
 
-        pipeline = self._ensure_pipeline(device, dtype)
+        pipeline = self.ensure_pipeline(device, dtype)
         prompt_ids = tu.get(batch, "prompt_ids", tu.get(batch, "prompts"))
         prompt_mask = tu.get(
             batch,
@@ -232,8 +244,8 @@ class _QwenImageConditionProvider:
             raw_prompt = tu.get(batch, "raw_prompt")
             if raw_prompt is None:
                 raise ValueError("Qwen DMD batches require prompt_ids, prompts, prompt_embeds, or raw_prompt.")
-            rows = self._rows(raw_prompt, batch.batch_size[0], "raw_prompt")
-            prompt_ids, prompt_mask = self._tokenize_rows(pipeline, rows, device)
+            rows = self.prompt_rows(raw_prompt, batch.batch_size[0], "raw_prompt")
+            prompt_ids, prompt_mask = self.tokenize_rows(pipeline, rows, device)
         else:
             if prompt_mask is None:
                 raise ValueError("Pre-tokenized Qwen prompts require prompt_attention_mask or attention_mask.")
@@ -243,7 +255,7 @@ class _QwenImageConditionProvider:
                 prompt_ids = prompt_ids.to(device=device, dtype=torch.long)
         if prompt_mask is not None:
             prompt_mask = torch.as_tensor(prompt_mask, device=device, dtype=torch.long)
-        positive = self._encode_ids(pipeline, prompt_ids, prompt_mask)
+        positive = self.encode_ids(pipeline, prompt_ids, prompt_mask)
 
         if not require_negative:
             return positive, None
@@ -253,28 +265,28 @@ class _QwenImageConditionProvider:
         if negative_ids is None:
             raw_negative = tu.get(batch, "raw_negative_prompt", tu.get(batch, "negative_prompt"))
             if raw_negative is not None:
-                negative_rows = self._rows(raw_negative, batch.batch_size[0], "negative_prompt")
-                negative_ids, negative_mask = self._tokenize_rows(pipeline, negative_rows, device)
-                negative = self._encode_ids(pipeline, negative_ids, negative_mask)
+                negative_rows = self.prompt_rows(raw_negative, batch.batch_size[0], "negative_prompt")
+                negative_ids, negative_mask = self.tokenize_rows(pipeline, negative_rows, device)
+                negative = self.encode_ids(pipeline, negative_ids, negative_mask)
             else:
                 if self._negative_condition is None:
                     negative_rows = [self.negative_prompt] * batch.batch_size[0]
-                    negative_ids, negative_mask = self._tokenize_rows(pipeline, negative_rows, device)
-                    self._negative_condition = self._encode_ids(pipeline, negative_ids, negative_mask)
+                    negative_ids, negative_mask = self.tokenize_rows(pipeline, negative_rows, device)
+                    self._negative_condition = self.encode_ids(pipeline, negative_ids, negative_mask)
                 negative = self._negative_condition
         else:
             if negative_mask is None:
                 raise ValueError("Pre-tokenized negative Qwen prompts require negative_prompt_attention_mask.")
             negative_ids = torch.as_tensor(negative_ids, device=device, dtype=torch.long)
             negative_mask = torch.as_tensor(negative_mask, device=device, dtype=torch.long)
-            negative = self._encode_ids(pipeline, negative_ids, negative_mask)
+            negative = self.encode_ids(pipeline, negative_ids, negative_mask)
         return positive, negative
 
 
-class QwenImageDmdPhaseRunner:
+class QwenImageDMDPhaseRunner:
     """Differentiable Qwen-Image phase program for DMD and distribution-only DMD2."""
 
-    _STREAM_OFFSETS = {
+    STREAM_OFFSETS = {
         "initial_noise": 0,
         "rollout_decision": 1,
         "rollout_transition": 2,
@@ -311,7 +323,7 @@ class QwenImageDmdPhaseRunner:
         else:
             inference_shift = getattr(rollout_config, "rollout_timestep_shift", None)
         self.inference_rollout_timestep_shift = 3.0 if inference_shift is None else float(inference_shift)
-        self.condition_provider = _QwenImageConditionProvider(
+        self.condition_provider = QwenImageConditionProvider(
             model_config.local_path or model_config.path,
             str(plan.data_requirements["conditioning_provider"]),
             int(model_config.pipeline.max_sequence_length),
@@ -321,9 +333,10 @@ class QwenImageDmdPhaseRunner:
         self._pending_generator_states: dict[str, torch.Tensor] = {}
         self._vae = None
         self._lpips = None
-        self._validate()
+        self.validate_config()
 
-    def _validate(self) -> None:
+    def validate_config(self) -> None:
+        """Reject unsupported Qwen sampling, geometry, and objective settings."""
         if self.height <= 0 or self.width <= 0:
             raise ValueError("Qwen DMD height and width must be positive.")
         divisor = QWEN_IMAGE_VAE_SCALE_FACTOR * 2
@@ -366,47 +379,58 @@ class QwenImageDmdPhaseRunner:
             raise ValueError("The Qwen original-DMD profile requires rollout_strategy='one_step'.")
 
     @staticmethod
-    def _module_dtype(module: torch.nn.Module) -> torch.dtype:
+    def module_dtype(module: torch.nn.Module) -> torch.dtype:
+        """Read the model parameter dtype for frozen conditioning."""
         try:
             return next(module.parameters()).dtype
         except StopIteration:
             return torch.float32
 
     @staticmethod
-    def _module_config(module: torch.nn.Module):
+    def module_config(module: torch.nn.Module):
+        """Read the underlying transformer configuration through a wrapper."""
         return getattr(getattr(module, "module", module), "config", None)
 
-    def _generator(self, name: str, device: torch.device, runtime: DistillationRoleRuntime) -> torch.Generator:
+    def generator_for_stream(
+        self, name: str, device: torch.device, runtime: DistillationRoleRuntime
+    ) -> torch.Generator:
+        """Resolve a checkpointable RNG stream, shared by sequence-parallel peers."""
         if name in self._generators:
             return self._generators[name]
-        if name not in self._STREAM_OFFSETS:
+        if name not in self.STREAM_OFFSETS:
             raise KeyError(f"Unknown Qwen DMD RNG stream {name!r}.")
         engine = runtime.engine_for_role("student")
         rank = int(engine.get_data_parallel_rank()) if hasattr(engine, "get_data_parallel_rank") else 0
         generator = torch.Generator(device=device)
-        generator.manual_seed(self.rng_seed + rank * len(self._STREAM_OFFSETS) + self._STREAM_OFFSETS[name])
+        generator.manual_seed(self.rng_seed + rank * len(self.STREAM_OFFSETS) + self.STREAM_OFFSETS[name])
         pending = self._pending_generator_states.pop(name, None)
         if pending is not None:
             generator.set_state(pending)
         self._generators[name] = generator
         return generator
 
-    def _randn(self, shape: tuple[int, ...], device: torch.device, runtime: DistillationRoleRuntime, stream: str):
+    def sample_noise(self, shape: tuple[int, ...], device: torch.device, runtime: DistillationRoleRuntime, stream: str):
+        """Draw fp32 noise from the named independent RNG stream."""
         return torch.randn(
-            shape, device=device, dtype=torch.float32, generator=self._generator(stream, device, runtime)
+            shape, device=device, dtype=torch.float32, generator=self.generator_for_stream(stream, device, runtime)
         )
 
-    def _randint(self, high: int, device: torch.device, runtime: DistillationRoleRuntime) -> int:
+    def sample_rollout_exit(self, high: int, device: torch.device, runtime: DistillationRoleRuntime) -> int:
+        """Broadcast one exit step so FSDP and sequence-parallel control flow agree."""
         value = torch.randint(
             high,
             (1,),
             device=device,
-            generator=self._generator("rollout_decision", device, runtime),
+            generator=self.generator_for_stream("rollout_decision", device, runtime),
         )
+        if torch.distributed.is_initialized():
+            # FSDP shards and SP peers must enter identical forward/backward collectives.
+            torch.distributed.broadcast(value, src=0)
         return int(value.item())
 
     @staticmethod
-    def _batch_int(batch: TensorDict, key: str, default: int) -> int:
+    def batch_int(batch: TensorDict, key: str, default: int) -> int:
+        """Require homogeneous integer geometry metadata within a micro-batch."""
         value = tu.get(batch, key, default)
         if isinstance(value, torch.Tensor):
             values = value.detach().reshape(-1)
@@ -420,17 +444,18 @@ class QwenImageDmdPhaseRunner:
             return values[0]
         return int(value)
 
-    def _geometry(self, batch: TensorDict, module: torch.nn.Module) -> tuple[int, int, int, tuple[int, ...]]:
+    def latent_geometry(self, batch: TensorDict, module: torch.nn.Module) -> tuple[int, int, int, tuple[int, ...]]:
+        """Resolve the declared Qwen packed-token and VAE latent dimensions."""
         if batch.batch_size[0] != 1:
             raise ValueError("Qwen DMD currently requires physical micro-batch size 1 per data-parallel rank.")
-        height = self._batch_int(batch, "height", self.height)
-        width = self._batch_int(batch, "width", self.width)
+        height = self.batch_int(batch, "height", self.height)
+        width = self.batch_int(batch, "width", self.width)
         divisor = QWEN_IMAGE_VAE_SCALE_FACTOR * 2
         if height <= 0 or width <= 0 or height % divisor or width % divisor:
             raise ValueError(
                 f"Qwen DMD height and width must be positive multiples of {divisor}, got {height}x{width}."
             )
-        module_config = self._module_config(module)
+        module_config = self.module_config(module)
         in_channels = getattr(module_config, "in_channels", None)
         if in_channels is None:
             in_channels = (self.model_config.transformer_config or {}).get("in_channels")
@@ -442,14 +467,16 @@ class QwenImageDmdPhaseRunner:
         return height, width, in_channels, (1, latent_channels, 1, latent_height, latent_width)
 
     @staticmethod
-    def _pack(latents: torch.Tensor) -> torch.Tensor:
+    def pack_latents(latents: torch.Tensor) -> torch.Tensor:
+        """Pack normalized [B, C, 1, H, W] latents with the Diffusers Qwen helper."""
         from diffusers import QwenImagePipeline
 
         batch, channels, _, height, width = latents.shape
         return QwenImagePipeline._pack_latents(latents, batch, channels, height, width)
 
     @staticmethod
-    def _expand_sigma(sigma: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
+    def expand_sigma(sigma: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
+        """Broadcast a scalar or per-sample sigma over non-batch latent dimensions."""
         if sigma.ndim == 0:
             sigma = sigma.reshape(1)
         if sigma.shape[0] == 1 and tensor.shape[0] != 1:
@@ -458,7 +485,7 @@ class QwenImageDmdPhaseRunner:
             raise ValueError(f"Sigma batch {sigma.shape[0]} does not match latent batch {tensor.shape[0]}.")
         return sigma.reshape(sigma.shape[0], *((1,) * (tensor.ndim - 1)))
 
-    def _predict_velocity(
+    def predict_velocity(
         self,
         runtime: DistillationRoleRuntime,
         role: str,
@@ -470,12 +497,13 @@ class QwenImageDmdPhaseRunner:
         width: int,
         grad_enabled: bool,
     ) -> torch.Tensor:
+        """Predict Qwen flow velocity with explicit role and gradient ownership."""
         with runtime.use_role(role, grad_enabled=grad_enabled) as module:
             module.eval()
             timestep = sigma.reshape(-1)
             if timestep.shape[0] == 1 and latents.shape[0] != 1:
                 timestep = timestep.expand(latents.shape[0])
-            module_config = self._module_config(module)
+            module_config = self.module_config(module)
             guidance = None
             if getattr(module_config, "guidance_embeds", False):
                 configured = self.model_config.pipeline.guidance_scale
@@ -500,12 +528,13 @@ class QwenImageDmdPhaseRunner:
             )
         return output
 
-    def _rollout_sigmas(self, scheduler, height: int, width: int, device: torch.device) -> torch.Tensor:
+    def rollout_sigmas(self, scheduler, height: int, width: int, device: torch.device) -> torch.Tensor:
+        """Return the inference-matched fixed-shift student sigma schedule."""
         del scheduler, height, width
         steps = 1 if self.strategy == "one_step" else self.num_inference_steps
         return build_qwen_dmd_sigmas(steps, self.rollout_timestep_shift, device=device)
 
-    def _rollout(
+    def rollout(
         self,
         runtime: DistillationRoleRuntime,
         condition: ConditionBundle,
@@ -515,17 +544,20 @@ class QwenImageDmdPhaseRunner:
         width: int,
         grad_enabled: bool,
     ) -> tuple[torch.Tensor, int, torch.Tensor, torch.Tensor]:
+        """Run to the shared exit step, retaining only its student graph."""
         scheduler = runtime.scheduler_for_role("student")
-        sigmas = self._rollout_sigmas(scheduler, height, width, initial_noise.device)
+        sigmas = self.rollout_sigmas(scheduler, height, width, initial_noise.device)
         exit_index = (
-            0 if self.strategy == "one_step" else self._randint(sigmas.numel() - 1, initial_noise.device, runtime)
+            0
+            if self.strategy == "one_step"
+            else self.sample_rollout_exit(sigmas.numel() - 1, initial_noise.device, runtime)
         )
         sample = initial_noise
         x0 = None
         for index in range(exit_index + 1):
             sigma = sigmas[index].reshape(1)
             use_grad = grad_enabled and index == exit_index
-            velocity = self._predict_velocity(
+            velocity = self.predict_velocity(
                 runtime,
                 "student",
                 sample,
@@ -535,22 +567,23 @@ class QwenImageDmdPhaseRunner:
                 width=width,
                 grad_enabled=use_grad,
             )
-            expanded_sigma = self._expand_sigma(sigma, sample)
+            expanded_sigma = self.expand_sigma(sigma, sample)
             x0 = velocity_to_x0(sample, velocity, expanded_sigma)
             if index == exit_index:
                 break
             sigma_next = sigmas[index + 1].reshape(1)
-            expanded_next = self._expand_sigma(sigma_next, sample)
+            expanded_next = self.expand_sigma(sigma_next, sample)
             if self.strategy == "consistency_renoise":
-                transition_noise = self._randn(tuple(sample.shape), sample.device, runtime, "rollout_transition")
+                transition_noise = self.sample_noise(tuple(sample.shape), sample.device, runtime, "rollout_transition")
                 sample = consistency_renoise_step(x0, transition_noise, expanded_next)
             else:
                 sample = ode_euler_step(sample, velocity, expanded_sigma, expanded_next)
         assert x0 is not None
         return x0, exit_index, sigmas[exit_index], sigmas[exit_index + 1]
 
-    def _sample_score_sigma(self, generated: torch.Tensor, runtime: DistillationRoleRuntime) -> torch.Tensor:
-        generator = self._generator("score_sigma", generated.device, runtime)
+    def sample_score_sigma(self, generated: torch.Tensor, runtime: DistillationRoleRuntime) -> torch.Tensor:
+        """Sample discrete shifted timesteps or continuous unshifted sigma values."""
+        generator = self.generator_for_stream("score_sigma", generated.device, runtime)
         if self.score_discrete_steps > 0:
             scheduler = runtime.scheduler_for_role("student")
             scheduler_config = getattr(scheduler, "config", {})
@@ -576,24 +609,27 @@ class QwenImageDmdPhaseRunner:
                 dtype=torch.float32,
                 generator=generator,
             )
+            sigma = self.score_sigma_min + (self.score_sigma_max - self.score_sigma_min) * sigma
         return sigma.clamp(self.score_sigma_min, self.score_sigma_max)
 
-    def _score_batch(
+    def score_batch(
         self,
         generated: torch.Tensor,
         runtime: DistillationRoleRuntime,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        sigma = self._sample_score_sigma(generated, runtime)
-        noise = self._randn(tuple(generated.shape), generated.device, runtime, "score_noise")
-        expanded = self._expand_sigma(sigma, generated)
+        """Re-noise detached generated latents using independent score RNG streams."""
+        sigma = self.sample_score_sigma(generated, runtime)
+        noise = self.sample_noise(tuple(generated.shape), generated.device, runtime, "score_noise")
+        expanded = self.expand_sigma(sigma, generated)
         noisy = (1.0 - expanded) * generated.detach().float() + expanded * noise
         return noisy, noise, sigma
 
     @staticmethod
-    def _prepare_condition_for_sequence_parallel(
+    def prepare_condition_for_sequence_parallel(
         runtime: DistillationRoleRuntime,
         condition: ConditionBundle,
     ) -> ConditionBundle:
+        """Reuse engine padding for sequence-parallel prompt embeddings."""
         engine = runtime.engine_for_role("student")
         if not getattr(engine, "use_ulysses_sp", False):
             return condition
@@ -602,9 +638,9 @@ class QwenImageDmdPhaseRunner:
             condition.masks.get("prompt_embeds"),
             engine.ulysses_sequence_parallel_size,
         )
-        return _QwenImageConditionProvider._condition(embeds, mask)
+        return QwenImageConditionProvider.make_condition(embeds, mask)
 
-    def _student_loss(
+    def student_loss(
         self,
         batch: TensorDict,
         runtime: DistillationRoleRuntime,
@@ -615,10 +651,13 @@ class QwenImageDmdPhaseRunner:
         width: int,
         latent_shape: tuple[int, ...],
     ):
-        initial_noise = self._randn(latent_shape, condition.tensors["prompt_embeds"].device, runtime, "initial_noise")
-        packed_noise = self._pack(initial_noise)
+        """Build DMD and optional paired-regression losses for the student only."""
+        initial_noise = self.sample_noise(
+            latent_shape, condition.tensors["prompt_embeds"].device, runtime, "initial_noise"
+        )
+        packed_noise = self.pack_latents(initial_noise)
         rollout_start = time.perf_counter()
-        generated, exit_index, sigma_from, sigma_to = self._rollout(
+        generated, exit_index, sigma_from, sigma_to = self.rollout(
             runtime,
             condition,
             packed_noise,
@@ -627,10 +666,10 @@ class QwenImageDmdPhaseRunner:
             grad_enabled=True,
         )
         rollout_duration = time.perf_counter() - rollout_start
-        noisy, _, score_sigma = self._score_batch(generated, runtime)
+        noisy, _, score_sigma = self.score_batch(generated, runtime)
         with torch.no_grad():
             fake_start = time.perf_counter()
-            fake_velocity = self._predict_velocity(
+            fake_velocity = self.predict_velocity(
                 runtime,
                 "fake_score",
                 noisy,
@@ -642,7 +681,7 @@ class QwenImageDmdPhaseRunner:
             )
             fake_duration = time.perf_counter() - fake_start
             teacher_start = time.perf_counter()
-            teacher_positive = self._predict_velocity(
+            teacher_positive = self.predict_velocity(
                 runtime,
                 "teacher_score",
                 noisy,
@@ -652,7 +691,7 @@ class QwenImageDmdPhaseRunner:
                 width=width,
                 grad_enabled=False,
             )
-            teacher_negative = self._predict_velocity(
+            teacher_negative = self.predict_velocity(
                 runtime,
                 "teacher_score",
                 noisy,
@@ -668,7 +707,7 @@ class QwenImageDmdPhaseRunner:
                 self.guidance_scale,
                 self.cfg_norm,
             )
-            expanded_sigma = self._expand_sigma(score_sigma, noisy)
+            expanded_sigma = self.expand_sigma(score_sigma, noisy)
             fake_x0 = velocity_to_x0(noisy, fake_velocity, expanded_sigma)
             teacher_x0 = velocity_to_x0(noisy, teacher_velocity, expanded_sigma)
             gradient, normalizer, nonfinite = dmd_gradient(
@@ -695,13 +734,13 @@ class QwenImageDmdPhaseRunner:
         }
         if self.plan.name == "dmd":
             regression_start = time.perf_counter()
-            regression_loss = self._regression_loss(batch, runtime, condition, height=height, width=width)
+            regression_loss = self.regression_loss(batch, runtime, condition, height=height, width=width)
             total = total + self.regression_loss_weight * regression_loss
             metrics["regression/loss"] = float(regression_loss.detach())
             metrics["perf/regression_s"] = time.perf_counter() - regression_start
         return total, metrics
 
-    def _fake_loss(
+    def fake_loss(
         self,
         runtime: DistillationRoleRuntime,
         condition: ConditionBundle,
@@ -710,11 +749,14 @@ class QwenImageDmdPhaseRunner:
         width: int,
         latent_shape: tuple[int, ...],
     ):
-        initial_noise = self._randn(latent_shape, condition.tensors["prompt_embeds"].device, runtime, "initial_noise")
-        packed_noise = self._pack(initial_noise)
+        """Train the fake score to denoise detached student samples."""
+        initial_noise = self.sample_noise(
+            latent_shape, condition.tensors["prompt_embeds"].device, runtime, "initial_noise"
+        )
+        packed_noise = self.pack_latents(initial_noise)
         rollout_start = time.perf_counter()
         with torch.no_grad():
-            generated, exit_index, sigma_from, sigma_to = self._rollout(
+            generated, exit_index, sigma_from, sigma_to = self.rollout(
                 runtime,
                 condition,
                 packed_noise,
@@ -724,9 +766,9 @@ class QwenImageDmdPhaseRunner:
             )
             generated = generated.detach()
         rollout_duration = time.perf_counter() - rollout_start
-        noisy, score_noise, score_sigma = self._score_batch(generated, runtime)
+        noisy, score_noise, score_sigma = self.score_batch(generated, runtime)
         fake_start = time.perf_counter()
-        fake_velocity = self._predict_velocity(
+        fake_velocity = self.predict_velocity(
             runtime,
             "fake_score",
             noisy,
@@ -749,14 +791,15 @@ class QwenImageDmdPhaseRunner:
             "perf/fake_score_model_s": fake_duration,
         }
 
-    def _coerce_packed(self, value: Any, expected_shape: torch.Size, key: str, device: torch.device) -> torch.Tensor:
+    def coerce_packed(self, value: Any, expected_shape: torch.Size, key: str, device: torch.device) -> torch.Tensor:
+        """Validate and pack a reference noise or teacher-target tensor."""
         if not isinstance(value, torch.Tensor):
             raise ValueError(f"Qwen DMD regression requires tensor batch field {key!r}.")
         value = value.to(device=device, dtype=torch.float32)
         if value.ndim == 4:
             value = value.unsqueeze(2)
         if value.ndim == 5:
-            value = self._pack(value)
+            value = self.pack_latents(value)
         if value.shape != expected_shape:
             raise ValueError(
                 f"Qwen DMD {key} shape {tuple(value.shape)} does not match generated latent shape "
@@ -764,7 +807,7 @@ class QwenImageDmdPhaseRunner:
             )
         return value
 
-    def _regression_loss(
+    def regression_loss(
         self,
         batch: TensorDict,
         runtime: DistillationRoleRuntime,
@@ -773,6 +816,7 @@ class QwenImageDmdPhaseRunner:
         height: int,
         width: int,
     ) -> torch.Tensor:
+        """Regress a paired student sample against its teacher target."""
         manifest = tu.get(batch, "teacher_sampling_manifest")
         if isinstance(manifest, list) and len(manifest) == 1:
             manifest = manifest[0]
@@ -787,15 +831,15 @@ class QwenImageDmdPhaseRunner:
             raise ValueError("Provide only one of teacher_target_latents and teacher_target_pixels.")
 
         with runtime.use_role("student", grad_enabled=True) as module:
-            _, _, in_channels, latent_shape = self._geometry(batch, module)
+            _, _, in_channels, latent_shape = self.latent_geometry(batch, module)
         expected_packed = torch.Size((latent_shape[0], (latent_shape[-2] // 2) * (latent_shape[-1] // 2), in_channels))
-        reference_noise = self._coerce_packed(
+        reference_noise = self.coerce_packed(
             reference_noise,
             expected_packed,
             "reference_noise",
             condition.tensors["prompt_embeds"].device,
         )
-        prediction, _, _, _ = self._rollout(
+        prediction, _, _, _ = self.rollout(
             runtime,
             condition,
             reference_noise,
@@ -806,11 +850,12 @@ class QwenImageDmdPhaseRunner:
         if self.regression_type == "latent_mse":
             if target_pixels is not None:
                 raise ValueError("regression_type='latent_mse' requires teacher_target_latents.")
-            target = self._coerce_packed(target_latents, prediction.shape, "teacher_target_latents", prediction.device)
+            target = self.coerce_packed(target_latents, prediction.shape, "teacher_target_latents", prediction.device)
             return torch.mean((prediction.float() - target.detach().float()) ** 2)
-        return self._decoded_lpips(prediction, target_latents, target_pixels, height=height, width=width)
+        return self.decoded_lpips_loss(prediction, target_latents, target_pixels, height=height, width=width)
 
-    def _ensure_vae_and_lpips(self, device: torch.device):
+    def ensure_vae_and_lpips(self, device: torch.device):
+        """Load frozen VAE and perceptual-loss modules only for original DMD."""
         if self._vae is None:
             from diffusers import AutoencoderKLQwenImage
 
@@ -834,10 +879,11 @@ class QwenImageDmdPhaseRunner:
             self._lpips.eval()
         return self._vae, self._lpips
 
-    def _decode(self, packed: torch.Tensor, *, height: int, width: int) -> torch.Tensor:
+    def decode_latents(self, packed: torch.Tensor, *, height: int, width: int) -> torch.Tensor:
+        """Undo Qwen latent normalization and decode differentiably to RGB."""
         from diffusers import QwenImagePipeline
 
-        vae, _ = self._ensure_vae_and_lpips(packed.device)
+        vae, _ = self.ensure_vae_and_lpips(packed.device)
         latent = QwenImagePipeline._unpack_latents(
             packed,
             height=height,
@@ -850,7 +896,7 @@ class QwenImageDmdPhaseRunner:
         decoded = vae.decode(latent * std + mean, return_dict=False)[0][:, :, 0]
         return decoded.float().mul(0.5).add(0.5)
 
-    def _decoded_lpips(
+    def decoded_lpips_loss(
         self,
         prediction: torch.Tensor,
         target_latents: Optional[torch.Tensor],
@@ -859,8 +905,9 @@ class QwenImageDmdPhaseRunner:
         height: int,
         width: int,
     ) -> torch.Tensor:
-        _, lpips = self._ensure_vae_and_lpips(prediction.device)
-        prediction_pixels = self._decode(prediction, height=height, width=width)
+        """Apply perceptual regression with gradients only through the prediction."""
+        _, lpips = self.ensure_vae_and_lpips(prediction.device)
+        prediction_pixels = self.decode_latents(prediction, height=height, width=width)
         if target_pixels is not None:
             target = target_pixels.to(device=prediction.device, dtype=torch.float32)
             if target.ndim == 3:
@@ -873,14 +920,14 @@ class QwenImageDmdPhaseRunner:
             if torch.any((target < 0) | (target > 1)):
                 raise ValueError("teacher_target_pixels must be normalized to [0, 1].")
         else:
-            target = self._coerce_packed(
+            target = self.coerce_packed(
                 target_latents,
                 prediction.shape,
                 "teacher_target_latents",
                 prediction.device,
             )
             with torch.no_grad():
-                target = self._decode(target, height=height, width=width)
+                target = self.decode_latents(target, height=height, width=width)
         return lpips(prediction_pixels, target.detach()).mean()
 
     def compute_phase(
@@ -889,13 +936,14 @@ class QwenImageDmdPhaseRunner:
         batch: TensorDict,
         runtime: DistillationRoleRuntime,
     ) -> DistillationPhaseComputation:
+        """Build the requested role loss and detached metrics for one micro-batch."""
         from verl_omni.workers.diffusion_distillation_worker import DistillationPhaseComputation
 
         if request.kind not in {"student", "fake_score"}:
             raise ValueError(f"Unsupported Qwen DMD phase {request.kind!r}.")
         with runtime.use_role("student", grad_enabled=False) as module:
-            height, width, _, latent_shape = self._geometry(batch, module)
-            dtype = self._module_dtype(module)
+            height, width, _, latent_shape = self.latent_geometry(batch, module)
+            dtype = self.module_dtype(module)
             device = next(module.parameters()).device
         condition_start = time.perf_counter()
         condition, negative_condition = self.condition_provider.encode(
@@ -904,14 +952,14 @@ class QwenImageDmdPhaseRunner:
             dtype=dtype,
             require_negative=request.kind == "student",
         )
-        condition = self._prepare_condition_for_sequence_parallel(runtime, condition)
+        condition = self.prepare_condition_for_sequence_parallel(runtime, condition)
         if negative_condition is not None:
-            negative_condition = self._prepare_condition_for_sequence_parallel(runtime, negative_condition)
+            negative_condition = self.prepare_condition_for_sequence_parallel(runtime, negative_condition)
         condition_duration = time.perf_counter() - condition_start
         if request.kind == "student":
             if negative_condition is None:
                 raise ValueError("Qwen DMD student phases require negative teacher conditioning.")
-            loss, metrics = self._student_loss(
+            loss, metrics = self.student_loss(
                 batch,
                 runtime,
                 condition,
@@ -922,7 +970,7 @@ class QwenImageDmdPhaseRunner:
             )
             metrics["perf/condition_encode_s"] = condition_duration
             return DistillationPhaseComputation(losses={"student": loss}, metrics=metrics)
-        loss, metrics = self._fake_loss(
+        loss, metrics = self.fake_loss(
             runtime,
             condition,
             height=height,
@@ -943,7 +991,7 @@ class QwenImageDmdPhaseRunner:
         if state.get("version") != 1 or state.get("rng_seed") != self.rng_seed:
             raise ValueError("Qwen DMD phase-runner checkpoint is incompatible with the active RNG configuration.")
         generator_states = state.get("generator_states")
-        if not isinstance(generator_states, Mapping) or set(generator_states) - set(self._STREAM_OFFSETS):
+        if not isinstance(generator_states, Mapping) or set(generator_states) - set(self.STREAM_OFFSETS):
             raise ValueError("Qwen DMD phase-runner checkpoint contains invalid RNG streams.")
         self._generators.clear()
         self._pending_generator_states.clear()

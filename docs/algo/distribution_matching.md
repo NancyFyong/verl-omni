@@ -54,14 +54,21 @@ The Qwen adapter preserves the checkpoint's native conventions:
 - the transformer receives timesteps in `[0, 1]`;
 - its velocity is `noise - x0`;
 - the few-step rollout uses deterministic Euler transitions;
-- only the sampled exit step retains a student autograd graph;
+- all ranks sharing FSDP collectives use one broadcast rollout exit step;
+- only that exit step retains a student autograd graph;
 - all preceding rollout steps execute under `no_grad`;
 - student, teacher, and fake-score forwards remain in evaluation mode.
 
 The default four-step schedule applies the reference linear shift `3.0`, giving
 sigmas `[1.0, 0.9, 0.75, 0.5, 0.0]`. Score timesteps are sampled discretely
 from the model's 1,000 training timesteps, shifted once, and clamped to
-`[0.02, 0.98]`.
+`[0.02, 0.98]`. With `score_discrete_steps=0`, sigma is instead sampled
+uniformly inside the configured bounds without timestep shifting. Sampling
+from `[0, 1)` and clamping is not equivalent to that continuous distribution.
+
+Raw prompts use one text-only user message. Conditioning applies the fixed
+Qwen pipeline template before the encoder removes its 34-token prefix; a
+generic chat template can leave short prompts with no encoded tokens.
 
 A registered vLLM-Omni adapter uses the same sigma construction for
 non-autograd inference. It requires deterministic sampling (`noise_level=0`)

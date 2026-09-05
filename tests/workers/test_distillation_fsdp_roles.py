@@ -15,6 +15,7 @@
 
 import os
 import tempfile
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -273,7 +274,7 @@ def test_distillation_role_switch_preserves_graph_ema_and_state(strategy):
             dist.destroy_process_group()
 
 
-def _wrap_qwen_image_model(strategy, model_path):
+def wrap_qwen_image_model(strategy, model_path):
     from diffusers import QwenImageTransformer2DModel
 
     model = QwenImageTransformer2DModel.from_pretrained(
@@ -298,92 +299,95 @@ def _wrap_qwen_image_model(strategy, model_path):
     return model
 
 
-@pytest.mark.parametrize("strategy", ["fsdp", "fsdp2"])
-def test_qwen_image_dmd2_phase_runner_on_fsdp(strategy):
+@pytest.fixture(scope="module")
+def qwen_process_group():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for Qwen-Image FSDP distillation tests.")
     if dist.is_initialized():
-        pytest.skip("This isolated one-rank FSDP test requires no existing process group.")
+        pytest.skip("This FSDP fixture creates its own process group.")
+    with tempfile.TemporaryDirectory(prefix="qwen_image_dmd_fsdp_") as tmp_dir:
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://" if world_size > 1 else f"file://{os.path.join(tmp_dir, 'rendezvous')}",
+            rank=int(os.environ.get("RANK", "0")),
+            world_size=world_size,
+            timeout=timedelta(seconds=90),
+        )
+        try:
+            yield
+        finally:
+            dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("strategy", ["fsdp", "fsdp2"])
+def test_qwen_image_dmd2_phase_runner_on_fsdp(strategy, qwen_process_group):
     model_path = os.environ.get("QWEN_IMAGE_MODEL_PATH", os.path.expanduser("~/models/tiny-random/Qwen-Image"))
     if not os.path.isfile(os.path.join(model_path, "model_index.json")):
         pytest.skip(f"Tiny Qwen-Image checkpoint not found at {model_path}.")
 
-    from verl_omni.pipelines.qwen_image_distillation.diffusers_training_adapter import QwenImageDmdPhaseRunner
+    from verl_omni.pipelines.qwen_image_distillation.phase_runner import QwenImageDMDPhaseRunner
 
-    with tempfile.TemporaryDirectory(prefix="qwen_image_dmd_fsdp_") as tmp_dir:
-        torch.cuda.set_device(0)
-        dist.init_process_group(
-            backend="nccl",
-            init_method=f"file://{os.path.join(tmp_dir, 'rendezvous')}",
-            rank=0,
-            world_size=1,
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    torch.manual_seed(7)
+    engine = engine_shell(wrap_qwen_image_model(strategy, model_path))
+    engine.scheduler = SimpleNamespace()
+    engine.model_config = SimpleNamespace(fsdp_layer_prefixes=["transformer_blocks."])
+    engine.ulysses_device_mesh = None
+    engine.ulysses_sequence_parallel_size = 1
+    plan = build_plan(
+        "dmd2",
+        {
+            "model_path": model_path,
+            "conditioning_provider": "local_frozen_encoder",
+            "fake_update_ratio": 1,
+            "rng_seed": 3,
+        },
+        frozenset({"distribution_matching"}),
+    )
+    runtime = DistillationRoleRuntime(plan, {"base": engine}, ema_decay=0.9, ema_start_step=0)
+    model_config = SimpleNamespace(
+        path=model_path,
+        local_path=model_path,
+        transformer_config={"in_channels": 64},
+        pipeline=SimpleNamespace(
+            height=64,
+            width=64,
+            num_inference_steps=4,
+            max_sequence_length=64,
+            guidance_scale=None,
+        ),
+    )
+    runner = QwenImageDMDPhaseRunner(model_config, plan)
+    batch = TensorDict({"dummy_tensor": torch.zeros(1, 1, device="cuda")}, batch_size=[1])
+    tu.assign_non_tensor_stack(
+        batch,
+        "raw_prompt",
+        [[{"role": "user", "content": "cat" if rank % 2 == 0 else "a red apple on a wooden table"}]],
+    )
+    for kind, role in (("student", "student"), ("fake_score", "fake_score"), ("fake_score", "fake_score")) * 3:
+        request = PhaseRequest(
+            kind=kind,
+            global_step=0,
+            repeat_index=0,
+            batch_policy="fresh",
+            trainable_roles=(role,),
+            update_ema=kind == "student",
         )
-        try:
-            engine = _engine_shell(_wrap_qwen_image_model(strategy, model_path))
-            engine.scheduler = SimpleNamespace()
-            engine.model_config = SimpleNamespace(fsdp_layer_prefixes=["transformer_blocks."])
-            engine.ulysses_device_mesh = None
-            engine.ulysses_sequence_parallel_size = 1
-            plan = build_plan(
-                "dmd2",
-                {
-                    "model_path": model_path,
-                    "conditioning_provider": "local_frozen_encoder",
-                    "fake_update_ratio": 1,
-                    "rng_seed": 3,
-                },
-                frozenset({"distribution_matching"}),
-            )
-            runtime = DistillationRoleRuntime(plan, {"base": engine}, ema_decay=0.9, ema_start_step=0)
-            model_config = SimpleNamespace(
-                path=model_path,
-                local_path=model_path,
-                transformer_config={"in_channels": 64},
-                pipeline=SimpleNamespace(
-                    height=64,
-                    width=64,
-                    num_inference_steps=2,
-                    max_sequence_length=64,
-                    guidance_scale=None,
-                ),
-            )
-            runner = QwenImageDmdPhaseRunner(model_config, plan)
-            batch = TensorDict({"dummy_tensor": torch.zeros(1, 1, device="cuda")}, batch_size=[1])
-            tu.assign_non_tensor_stack(
-                batch,
-                "raw_prompt",
-                [
-                    [
-                        {
-                            "role": "system",
-                            "content": (
-                                "Describe the image by detailing the color, shape, size, texture, quantity, text, "
-                                "spatial relationships of the objects and background:"
-                            ),
-                        },
-                        {"role": "user", "content": "A red square"},
-                    ]
-                ],
-            )
-            for kind, role in (("student", "student"), ("fake_score", "fake_score")):
-                request = PhaseRequest(
-                    kind=kind,
-                    global_step=0,
-                    repeat_index=0,
-                    batch_policy="fresh",
-                    trainable_roles=(role,),
-                    update_ema=kind == "student",
-                )
-                runtime.zero_grad(request.trainable_roles)
-                computation = runner.compute_phase(request, batch, runtime)
-                runtime.backward_micro_batch(request, computation, weight=1.0)
-                optimizer_steps, _ = runtime.step_phase(request)
-                assert optimizer_steps == {role: 1}
+        runtime.zero_grad(request.trainable_roles)
+        computation = runner.compute_phase(request, batch, runtime)
+        exits = torch.tensor([computation.metrics["rollout/exit_index"]], device="cuda")
+        gathered = [torch.zeros_like(exits) for _ in range(world_size)]
+        dist.all_gather(gathered, exits)
+        assert all(value.item() == exits.item() for value in gathered)
+        runtime.backward_micro_batch(request, computation, weight=1.0)
+        optimizer_steps, _ = runtime.step_phase(request)
+        assert optimizer_steps == {role: 1}
 
-            tensors, peft_config = runtime.export_tensors(base_sync_done=True)
-            exported = list(tensors)
-            assert exported
-            assert peft_config["r"] == 2
-            assert all(name.startswith("transformer.") for name, _ in exported)
-        finally:
-            dist.destroy_process_group()
+    tensors, peft_config = runtime.export_tensors(base_sync_done=True)
+    exported = list(tensors)
+    assert exported
+    assert peft_config["r"] == 2
+    assert all(name.startswith("transformer.") for name, _ in exported)

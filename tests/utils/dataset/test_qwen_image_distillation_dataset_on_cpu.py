@@ -19,15 +19,15 @@ import pytest
 import torch
 from verl.utils.dataset.rl_dataset import RLHFDataset
 
-from verl_omni.utils.dataset.qwen_image_distillation_dataset import QwenImageDMDPairDataset, _load_float_tensor
+from verl_omni.utils.dataset.qwen_image_distillation_dataset import QwenImageDMDPairDataset, load_float_tensor
 
 
 class TestDMDTensorLoading:
     def test_loads_nested_values_and_serialized_tensors(self):
-        nested = _load_float_tensor([[1, 2], [3, 4]], "value")
+        nested = load_float_tensor([[1, 2], [3, 4]], "value")
         buffer = io.BytesIO()
         torch.save(torch.tensor([5.0]), buffer)
-        serialized = _load_float_tensor(buffer.getvalue(), "value")
+        serialized = load_float_tensor(buffer.getvalue(), "value")
 
         assert nested.dtype == torch.float32
         torch.testing.assert_close(nested, torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
@@ -35,12 +35,12 @@ class TestDMDTensorLoading:
 
     def test_rejects_empty_tensor(self):
         with pytest.raises(ValueError, match="must not be empty"):
-            _load_float_tensor([], "value")
+            load_float_tensor([], "value")
 
 
 class TestQwenImageDMDPairDataset:
     @staticmethod
-    def _dataset():
+    def make_dataset():
         return object.__new__(QwenImageDMDPairDataset)
 
     def test_converts_regression_pair_and_preserves_manifest(self, monkeypatch):
@@ -52,7 +52,7 @@ class TestQwenImageDMDPairDataset:
         }
         monkeypatch.setattr(RLHFDataset, "__getitem__", lambda self, item: dict(row))
 
-        output = self._dataset()[0]
+        output = self.make_dataset()[0]
 
         assert output["reference_noise"].dtype == torch.float32
         assert output["teacher_target_latents"].dtype == torch.float32
@@ -79,4 +79,4 @@ class TestQwenImageDMDPairDataset:
     def test_rejects_incomplete_rows(self, monkeypatch, row, error):
         monkeypatch.setattr(RLHFDataset, "__getitem__", lambda self, item: dict(row))
         with pytest.raises(ValueError, match=error):
-            self._dataset()[0]
+            self.make_dataset()[0]
