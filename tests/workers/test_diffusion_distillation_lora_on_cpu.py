@@ -14,6 +14,7 @@
 """CPU regressions for role-aware LoRA switching and export."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -22,7 +23,7 @@ from verl_omni.workers.engine.fsdp.diffusers_impl import DiffusersFSDPEngine
 from verl_omni.workers.engine.lora_adapter_mixin import LoRAAdapterMixin
 
 
-class _PeftConfig:
+class PeftConfig:
     def __init__(self, name):
         self.name = name
 
@@ -30,14 +31,14 @@ class _PeftConfig:
         return {"name": self.name}
 
 
-class _PeftModule(torch.nn.Module):
+class PeftModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.tensor(1.0))
         self.peft_config = {
-            "default": _PeftConfig("default"),
-            "student": _PeftConfig("student"),
-            "student_ema": _PeftConfig("student_ema"),
+            "default": PeftConfig("default"),
+            "student": PeftConfig("student"),
+            "student_ema": PeftConfig("student_ema"),
         }
         self.active_adapter = "student"
         self.adapters_enabled = True
@@ -56,15 +57,15 @@ class _PeftModule(torch.nn.Module):
         self.adapters_enabled = True
 
 
-class _MixinHarness(LoRAAdapterMixin):
+class MixinHarness(LoRAAdapterMixin):
     def __init__(self):
-        self.module = _PeftModule()
+        self.module = PeftModule()
         self._is_offload_param = False
 
 
 class TestAdapterContext:
     def test_nested_named_adapter_context_restores_exact_selection(self):
-        harness = _MixinHarness()
+        harness = MixinHarness()
         with harness.use_adapter("student_ema"):
             assert harness.module.active_adapter == "student_ema"
             with harness.use_adapter("default"):
@@ -73,14 +74,14 @@ class TestAdapterContext:
         assert harness.module.active_adapter == "student"
 
     def test_exception_restores_previous_adapter(self):
-        harness = _MixinHarness()
+        harness = MixinHarness()
         with pytest.raises(RuntimeError, match="boom"):
             with harness.use_adapter("student_ema"):
                 raise RuntimeError("boom")
         assert harness.module.active_adapter == "student"
 
     def test_reference_context_reenables_prior_named_adapter(self):
-        harness = _MixinHarness()
+        harness = MixinHarness()
         with harness.use_adapter("reference"):
             assert not harness.module.adapters_enabled
             assert harness.module.active_adapter == "student"
@@ -90,14 +91,10 @@ class TestAdapterContext:
 
 class TestAdapterAwareExport:
     def test_non_default_adapter_exports_its_own_peft_config(self, monkeypatch):
-        harness = _MixinHarness()
+        harness = MixinHarness()
         harness._uses_fsdp2_cpu_offload_policy = True
         harness.model_config = SimpleNamespace(fsdp_layer_prefixes=["transformer_blocks."])
-        collected = []
-
-        def collect_lora_params(**kwargs):
-            collected.append(kwargs["adapter_name"])
-            return {"adapter.weight": torch.tensor([2.0])}
+        collect_lora_params = Mock(return_value={"adapter.weight": torch.tensor([2.0])})
 
         monkeypatch.setattr(
             "verl_omni.workers.engine.fsdp.diffusers_impl.collect_lora_params",
@@ -114,11 +111,12 @@ class TestAdapterAwareExport:
         )
         assert dict(params) == {"transformer.adapter.weight": torch.tensor([2.0])}
         assert peft_config == {"name": "student_ema"}
-        assert collected == ["student_ema"]
+        collect_lora_params.assert_called_once()
+        assert collect_lora_params.call_args.kwargs["adapter_name"] == "student_ema"
         assert harness.module.active_adapter == "student"
 
     def test_unknown_adapter_fails_before_export(self):
-        harness = _MixinHarness()
+        harness = MixinHarness()
         harness._uses_fsdp2_cpu_offload_policy = True
         harness.model_config = SimpleNamespace(fsdp_layer_prefixes=[])
         with pytest.raises(ValueError, match="unknown LoRA adapter"):

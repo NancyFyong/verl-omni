@@ -22,6 +22,8 @@ import random
 import shutil
 import tempfile
 import time
+from collections.abc import Mapping
+from dataclasses import asdict
 from typing import Any, Optional
 
 import numpy as np
@@ -51,7 +53,16 @@ from verl_omni.workers.diffusion_distillation_worker import DiffusionDistillatio
 __all__ = ["DistillationRayTrainer"]
 
 
-class _DistillationBatchProvider:
+def checkpoint_json_value(value: Any):
+    """Serialize immutable plan containers independently of insertion order and hash seed."""
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, set | frozenset):
+        return sorted(value)
+    raise TypeError(f"Unsupported checkpoint fingerprint value: {type(value).__name__}.")
+
+
+class DistillationBatchProvider:
     """Stateful dataloader adapter implementing phase batch reuse semantics."""
 
     def __init__(self, dataloader) -> None:
@@ -66,7 +77,8 @@ class _DistillationBatchProvider:
         self._student_batch = None
         self.last_data_proto = None
 
-    def _fresh(self) -> TensorDict:
+    def fresh_batch(self) -> TensorDict:
+        """Read the next batch, restarting the dataloader at epoch boundaries."""
         try:
             batch_dict = next(self._iterator)
         except StopIteration:
@@ -82,7 +94,7 @@ class _DistillationBatchProvider:
             if self._student_batch is None:
                 raise RuntimeError("A reuse_student phase ran before a student batch was cached.")
             return self._student_batch.copy()
-        batch = self._fresh()
+        batch = self.fresh_batch()
         if phase.kind == "student":
             self._student_batch = batch.copy()
         return batch
@@ -171,9 +183,10 @@ class DistillationRayTrainer(BaseRayDiffusionTrainer):
         self.global_steps = 0
         self._logger = None
         if self._production and self.plan is not None:
-            self._validate_runtime_config()
+            self.validate_runtime_config()
 
-    def _validate_runtime_config(self) -> None:
+    def validate_runtime_config(self) -> None:
+        """Reject unsupported role storage and distributed batch layouts."""
         distribution_matching = self.config.distillation.distribution_matching
         strategy = self.config.actor_rollout_ref.actor.strategy
         if strategy not in {"fsdp", "fsdp2"}:
@@ -202,7 +215,8 @@ class DistillationRayTrainer(BaseRayDiffusionTrainer):
                 f"{data_parallel_size}."
             )
 
-    def _configure_role_steps(self) -> None:
+    def configure_role_steps(self) -> None:
+        """Set the fake-score scheduler horizon in its own optimizer-step units."""
         distribution_matching = self.config.distillation.distribution_matching
         fake_repeats = sum(phase.repeats for phase in self.plan.update_schedule.phases if phase.kind == "fake_score")
         warmup_fake_repeats = sum(
@@ -228,7 +242,7 @@ class DistillationRayTrainer(BaseRayDiffusionTrainer):
         if Role.Actor not in self.role_worker_mapping:
             raise ValueError("Distillation training requires a Role.Actor worker mapping.")
 
-        self._configure_role_steps()
+        self.configure_role_steps()
         self.resource_pool_manager.create_resource_pool()
         resource_pool = self.resource_pool_manager.get_resource_pool(Role.Actor)
         worker_cls = RayClassWithInitArgs(
@@ -261,7 +275,7 @@ class DistillationRayTrainer(BaseRayDiffusionTrainer):
         )
         self.distillation_worker_group.init_model()
         self.executor = DiffusionDistillationWorkerGroup(self.distillation_worker_group)
-        self.batch_provider = _DistillationBatchProvider(self.train_dataloader)
+        self.batch_provider = DistillationBatchProvider(self.train_dataloader)
 
     def build_control_plane(self) -> DistillationTrainerControlPlane:
         """Construct the pure control plane from the bound worker data plane."""
@@ -294,8 +308,9 @@ class DistillationRayTrainer(BaseRayDiffusionTrainer):
             self._save_checkpoint()
             metrics.setdefault("system", {})["perf/checkpoint_s"] = time.perf_counter() - checkpoint_start
 
-    def _checkpoint_fingerprint(self) -> str:
-        payload = {"plan": repr(self.plan)}
+    def checkpoint_fingerprint(self) -> str:
+        """Hash canonical plan and optimizer configuration for resume validation."""
+        payload = {"plan": asdict(self.plan)}
         if self.config is not None and OmegaConf.select(self.config, "distillation.distribution_matching") is not None:
             payload["distribution_matching"] = OmegaConf.to_container(
                 self.config.distillation.distribution_matching, resolve=True
@@ -304,10 +319,11 @@ class DistillationRayTrainer(BaseRayDiffusionTrainer):
             payload["student_optimizer"] = OmegaConf.to_container(
                 self.config.actor_rollout_ref.actor.optim, resolve=True
             )
-        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, default=checkpoint_json_value).encode()).hexdigest()
 
     @staticmethod
-    def _driver_rng_state() -> dict[str, Any]:
+    def driver_rng_state() -> dict[str, Any]:
+        """Capture driver RNG state separately from worker sampling streams."""
         return {
             "python": random.getstate(),
             "numpy": np.random.get_state(),
@@ -315,7 +331,8 @@ class DistillationRayTrainer(BaseRayDiffusionTrainer):
         }
 
     @staticmethod
-    def _restore_driver_rng_state(state: dict[str, Any]) -> None:
+    def restore_driver_rng_state(state: dict[str, Any]) -> None:
+        """Restore the driver RNG streams saved at a completed cycle."""
         random.setstate(state["python"])
         np.random.set_state(state["numpy"])
         torch.set_rng_state(state["torch"])
@@ -334,7 +351,7 @@ class DistillationRayTrainer(BaseRayDiffusionTrainer):
             self.executor.save_checkpoint(os.path.join(temporary_path, "workers"), self.global_steps)
             torch.save(self.control_plane.state_dict(), os.path.join(temporary_path, "trainer_state.pt"))
             torch.save(self.train_dataloader.state_dict(), os.path.join(temporary_path, "data.pt"))
-            torch.save(self._driver_rng_state(), os.path.join(temporary_path, "rng.pt"))
+            torch.save(self.driver_rng_state(), os.path.join(temporary_path, "rng.pt"))
             with open(os.path.join(temporary_path, "manifest.json"), "w", encoding="utf-8") as file:
                 json.dump(
                     {
@@ -342,7 +359,7 @@ class DistillationRayTrainer(BaseRayDiffusionTrainer):
                         "plan_version": self.plan.version,
                         "global_step": self.global_steps,
                         "export_role": self.plan.export.role,
-                        "fingerprint": self._checkpoint_fingerprint(),
+                        "fingerprint": self.checkpoint_fingerprint(),
                     },
                     file,
                     indent=2,
@@ -381,7 +398,7 @@ class DistillationRayTrainer(BaseRayDiffusionTrainer):
             manifest = json.load(file)
         if manifest.get("plan_name") != self.plan.name or manifest.get("plan_version") != self.plan.version:
             raise ValueError("Checkpoint recipe identity does not match the active DistillationPlan.")
-        if manifest.get("fingerprint") != self._checkpoint_fingerprint():
+        if manifest.get("fingerprint") != self.checkpoint_fingerprint():
             raise ValueError("Checkpoint distillation plan or optimizer configuration does not match the active run.")
 
         self.executor.load_checkpoint(os.path.join(checkpoint_path, "workers"))
@@ -390,15 +407,17 @@ class DistillationRayTrainer(BaseRayDiffusionTrainer):
         self.train_dataloader.load_state_dict(torch.load(os.path.join(checkpoint_path, "data.pt"), weights_only=False))
         if hasattr(self.batch_provider, "reset_iterator"):
             self.batch_provider.reset_iterator()
-        self._restore_driver_rng_state(torch.load(os.path.join(checkpoint_path, "rng.pt"), weights_only=False))
+        self.restore_driver_rng_state(torch.load(os.path.join(checkpoint_path, "rng.pt"), weights_only=False))
         self.global_steps = self.control_plane.counters.global_step
         return self.global_steps
 
     @staticmethod
-    def _flatten_metrics(metrics: dict[str, dict]) -> dict[str, float]:
+    def flatten_metrics(metrics: dict[str, dict]) -> dict[str, float]:
+        """Flatten phase metrics for the existing tracking backends."""
         return {key: value for phase_metrics in metrics.values() for key, value in phase_metrics.items()}
 
-    def _profile_workers(self, *, start: bool, step: int) -> None:
+    def profile_workers(self, *, start: bool, step: int) -> None:
+        """Start or stop the configured distributed profiler."""
         if self.distillation_worker_group is None:
             return
         if start:
@@ -437,14 +456,14 @@ class DistillationRayTrainer(BaseRayDiffusionTrainer):
             before_global_step = control_plane.counters.global_step
             profile_step = before_global_step + 1
             do_profile = profile_steps is not None and profile_step in profile_steps
-            self._profile_workers(start=do_profile, step=profile_step)
+            self.profile_workers(start=do_profile, step=profile_step)
             try:
                 control_plane.run_cycle()
             finally:
                 if do_profile:
-                    self._profile_workers(start=False, step=profile_step)
+                    self.profile_workers(start=False, step=profile_step)
             self.global_steps = control_plane.counters.global_step
-            metrics = self._flatten_metrics(control_plane.metrics)
+            metrics = self.flatten_metrics(control_plane.metrics)
             metrics["training/global_step"] = float(self.global_steps)
             metrics["training/completed_cycles"] = float(control_plane.counters.completed_cycles)
             self._logger.log(data=metrics, step=self.global_steps)

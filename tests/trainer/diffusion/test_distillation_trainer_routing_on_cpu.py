@@ -18,6 +18,9 @@ orthogonal to the existing on-policy distillation (OPD) path. OPD keeps using
 ``distillation.enabled=true`` together with ``trainer_type=policy_gradient``.
 """
 
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 from omegaconf import OmegaConf
 
@@ -35,6 +38,15 @@ class FakeAlgorithmConfig:
 class FakeTrainerConfig:
     def __init__(self, trainer_type):
         self.algorithm = FakeAlgorithmConfig(trainer_type)
+
+
+def initialize_fake_base_trainer(self, **kwargs):
+    for name, value in kwargs.items():
+        setattr(self, name, value)
+    self.config = kwargs["config"]
+    self.total_training_steps = 4
+    self.train_dataloader = []
+    self.device_name = "cuda"
 
 
 class TestTrainerRouting:
@@ -56,7 +68,7 @@ class TestTrainerRouting:
             _get_trainer_cls(FakeTrainerConfig("bogus"))
 
     def test_task_runner_rejects_external_rollout_for_distillation(self):
-        config = _Config("distillation")
+        config = FakeTrainerConfig("distillation")
         config.algorithm.sample_source = "online"
         with pytest.raises(ValueError, match="sample_source=offline"):
             TaskRunner().add_actor_rollout_worker(config)
@@ -69,7 +81,7 @@ class TestTrainerRouting:
 
         monkeypatch.setattr(ray, "remote", lambda worker_cls: worker_cls)
         runner = TaskRunner()
-        worker_cls, _ = runner.add_actor_rollout_worker(_Config("distillation"))
+        worker_cls, _ = runner.add_actor_rollout_worker(FakeTrainerConfig("distillation"))
         assert worker_cls is DiffusionDistillationWorker
         assert runner.role_worker_mapping[Role.Actor] is DiffusionDistillationWorker
         assert runner.mapping[Role.Actor] == "global_pool"
@@ -125,7 +137,7 @@ def runtime_config():
 
 class TestRuntimeValidation:
     @staticmethod
-    def _trainer_config(*, role_storage="shared_base_adapters", strategy="fsdp2", lora_rank=8, use_orig=True):
+    def trainer_config(*, role_storage="shared_base_adapters", strategy="fsdp2", lora_rank=8, use_orig=True):
         return OmegaConf.create(
             {
                 "distillation": {"distribution_matching": {"role_storage": role_storage}},
@@ -141,18 +153,18 @@ class TestRuntimeValidation:
 
         trainer = object.__new__(DistillationRayTrainer)
         trainer.plan = build_plan("dmd2", {"model_path": "/m"}, frozenset({"distribution_matching"}))
-        trainer.config = self._trainer_config(lora_rank=0)
+        trainer.config = self.trainer_config(lora_rank=0)
         with pytest.raises(ValueError, match="lora_rank > 0"):
-            trainer._validate_runtime_config()
+            trainer.validate_runtime_config()
 
     def test_fsdp1_shared_base_requires_orig_params(self):
         from verl_omni.trainer.diffusion.distillation.recipes import build_plan
 
         trainer = object.__new__(DistillationRayTrainer)
         trainer.plan = build_plan("dmd2", {"model_path": "/m"}, frozenset({"distribution_matching"}))
-        trainer.config = self._trainer_config(strategy="fsdp", use_orig=False)
+        trainer.config = self.trainer_config(strategy="fsdp", use_orig=False)
         with pytest.raises(ValueError, match="use_orig_params=true"):
-            trainer._validate_runtime_config()
+            trainer.validate_runtime_config()
 
 
 class TestDataPlaneBoundary:
@@ -202,7 +214,7 @@ class TestDataPlaneBoundary:
         from verl_omni.trainer.diffusion.ray_diffusion_trainer import BaseRayDiffusionTrainer
         from verl_omni.workers.diffusion_distillation_worker import DiffusionDistillationWorkerGroup
 
-        config = _runtime_config()
+        config = runtime_config()
         config.trainer = {
             "device": "cuda",
             "ray_master_port_range": None,
@@ -224,46 +236,21 @@ class TestDataPlaneBoundary:
             frozenset({"distribution_matching"}),
         )
 
-        def fake_base_init(self, **kwargs):
-            for name, value in kwargs.items():
-                setattr(self, name, value)
-            self.config = kwargs["config"]
-            self.total_training_steps = 4
-            self.train_dataloader = []
-            self.device_name = "cuda"
-
-        monkeypatch.setattr(BaseRayDiffusionTrainer, "__init__", fake_base_init)
-
-        class FakeResourcePoolManager:
-            def __init__(self):
-                self.created = False
-
-            def create_resource_pool(self):
-                self.created = True
-
-            def get_resource_pool(self, role):
-                assert role is Role.Actor
-                return "pool"
-
-        class FakeWorkerGroup:
-            def __init__(self, **kwargs):
-                self.kwargs = kwargs
-                self.initialized = False
-
-            def init_model(self):
-                self.initialized = True
-
-        resource_manager = FakeResourcePoolManager()
+        monkeypatch.setattr(BaseRayDiffusionTrainer, "__init__", initialize_fake_base_trainer)
+        resource_manager = SimpleNamespace(create_resource_pool=Mock(), get_resource_pool=Mock(return_value="pool"))
+        worker_group = SimpleNamespace(init_model=Mock())
+        worker_group_factory = Mock(return_value=worker_group)
         trainer = DistillationRayTrainer(
             config=config,
             plan=plan,
             role_worker_mapping={Role.Actor: object},
             resource_pool_manager=resource_manager,
-            ray_worker_group_cls=FakeWorkerGroup,
+            ray_worker_group_cls=worker_group_factory,
         )
         trainer.init_workers()
-        assert resource_manager.created
-        assert trainer.distillation_worker_group.initialized
+        resource_manager.create_resource_pool.assert_called_once()
+        resource_manager.get_resource_pool.assert_called_once_with(Role.Actor)
+        worker_group.init_model.assert_called_once()
         assert isinstance(trainer.executor, DiffusionDistillationWorkerGroup)
         assert config.distillation.distribution_matching.fake_score_optim.total_training_steps == 8
 

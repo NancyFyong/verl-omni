@@ -99,15 +99,15 @@ class DistillationLoRAFSDPTestWorker(Worker):
     def init_model(self):
         self.engine.initialize()
 
-    def _collect(self, role):
-        params, config = self.engine.iter_export_tensors(role, base_sync_done=True)
+    def collect_adapter(self, role):
+        params, config = self.engine.get_per_tensor_param(adapter_name=role, base_sync_done=True)
         return {name: tensor.detach().cpu() for name, tensor in params}, config
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def collect_roles(self):
-        student, student_config = self._collect("student")
-        fake, fake_config = self._collect("fake_score")
-        ema, ema_config = self._collect("student_ema")
+        student, student_config = self.collect_adapter("student")
+        fake, fake_config = self.collect_adapter("fake_score")
+        ema, ema_config = self.collect_adapter("student_ema")
         return {
             "student": student,
             "fake_score": fake,

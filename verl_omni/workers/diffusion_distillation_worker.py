@@ -46,7 +46,7 @@ from verl_omni.trainer.diffusion.distillation.contracts import (
     RoleBinding,
 )
 from verl_omni.utils.fs import resolve_model_local_dir
-from verl_omni.workers.config import DiffusionActorConfig, DiffusionModelConfig
+from verl_omni.workers.config import DiffusionModelConfig
 from verl_omni.workers.config.diffusion import DiffusionDistributionMatchingConfig
 from verl_omni.workers.engine.fsdp.distillation_impl import DistillationRoleGroupEngine
 
@@ -59,7 +59,8 @@ __all__ = [
 ]
 
 
-def _resolve_profiler_configs(omega_profiler_config):
+def resolve_profiler_configs(omega_profiler_config):
+    """Resolve the selected profiler and its typed tool configuration."""
     profiler_config = omega_conf_to_dataclass(omega_profiler_config, dataclass_type=ProfilerConfig)
     tool = omega_profiler_config.get("tool", None)
     if tool in {"npu", "nsys", "torch", "torch_memory", "precision_debugger"}:
@@ -175,11 +176,12 @@ class DistillationRoleRuntime:
         for role in roles:
             self.engine_for_role(role).optimizer_zero_grad(role)
 
-    def _validate_computation(
+    def validate_computation(
         self,
         request: PhaseRequest,
         computation: DistillationPhaseComputation,
     ) -> str:
+        """Require one graph-bearing scalar loss owned by the requested role."""
         if not isinstance(computation, DistillationPhaseComputation):
             raise TypeError(f"compute_phase must return DistillationPhaseComputation, got {type(computation)}.")
         expected_roles = set(request.trainable_roles)
@@ -210,7 +212,7 @@ class DistillationRoleRuntime:
         """Accumulate one weighted micro-batch loss without stepping."""
         if not 0.0 < weight <= 1.0:
             raise ValueError(f"Micro-batch weight must be in (0, 1], got {weight}.")
-        role = self._validate_computation(request, computation)
+        role = self.validate_computation(request, computation)
         self.engine_for_role(role).backward_role(role, computation.losses[role] * weight)
 
     def step_phase(self, request: PhaseRequest) -> tuple[dict[str, int], dict[str, float]]:
@@ -256,13 +258,14 @@ class DistillationRoleRuntime:
 
     def initialize_ema(self) -> None:
         """Initialize the semantic EMA role exactly from the student role."""
-        self._update_ema(decay=0.0)
+        self.update_ema_parameters(decay=0.0)
 
     def update_ema(self) -> None:
         """Update the semantic student EMA in shared or independent storage."""
-        self._update_ema(decay=self.ema_decay)
+        self.update_ema_parameters(decay=self.ema_decay)
 
-    def _update_ema(self, decay: float) -> None:
+    def update_ema_parameters(self, decay: float) -> None:
+        """Route EMA updates according to the physical role-group layout."""
         student_engine = self.engine_for_role("student")
         ema_engine = self.engine_for_role("student_ema")
         if student_engine is ema_engine:
@@ -304,7 +307,7 @@ class DiffusionDistillationWorker(Worker, DistProfilerExtension):
         self.config = config
         self.plan = plan
         self.device_name = get_device_name()
-        profiler_config, tool_config = _resolve_profiler_configs(config.actor_rollout_ref.actor.get("profiler", {}))
+        profiler_config, tool_config = resolve_profiler_configs(config.actor_rollout_ref.actor.get("profiler", {}))
         DistProfilerExtension.__init__(
             self,
             DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config),
@@ -312,18 +315,19 @@ class DiffusionDistillationWorker(Worker, DistProfilerExtension):
         self.runtime: Optional[DistillationRoleRuntime] = None
         self.phase_runner: Optional[DistillationPhaseRunner] = None
 
-    def _optimizer_configs(
+    def build_optimizer_configs(
         self,
         bindings: tuple[RoleBinding, ...],
-        actor_config: DiffusionActorConfig,
+        student_optimizer_config: FSDPOptimizerConfig,
         distillation_config: DiffusionDistributionMatchingConfig,
     ) -> dict[str, FSDPOptimizerConfig]:
+        """Give each trainable role its own optimizer configuration."""
         configs = {}
         for binding in bindings:
             if not binding.trainable:
                 continue
             if binding.role == "student":
-                configs[binding.role] = deepcopy(actor_config.optim)
+                configs[binding.role] = deepcopy(student_optimizer_config)
             elif binding.role == "fake_score":
                 configs[binding.role] = deepcopy(distillation_config.fake_score_optim)
             else:
@@ -334,7 +338,15 @@ class DiffusionDistillationWorker(Worker, DistProfilerExtension):
     def init_model(self) -> None:
         """Allocate every physical group once and bind the architecture phase runner."""
         model_config: DiffusionModelConfig = omega_conf_to_dataclass(self.config.actor_rollout_ref.model)
-        actor_config: DiffusionActorConfig = omega_conf_to_dataclass(self.config.actor_rollout_ref.actor)
+        # DMD losses live in the phase runner, so instantiate only the actor sub-configs the role engine consumes.
+        actor_config = self.config.actor_rollout_ref.actor
+        actor_engine_config = omega_conf_to_dataclass(actor_config.fsdp_config)
+        object.__setattr__(actor_engine_config, "strategy", actor_config.strategy)
+        student_optimizer_config: FSDPOptimizerConfig = omega_conf_to_dataclass(
+            actor_config.optim,
+            dataclass_type=FSDPOptimizerConfig,
+        )
+        checkpoint_config = omega_conf_to_dataclass(actor_config.checkpoint)
         distillation_config: DiffusionDistributionMatchingConfig = omega_conf_to_dataclass(
             self.config.distillation.distribution_matching,
             dataclass_type=DiffusionDistributionMatchingConfig,
@@ -373,17 +385,19 @@ class DiffusionDistillationWorker(Worker, DistProfilerExtension):
                     tuple(dict.fromkeys(("default", *adapters, "reference"))),
                 )
 
-            group_engine_config = deepcopy(actor_config.engine)
+            group_engine_config = deepcopy(actor_engine_config)
             object.__setattr__(group_engine_config, "forward_only", not trainable_bindings)
-            role_optimizer_configs = self._optimizer_configs(bindings, actor_config, distillation_config)
-            primary_optimizer_config = next(iter(role_optimizer_configs.values()), deepcopy(actor_config.optim))
+            role_optimizer_configs = self.build_optimizer_configs(
+                bindings, student_optimizer_config, distillation_config
+            )
+            primary_optimizer_config = next(iter(role_optimizer_configs.values()), deepcopy(student_optimizer_config))
             engine = EngineRegistry.new(
                 model_type="diffusion_distillation_model",
                 backend=group_engine_config.strategy,
                 model_config=group_model_config,
                 engine_config=group_engine_config,
                 optimizer_config=primary_optimizer_config,
-                checkpoint_config=deepcopy(actor_config.checkpoint),
+                checkpoint_config=deepcopy(checkpoint_config),
                 role_group=group,
                 role_bindings=bindings,
                 optimizer_configs=role_optimizer_configs,
@@ -414,10 +428,10 @@ class DiffusionDistillationWorker(Worker, DistProfilerExtension):
             is_collect=first_engine.is_mp_src_rank_with_outputs(),
         )
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="distillation"), blocking=False)
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="distillation"), blocking=True)
     @DistProfiler.annotate(color="red", role="distillation_phase")
     def execute_phase(self, data: TensorDict) -> TensorDict:
-        """Execute one differentiable phase and return only metrics and step records."""
+        """Resolve rank failures before lazy collect metadata RPCs can wait behind peer collectives."""
         if self.runtime is None or self.phase_runner is None:
             raise RuntimeError("init_model() must be called before execute_phase().")
         request = tu.pop(data, key="phase_request")

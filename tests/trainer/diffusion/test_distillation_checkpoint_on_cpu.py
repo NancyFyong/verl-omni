@@ -15,6 +15,7 @@
 
 import os
 import random
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -28,11 +29,11 @@ from verl_omni.trainer.diffusion.distillation.control_plane import (
     FakeDistillationHooks,
     FakePhaseExecutor,
 )
-from verl_omni.trainer.diffusion.distillation.ray_trainer import DistillationRayTrainer, _DistillationBatchProvider
+from verl_omni.trainer.diffusion.distillation.ray_trainer import DistillationBatchProvider, DistillationRayTrainer
 from verl_omni.trainer.diffusion.distillation.recipes import build_plan
 
 
-class _CheckpointExecutor(FakePhaseExecutor):
+class CheckpointExecutor(FakePhaseExecutor):
     def __init__(self, *, fail_save=False):
         super().__init__()
         self.role_state = {
@@ -59,7 +60,7 @@ class _CheckpointExecutor(FakePhaseExecutor):
         self.loaded_path = local_path
 
 
-class _StatefulLoader:
+class StatefulLoader:
     def __init__(self):
         self.position = 0
 
@@ -76,7 +77,7 @@ class TestDistillationBatchProvider:
             {"values": torch.tensor([[1.0]]), "responses": torch.tensor([[9.0]])},
             {"values": torch.tensor([[2.0]]), "responses": torch.tensor([[8.0]])},
         ]
-        provider = _DistillationBatchProvider(batches)
+        provider = DistillationBatchProvider(batches)
         student = PhaseRequest("student", 0, 0, "fresh", ("student",), True)
         reused = PhaseRequest("fake_score", 0, 0, "reuse_student", ("fake_score",), False)
         fresh = PhaseRequest("fake_score", 0, 1, "fresh", ("fake_score",), False)
@@ -88,7 +89,7 @@ class TestDistillationBatchProvider:
         assert "responses" not in student_batch
 
     def test_reuse_before_student_fails(self):
-        provider = _DistillationBatchProvider([{"values": torch.tensor([[1.0]])}])
+        provider = DistillationBatchProvider([{"values": torch.tensor([[1.0]])}])
         request = PhaseRequest("fake_score", 0, 0, "reuse_student", ("fake_score",), False)
         with pytest.raises(RuntimeError, match="before a student batch"):
             provider.next(request)
@@ -96,13 +97,13 @@ class TestDistillationBatchProvider:
 
 class TestDistillationCheckpoint:
     @staticmethod
-    def _trainer(tmp_path, *, fail_save=False):
+    def make_trainer(tmp_path, *, fail_save=False):
         plan = build_plan(
             "dmd2",
             {"model_path": "/m", "fake_update_ratio": 1},
             frozenset({"distribution_matching"}),
         )
-        executor = _CheckpointExecutor(fail_save=fail_save)
+        executor = CheckpointExecutor(fail_save=fail_save)
         hooks = FakeDistillationHooks()
         control_plane = DistillationTrainerControlPlane(
             plan=plan,
@@ -118,7 +119,7 @@ class TestDistillationCheckpoint:
         trainer._control_plane = control_plane
         trainer._production = True
         trainer.global_steps = control_plane.counters.global_step
-        trainer.train_dataloader = _StatefulLoader()
+        trainer.train_dataloader = StatefulLoader()
         trainer.train_dataloader.position = 7
         trainer.config = OmegaConf.create(
             {
@@ -133,7 +134,7 @@ class TestDistillationCheckpoint:
         return trainer, executor
 
     def test_round_trip_restores_roles_counters_dataloader_and_rng(self, tmp_path):
-        trainer, executor = self._trainer(tmp_path)
+        trainer, executor = self.make_trainer(tmp_path)
         random.seed(11)
         np.random.seed(12)
         torch.manual_seed(13)
@@ -170,15 +171,21 @@ class TestDistillationCheckpoint:
         assert executor.loaded_path == str(checkpoint / "workers")
 
     def test_failed_save_never_publishes_a_checkpoint(self, tmp_path):
-        trainer, _ = self._trainer(tmp_path, fail_save=True)
+        trainer, _ = self.make_trainer(tmp_path, fail_save=True)
         with pytest.raises(RuntimeError, match="injected save failure"):
             trainer._save_checkpoint()
         assert not (tmp_path / "global_step_1").exists()
         assert not list(tmp_path.glob(".global_step_1_*"))
         assert not (tmp_path / "latest_checkpointed_iteration.txt").exists()
 
+    def test_equivalent_plan_mappings_have_identical_fingerprints(self, tmp_path):
+        trainer, _ = self.make_trainer(tmp_path)
+        fingerprint = trainer.checkpoint_fingerprint()
+        trainer.plan = replace(trainer.plan, objective=dict(reversed(list(trainer.plan.objective.items()))))
+        assert trainer.checkpoint_fingerprint() == fingerprint
+
     def test_changed_plan_is_rejected_before_worker_restore(self, tmp_path):
-        trainer, executor = self._trainer(tmp_path)
+        trainer, executor = self.make_trainer(tmp_path)
         trainer._save_checkpoint()
         trainer.plan = build_plan(
             "dmd2",
@@ -190,7 +197,7 @@ class TestDistillationCheckpoint:
         assert executor.loaded_path is None
 
     def test_incomplete_checkpoint_is_rejected(self, tmp_path):
-        trainer, _ = self._trainer(tmp_path)
+        trainer, _ = self.make_trainer(tmp_path)
         incomplete = tmp_path / "global_step_1"
         incomplete.mkdir()
         (tmp_path / "latest_checkpointed_iteration.txt").write_text("1")

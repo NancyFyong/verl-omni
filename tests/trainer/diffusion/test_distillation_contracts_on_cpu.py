@@ -382,7 +382,7 @@ class TestUpdateSchedule:
     def test_warmup_cannot_reuse_a_missing_student_batch(self):
         with pytest.raises(ValueError, match="cannot reuse a student batch"):
             UpdateSchedule(
-                phases=(self._normal_phase(), self._fake_phase()),
+                phases=(self.student_phase(), self.fake_phase()),
                 warmup_phases=(
                     UpdatePhaseSpec(
                         kind="fake_score",

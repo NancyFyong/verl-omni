@@ -304,7 +304,7 @@ def causal_bidirectional_layout(causal_model_ref: str, bidirectional_model_ref: 
     )
 
 
-def _apply_role_storage(layout: RoleLayoutSpec, role_storage: str) -> RoleLayoutSpec:
+def apply_role_storage(layout: RoleLayoutSpec, role_storage: str) -> RoleLayoutSpec:
     """Materialize either shared groups or one colocated model per logical role."""
     require_choice(
         "role_storage",
@@ -418,7 +418,7 @@ class DMDRecipe(DistillationRecipeBase):
         model_ref = get_config_value(config, "model_path", "") or ""
         return DistillationPlan(
             name="dmd",
-            role_layout=_apply_role_storage(
+            role_layout=apply_role_storage(
                 shared_base_layout(model_ref),
                 get_config_or_default(config, "role_storage", "shared_base_adapters"),
             ),
@@ -455,7 +455,7 @@ class DMD2Recipe(DistillationRecipeBase):
         model_ref = get_config_value(config, "model_path", "") or ""
         return DistillationPlan(
             name="dmd2",
-            role_layout=_apply_role_storage(
+            role_layout=apply_role_storage(
                 shared_base_layout(model_ref, with_discriminator=adversarial),
                 get_config_or_default(config, "role_storage", "shared_base_adapters"),
             ),
@@ -492,7 +492,7 @@ class CausVidRecipe(DistillationRecipeBase):
         bidirectional_ref = get_config_value(config, "bidirectional_model_path", model_ref) or model_ref
         return DistillationPlan(
             name="causvid",
-            role_layout=_apply_role_storage(
+            role_layout=apply_role_storage(
                 causal_bidirectional_layout(causal_ref, bidirectional_ref),
                 get_config_or_default(config, "role_storage", "shared_base_adapters"),
             ),
@@ -527,7 +527,7 @@ class SelfForcingRecipe(DistillationRecipeBase):
         bidirectional_ref = get_config_value(config, "bidirectional_model_path", model_ref) or model_ref
         return DistillationPlan(
             name="self_forcing",
-            role_layout=_apply_role_storage(
+            role_layout=apply_role_storage(
                 causal_bidirectional_layout(causal_ref, bidirectional_ref),
                 get_config_or_default(config, "role_storage", "shared_base_adapters"),
             ),
