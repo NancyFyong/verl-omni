@@ -19,7 +19,7 @@ from verl.base_config import BaseConfig
 from verl.workers.config import FSDPOptimizerConfig
 
 
-def _default_fake_score_optimizer() -> FSDPOptimizerConfig:
+def default_fake_score_optimizer() -> FSDPOptimizerConfig:
     return FSDPOptimizerConfig(lr=2e-5, weight_decay=0.01, clip_grad=1.0, lr_scheduler_type="constant")
 
 
@@ -86,7 +86,7 @@ class DiffusionDistributionMatchingConfig(BaseConfig):
     # Per-device fake-score phase micro-batch size.
     fake_score_micro_batch_size_per_gpu: int = 1
     # Independent fake-score optimizer and scheduler configuration.
-    fake_score_optim: FSDPOptimizerConfig = field(default_factory=_default_fake_score_optimizer)
+    fake_score_optim: FSDPOptimizerConfig = field(default_factory=default_fake_score_optimizer)
     # EMA decay applied after successful student optimizer steps.
     ema_decay: float = 0.999
     # First completed student step that updates EMA.

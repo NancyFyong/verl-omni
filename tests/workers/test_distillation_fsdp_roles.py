@@ -28,7 +28,7 @@ from verl_omni.trainer.diffusion.distillation.contracts import RoleBinding, Role
 from verl_omni.workers.engine.fsdp.distillation_impl import DistillationRoleGroupEngine
 
 
-class _TinyCheckpointManager:
+class TinyCheckpointManager:
     def __init__(self, module, optimizer, scheduler):
         self.module = module
         self.optimizer = optimizer
@@ -52,7 +52,7 @@ class _TinyCheckpointManager:
         self.scheduler.load_state_dict(state["scheduler"])
 
 
-class _TinyModel(nn.Module):
+class TinyModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.proj = nn.Linear(4, 4)
@@ -61,9 +61,9 @@ class _TinyModel(nn.Module):
         return self.proj(inputs)
 
 
-def _wrap_model(strategy):
+def wrap_model(strategy):
     model = get_peft_model(
-        _TinyModel(),
+        TinyModel(),
         LoraConfig(r=2, lora_alpha=2, target_modules=["proj"]),
         adapter_name="student",
     ).cuda()
@@ -81,9 +81,9 @@ def _wrap_model(strategy):
     return model
 
 
-def _wrap_independent_model(strategy, role):
+def wrap_independent_model(strategy, role):
     model = get_peft_model(
-        _TinyModel(),
+        TinyModel(),
         LoraConfig(r=2, lora_alpha=2, target_modules=["proj"]),
         adapter_name="default",
     ).cuda()
@@ -99,7 +99,7 @@ def _wrap_independent_model(strategy, role):
     return model
 
 
-def _engine_shell(module):
+def engine_shell(module):
     engine = object.__new__(DistillationRoleGroupEngine)
     engine.module = module
     engine.role_group = RoleGroupSpec(
@@ -134,11 +134,11 @@ def _engine_shell(module):
     engine._is_offload_param = False
     engine._is_offload_optimizer = False
     engine._uses_fsdp2_cpu_offload_policy = False
-    engine.checkpoint_manager = _TinyCheckpointManager(engine.module, engine.optimizer, engine.lr_scheduler)
+    engine.checkpoint_manager = TinyCheckpointManager(engine.module, engine.optimizer, engine.lr_scheduler)
     return engine
 
 
-def _independent_engine_shell(module, role, trainable):
+def independent_engine_shell(module, role, trainable):
     engine = object.__new__(DistillationRoleGroupEngine)
     engine.module = module
     engine.role_group = SimpleNamespace(name=f"{role}_model", storage="independent_module")
@@ -153,7 +153,7 @@ def _independent_engine_shell(module, role, trainable):
     return engine
 
 
-def _adapter_snapshot(engine, role):
+def adapter_snapshot(engine, role):
     binding = engine.role_bindings[role]
     with engine._adapter_state_context(), torch.no_grad():
         parameters = engine._active_adapter_trainable_params(binding.adapter)
@@ -163,7 +163,7 @@ def _adapter_snapshot(engine, role):
         )
 
 
-def _assert_tensors_equal(left, right):
+def assert_tensors_equal(left, right):
     assert len(left) == len(right)
     for left_tensor, right_tensor in zip(left, right, strict=True):
         torch.testing.assert_close(left_tensor, right_tensor, rtol=0, atol=0)
@@ -186,12 +186,12 @@ def test_distillation_role_switch_preserves_graph_ema_and_state(strategy):
         )
         try:
             torch.manual_seed(7)
-            engine = _engine_shell(_wrap_model(strategy))
+            engine = engine_shell(wrap_model(strategy))
             engine.copy_adapter("student", "student_ema")
-            student_before = _adapter_snapshot(engine, "student")
-            fake_before = _adapter_snapshot(engine, "fake_score")
-            ema_before = _adapter_snapshot(engine, "student_ema")
-            _assert_tensors_equal(student_before, ema_before)
+            student_before = adapter_snapshot(engine, "student")
+            fake_before = adapter_snapshot(engine, "fake_score")
+            ema_before = adapter_snapshot(engine, "student_ema")
+            assert_tensors_equal(student_before, ema_before)
 
             inputs = torch.randn(2, 4, device="cuda")
             engine.optimizer_zero_grad("student")
@@ -208,13 +208,13 @@ def test_distillation_role_switch_preserves_graph_ema_and_state(strategy):
             engine.optimizers["student"].step()
             engine.update_role_ema("student", "student_ema", decay=0.5)
 
-            student_after = _adapter_snapshot(engine, "student")
-            fake_after = _adapter_snapshot(engine, "fake_score")
-            ema_after = _adapter_snapshot(engine, "student_ema")
+            student_after = adapter_snapshot(engine, "student")
+            fake_after = adapter_snapshot(engine, "fake_score")
+            ema_after = adapter_snapshot(engine, "student_ema")
             assert any(
                 not torch.equal(before, after) for before, after in zip(student_before, student_after, strict=True)
             )
-            _assert_tensors_equal(fake_before, fake_after)
+            assert_tensors_equal(fake_before, fake_after)
             for before, student, ema in zip(ema_before, student_after, ema_after, strict=True):
                 torch.testing.assert_close(ema.float(), (before.float() + student.float()) * 0.5)
             with engine.use_role("teacher_score") as module:
@@ -228,9 +228,9 @@ def test_distillation_role_switch_preserves_graph_ema_and_state(strategy):
             engine.backward_role("fake_score", fake_loss)
             engine.optimizers["fake_score"].step()
             engine.lr_schedulers["fake_score"].step()
-            checkpoint_student = _adapter_snapshot(engine, "student")
-            checkpoint_fake = _adapter_snapshot(engine, "fake_score")
-            checkpoint_ema = _adapter_snapshot(engine, "student_ema")
+            checkpoint_student = adapter_snapshot(engine, "student")
+            checkpoint_fake = adapter_snapshot(engine, "fake_score")
+            checkpoint_ema = adapter_snapshot(engine, "student_ema")
             checkpoint_path = os.path.join(tmp_dir, f"{strategy}_checkpoint")
             engine.save_role_group_checkpoint(checkpoint_path, global_step=1)
 
@@ -243,17 +243,15 @@ def test_distillation_role_switch_preserves_graph_ema_and_state(strategy):
                 for parameter in engine._active_adapter_trainable_params("fake_score"):
                     parameter.fill_(17.0)
             engine.load_role_group_checkpoint(checkpoint_path)
-            _assert_tensors_equal(_adapter_snapshot(engine, "student"), checkpoint_student)
-            _assert_tensors_equal(_adapter_snapshot(engine, "fake_score"), checkpoint_fake)
-            _assert_tensors_equal(_adapter_snapshot(engine, "student_ema"), checkpoint_ema)
+            assert_tensors_equal(adapter_snapshot(engine, "student"), checkpoint_student)
+            assert_tensors_equal(adapter_snapshot(engine, "fake_score"), checkpoint_fake)
+            assert_tensors_equal(adapter_snapshot(engine, "student_ema"), checkpoint_ema)
 
             torch.manual_seed(17)
-            independent_student = _independent_engine_shell(
-                _wrap_independent_model(strategy, "student"), "student", True
-            )
+            independent_student = independent_engine_shell(wrap_independent_model(strategy, "student"), "student", True)
             torch.manual_seed(19)
-            independent_ema = _independent_engine_shell(
-                _wrap_independent_model(strategy, "student_ema"), "student_ema", False
+            independent_ema = independent_engine_shell(
+                wrap_independent_model(strategy, "student_ema"), "student_ema", False
             )
             with independent_student._adapter_state_context(), torch.no_grad():
                 for parameter in independent_student._active_adapter_trainable_params("student"):
@@ -262,7 +260,7 @@ def test_distillation_role_switch_preserves_graph_ema_and_state(strategy):
                 for parameter in independent_ema._active_adapter_trainable_params("student_ema"):
                     parameter.fill_(0.0)
             independent_ema.update_module_ema_from(independent_student, decay=0.25)
-            independent_values = _adapter_snapshot(independent_ema, "student_ema")
+            independent_values = adapter_snapshot(independent_ema, "student_ema")
             assert independent_values
             assert all(
                 torch.allclose(value.float(), torch.full_like(value.float(), 3.0)) for value in independent_values

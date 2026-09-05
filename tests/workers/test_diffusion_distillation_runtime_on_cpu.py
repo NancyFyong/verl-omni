@@ -15,6 +15,7 @@
 
 from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -28,7 +29,7 @@ from verl_omni.workers.diffusion_distillation_worker import (
     DiffusionDistillationWorkerGroup,
     DistillationPhaseComputation,
     DistillationRoleRuntime,
-    _resolve_profiler_configs,
+    resolve_profiler_configs,
 )
 from verl_omni.workers.engine.fsdp.distillation_impl import DistillationRoleGroupEngine
 
@@ -55,14 +56,14 @@ def test_distillation_worker_instantiates_nested_profiler_tool_config():
         }
     )
 
-    profiler_config, tool_config = _resolve_profiler_configs(config)
+    profiler_config, tool_config = resolve_profiler_configs(config)
 
     assert profiler_config.tool == "torch"
     assert tool_config.name == "torch"
     assert tool_config.contents == []
 
 
-class _ToyRoleEngine:
+class ToyRoleEngine:
     def __init__(self, roles, initial=None):
         values = initial or {}
         self.parameters = {
@@ -116,7 +117,7 @@ class _ToyRoleEngine:
 class TestRoleRuntime:
     def test_role_group_engines_must_match_the_plan_exactly(self):
         plan = build_plan("dmd2", {"model_path": "/m"}, _CAPABILITIES)
-        engine = _ToyRoleEngine(("student", "teacher_score", "fake_score", "student_ema"))
+        engine = ToyRoleEngine(("student", "teacher_score", "fake_score", "student_ema"))
         with pytest.raises(ValueError, match="missing=.*base"):
             DistillationRoleRuntime(plan, {}, ema_decay=0.9, ema_start_step=0)
         with pytest.raises(ValueError, match="extra=.*other"):
@@ -124,7 +125,7 @@ class TestRoleRuntime:
 
     def test_invalid_micro_batch_configuration_fails_closed(self):
         plan = build_plan("dmd2", {"model_path": "/m"}, _CAPABILITIES)
-        engine = _ToyRoleEngine(("student", "teacher_score", "fake_score", "student_ema"))
+        engine = ToyRoleEngine(("student", "teacher_score", "fake_score", "student_ema"))
         with pytest.raises(ValueError, match="micro_batch_sizes"):
             DistillationRoleRuntime(
                 plan,
@@ -140,7 +141,7 @@ class TestRoleRuntime:
             {"model_path": "/m", "fake_update_ratio": 1},
             _CAPABILITIES,
         )
-        engine = _ToyRoleEngine(
+        engine = ToyRoleEngine(
             ("student", "teacher_score", "fake_score", "student_ema"),
             {"student": 1.0, "teacher_score": 7.0, "fake_score": 2.0, "student_ema": -5.0},
         )
@@ -193,7 +194,7 @@ class TestRoleRuntime:
         )
         engines = {}
         for binding in plan.role_layout.bindings:
-            engines[binding.group] = _ToyRoleEngine(
+            engines[binding.group] = ToyRoleEngine(
                 (binding.role,), {binding.role: 3.0 if binding.role == "student" else -2.0}
             )
         runtime = DistillationRoleRuntime(plan, engines, ema_decay=0.25, ema_start_step=0)
@@ -207,8 +208,8 @@ class TestRoleRuntime:
 
     def test_gradient_accumulation_matches_full_batch_mean(self):
         plan = build_plan("dmd2", {"model_path": "/m"}, _CAPABILITIES)
-        accumulated_engine = _ToyRoleEngine(("student", "teacher_score", "fake_score", "student_ema"), {"student": 1.0})
-        full_engine = _ToyRoleEngine(("student", "teacher_score", "fake_score", "student_ema"), {"student": 1.0})
+        accumulated_engine = ToyRoleEngine(("student", "teacher_score", "fake_score", "student_ema"), {"student": 1.0})
+        full_engine = ToyRoleEngine(("student", "teacher_score", "fake_score", "student_ema"), {"student": 1.0})
         accumulated = DistillationRoleRuntime(plan, {"base": accumulated_engine}, ema_decay=0.9, ema_start_step=0)
         full = DistillationRoleRuntime(plan, {"base": full_engine}, ema_decay=0.9, ema_start_step=0)
         request = PhaseRequest("student", 0, 0, "fresh", ("student",), False)
@@ -240,14 +241,14 @@ class TestRoleRuntime:
             {"model_path": "/m", "export_role": "student_ema"},
             _CAPABILITIES,
         )
-        engine = _ToyRoleEngine(("student", "teacher_score", "fake_score", "student_ema"))
+        engine = ToyRoleEngine(("student", "teacher_score", "fake_score", "student_ema"))
         engine.iter_export_tensors = lambda role, base_sync_done: (role, base_sync_done)
         runtime = DistillationRoleRuntime(plan, {"base": engine}, ema_decay=0.9, ema_start_step=0)
         assert runtime.export_tensors(base_sync_done=True) == ("student_ema", True)
 
     def test_phase_losses_must_match_requested_roles(self):
         plan = build_plan("dmd2", {"model_path": "/m"}, _CAPABILITIES)
-        engine = _ToyRoleEngine(("student", "teacher_score", "fake_score", "student_ema"))
+        engine = ToyRoleEngine(("student", "teacher_score", "fake_score", "student_ema"))
         runtime = DistillationRoleRuntime(plan, {"base": engine}, ema_decay=0.9, ema_start_step=0)
         request = PhaseRequest("student", 0, 0, "fresh", ("student",), True)
         with pytest.raises(ValueError, match="must match requested roles"):
@@ -260,7 +261,7 @@ class TestRoleRuntime:
 
     def test_pr2_rejects_multi_optimizer_adversarial_phase(self):
         plan = build_plan("dmd2", {"model_path": "/m", "profile": "paper"}, _CAPABILITIES | {"adversarial"})
-        engine = _ToyRoleEngine(("student", "teacher_score", "fake_score", "student_ema", "discriminator"))
+        engine = ToyRoleEngine(("student", "teacher_score", "fake_score", "student_ema", "discriminator"))
         runtime = DistillationRoleRuntime(plan, {"base": engine}, ema_decay=0.9, ema_start_step=0)
         request = plan.update_schedule.next_cycle(SimpleNamespace(global_step=0, completed_cycles=0)).requests[-1]
         with pytest.raises(NotImplementedError, match="Multi-role optimizer phases"):
@@ -276,7 +277,7 @@ class TestRoleRuntime:
             )
 
 
-class _ToyPeftModule(torch.nn.Module):
+class ToyPeftModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.tensor(1.0))
@@ -295,7 +296,7 @@ class _ToyPeftModule(torch.nn.Module):
 
 class TestRoleEngineValidation:
     @staticmethod
-    def _uninitialized_engine():
+    def uninitialized_engine():
         engine = object.__new__(DistillationRoleGroupEngine)
         engine.role_group = SimpleNamespace(name="base", storage="shared_base_adapters")
         engine.role_bindings = {
@@ -306,18 +307,18 @@ class TestRoleEngineValidation:
         return engine
 
     def test_fsdp1_shared_base_requires_orig_params(self):
-        engine = self._uninitialized_engine()
+        engine = self.uninitialized_engine()
         with pytest.raises(ValueError, match="use_orig_params=true"):
-            engine._validate_constructor_inputs(SimpleNamespace(strategy="fsdp", use_orig_params=False))
+            engine.validate_constructor_inputs(SimpleNamespace(strategy="fsdp", use_orig_params=False))
 
     def test_optimizer_configs_must_match_trainable_roles(self):
-        engine = self._uninitialized_engine()
+        engine = self.uninitialized_engine()
         engine.optimizer_configs = {"fake_score": object()}
         with pytest.raises(ValueError, match="must match trainable roles"):
-            engine._validate_constructor_inputs(SimpleNamespace(strategy="fsdp2", use_orig_params=False))
+            engine.validate_constructor_inputs(SimpleNamespace(strategy="fsdp2", use_orig_params=False))
 
     def test_gradient_leak_into_inactive_role_is_rejected(self):
-        engine = self._uninitialized_engine()
+        engine = self.uninitialized_engine()
         student = torch.nn.Parameter(torch.tensor(1.0))
         fake_score = torch.nn.Parameter(torch.tensor(2.0))
         fake_score.grad = torch.tensor(1.0)
@@ -328,7 +329,7 @@ class TestRoleEngineValidation:
 
 class TestRoleContext:
     @staticmethod
-    def _engine():
+    def make_engine():
         engine = object.__new__(DistillationRoleGroupEngine)
         engine.role_group = SimpleNamespace(name="base", storage="shared_base_adapters")
         engine.role_bindings = {
@@ -336,7 +337,7 @@ class TestRoleContext:
             "student_ema": SimpleNamespace(adapter="student_ema", trainable=False),
             "teacher_score": SimpleNamespace(adapter=None, trainable=False),
         }
-        engine.module = _ToyPeftModule()
+        engine.module = ToyPeftModule()
         engine.optimizers = {}
         engine.lr_schedulers = {}
         engine.optimizer_configs = {}
@@ -345,7 +346,7 @@ class TestRoleContext:
         return engine
 
     def test_frozen_role_is_eval_no_grad_and_context_restores_on_error(self):
-        engine = self._engine()
+        engine = self.make_engine()
         engine.module.train()
         with pytest.raises(RuntimeError, match="boom"):
             with engine.use_role("teacher_score") as module:
@@ -359,55 +360,72 @@ class TestRoleContext:
         assert engine._active_role == "student"
 
     def test_non_student_export_is_rejected(self):
-        engine = self._engine()
+        engine = self.make_engine()
         with pytest.raises(ValueError, match="Only student or student_ema"):
             engine.iter_export_tensors("teacher_score", base_sync_done=False)
 
     def test_export_uses_the_semantic_roles_adapter(self):
-        engine = self._engine()
-        observed = []
+        engine = self.make_engine()
         parameter = torch.tensor(1.0)
-
-        def get_per_tensor_param(*, base_sync_done, adapter_name):
-            observed.append((adapter_name, base_sync_done))
-            return iter((("weight", parameter),)), {"adapter": adapter_name}
-
-        engine.get_per_tensor_param = get_per_tensor_param
+        engine.get_per_tensor_param = Mock(return_value=(iter((("weight", parameter),)), {"adapter": "student_ema"}))
         tensors, peft_config = engine.iter_export_tensors("student_ema", base_sync_done=False)
         assert list(tensors) == [("weight", parameter)]
         assert peft_config == {"adapter": "student_ema"}
-        assert observed == [("student_ema", False)]
+        engine.get_per_tensor_param.assert_called_once_with(adapter_name="student_ema", base_sync_done=False)
 
 
 class TestWorkerGroupFacade:
+    def test_rank_failure_surfaces_before_lazy_collect_metadata(self, monkeypatch):
+        import ray
+        from verl.single_controller.base.decorator import MAGIC_ATTR
+        from verl.single_controller.ray.base import func_generator
+
+        from verl_omni.workers.diffusion_distillation_worker import DiffusionDistillationWorker
+
+        registration = getattr(DiffusionDistillationWorker.execute_phase, MAGIC_ATTR)
+        futures = [object(), object()]
+
+        get_results = Mock(side_effect=ValueError("rank 0: invalid conditioning"))
+        collect = Mock(side_effect=AssertionError("Lazy metadata RPCs queued behind a peer collective"))
+
+        monkeypatch.setattr(ray, "get", get_results)
+        execute = func_generator(
+            object(),
+            "execute_phase",
+            lambda group, *args, **kwargs: (args, kwargs),
+            collect,
+            lambda name, *args, **kwargs: futures,
+            registration["blocking"],
+        )
+        with pytest.raises(ValueError, match="rank 0: invalid conditioning"):
+            execute(tu.get_tensordict({}, {}))
+        get_results.assert_called_once_with(futures)
+        collect.assert_not_called()
+
     def test_tensordict_result_is_converted_to_phase_result(self):
-        class _WorkerGroup:
-            def execute_phase(self, batch):
-                assert tu.get(batch, "phase_request").kind == "student"
-                return tu.get_tensordict(
+        worker_group = SimpleNamespace(
+            execute_phase=Mock(
+                return_value=tu.get_tensordict(
                     tensor_dict={},
                     non_tensor_dict={"metrics": {"loss": 1.25}, "optimizer_steps": {"student": 1}},
                 )
-
-        facade = DiffusionDistillationWorkerGroup(_WorkerGroup())
+            )
+        )
+        facade = DiffusionDistillationWorkerGroup(worker_group)
         request = PhaseRequest("student", 0, 0, "fresh", ("student",), True)
         result = facade.execute_phase(request, tu.get_tensordict({}, {}))
         assert result.metrics == {"loss": 1.25}
         assert result.optimizer_steps == {"student": 1}
+        assert tu.get(worker_group.execute_phase.call_args.args[0], "phase_request").kind == "student"
 
     def test_future_result_is_resolved_before_conversion(self, monkeypatch):
         output = tu.get_tensordict(
             tensor_dict={},
             non_tensor_dict={"metrics": {"loss": 2.5}, "optimizer_steps": {"fake_score": 1}},
         )
-        monkeypatch.setattr(DataProtoFuture, "get", lambda self: output)
-
-        class _WorkerGroup:
-            def execute_phase(self, batch):
-                del batch
-                return DataProtoFuture(collect_fn=None, futures=[])
-
-        facade = DiffusionDistillationWorkerGroup(_WorkerGroup())
+        monkeypatch.setattr(DataProtoFuture, "get", Mock(return_value=output))
+        future = DataProtoFuture(collect_fn=None, futures=[])
+        facade = DiffusionDistillationWorkerGroup(SimpleNamespace(execute_phase=Mock(return_value=future)))
         request = PhaseRequest("fake_score", 0, 0, "fresh", ("fake_score",), False)
         result = facade.execute_phase(request, tu.get_tensordict({}, {}))
 

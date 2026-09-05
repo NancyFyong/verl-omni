@@ -20,7 +20,6 @@ import math
 import os
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, nullcontext
-from copy import deepcopy
 from dataclasses import asdict
 from typing import Any, Optional
 
@@ -66,11 +65,11 @@ class DistillationRoleGroupEngine(DiffusersFSDPEngine):
         self._role_parameters: dict[str, tuple[torch.nn.Parameter, ...]] = {}
         self._active_role: Optional[str] = None
         self._primary_role: Optional[str] = None
-        self._checkpoint_config_template = deepcopy(checkpoint_config)
-        self._validate_constructor_inputs(engine_config)
+        self.validate_constructor_inputs(engine_config)
         super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
 
-    def _validate_constructor_inputs(self, engine_config: FSDPEngineConfig) -> None:
+    def validate_constructor_inputs(self, engine_config: FSDPEngineConfig) -> None:
+        """Validate role ownership and supported FSDP adapter layouts."""
         if not self.role_bindings:
             raise ValueError(f"Role group {self.role_group.name!r} must contain at least one binding.")
         if any(binding.group != self.role_group.name for binding in self.role_bindings.values()):
@@ -88,8 +87,8 @@ class DistillationRoleGroupEngine(DiffusersFSDPEngine):
     def initialize(self) -> None:
         """Build the shared/independent module and all role optimizer states."""
         super().initialize()
-        if self._has_adapters():
-            available_adapters = set(getattr(self._peft_model(), "peft_config", {}))
+        if self.has_adapters():
+            available_adapters = set(getattr(self.peft_model(), "peft_config", {}))
             required_adapters = {
                 binding.adapter for binding in self.role_bindings.values() if binding.adapter is not None
             }
@@ -153,14 +152,17 @@ class DistillationRoleGroupEngine(DiffusersFSDPEngine):
             self.optimizer = None
             self.lr_scheduler = None
 
-    def _peft_model(self):
+    def peft_model(self):
+        """Unwrap the FSDP1 root to reach the adapter interface."""
         return getattr(self.module, "_fsdp_wrapped_module", self.module)
 
-    def _has_adapters(self) -> bool:
-        return hasattr(self._peft_model(), "set_adapter")
+    def has_adapters(self) -> bool:
+        """Whether the physical model exposes named adapters."""
+        return hasattr(self.peft_model(), "set_adapter")
 
-    def _set_adapters_enabled(self, enabled: bool) -> None:
-        peft_model = self._peft_model()
+    def set_adapters_enabled(self, enabled: bool) -> None:
+        """Toggle adapters through the Diffusers or PEFT interface."""
+        peft_model = self.peft_model()
         method_name = "enable_adapters" if enabled else "disable_adapters"
         method = getattr(peft_model, method_name, None)
         if method is None:
@@ -180,12 +182,12 @@ class DistillationRoleGroupEngine(DiffusersFSDPEngine):
                 f"bound roles: {sorted(self.role_bindings)}."
             ) from None
 
-        if self._has_adapters():
-            peft_model = self._peft_model()
+        if self.has_adapters():
+            peft_model = self.peft_model()
             if binding.adapter is None:
-                self._set_adapters_enabled(False)
+                self.set_adapters_enabled(False)
             else:
-                self._set_adapters_enabled(True)
+                self.set_adapters_enabled(True)
                 peft_model.set_adapter(binding.adapter)
         elif binding.adapter is not None and self.role_group.storage == "shared_base_adapters":
             raise ValueError(
@@ -298,12 +300,12 @@ class DistillationRoleGroupEngine(DiffusersFSDPEngine):
             raise ValueError(f"EMA decay must be in [0, 1], got {decay}.")
         source_adapter = (
             next((binding.adapter for binding in source.role_bindings.values() if binding.adapter is not None), None)
-            if source._has_adapters()
+            if source.has_adapters()
             else None
         )
         target_adapter = (
             next((binding.adapter for binding in self.role_bindings.values() if binding.adapter is not None), None)
-            if self._has_adapters()
+            if self.has_adapters()
             else None
         )
         if (source_adapter is None) != (target_adapter is None):
@@ -313,7 +315,7 @@ class DistillationRoleGroupEngine(DiffusersFSDPEngine):
             with source._adapter_state_context(), self._adapter_state_context(), torch.no_grad():
                 source_parameters = source._active_adapter_trainable_params(source_adapter)
                 target_parameters = self._active_adapter_trainable_params(target_adapter)
-                self._ema_parameter_lists(source_parameters, target_parameters, decay)
+                self.ema_parameter_lists(source_parameters, target_parameters, decay)
             return
 
         source_parameters = tuple(source.module.named_parameters())
@@ -333,7 +335,8 @@ class DistillationRoleGroupEngine(DiffusersFSDPEngine):
                 target_parameter.lerp_(source_parameter, 1.0 - decay)
 
     @staticmethod
-    def _ema_parameter_lists(source_parameters, target_parameters, decay: float) -> None:
+    def ema_parameter_lists(source_parameters, target_parameters, decay: float) -> None:
+        """Blend corresponding independent-module adapter parameters in place."""
         if len(source_parameters) != len(target_parameters) or not source_parameters:
             raise ValueError("Independent EMA source and target adapter parameter counts must match and be non-empty.")
         for source_parameter, target_parameter in zip(source_parameters, target_parameters, strict=True):
@@ -351,7 +354,8 @@ class DistillationRoleGroupEngine(DiffusersFSDPEngine):
             adapter_name=binding.adapter,
         )
 
-    def _additional_state_path(self, local_path: str) -> str:
+    def additional_state_path(self, local_path: str) -> str:
+        """Locate this rank's secondary optimizer and scheduler state."""
         return os.path.join(local_path, f"role_state_rank_{self.rank}.pt")
 
     def save_role_group_checkpoint(self, local_path: str, global_step: int) -> None:
@@ -370,7 +374,7 @@ class DistillationRoleGroupEngine(DiffusersFSDPEngine):
                 "schedulers": {role: self.lr_schedulers[role].state_dict() for role in additional_roles},
                 "primary_role": self._primary_role,
             },
-            self._additional_state_path(local_path),
+            self.additional_state_path(local_path),
         )
         if self.rank == 0:
             with open(os.path.join(local_path, "role_group.json"), "w", encoding="utf-8") as file:
@@ -402,7 +406,7 @@ class DistillationRoleGroupEngine(DiffusersFSDPEngine):
                 self.activate_role(self._primary_role)
             super().load_checkpoint(local_path=local_path, del_local_after_load=False)
 
-        role_state = torch.load(self._additional_state_path(local_path), map_location="cpu", weights_only=False)
+        role_state = torch.load(self.additional_state_path(local_path), map_location="cpu", weights_only=False)
         if role_state.get("primary_role") != self._primary_role:
             raise ValueError(
                 f"Checkpoint primary role {role_state.get('primary_role')!r} does not match {self._primary_role!r}."
@@ -423,10 +427,13 @@ class DistillationRoleGroupEngine(DiffusersFSDPEngine):
         raise NotImplementedError("DistillationRoleGroupEngine is driven through DiffusionDistillationWorker phases.")
 
     def prepare_model_inputs(self, micro_batch: TensorDict, step: int):
+        """Keep model-specific preparation in the architecture phase runner."""
         raise NotImplementedError("Architecture-owned distillation phase runners prepare model inputs.")
 
     def prepare_model_outputs(self, output, micro_batch: TensorDict):
+        """Keep model-specific output conversion in the phase runner."""
         raise NotImplementedError("Architecture-owned distillation phase runners prepare model outputs.")
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only, step):
+        """Reject the PPO step interface for multi-role computation."""
         raise NotImplementedError("Architecture-owned distillation phase runners execute forwards.")
