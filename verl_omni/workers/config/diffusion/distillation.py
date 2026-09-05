@@ -91,6 +91,33 @@ class DiffusionDistributionMatchingConfig(BaseConfig):
     ema_decay: float = 0.999
     # First completed student step that updates EMA.
     ema_start_step: int = 0
+    # Conditioning source used by architecture phase runners.
+    conditioning_provider: str = "local_frozen_encoder"
+    # Negative prompt used by the guided frozen teacher.
+    negative_prompt: str = " "
+    # Standard CFG scale for the frozen teacher score.
+    teacher_guidance_scale: float = 4.0
+    # Teacher CFG normalization mode.
+    teacher_cfg_norm: str = "layer_norm"
+    # Linear time shift used by the few-step student rollout schedule.
+    rollout_timestep_shift: float = 3.0
+    # Lower and upper score-noising sigma bounds.
+    score_sigma_min: float = 0.02
+    score_sigma_max: float = 0.98
+    # Rational time shift applied to score-noising samples.
+    score_timestep_shift: float = 3.0
+    # Number of discrete score-noising samples; zero selects continuous sampling.
+    score_discrete_steps: int = 1000
+    # Stabilizer for the DMD score-difference normalizer.
+    normalization_epsilon: float = 1e-5
+    # Distribution-matching loss weight.
+    dmd_loss_weight: float = 1.0
+    # DMD paired-regression distance.
+    regression_type: str = "decoded_lpips"
+    # DMD paired-regression loss weight.
+    regression_loss_weight: float = 1.0
+    # Base seed for worker-local rollout and score-noise generators.
+    rng_seed: int = 0
 
     def __post_init__(self):
         valid_recipes = {"dmd", "dmd2", "causvid", "self_forcing"}
@@ -137,6 +164,52 @@ class DiffusionDistributionMatchingConfig(BaseConfig):
             raise ValueError(f"ema_decay must be in [0, 1], got {self.ema_decay}")
         if self.ema_start_step < 0:
             raise ValueError(f"ema_start_step must be non-negative, got {self.ema_start_step}")
+        valid_conditioning_providers = {"local_frozen_encoder", "precomputed"}
+        if self.conditioning_provider not in valid_conditioning_providers:
+            raise ValueError(
+                f"Invalid conditioning_provider: {self.conditioning_provider}. "
+                f"Must be one of {sorted(valid_conditioning_providers)}"
+            )
+        if not isinstance(self.negative_prompt, str):
+            raise ValueError("negative_prompt must be a string")
+        if self.teacher_guidance_scale <= 1.0:
+            raise ValueError(
+                f"teacher_guidance_scale must be greater than 1 for guided teacher scoring, "
+                f"got {self.teacher_guidance_scale}"
+            )
+        valid_cfg_norms = {"none", "layer_norm", "scalar"}
+        if self.teacher_cfg_norm not in valid_cfg_norms:
+            raise ValueError(
+                f"Invalid teacher_cfg_norm: {self.teacher_cfg_norm}. Must be one of {sorted(valid_cfg_norms)}"
+            )
+        if self.rollout_timestep_shift < 1:
+            raise ValueError(f"rollout_timestep_shift must be at least 1, got {self.rollout_timestep_shift}")
+        if not 0.0 <= self.score_sigma_min < self.score_sigma_max <= 1.0:
+            raise ValueError(
+                "score sigma bounds must satisfy 0 <= score_sigma_min < score_sigma_max <= 1, "
+                f"got [{self.score_sigma_min}, {self.score_sigma_max}]"
+            )
+        if self.score_timestep_shift < 1:
+            raise ValueError(f"score_timestep_shift must be at least 1, got {self.score_timestep_shift}")
+        if self.score_discrete_steps < 0:
+            raise ValueError(f"score_discrete_steps must be non-negative, got {self.score_discrete_steps}")
+        if self.normalization_epsilon <= 0:
+            raise ValueError(f"normalization_epsilon must be positive, got {self.normalization_epsilon}")
+        if self.dmd_loss_weight < 0:
+            raise ValueError(f"dmd_loss_weight must be non-negative, got {self.dmd_loss_weight}")
+        valid_regression_types = {"decoded_lpips", "latent_mse"}
+        if self.regression_type not in valid_regression_types:
+            raise ValueError(
+                f"Invalid regression_type: {self.regression_type}. Must be one of {sorted(valid_regression_types)}"
+            )
+        if self.regression_loss_weight < 0:
+            raise ValueError(f"regression_loss_weight must be non-negative, got {self.regression_loss_weight}")
+        if self.recipe == "dmd2" and self.dmd_loss_weight == 0:
+            raise ValueError("DMD2 requires dmd_loss_weight > 0")
+        if self.recipe == "dmd" and self.dmd_loss_weight == 0 and self.regression_loss_weight == 0:
+            raise ValueError("DMD requires at least one positive objective weight")
+        if self.rng_seed < 0:
+            raise ValueError(f"rng_seed must be non-negative, got {self.rng_seed}")
 
 
 @dataclass

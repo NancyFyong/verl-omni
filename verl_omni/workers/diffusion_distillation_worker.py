@@ -202,6 +202,7 @@ class DistillationRoleRuntime:
             raise ValueError(f"Role loss for {role!r} must retain an autograd graph.")
         return role
 
+    @torch.profiler.record_function("distillation/backward")
     def backward_micro_batch(
         self,
         request: PhaseRequest,
@@ -227,7 +228,8 @@ class DistillationRoleRuntime:
                 role_engine.assert_gradient_isolation({role})
         engine = self.engine_for_role(role)
         optimizer_start = time.perf_counter()
-        stepped, grad_norm = engine.optimizer_step(role)
+        with torch.profiler.record_function(f"distillation/{role}_optimizer"):
+            stepped, grad_norm = engine.optimizer_step(role)
         metrics = {
             f"{role}/grad_norm": grad_norm,
             f"perf/{role}_optimizer_s": time.perf_counter() - optimizer_start,
@@ -260,6 +262,7 @@ class DistillationRoleRuntime:
         """Initialize the semantic EMA role exactly from the student role."""
         self.update_ema_parameters(decay=0.0)
 
+    @torch.profiler.record_function("distillation/ema")
     def update_ema(self) -> None:
         """Update the semantic student EMA in shared or independent storage."""
         self.update_ema_parameters(decay=self.ema_decay)
@@ -274,7 +277,7 @@ class DistillationRoleRuntime:
             ema_engine.update_module_ema_from(student_engine, decay)
 
     def reduce_metrics(self, metrics: dict[str, float]) -> dict[str, float]:
-        """Average scalar metrics across data-parallel replicas."""
+        """Reduce DP means plus peak memory and explicit slowest-rank host timings."""
         if not metrics:
             return metrics
         first_engine = next(iter(self.engines.values()))
@@ -283,8 +286,16 @@ class DistillationRoleRuntime:
             return metrics
         names = sorted(metrics)
         values = torch.tensor([metrics[name] for name in names], dtype=torch.float32, device=get_device_id())
+        maxima = values.clone()
         torch.distributed.all_reduce(values, op=torch.distributed.ReduceOp.AVG, group=group)
-        return {name: value for name, value in zip(names, values.cpu().tolist(), strict=True)}
+        torch.distributed.all_reduce(maxima, op=torch.distributed.ReduceOp.MAX, group=group)
+        reduced = dict(zip(names, values.cpu().tolist(), strict=True))
+        for name, maximum in zip(names, maxima.cpu().tolist(), strict=True):
+            if name.startswith("memory/max_"):
+                reduced[name] = maximum
+            elif name.startswith("perf/") and name.endswith("_s") and not name.endswith("_per_s"):
+                reduced[name.replace("perf/", "perf_max_rank/", 1)] = maximum
+        return reduced
 
     def group_metrics(self) -> dict[str, float]:
         """Return stable placement diagnostics for logging."""
@@ -465,7 +476,9 @@ class DiffusionDistillationWorker(Worker, DistProfilerExtension):
                 self.runtime.backward_micro_batch(request, computation, weight=weight)
                 backward_duration += time.perf_counter() - backward_start
                 for name, value in computation.metrics.items():
-                    accumulated_metrics[name] = accumulated_metrics.get(name, 0.0) + float(value) * weight
+                    is_duration = name.startswith("perf/") and name.endswith("_s") and not name.endswith("_per_s")
+                    metric_weight = 1.0 if is_duration or name.endswith(("/active_elements", "/nonfinite")) else weight
+                    accumulated_metrics[name] = accumulated_metrics.get(name, 0.0) + float(value) * metric_weight
                 for role, loss in computation.losses.items():
                     accumulated_losses[role] = accumulated_losses.get(role, 0.0) + float(loss.detach().float()) * weight
             optimizer_steps, step_metrics = self.runtime.step_phase(request)
@@ -477,6 +490,12 @@ class DiffusionDistillationWorker(Worker, DistProfilerExtension):
             metrics["memory/max_allocated_gb"] = device_module.max_memory_allocated() / (1024**3)
             metrics["memory/max_reserved_gb"] = device_module.max_memory_reserved() / (1024**3)
             metrics.update(self.runtime.group_metrics())
+            engine = self.runtime.engine_for_role(request.trainable_roles[0])
+            metrics[f"training/{request.kind}_samples"] = float(total_samples * engine.get_data_parallel_size())
+            metrics[f"batch/{request.kind}_micro_batches"] = float(
+                (total_samples + micro_batch_size - 1) // micro_batch_size
+            )
+            metrics[f"batch/{request.kind}_micro_batch_size"] = float(min(total_samples, micro_batch_size))
             metrics = self.runtime.reduce_metrics(metrics)
         return tu.get_tensordict(
             tensor_dict={},

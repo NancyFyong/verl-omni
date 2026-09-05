@@ -120,6 +120,7 @@ class DistillationTrainerControlPlane:
         )
         before_metrics = dict(self._metrics)
         try:
+            self._metrics = {}
             cycle = self.plan.update_schedule.next_cycle(self.counters)
             student_step_reported = self.drive_requests(cycle.requests)
 
@@ -180,10 +181,12 @@ class DistillationTrainerControlPlane:
             raise ValueError(f"Each completed phase role must report exactly one optimizer step, got {invalid_steps}.")
 
     def accumulate_result(self, result: PhaseResult, request: PhaseRequest) -> None:
-        """Record validated role counters and the latest phase metrics."""
+        """Record validated counters and every phase result in the current cycle."""
         for role, steps in result.optimizer_steps.items():
             self.counters.optimizer_steps[role] = self.counters.optimizer_steps.get(role, 0) + steps
-        self._metrics[request.kind] = dict(result.metrics)
+        count = sum(name.split("/")[0] == request.kind for name in self._metrics)
+        phase_name = request.kind if count == 0 else f"{request.kind}/{count}"
+        self._metrics[phase_name] = dict(result.metrics)
 
     def assert_progress(self, before: TrainerCounters) -> None:
         """A cycle must advance global_step or at least one role optimizer counter."""
@@ -195,7 +198,7 @@ class DistillationTrainerControlPlane:
 
     @property
     def metrics(self) -> dict[str, dict]:
-        """Metrics recorded for the most recent phase of each kind."""
+        """Metrics for every phase in the last completed cycle, including repeats."""
         return self._metrics
 
     def state_dict(self) -> dict[str, Any]:

@@ -43,6 +43,8 @@ class DiffusionRolloutAlgoConfig(BaseConfig):
     sde_window_size: Optional[int] = None
     sde_window_range: Optional[list[int]] = None
     sde_contiguous: bool = True
+    # Optional fixed linear time shift for few-step distilled-model inference.
+    rollout_timestep_shift: Optional[float] = None
 
     # MixGRPO-only configs
     sample_strategy: str = "random"
@@ -50,6 +52,8 @@ class DiffusionRolloutAlgoConfig(BaseConfig):
     sde_window_seed: int = 0
 
     def __post_init__(self):
+        if self.rollout_timestep_shift is not None and self.rollout_timestep_shift < 1:
+            raise ValueError(f"rollout_timestep_shift must be at least 1 when set, got {self.rollout_timestep_shift}.")
         if self.sample_strategy not in ("random", "progressive"):
             raise ValueError(f"Unknown sample_strategy: {self.sample_strategy!r}")
         if self.sample_strategy == "progressive" and self.iters_per_group <= 0:

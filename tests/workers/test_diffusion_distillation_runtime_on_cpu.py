@@ -13,7 +13,7 @@
 # limitations under the License.
 """CPU tests for the generic multi-role distillation data plane."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -26,6 +26,7 @@ from verl.utils import tensordict_utils as tu
 from verl_omni.trainer.diffusion.distillation.contracts import PhaseRequest
 from verl_omni.trainer.diffusion.distillation.recipes import build_plan
 from verl_omni.workers.diffusion_distillation_worker import (
+    DiffusionDistillationWorker,
     DiffusionDistillationWorkerGroup,
     DistillationPhaseComputation,
     DistillationRoleRuntime,
@@ -78,6 +79,15 @@ class ToyRoleEngine:
         self.scheduler = object()
         self.model_config = object()
         self.active_role = None
+
+    def train_mode(self):
+        return nullcontext()
+
+    def get_data_parallel_group(self):
+        return None
+
+    def get_data_parallel_size(self):
+        return 2
 
     @contextmanager
     def use_role(self, role):
@@ -275,6 +285,85 @@ class TestRoleRuntime:
                     metrics={},
                 ),
             )
+
+
+class ToyPhaseRunner:
+    def compute_phase(self, request, batch, runtime):
+        role = request.trainable_roles[0]
+        parameter = runtime.engine_for_role(role).parameters[role]
+        return DistillationPhaseComputation(
+            losses={role: (parameter - batch["target"]).square().mean()},
+            metrics={
+                "perf/condition_encode_s": 1.0,
+                "perf/mfu": 0.25,
+                "dmd/active_elements": float(batch.batch_size[0]),
+            },
+        )
+
+
+def simulate_dp_reduce(values, op, group):
+    assert group == "dp"
+    # Sorted names: loss, peak memory, host time; simulate a slower second rank.
+    peer = torch.tensor([5.0, 7.0, 9.0])
+    if op == torch.distributed.ReduceOp.AVG:
+        values.copy_((values + peer) / 2)
+    else:
+        assert op == torch.distributed.ReduceOp.MAX
+        values.copy_(torch.maximum(values, peer))
+
+
+class TestWorkerMetrics:
+    @pytest.mark.parametrize("micro_batch_size", [1, 2, 3])
+    def test_existing_worker_accumulation_keeps_loss_weights_but_sums_elapsed_time(self, monkeypatch, micro_batch_size):
+        plan = build_plan("dmd2", {"model_path": "/m"}, _CAPABILITIES)
+        engine = ToyRoleEngine(("student", "teacher_score", "fake_score", "student_ema"), {"student": 1.0})
+        runtime = DistillationRoleRuntime(
+            plan,
+            {"base": engine},
+            ema_decay=0.9,
+            ema_start_step=0,
+            micro_batch_sizes={"student": micro_batch_size, "fake_score": 1},
+        )
+        worker = object.__new__(DiffusionDistillationWorker)
+        worker.runtime = runtime
+        worker.phase_runner = ToyPhaseRunner()
+        device = Mock()
+        device.max_memory_allocated.return_value = 2 * 1024**3
+        device.max_memory_reserved.return_value = 3 * 1024**3
+        monkeypatch.setattr(
+            "verl_omni.workers.diffusion_distillation_worker.get_torch_device", Mock(return_value=device)
+        )
+        monkeypatch.setattr("verl_omni.workers.diffusion_distillation_worker.get_device_id", Mock(return_value="cpu"))
+        batch = tu.get_tensordict({"target": torch.tensor([0.0, 2.0, 6.0])})
+        tu.assign_non_tensor(batch, phase_request=PhaseRequest("student", 0, 0, "fresh", ("student",), True))
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
+            result = worker.execute_phase(batch)
+        metrics = tu.get(result, "metrics")
+        assert tu.get(result, "optimizer_steps") == {"student": 1}
+        assert metrics["student/loss"] == pytest.approx(9.0)
+        assert metrics["perf/condition_encode_s"] == (3 + micro_batch_size - 1) // micro_batch_size
+        assert metrics["dmd/active_elements"] == 3
+        assert metrics["perf/mfu"] == 0.25
+        assert metrics["training/student_samples"] == 6
+        assert metrics["memory/max_allocated_gb"] == 2
+        assert engine.parameters["student"].item() == pytest.approx(4 / 3)
+        names = {event.key for event in profile.key_averages()}
+        assert {"distillation/backward", "distillation/student_optimizer", "distillation/ema"} <= names
+
+    def test_dp_reports_mean_and_slowest_rank_time_without_averaging_peak_memory(self, monkeypatch):
+        plan = build_plan("dmd2", {"model_path": "/m"}, _CAPABILITIES)
+        engine = ToyRoleEngine(("student", "teacher_score", "fake_score", "student_ema"))
+        engine.get_data_parallel_group = Mock(return_value="dp")
+        runtime = DistillationRoleRuntime(plan, {"base": engine}, ema_decay=0.9, ema_start_step=0)
+        monkeypatch.setattr("verl_omni.workers.diffusion_distillation_worker.get_device_id", Mock(return_value="cpu"))
+        monkeypatch.setattr(torch.distributed, "all_reduce", simulate_dp_reduce)
+        metrics = runtime.reduce_metrics({"loss": 1.0, "memory/max_allocated_gb": 2.0, "perf/student_s": 3.0})
+        assert metrics == {
+            "loss": 3.0,
+            "memory/max_allocated_gb": 7.0,
+            "perf/student_s": 6.0,
+            "perf_max_rank/student_s": 9.0,
+        }
 
 
 class ToyPeftModule(torch.nn.Module):

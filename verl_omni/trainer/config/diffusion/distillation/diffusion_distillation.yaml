@@ -137,3 +137,45 @@ distribution_matching:
 
   # First completed student step that updates EMA
   ema_start_step: 0
+
+  # Conditioning source: local_frozen_encoder or precomputed
+  conditioning_provider: local_frozen_encoder
+
+  # Negative prompt used by the guided frozen teacher
+  negative_prompt: " "
+
+  # Standard CFG scale for frozen-teacher scoring
+  teacher_guidance_scale: 4.0
+
+  # Teacher CFG normalization: none, layer_norm, or scalar
+  teacher_cfg_norm: layer_norm
+
+  # Linear time shift used by the few-step student rollout schedule
+  rollout_timestep_shift: 3.0
+
+  # Minimum score-noising sigma
+  score_sigma_min: 0.02
+
+  # Maximum score-noising sigma
+  score_sigma_max: 0.98
+
+  # Rational shift used for score-noising samples
+  score_timestep_shift: 3.0
+
+  # Number of discrete score-noising samples; zero selects continuous sampling
+  score_discrete_steps: 1000
+
+  # Stabilizer for distribution-matching normalization
+  normalization_epsilon: 1.0e-5
+
+  # Distribution-matching loss weight
+  dmd_loss_weight: 1.0
+
+  # Original-DMD paired-regression distance; latent_mse is a non-paper diagnostic
+  regression_type: decoded_lpips
+
+  # Original-DMD paired-regression loss weight
+  regression_loss_weight: 1.0
+
+  # Base seed for worker-local rollout and score-noise generators
+  rng_seed: 0

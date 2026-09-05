@@ -36,6 +36,8 @@ from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo.ray_trainer import Role
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.metric import Metric, reduce_metrics
+from verl.utils.profiler import marked_timer
 from verl.utils.tracking import Tracking
 
 from verl_omni.pipelines.model_base import DiffusionModelBase, DistributionMatchingModelAdapter
@@ -188,6 +190,13 @@ class DistillationRayTrainer(BaseRayDiffusionTrainer):
     def validate_runtime_config(self) -> None:
         """Reject unsupported role storage and distributed batch layouts."""
         distribution_matching = self.config.distillation.distribution_matching
+        model_algorithm = OmegaConf.select(self.config, "actor_rollout_ref.model.algorithm")
+        recipe = OmegaConf.select(self.config, "distillation.distribution_matching.recipe")
+        if model_algorithm is not None and recipe is not None and model_algorithm != recipe:
+            raise ValueError(
+                "actor_rollout_ref.model.algorithm must match distillation.distribution_matching.recipe; "
+                f"got {model_algorithm!r} and {recipe!r}."
+            )
         strategy = self.config.actor_rollout_ref.actor.strategy
         if strategy not in {"fsdp", "fsdp2"}:
             raise ValueError(f"Distillation role groups require strategy 'fsdp' or 'fsdp2', got {strategy!r}.")
@@ -413,8 +422,26 @@ class DistillationRayTrainer(BaseRayDiffusionTrainer):
 
     @staticmethod
     def flatten_metrics(metrics: dict[str, dict]) -> dict[str, float]:
-        """Flatten phase metrics for the existing tracking backends."""
-        return {key: value for phase_metrics in metrics.values() for key, value in phase_metrics.items()}
+        """Sum cycle timings/counts, retain peak memory, and average other phase values."""
+        collected: dict[str, Metric] = {}
+        result = {}
+        for phase, phase_metrics in metrics.items():
+            for key, value in phase_metrics.items():
+                result[f"phase/{phase}/{key}"] = float(value)
+                is_duration = (
+                    key.startswith(("perf/", "perf_max_rank/")) and key.endswith("_s") and not key.endswith("_per_s")
+                )
+                if is_duration or key.endswith(("/active_elements", "/nonfinite", "_samples", "_micro_batches")):
+                    aggregation = "sum"
+                elif key.startswith("memory/max_"):
+                    aggregation = "max"
+                else:
+                    aggregation = "mean"
+                if key not in collected:
+                    collected[key] = Metric(aggregation=aggregation)
+                collected[key].append(value)
+        result.update({key: float(value) for key, value in reduce_metrics(collected).items()})
+        return result
 
     def profile_workers(self, *, start: bool, step: int) -> None:
         """Start or stop the configured distributed profiler."""
@@ -455,18 +482,35 @@ class DistillationRayTrainer(BaseRayDiffusionTrainer):
         while control_plane.counters.global_step < target_steps:
             before_global_step = control_plane.counters.global_step
             profile_step = before_global_step + 1
-            do_profile = profile_steps is not None and profile_step in profile_steps
-            self.profile_workers(start=do_profile, step=profile_step)
+            do_profile = (
+                profile_steps is not None
+                and profile_step in profile_steps
+                and control_plane.counters.completed_cycles >= self.plan.update_schedule.warmup_cycles
+            )
+            if do_profile:
+                self.profile_workers(start=True, step=profile_step)
+            timing_raw = {}
             try:
-                control_plane.run_cycle()
+                with marked_timer("perf/cycle_s", timing_raw):
+                    control_plane.run_cycle()
             finally:
                 if do_profile:
                     self.profile_workers(start=False, step=profile_step)
             self.global_steps = control_plane.counters.global_step
             metrics = self.flatten_metrics(control_plane.metrics)
+            metrics.update(timing_raw)
+            for kind in ("student", "fake_score"):
+                samples = metrics.setdefault(f"training/{kind}_samples", 0.0)
+                metrics[f"perf/{kind}_samples_per_s"] = samples / timing_raw["perf/cycle_s"]
+            metrics.update(
+                {
+                    f"training/{role}_optimizer_steps": float(steps)
+                    for role, steps in control_plane.counters.optimizer_steps.items()
+                }
+            )
             metrics["training/global_step"] = float(self.global_steps)
             metrics["training/completed_cycles"] = float(control_plane.counters.completed_cycles)
-            self._logger.log(data=metrics, step=self.global_steps)
+            self._logger.log(data=metrics, step=control_plane.counters.completed_cycles)
             if self.global_steps > before_global_step:
                 progress_bar.update(1)
             if hasattr(self.train_dataset, "on_batch_end"):

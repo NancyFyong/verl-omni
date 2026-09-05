@@ -15,16 +15,21 @@
 
 import os
 import tempfile
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
 from peft import LoraConfig, get_peft_model
+from tensordict import TensorDict
 from torch import nn
 from torch.distributed.tensor import DTensor
+from verl.utils import tensordict_utils as tu
 
-from verl_omni.trainer.diffusion.distillation.contracts import RoleBinding, RoleGroupSpec
+from verl_omni.trainer.diffusion.distillation.contracts import PhaseRequest, RoleBinding, RoleGroupSpec
+from verl_omni.trainer.diffusion.distillation.recipes import build_plan
+from verl_omni.workers.diffusion_distillation_worker import DistillationRoleRuntime
 from verl_omni.workers.engine.fsdp.distillation_impl import DistillationRoleGroupEngine
 
 
@@ -267,3 +272,135 @@ def test_distillation_role_switch_preserves_graph_ema_and_state(strategy):
             )
         finally:
             dist.destroy_process_group()
+
+
+def wrap_qwen_image_model(strategy, model_path):
+    from diffusers import QwenImageTransformer2DModel
+
+    model = QwenImageTransformer2DModel.from_pretrained(
+        model_path,
+        subfolder="transformer",
+        torch_dtype=torch.float32,
+    ).cuda()
+    adapter_config = LoraConfig(r=2, lora_alpha=2, target_modules=["to_q", "to_k", "to_v", "to_out.0"])
+    model.add_adapter(adapter_config, adapter_name="student")
+    model.add_adapter(adapter_config, adapter_name="fake_score")
+    model.add_adapter(adapter_config, adapter_name="student_ema")
+    model.set_adapter("student")
+    if strategy == "fsdp":
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        return FSDP(model, use_orig_params=True, device_id=torch.cuda.current_device())
+    from torch.distributed.fsdp import fully_shard
+
+    for block in model.transformer_blocks:
+        fully_shard(block)
+    fully_shard(model)
+    return model
+
+
+@pytest.fixture(scope="module")
+def qwen_process_group():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for Qwen-Image FSDP distillation tests.")
+    if dist.is_initialized():
+        pytest.skip("This FSDP fixture creates its own process group.")
+    with tempfile.TemporaryDirectory(prefix="qwen_image_dmd_fsdp_") as tmp_dir:
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://" if world_size > 1 else f"file://{os.path.join(tmp_dir, 'rendezvous')}",
+            rank=int(os.environ.get("RANK", "0")),
+            world_size=world_size,
+            timeout=timedelta(seconds=90),
+        )
+        try:
+            yield
+        finally:
+            dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("strategy", ["fsdp", "fsdp2"])
+@pytest.mark.parametrize("algorithm", ["dmd", "dmd2"])
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_qwen_image_distillation_phase_runner_on_fsdp(strategy, algorithm, batch_size, qwen_process_group):
+    model_path = os.environ.get("QWEN_IMAGE_MODEL_PATH", os.path.expanduser("~/models/tiny-random/Qwen-Image"))
+    if not os.path.isfile(os.path.join(model_path, "model_index.json")):
+        pytest.skip(f"Tiny Qwen-Image checkpoint not found at {model_path}.")
+
+    from verl_omni.pipelines.qwen_image_distillation.phase_runner import QwenImageDMDPhaseRunner
+
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    torch.manual_seed(7)
+    engine = engine_shell(wrap_qwen_image_model(strategy, model_path))
+    engine.scheduler = SimpleNamespace()
+    engine.model_config = SimpleNamespace(fsdp_layer_prefixes=["transformer_blocks."])
+    engine.ulysses_device_mesh = None
+    engine.ulysses_sequence_parallel_size = 1
+    plan = build_plan(
+        algorithm,
+        {
+            "model_path": model_path,
+            "conditioning_provider": "local_frozen_encoder",
+            "fake_update_ratio": 2,
+            "regression_type": "decoded_lpips",
+            "rng_seed": 3,
+        },
+        frozenset({"distribution_matching"}),
+    )
+    runtime = DistillationRoleRuntime(plan, {"base": engine}, ema_decay=0.9, ema_start_step=0)
+    model_config = SimpleNamespace(
+        path=model_path,
+        local_path=model_path,
+        transformer_config={"in_channels": 64},
+        pipeline=SimpleNamespace(
+            height=64,
+            width=64,
+            num_inference_steps=4,
+            max_sequence_length=64,
+            guidance_scale=None,
+        ),
+    )
+    runner = QwenImageDMDPhaseRunner(model_config, plan)
+    batch = TensorDict({"dummy_tensor": torch.zeros(batch_size, 1, device="cuda")}, batch_size=[batch_size])
+    tu.assign_non_tensor_stack(
+        batch,
+        "raw_prompt",
+        [
+            [{"role": "user", "content": "cat" if (rank + row) % 2 == 0 else "a red apple on a wooden table"}]
+            for row in range(batch_size)
+        ],
+    )
+    if algorithm == "dmd":
+        pytest.importorskip("piq")
+        batch["reference_noise"] = torch.randn(batch_size, 16, 64, device="cuda")
+        batch["teacher_target_latents"] = torch.zeros(batch_size, 16, 64, device="cuda")
+        tu.assign_non_tensor_stack(
+            batch, "teacher_sampling_manifest", [{"scheduler": "tiny-qwen", "sample": row} for row in range(batch_size)]
+        )
+    for kind, role in (("student", "student"), ("fake_score", "fake_score"), ("fake_score", "fake_score")) * 3:
+        request = PhaseRequest(
+            kind=kind,
+            global_step=0,
+            repeat_index=0,
+            batch_policy="fresh",
+            trainable_roles=(role,),
+            update_ema=kind == "student",
+        )
+        runtime.zero_grad(request.trainable_roles)
+        computation = runner.compute_phase(request, batch, runtime)
+        exits = torch.tensor([computation.metrics["rollout/exit_index"]], device="cuda")
+        gathered = [torch.zeros_like(exits) for _ in range(world_size)]
+        dist.all_gather(gathered, exits)
+        assert all(value.item() == exits.item() for value in gathered)
+        runtime.backward_micro_batch(request, computation, weight=1.0)
+        optimizer_steps, _ = runtime.step_phase(request)
+        assert optimizer_steps == {role: 1}
+
+    tensors, peft_config = runtime.export_tensors(base_sync_done=True)
+    exported = list(tensors)
+    assert exported
+    assert peft_config["r"] == 2
+    assert all(name.startswith("transformer.") for name, _ in exported)

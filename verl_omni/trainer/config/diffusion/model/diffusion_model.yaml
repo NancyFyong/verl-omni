@@ -147,3 +147,6 @@ algo:
 
   # Whether selected SDE steps must form one consecutive window
   sde_contiguous: ${oc.select:actor_rollout_ref.rollout.algo.sde_contiguous,true}
+
+  # Optional fixed linear time shift for distilled-model inference
+  rollout_timestep_shift: ${oc.select:actor_rollout_ref.rollout.algo.rollout_timestep_shift,null}
