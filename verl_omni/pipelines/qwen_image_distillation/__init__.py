@@ -14,14 +14,14 @@
 
 from .diffusers_training_adapter import (
     QwenImageDistributionMatching,
-    QwenImageDmdPhaseRunner,
+    QwenImageDMDPhaseRunner,
     build_qwen_dmd_sigmas,
 )
-from .vllm_omni_rollout_adapter import QwenImageDmdPipeline
+from .vllm_omni_rollout_adapter import QwenImageDMDPipeline
 
 __all__ = [
     "QwenImageDistributionMatching",
-    "QwenImageDmdPhaseRunner",
-    "QwenImageDmdPipeline",
+    "QwenImageDMDPhaseRunner",
+    "QwenImageDMDPipeline",
     "build_qwen_dmd_sigmas",
 ]

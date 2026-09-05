@@ -153,11 +153,11 @@ class TestRuntimeValidation:
 
         trainer = object.__new__(DistillationRayTrainer)
         trainer.plan = build_plan("dmd2", {"model_path": "/m"}, frozenset({"distribution_matching"}))
-        trainer.config = self._trainer_config()
+        trainer.config = self.trainer_config()
         trainer.config.actor_rollout_ref.model.algorithm = "dmd"
         trainer.config.distillation.distribution_matching.recipe = "dmd2"
         with pytest.raises(ValueError, match="must match"):
-            trainer._validate_runtime_config()
+            trainer.validate_runtime_config()
 
     def test_shared_base_requires_lora(self):
         from verl_omni.trainer.diffusion.distillation.recipes import build_plan

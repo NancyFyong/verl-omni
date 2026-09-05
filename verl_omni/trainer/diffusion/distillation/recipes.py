@@ -383,7 +383,8 @@ def require_choice(field: str, value: str, valid_values: set[str]) -> str:
     return value
 
 
-def _dmd_data_requirements(config, mode: str) -> dict:
+def dmd_data_requirements(config, mode: str) -> dict:
+    """Declare the selected conditioning and sample-data contract."""
     return {
         "mode": mode,
         "conditioning_provider": get_config_or_default(config, "conditioning_provider", "local_frozen_encoder"),
@@ -391,7 +392,8 @@ def _dmd_data_requirements(config, mode: str) -> dict:
     }
 
 
-def _dmd_objective(config, *, name: str, profile: str, **extra) -> dict:
+def dmd_objective(config, *, name: str, profile: str, **extra) -> dict:
+    """Declare guidance and objective weights without executing loss math."""
     return {
         "name": name,
         "profile": profile,
@@ -405,7 +407,8 @@ def _dmd_objective(config, *, name: str, profile: str, **extra) -> dict:
     }
 
 
-def _dmd_rollout(config, strategy: str) -> dict:
+def dmd_rollout(config, strategy: str) -> dict:
+    """Declare deterministic rollout and score-noise sampling settings."""
     return {
         "strategy": strategy,
         "rollout_timestep_shift": float(get_config_or_default(config, "rollout_timestep_shift", 3.0)),
@@ -456,9 +459,9 @@ class DMDRecipe(DistillationRecipeBase):
                 shared_base_layout(model_ref),
                 get_config_or_default(config, "role_storage", "shared_base_adapters"),
             ),
-            data_requirements=_dmd_data_requirements(config, data_mode),
-            objective=_dmd_objective(config, name="dmd", profile=profile),
-            rollout=_dmd_rollout(config, rollout),
+            data_requirements=dmd_data_requirements(config, data_mode),
+            objective=dmd_objective(config, name="dmd", profile=profile),
+            rollout=dmd_rollout(config, rollout),
             initialization={"stage": "base"},
             required_capabilities=frozenset({"distribution_matching"}),
             **common_plan_kwargs(config, default_fake_repeats=1),
@@ -493,14 +496,14 @@ class DMD2Recipe(DistillationRecipeBase):
                 shared_base_layout(model_ref, with_discriminator=adversarial),
                 get_config_or_default(config, "role_storage", "shared_base_adapters"),
             ),
-            data_requirements=_dmd_data_requirements(config, data_mode),
-            objective=_dmd_objective(
+            data_requirements=dmd_data_requirements(config, data_mode),
+            objective=dmd_objective(
                 config,
                 name="dmd2",
                 profile=profile,
                 adversarial=adversarial,
             ),
-            rollout=_dmd_rollout(config, rollout),
+            rollout=dmd_rollout(config, rollout),
             initialization={"stage": "base"},
             required_capabilities=frozenset({"distribution_matching"} | ({"adversarial"} if adversarial else set())),
             **common_plan_kwargs(config, with_discriminator=adversarial),

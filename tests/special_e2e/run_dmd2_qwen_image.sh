@@ -14,7 +14,8 @@ TOTAL_TRAIN_STEPS=${TOTAL_TRAIN_STEPS:-2}
 python3 tests/special_e2e/create_dummy_diffusion_data.py \
     --local_save_dir "${DATA_DIR}" \
     --train_size "$((NUM_GPUS * TOTAL_TRAIN_STEPS))" \
-    --val_size "${NUM_GPUS}"
+    --val_size "${NUM_GPUS}" \
+    --user_prompt_only
 
 python3 -m verl_omni.trainer.main_diffusion \
     data.train_files=${TRAIN_FILES} \

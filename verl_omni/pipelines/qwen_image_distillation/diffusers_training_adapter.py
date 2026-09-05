@@ -18,9 +18,9 @@ from verl_omni.pipelines.qwen_image_flow_grpo.diffusers_training_adapter import 
 from verl_omni.trainer.diffusion.distillation.contracts import DistillationPlan
 from verl_omni.workers.config import DiffusionModelConfig
 
-from .phase_runner import QwenImageDmdPhaseRunner, build_qwen_dmd_sigmas
+from .phase_runner import QwenImageDMDPhaseRunner, build_qwen_dmd_sigmas
 
-__all__ = ["QwenImageDistributionMatching", "QwenImageDmdPhaseRunner", "build_qwen_dmd_sigmas"]
+__all__ = ["QwenImageDistributionMatching", "QwenImageDMDPhaseRunner", "build_qwen_dmd_sigmas"]
 
 
 @DiffusionModelBase.register("QwenImagePipeline", algorithm="dmd")
@@ -33,6 +33,6 @@ class QwenImageDistributionMatching(QwenImage, DistributionMatchingModelAdapter)
         cls,
         model_config: DiffusionModelConfig,
         plan: DistillationPlan,
-    ) -> QwenImageDmdPhaseRunner:
+    ) -> QwenImageDMDPhaseRunner:
         """Build the architecture-owned Qwen DMD phase program."""
-        return QwenImageDmdPhaseRunner(model_config, plan)
+        return QwenImageDMDPhaseRunner(model_config, plan)

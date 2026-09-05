@@ -24,15 +24,15 @@ from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.qwen_image_distillation.phase_runner import build_qwen_dmd_sigmas
 from verl_omni.pipelines.qwen_image_flow_grpo.vllm_omni_rollout_adapter import QwenImagePipelineWithLogProb
 
-__all__ = ["QwenImageDmdPipeline"]
+__all__ = ["QwenImageDMDPipeline"]
 
 
 @VllmOmniPipelineBase.register("QwenImagePipeline", algorithm="dmd")
 @VllmOmniPipelineBase.register("QwenImagePipeline", algorithm="dmd2")
-class QwenImageDmdPipeline(QwenImagePipelineWithLogProb):
+class QwenImageDMDPipeline(QwenImagePipelineWithLogProb):
     """Qwen-Image rollout with the same fixed-shift schedule used for DMD training."""
 
-    _rollout_timestep_shift = 3.0
+    rollout_timestep_shift = 3.0
 
     def forward(self, req: OmniDiffusionRequest | DiffusionRequestBatch, *args, **kwargs):
         """Apply one batch-consistent DMD rollout shift before normal Qwen generation."""
@@ -57,12 +57,12 @@ class QwenImageDmdPipeline(QwenImagePipelineWithLogProb):
         kwargs.setdefault("noise_level", 0.0)
         kwargs.setdefault("logprobs", False)
         kwargs.setdefault("true_cfg_scale", 1.0)
-        previous_shift = self._rollout_timestep_shift
-        self._rollout_timestep_shift = shift
+        previous_shift = self.rollout_timestep_shift
+        self.rollout_timestep_shift = shift
         try:
             return super().forward(req, *args, **kwargs)
         finally:
-            self._rollout_timestep_shift = previous_shift
+            self.rollout_timestep_shift = previous_shift
 
     def prepare_timesteps(self, num_inference_steps, sigmas, image_seq_len):
         """Build the fixed linear-shift schedule shared with the training phase runner."""
@@ -70,7 +70,7 @@ class QwenImageDmdPipeline(QwenImagePipelineWithLogProb):
         if num_inference_steps <= 0:
             raise ValueError(f"num_inference_steps must be positive, got {num_inference_steps}.")
         if sigmas is None:
-            sigmas = build_qwen_dmd_sigmas(num_inference_steps, self._rollout_timestep_shift)[:-1].numpy()
+            sigmas = build_qwen_dmd_sigmas(num_inference_steps, self.rollout_timestep_shift)[:-1].numpy()
         else:
             sigmas = np.asarray(sigmas, dtype=np.float32)
             if sigmas.ndim != 1 or len(sigmas) != num_inference_steps:
