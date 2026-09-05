@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import abc
+from functools import partial
 
 from verl_omni.trainer.diffusion.distillation.contracts import (
     DistillationPlan,
@@ -45,7 +46,7 @@ __all__ = [
     "RolloutStrategyRegistry",
     "InitializationBase",
     "InitializationRegistry",
-    "_Registry",
+    "DistillationRegistry",
     "objective_registry",
     "rollout_registry",
     "initialization_registry",
@@ -72,25 +73,25 @@ class DistillationRecipeBase(abc.ABC):
         """Return a validated immutable :class:`DistillationPlan`."""
 
 
-class _Registry:
+class DistillationRegistry:
     """Minimal name-to-class registry with duplicate rejection."""
 
     def __init__(self) -> None:
         self._registry: dict[str, type] = {}
 
-    def register(self, name: str):
+    def register(self, name: str, subclass: type | None = None):
+        """Register a class directly or return its registration decorator."""
         if not name:
             raise ValueError("Registry names must not be empty.")
-
-        def decorator(subclass: type) -> type:
-            if name in self._registry:
-                raise ValueError(f"Duplicate registration for {name!r}.")
-            self._registry[name] = subclass
-            return subclass
-
-        return decorator
+        if subclass is None:
+            return partial(self.register, name)
+        if name in self._registry:
+            raise ValueError(f"Duplicate registration for {name!r}.")
+        self._registry[name] = subclass
+        return subclass
 
     def get(self, name: str) -> type:
+        """Resolve a registered class by name."""
         try:
             return self._registry[name]
         except KeyError:
@@ -98,14 +99,16 @@ class _Registry:
 
     @property
     def names(self) -> tuple[str, ...]:
+        """Return the registered names in stable order."""
         return tuple(sorted(self._registry))
 
     @property
     def kind(self) -> str:
+        """Identify this registry in resolution errors."""
         return self.__class__.__name__
 
 
-class DistillationRecipeRegistry(_Registry):
+class DistillationRecipeRegistry(DistillationRegistry):
     """Registry of named recipes that build a :class:`DistillationPlan`."""
 
     @property
@@ -117,7 +120,7 @@ class DistillationRecipeRegistry(_Registry):
         return self.get(name).build_plan(config, capabilities)
 
 
-class ObjectiveRegistry(_Registry):
+class ObjectiveRegistry(DistillationRegistry):
     """Registry of composed objective strategies."""
 
     @property
@@ -125,7 +128,7 @@ class ObjectiveRegistry(_Registry):
         return "objective"
 
 
-class RolloutStrategyRegistry(_Registry):
+class RolloutStrategyRegistry(DistillationRegistry):
     """Registry of student rollout strategies."""
 
     @property
@@ -133,7 +136,7 @@ class RolloutStrategyRegistry(_Registry):
         return "rollout strategy"
 
 
-class InitializationRegistry(_Registry):
+class InitializationRegistry(DistillationRegistry):
     """Registry of initialization strategies."""
 
     @property
@@ -244,7 +247,7 @@ class ODERegressionInitialization(InitializationBase):
 recipe_registry = DistillationRecipeRegistry()
 
 
-def _shared_base_layout(model_ref: str, with_discriminator: bool = False) -> RoleLayoutSpec:
+def shared_base_layout(model_ref: str, with_discriminator: bool = False) -> RoleLayoutSpec:
     """Build the image-first shared-base named-adapter role layout."""
     group_name = "base"
     bindings = [
@@ -272,7 +275,7 @@ def _shared_base_layout(model_ref: str, with_discriminator: bool = False) -> Rol
     )
 
 
-def _causal_bidirectional_layout(causal_model_ref: str, bidirectional_model_ref: str) -> RoleLayoutSpec:
+def causal_bidirectional_layout(causal_model_ref: str, bidirectional_model_ref: str) -> RoleLayoutSpec:
     """Keep causal student/EMA separate from bidirectional score models."""
     return RoleLayoutSpec(
         groups=(
@@ -301,7 +304,9 @@ def _causal_bidirectional_layout(causal_model_ref: str, bidirectional_model_ref:
     )
 
 
-def _schedule(fake_repeats: int, fake_warmup_cycles: int = 0, with_discriminator: bool = False) -> UpdateSchedule:
+def build_update_schedule(
+    fake_repeats: int, fake_warmup_cycles: int = 0, with_discriminator: bool = False
+) -> UpdateSchedule:
     """Build one student phase followed by ``fake_repeats`` fake phases."""
     fake_roles = ("fake_score", "discriminator") if with_discriminator else ("fake_score",)
     fake_phase = UpdatePhaseSpec(kind="fake_score", repeats=fake_repeats, trainable_roles=fake_roles)
@@ -316,7 +321,7 @@ def _schedule(fake_repeats: int, fake_warmup_cycles: int = 0, with_discriminator
     )
 
 
-def _get(config, key: str, default=None):
+def get_config_value(config, key: str, default=None):
     """Read ``key`` from a mapping-like or attribute-style config."""
     if config is None:
         return default
@@ -325,31 +330,34 @@ def _get(config, key: str, default=None):
     return getattr(config, key, default)
 
 
-def _get_or_default(config, key: str, default):
-    value = _get(config, key, default)
+def get_config_or_default(config, key: str, default):
+    """Use the default when a config field is absent or explicitly null."""
+    value = get_config_value(config, key, default)
     return default if value is None else value
 
 
-def _require_choice(field: str, value: str, valid_values: set[str]) -> str:
+def require_choice(field: str, value: str, valid_values: set[str]) -> str:
+    """Validate a named configuration choice."""
     if value not in valid_values:
         raise ValueError(f"Invalid {field} {value!r}; expected one of {sorted(valid_values)}.")
     return value
 
 
-def _common_plan_kwargs(
+def common_plan_kwargs(
     config,
     *,
     default_fake_repeats: int = 5,
     with_discriminator: bool = False,
 ) -> dict:
-    fake_repeats = int(_get_or_default(config, "fake_update_ratio", default_fake_repeats))
-    fake_warmup_cycles = int(_get_or_default(config, "fake_warmup_cycles", 0))
-    export_role = _require_choice(
-        "export_role", _get_or_default(config, "export_role", "student_ema"), {"student", "student_ema"}
+    """Build architecture-neutral scheduling and export settings."""
+    fake_repeats = get_config_or_default(config, "fake_update_ratio", default_fake_repeats)
+    fake_warmup_cycles = get_config_or_default(config, "fake_warmup_cycles", 0)
+    export_role = require_choice(
+        "export_role", get_config_or_default(config, "export_role", "student_ema"), {"student", "student_ema"}
     )
     return {
         "version": 1,
-        "update_schedule": _schedule(fake_repeats, fake_warmup_cycles, with_discriminator),
+        "update_schedule": build_update_schedule(fake_repeats, fake_warmup_cycles, with_discriminator),
         "export": ExportSpec(role=export_role, checkpoint_engine_backend="naive"),
     }
 
@@ -360,23 +368,23 @@ class DMDRecipe(DistillationRecipeBase):
 
     @classmethod
     def build_plan(cls, config, capabilities) -> DistillationPlan:
-        profile = _require_choice("DMD profile", _get_or_default(config, "profile", "paper"), {"paper"})
-        data_mode = _require_choice(
-            "DMD data_mode", _get_or_default(config, "data_mode", "regression_pairs"), {"regression_pairs"}
+        profile = require_choice("DMD profile", get_config_or_default(config, "profile", "paper"), {"paper"})
+        data_mode = require_choice(
+            "DMD data_mode", get_config_or_default(config, "data_mode", "regression_pairs"), {"regression_pairs"}
         )
-        rollout = _require_choice(
-            "DMD rollout_strategy", _get_or_default(config, "rollout_strategy", "one_step"), {"one_step"}
+        rollout = require_choice(
+            "DMD rollout_strategy", get_config_or_default(config, "rollout_strategy", "one_step"), {"one_step"}
         )
-        model_ref = _get(config, "model_path", "") or ""
+        model_ref = get_config_value(config, "model_path", "") or ""
         return DistillationPlan(
             name="dmd",
-            role_layout=_shared_base_layout(model_ref),
+            role_layout=shared_base_layout(model_ref),
             data_requirements={"mode": data_mode},
             objective={"name": "dmd", "profile": profile},
             rollout={"strategy": rollout},
             initialization={"stage": "base"},
             required_capabilities=frozenset({"distribution_matching"}),
-            **_common_plan_kwargs(config, default_fake_repeats=1),
+            **common_plan_kwargs(config, default_fake_repeats=1),
         )
 
 
@@ -386,31 +394,31 @@ class DMD2Recipe(DistillationRecipeBase):
 
     @classmethod
     def build_plan(cls, config, capabilities) -> DistillationPlan:
-        profile = _require_choice(
+        profile = require_choice(
             "DMD2 profile",
-            _get_or_default(config, "profile", "distribution_only"),
+            get_config_or_default(config, "profile", "distribution_only"),
             {"distribution_only", "paper"},
         )
         adversarial = profile == "paper"
         expected_data_mode = "prompt_and_real_latent" if adversarial else "prompts"
-        data_mode = _require_choice(
-            "DMD2 data_mode", _get_or_default(config, "data_mode", expected_data_mode), {expected_data_mode}
+        data_mode = require_choice(
+            "DMD2 data_mode", get_config_or_default(config, "data_mode", expected_data_mode), {expected_data_mode}
         )
-        rollout = _require_choice(
+        rollout = require_choice(
             "DMD2 rollout_strategy",
-            _get_or_default(config, "rollout_strategy", "ode_euler"),
+            get_config_or_default(config, "rollout_strategy", "ode_euler"),
             {"ode_euler", "consistency_renoise", "backward_simulated"},
         )
-        model_ref = _get(config, "model_path", "") or ""
+        model_ref = get_config_value(config, "model_path", "") or ""
         return DistillationPlan(
             name="dmd2",
-            role_layout=_shared_base_layout(model_ref, with_discriminator=adversarial),
+            role_layout=shared_base_layout(model_ref, with_discriminator=adversarial),
             data_requirements={"mode": data_mode},
             objective={"name": "dmd2", "profile": profile, "adversarial": adversarial},
             rollout={"strategy": rollout},
             initialization={"stage": "base"},
             required_capabilities=frozenset({"distribution_matching"} | ({"adversarial"} if adversarial else set())),
-            **_common_plan_kwargs(config, with_discriminator=adversarial),
+            **common_plan_kwargs(config, with_discriminator=adversarial),
         )
 
 
@@ -420,31 +428,31 @@ class CausVidRecipe(DistillationRecipeBase):
 
     @classmethod
     def build_plan(cls, config, capabilities) -> DistillationPlan:
-        _require_choice(
-            "CausVid profile", _get_or_default(config, "profile", "distribution_only"), {"distribution_only"}
+        require_choice(
+            "CausVid profile", get_config_or_default(config, "profile", "distribution_only"), {"distribution_only"}
         )
-        data_mode = _require_choice(
+        data_mode = require_choice(
             "CausVid data_mode",
-            _get_or_default(config, "data_mode", "prompt_and_real_latent"),
+            get_config_or_default(config, "data_mode", "prompt_and_real_latent"),
             {"prompt_and_real_latent"},
         )
-        rollout = _require_choice(
+        rollout = require_choice(
             "CausVid rollout_strategy",
-            _get_or_default(config, "rollout_strategy", "teacher_forced_causal"),
+            get_config_or_default(config, "rollout_strategy", "teacher_forced_causal"),
             {"teacher_forced_causal"},
         )
-        model_ref = _get(config, "model_path", "") or ""
-        causal_ref = _get(config, "causal_model_path", model_ref) or model_ref
-        bidirectional_ref = _get(config, "bidirectional_model_path", model_ref) or model_ref
+        model_ref = get_config_value(config, "model_path", "") or ""
+        causal_ref = get_config_value(config, "causal_model_path", model_ref) or model_ref
+        bidirectional_ref = get_config_value(config, "bidirectional_model_path", model_ref) or model_ref
         return DistillationPlan(
             name="causvid",
-            role_layout=_causal_bidirectional_layout(causal_ref, bidirectional_ref),
+            role_layout=causal_bidirectional_layout(causal_ref, bidirectional_ref),
             data_requirements={"mode": data_mode},
             objective={"name": "dmd", "profile": "distribution_only"},
             rollout={"strategy": rollout},
             initialization={"stage": "ode_regression", "requires_provenance": True},
             required_capabilities=frozenset({"distribution_matching", "autoregressive"}),
-            **_common_plan_kwargs(config),
+            **common_plan_kwargs(config),
         )
 
 
@@ -454,33 +462,34 @@ class SelfForcingRecipe(DistillationRecipeBase):
 
     @classmethod
     def build_plan(cls, config, capabilities) -> DistillationPlan:
-        _require_choice(
-            "Self-Forcing profile", _get_or_default(config, "profile", "distribution_only"), {"distribution_only"}
+        require_choice(
+            "Self-Forcing profile", get_config_or_default(config, "profile", "distribution_only"), {"distribution_only"}
         )
-        data_mode = _require_choice(
-            "Self-Forcing data_mode", _get_or_default(config, "data_mode", "prompts"), {"prompts"}
+        data_mode = require_choice(
+            "Self-Forcing data_mode", get_config_or_default(config, "data_mode", "prompts"), {"prompts"}
         )
-        rollout = _require_choice(
+        rollout = require_choice(
             "Self-Forcing rollout_strategy",
-            _get_or_default(config, "rollout_strategy", "self_forced"),
+            get_config_or_default(config, "rollout_strategy", "self_forced"),
             {"self_forced"},
         )
-        model_ref = _get(config, "model_path", "") or ""
-        causal_ref = _get(config, "causal_model_path", model_ref) or model_ref
-        bidirectional_ref = _get(config, "bidirectional_model_path", model_ref) or model_ref
+        model_ref = get_config_value(config, "model_path", "") or ""
+        causal_ref = get_config_value(config, "causal_model_path", model_ref) or model_ref
+        bidirectional_ref = get_config_value(config, "bidirectional_model_path", model_ref) or model_ref
         return DistillationPlan(
             name="self_forcing",
-            role_layout=_causal_bidirectional_layout(causal_ref, bidirectional_ref),
+            role_layout=causal_bidirectional_layout(causal_ref, bidirectional_ref),
             data_requirements={"mode": data_mode},
             objective={"name": "dmd", "profile": "distribution_only"},
             rollout={"strategy": rollout},
             initialization={"stage": "ode_regression", "requires_provenance": True},
             required_capabilities=frozenset({"distribution_matching", "autoregressive"}),
-            **_common_plan_kwargs(config),
+            **common_plan_kwargs(config),
         )
 
 
-def _validate_registered_strategies(plan: DistillationPlan) -> None:
+def validate_registered_strategies(plan: DistillationPlan) -> None:
+    """Resolve every strategy name before execution."""
     objective_registry.get(plan.objective["name"])
     rollout_registry.get(plan.rollout["strategy"])
     initialization_registry.get(plan.initialization["stage"])
@@ -489,7 +498,7 @@ def _validate_registered_strategies(plan: DistillationPlan) -> None:
 def build_plan(name: str, config=None, capabilities=frozenset()) -> DistillationPlan:
     """Build and fail-closed validate a named recipe plan."""
     plan = recipe_registry.build(name, config, capabilities)
-    _validate_registered_strategies(plan)
+    validate_registered_strategies(plan)
     validate_distillation_plan(plan)
     missing = plan.required_capabilities - frozenset(capabilities)
     if missing:
@@ -502,21 +511,21 @@ def build_plan(name: str, config=None, capabilities=frozenset()) -> Distillation
 
 def build_plan_from_config(config, capabilities) -> DistillationPlan:
     """Build a plan from the composed trainer config and adapter capabilities."""
-    distillation = _get(config, "distillation")
-    distribution_matching = _get(distillation, "distribution_matching")
+    distillation = get_config_value(config, "distillation")
+    distribution_matching = get_config_value(distillation, "distribution_matching")
     if distribution_matching is None:
         raise ValueError("config.distillation.distribution_matching is required for the distillation trainer.")
 
-    actor_rollout_ref = _get(config, "actor_rollout_ref")
-    model = _get(actor_rollout_ref, "model")
-    model_path = _get(model, "path", "") or ""
+    actor_rollout_ref = get_config_value(config, "actor_rollout_ref")
+    model = get_config_value(actor_rollout_ref, "model")
+    model_path = get_config_value(model, "path", "") or ""
     recipe_config = {
         "model_path": model_path,
-        "fake_warmup_cycles": _get(distribution_matching, "fake_warmup_cycles", 0),
-        "export_role": _get(distribution_matching, "export_role", "student_ema"),
+        "fake_warmup_cycles": get_config_value(distribution_matching, "fake_warmup_cycles", 0),
+        "export_role": get_config_value(distribution_matching, "export_role", "student_ema"),
     }
     for optional_key in ("profile", "fake_update_ratio", "rollout_strategy", "data_mode"):
-        value = _get(distribution_matching, optional_key)
+        value = get_config_value(distribution_matching, optional_key)
         if value is not None:
             recipe_config[optional_key] = value
-    return build_plan(_get(distribution_matching, "recipe", "dmd2"), recipe_config, capabilities)
+    return build_plan(get_config_value(distribution_matching, "recipe", "dmd2"), recipe_config, capabilities)

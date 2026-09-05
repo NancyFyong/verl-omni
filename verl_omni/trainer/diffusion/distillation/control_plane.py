@@ -55,7 +55,6 @@ __all__ = [
     "DistillationTrainerControlPlane",
     "BatchProvider",
     "DistillationTrainerHooks",
-    # phase executor protocol + CPU fakes
     "DistillationPhaseExecutor",
     "FakePhaseExecutor",
     "FakeBatchProvider",
@@ -101,8 +100,6 @@ class DistillationTrainerControlPlane:
         self._metrics: dict[str, dict] = {}
         self._failed = False
 
-    # -- public driver ----------------------------------------------------
-
     def run(self, num_cycles: int) -> None:
         """Drive ``num_cycles`` update cycles through the executor."""
         for _ in range(num_cycles):
@@ -124,7 +121,7 @@ class DistillationTrainerControlPlane:
         before_metrics = dict(self._metrics)
         try:
             cycle = self.plan.update_schedule.next_cycle(self.counters)
-            student_step_reported = self._drive_requests(cycle.requests)
+            student_step_reported = self.drive_requests(cycle.requests)
 
             if cycle.requires_student_update:
                 if not student_step_reported:
@@ -134,7 +131,7 @@ class DistillationTrainerControlPlane:
                     )
                 self.counters.increment_global()
 
-            self._assert_progress(before_counters)
+            self.assert_progress(before_counters)
             self.counters.completed_cycles += 1
 
             if cycle.requires_student_update and self.hooks is not None:
@@ -146,24 +143,22 @@ class DistillationTrainerControlPlane:
             self._failed = True
             raise
 
-    # -- internals --------------------------------------------------------
-
-    def _drive_requests(self, requests: tuple[PhaseRequest, ...]) -> bool:
+    def drive_requests(self, requests: tuple[PhaseRequest, ...]) -> bool:
         """Execute phases in order and validate each executor result fail closed."""
         student_step_reported = False
         for request in requests:
             batch = self.batch_provider.next(request)
             result = self.executor.execute_phase(request, batch)
-            self._validate_result(result, request)
+            self.validate_result(result, request)
             if request.kind == "student" and not result.optimizer_steps:
                 return False
-            self._accumulate(result, request)
+            self.accumulate_result(result, request)
             if request.kind == "student":
                 student_step_reported = True
         return student_step_reported
 
     @staticmethod
-    def _validate_result(result: PhaseResult, request: PhaseRequest) -> None:
+    def validate_result(result: PhaseResult, request: PhaseRequest) -> None:
         """Require exactly one step for every role declared by a completed phase."""
         if not isinstance(result, PhaseResult):
             raise TypeError(f"execute_phase must return PhaseResult, got {type(result)}.")
@@ -184,12 +179,13 @@ class DistillationTrainerControlPlane:
         if invalid_steps:
             raise ValueError(f"Each completed phase role must report exactly one optimizer step, got {invalid_steps}.")
 
-    def _accumulate(self, result: PhaseResult, request: PhaseRequest) -> None:
+    def accumulate_result(self, result: PhaseResult, request: PhaseRequest) -> None:
+        """Record validated role counters and the latest phase metrics."""
         for role, steps in result.optimizer_steps.items():
             self.counters.optimizer_steps[role] = self.counters.optimizer_steps.get(role, 0) + steps
         self._metrics[request.kind] = dict(result.metrics)
 
-    def _assert_progress(self, before: TrainerCounters) -> None:
+    def assert_progress(self, before: TrainerCounters) -> None:
         """A cycle must advance global_step or at least one role optimizer counter."""
         if self.counters.global_step != before.global_step:
             return
@@ -208,11 +204,6 @@ class DistillationTrainerControlPlane:
             raise RuntimeError("A failed control plane cannot be reset in-process; construct a new driver.")
         self.counters = TrainerCounters()
         self._metrics = {}
-
-
-# ---------------------------------------------------------------------------
-# §13.1 phase executor protocol and CPU fakes
-# ---------------------------------------------------------------------------
 
 
 @runtime_checkable
@@ -254,6 +245,7 @@ class FakePhaseExecutor:
         self.executed: list[PhaseRequest] = []
 
     def execute_phase(self, request: PhaseRequest, batch: Any) -> PhaseResult:
+        """Return synthetic phase results or a configured failure."""
         if batch.get("phase_kind") != request.kind:
             raise ValueError(f"Batch phase {batch.get('phase_kind')!r} does not match request {request.kind!r}.")
         self.executed.append(request)
@@ -273,4 +265,5 @@ class FakeDistillationHooks:
         self.calls: list[dict[str, Any]] = []
 
     def after_completed_step(self, counters, metrics, executor) -> None:
+        """Record the completed-step hook arguments."""
         self.calls.append({"global_step": counters.global_step, "metrics": dict(metrics), "executor": executor})

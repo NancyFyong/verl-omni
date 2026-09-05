@@ -30,12 +30,12 @@ from verl_omni.trainer.diffusion.distillation.recipes import build_plan
 CAPS = frozenset({"distribution_matching", "autoregressive", "adversarial"})
 
 
-def _plan(fake_repeats: int = 2, name: str = "dmd2", **config):
+def make_plan(fake_repeats: int = 2, name: str = "dmd2", **config):
     return build_plan(name, {"fake_update_ratio": fake_repeats, "model_path": "/m", **config}, CAPS)
 
 
-def _control_plane(plan=None, executor=None, hooks=None, batches: int = 1000):
-    plan = plan if plan is not None else _plan()
+def make_control_plane(plan=None, executor=None, hooks=None, batches: int = 1000):
+    plan = plan if plan is not None else make_plan()
     executor = executor if executor is not None else FakePhaseExecutor()
     hooks = hooks if hooks is not None else FakeDistillationHooks()
     return (
@@ -45,9 +45,28 @@ def _control_plane(plan=None, executor=None, hooks=None, batches: int = 1000):
     )
 
 
+class TwoStepExecutor(FakePhaseExecutor):
+    def execute_phase(self, request, batch):
+        if request.kind == "student":
+            return PhaseResult(optimizer_steps={"student": 2})
+        return super().execute_phase(request, batch)
+
+
+class WrongRoleExecutor(FakePhaseExecutor):
+    def execute_phase(self, request, batch):
+        if request.kind == "fake_score":
+            return PhaseResult(optimizer_steps={"fake_score": 1, "discriminator": 1})
+        return super().execute_phase(request, batch)
+
+
+class NoStepExecutor(FakePhaseExecutor):
+    def execute_phase(self, request, batch):
+        return PhaseResult()
+
+
 class TestPhaseExpansion:
     def test_normal_cycle_is_student_then_k_fake(self):
-        control_plane, executor, _ = _control_plane(_plan(fake_repeats=3))
+        control_plane, executor, _ = make_control_plane(make_plan(fake_repeats=3))
         control_plane.run_cycle()
         assert [request.kind for request in executor.executed] == [
             "student",
@@ -57,18 +76,18 @@ class TestPhaseExpansion:
         ]
 
     def test_deterministic_ordering_across_cycles(self):
-        control_plane, executor, _ = _control_plane(_plan(fake_repeats=2))
+        control_plane, executor, _ = make_control_plane(make_plan(fake_repeats=2))
         control_plane.run(3)
         assert [request.kind for request in executor.executed] == ["student", "fake_score", "fake_score"] * 3
 
     def test_repeat_index_is_per_phase(self):
-        control_plane, executor, _ = _control_plane(_plan(fake_repeats=3))
+        control_plane, executor, _ = make_control_plane(make_plan(fake_repeats=3))
         control_plane.run_cycle()
         fake_repeats = [request.repeat_index for request in executor.executed if request.kind == "fake_score"]
         assert fake_repeats == [0, 1, 2]
 
     def test_warmup_transitions_to_normal_cycle(self):
-        control_plane, executor, hooks = _control_plane(_plan(fake_repeats=2, fake_warmup_cycles=2))
+        control_plane, executor, hooks = make_control_plane(make_plan(fake_repeats=2, fake_warmup_cycles=2))
         first = control_plane.run_cycle()
         second = control_plane.run_cycle()
         third = control_plane.run_cycle()
@@ -89,23 +108,23 @@ class TestPhaseExpansion:
 
 class TestCounters:
     def test_global_step_and_completed_cycles_advance(self):
-        control_plane, _, _ = _control_plane(_plan(fake_repeats=2))
+        control_plane, _, _ = make_control_plane(make_plan(fake_repeats=2))
         control_plane.run(4)
         assert control_plane.counters.global_step == 4
         assert control_plane.counters.completed_cycles == 4
 
     def test_distribution_only_counts_only_bound_trainable_roles(self):
-        control_plane, _, _ = _control_plane(_plan(fake_repeats=3))
+        control_plane, _, _ = make_control_plane(make_plan(fake_repeats=3))
         control_plane.run(2)
         assert control_plane.counters.optimizer_steps == {"student": 2, "fake_score": 6}
 
     def test_paper_profile_counts_discriminator_steps(self):
-        control_plane, _, _ = _control_plane(_plan(fake_repeats=2, profile="paper"))
+        control_plane, _, _ = make_control_plane(make_plan(fake_repeats=2, profile="paper"))
         control_plane.run_cycle()
         assert control_plane.counters.optimizer_steps == {"student": 1, "fake_score": 2, "discriminator": 2}
 
     def test_phase_request_carries_current_global_step_and_roles(self):
-        control_plane, executor, _ = _control_plane(_plan(fake_repeats=1))
+        control_plane, executor, _ = make_control_plane(make_plan(fake_repeats=1))
         control_plane.run(2)
         student_requests = [request for request in executor.executed if request.kind == "student"]
         assert [request.global_step for request in student_requests] == [0, 1]
@@ -114,7 +133,7 @@ class TestCounters:
 
 class TestPhaseInvariants:
     def test_skipped_student_phase_rolls_back_and_marks_driver_failed(self):
-        control_plane, _, _ = _control_plane(_plan(), executor=FakePhaseExecutor(skip_student=True))
+        control_plane, _, _ = make_control_plane(make_plan(), executor=FakePhaseExecutor(skip_student=True))
         with pytest.raises(ValueError, match="no student optimizer step"):
             control_plane.run_cycle()
         assert control_plane.counters.global_step == 0
@@ -123,7 +142,7 @@ class TestPhaseInvariants:
             control_plane.run_cycle()
 
     def test_failed_fake_phase_rolls_back_and_cannot_retry(self):
-        control_plane, _, _ = _control_plane(_plan(), executor=FakePhaseExecutor(fail_on="fake_score"))
+        control_plane, _, _ = make_control_plane(make_plan(), executor=FakePhaseExecutor(fail_on="fake_score"))
         with pytest.raises(RuntimeError, match="failed on phase fake_score"):
             control_plane.run_cycle()
         assert control_plane.counters.global_step == 0
@@ -132,35 +151,19 @@ class TestPhaseInvariants:
             control_plane.run_cycle()
 
     def test_completed_role_must_report_exactly_one_step(self):
-        class TwoStepExecutor(FakePhaseExecutor):
-            def execute_phase(self, request, batch):
-                if request.kind == "student":
-                    return PhaseResult(optimizer_steps={"student": 2})
-                return super().execute_phase(request, batch)
-
-        control_plane, _, _ = _control_plane(_plan(), executor=TwoStepExecutor())
+        control_plane, _, _ = make_control_plane(make_plan(), executor=TwoStepExecutor())
         with pytest.raises(ValueError, match="exactly one optimizer step"):
             control_plane.run_cycle()
 
     def test_unexpected_optimizer_role_is_rejected(self):
-        class WrongRoleExecutor(FakePhaseExecutor):
-            def execute_phase(self, request, batch):
-                if request.kind == "fake_score":
-                    return PhaseResult(optimizer_steps={"fake_score": 1, "discriminator": 1})
-                return super().execute_phase(request, batch)
-
-        control_plane, _, _ = _control_plane(_plan(), executor=WrongRoleExecutor())
+        control_plane, _, _ = make_control_plane(make_plan(), executor=WrongRoleExecutor())
         with pytest.raises(ValueError, match="must report optimizer steps for exactly"):
             control_plane.run_cycle()
         assert control_plane.counters.optimizer_steps == {}
 
     def test_zero_progress_warmup_cycle_raises(self):
-        class NoStepExecutor(FakePhaseExecutor):
-            def execute_phase(self, request, batch):
-                return PhaseResult()
-
-        plan = _plan(fake_repeats=1, fake_warmup_cycles=1)
-        control_plane, _, _ = _control_plane(plan, executor=NoStepExecutor())
+        plan = make_plan(fake_repeats=1, fake_warmup_cycles=1)
+        control_plane, _, _ = make_control_plane(plan, executor=NoStepExecutor())
         with pytest.raises(ValueError, match="must report optimizer steps"):
             control_plane.run_cycle()
 
@@ -172,18 +175,18 @@ class TestPhaseInvariants:
 
 class TestHookScheduling:
     def test_hook_observes_incremented_global_step(self):
-        control_plane, _, hooks = _control_plane(_plan(fake_repeats=1))
+        control_plane, _, hooks = make_control_plane(make_plan(fake_repeats=1))
         control_plane.run(3)
         assert [call["global_step"] for call in hooks.calls] == [1, 2, 3]
 
     def test_hook_receives_executor_and_metrics(self):
-        control_plane, executor, hooks = _control_plane(_plan(fake_repeats=1))
+        control_plane, executor, hooks = make_control_plane(make_plan(fake_repeats=1))
         control_plane.run_cycle()
         assert hooks.calls[0]["executor"] is executor
         assert "student" in hooks.calls[0]["metrics"]
 
     def test_hook_not_called_during_warmup(self):
-        control_plane, _, hooks = _control_plane(_plan(fake_warmup_cycles=1))
+        control_plane, _, hooks = make_control_plane(make_plan(fake_warmup_cycles=1))
         control_plane.run_cycle()
         assert hooks.calls == []
 
@@ -206,7 +209,7 @@ class TestControlPlanePurity:
             assert imported_roots.isdisjoint(forbidden_roots)
 
     def test_reset_clears_healthy_driver_state(self):
-        control_plane, _, _ = _control_plane(_plan())
+        control_plane, _, _ = make_control_plane(make_plan())
         control_plane.run(2)
         control_plane.reset()
         assert control_plane.counters.global_step == 0
@@ -215,7 +218,7 @@ class TestControlPlanePurity:
         assert control_plane.metrics == {}
 
     def test_failed_driver_cannot_be_reset(self):
-        control_plane, _, _ = _control_plane(_plan(), executor=FakePhaseExecutor(fail_on="student"))
+        control_plane, _, _ = make_control_plane(make_plan(), executor=FakePhaseExecutor(fail_on="student"))
         with pytest.raises(RuntimeError):
             control_plane.run_cycle()
         with pytest.raises(RuntimeError, match="cannot be reset"):

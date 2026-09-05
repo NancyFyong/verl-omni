@@ -33,7 +33,7 @@ from verl_omni.trainer.diffusion.distillation.contracts import (
     validate_role_layout,
 )
 from verl_omni.trainer.diffusion.distillation.recipes import (
-    _Registry,
+    DistillationRegistry,
     build_plan,
     initialization_registry,
     objective_registry,
@@ -103,7 +103,7 @@ class TestImmutability:
 
 
 class TestRoleLayoutValidation:
-    def _layout(self, **kwargs):
+    def role_layout(self, **kwargs):
         defaults = dict(
             groups=(RoleGroupSpec(name="base"),),
             bindings=(
@@ -115,10 +115,10 @@ class TestRoleLayoutValidation:
         return RoleLayoutSpec(**defaults)
 
     def test_valid_layout_passes(self):
-        validate_role_layout(self._layout())
+        validate_role_layout(self.role_layout())
 
     def test_binding_to_unknown_group_raises(self):
-        layout = self._layout(
+        layout = self.role_layout(
             bindings=(
                 RoleBinding(
                     role="student", group="missing", adapter="student", trainable=True, optimizer_key="student"
@@ -129,24 +129,26 @@ class TestRoleLayoutValidation:
             validate_role_layout(layout)
 
     def test_trainable_role_without_optimizer_key_raises(self):
-        layout = self._layout(bindings=(RoleBinding(role="student", group="base", adapter="student", trainable=True),))
+        layout = self.role_layout(
+            bindings=(RoleBinding(role="student", group="base", adapter="student", trainable=True),)
+        )
         with pytest.raises(ValueError, match="optimizer_key"):
             validate_role_layout(layout)
 
     def test_frozen_role_with_optimizer_key_raises(self):
-        layout = self._layout(bindings=(RoleBinding(role="teacher_score", group="base", optimizer_key="teacher"),))
+        layout = self.role_layout(bindings=(RoleBinding(role="teacher_score", group="base", optimizer_key="teacher"),))
         with pytest.raises(ValueError, match="Frozen role"):
             validate_role_layout(layout)
 
     def test_shared_base_trainable_role_requires_adapter(self):
-        layout = self._layout(
+        layout = self.role_layout(
             bindings=(RoleBinding(role="student", group="base", trainable=True, optimizer_key="student"),)
         )
         with pytest.raises(ValueError, match="must name an adapter"):
             validate_role_layout(layout)
 
     def test_duplicate_adapter_in_shared_base_raises(self):
-        layout = self._layout(
+        layout = self.role_layout(
             bindings=(
                 RoleBinding(role="student", group="base", adapter="dup", trainable=True, optimizer_key="student"),
                 RoleBinding(role="fake_score", group="base", adapter="dup", trainable=True, optimizer_key="fake"),
@@ -156,12 +158,12 @@ class TestRoleLayoutValidation:
             validate_role_layout(layout)
 
     def test_duplicate_group_name_raises(self):
-        layout = self._layout(groups=(RoleGroupSpec(name="base"), RoleGroupSpec(name="base")))
+        layout = self.role_layout(groups=(RoleGroupSpec(name="base"), RoleGroupSpec(name="base")))
         with pytest.raises(ValueError, match="Duplicate role-group"):
             validate_role_layout(layout)
 
     def test_duplicate_optimizer_key_raises(self):
-        layout = self._layout(
+        layout = self.role_layout(
             bindings=(
                 RoleBinding(role="student", group="base", adapter="student", trainable=True, optimizer_key="same"),
                 RoleBinding(role="fake_score", group="base", adapter="fake", trainable=True, optimizer_key="same"),
@@ -210,21 +212,16 @@ class TestRegistry:
         }
 
     def test_duplicate_registration_raises(self):
-        registry = _Registry()
+        registry = DistillationRegistry()
 
-        @registry.register("thing")
-        class _A:
-            pass
-
+        assert registry.register("thing")(int) is int
+        assert registry.get("thing") is int
         with pytest.raises(ValueError, match="Duplicate registration"):
-
-            @registry.register("thing")
-            class _B:
-                pass
+            registry.register("thing")(str)
 
     def test_unknown_name_raises_with_registered_list(self):
         with pytest.raises(KeyError, match="Registered"):
-            _Registry().get("nope")
+            DistillationRegistry().get("nope")
 
 
 class TestRecipePlans:
@@ -291,6 +288,9 @@ class TestRecipePlans:
             ("dmd2", {"data_mode": "regression_pairs", "model_path": "/m"}, "data_mode"),
             ("dmd2", {"fake_update_ratio": 0, "model_path": "/m"}, "greater than zero"),
             ("dmd2", {"fake_update_ratio": -2, "model_path": "/m"}, "greater than zero"),
+            ("dmd2", {"fake_update_ratio": 1.5, "model_path": "/m"}, "integer"),
+            ("dmd2", {"fake_update_ratio": True, "model_path": "/m"}, "integer"),
+            ("dmd2", {"fake_warmup_cycles": 1.5, "model_path": "/m"}, "integer"),
         ],
     )
     def test_invalid_recipe_values_fail_closed(self, name, config, error):
@@ -299,14 +299,14 @@ class TestRecipePlans:
 
 
 class TestUpdateSchedule:
-    def _normal_phase(self):
+    def student_phase(self):
         return UpdatePhaseSpec(kind="student", trainable_roles=("student",))
 
-    def _fake_phase(self, repeats=1):
+    def fake_phase(self, repeats=1):
         return UpdatePhaseSpec(kind="fake_score", repeats=repeats, trainable_roles=("fake_score",))
 
     def test_normal_cycle_is_student_then_fake(self):
-        schedule = UpdateSchedule(phases=(self._normal_phase(), self._fake_phase(repeats=2)))
+        schedule = UpdateSchedule(phases=(self.student_phase(), self.fake_phase(repeats=2)))
         cycle = schedule.next_cycle(TrainerCounters())
         assert cycle.requires_student_update is True
         assert cycle.is_warmup is False
@@ -314,8 +314,8 @@ class TestUpdateSchedule:
 
     def test_warmup_transitions_to_normal_cycles(self):
         schedule = UpdateSchedule(
-            phases=(self._normal_phase(), self._fake_phase()),
-            warmup_phases=(self._fake_phase(repeats=2),),
+            phases=(self.student_phase(), self.fake_phase()),
+            warmup_phases=(self.fake_phase(repeats=2),),
             warmup_cycles=2,
         )
         counters = TrainerCounters(completed_cycles=0)
@@ -331,12 +331,18 @@ class TestUpdateSchedule:
 
     def test_two_student_phases_raise(self):
         with pytest.raises(ValueError, match="exactly one student"):
-            UpdateSchedule(phases=(self._normal_phase(), self._normal_phase()))
+            UpdateSchedule(phases=(self.student_phase(), self.student_phase()))
 
-    @pytest.mark.parametrize("repeats", [0, -1])
+    def test_repeated_student_phase_raises_before_any_execution(self):
+        with pytest.raises(ValueError, match="repeats=1"):
+            UpdateSchedule(
+                phases=(UpdatePhaseSpec(kind="student", repeats=2, trainable_roles=("student",)), self.fake_phase())
+            )
+
+    @pytest.mark.parametrize("repeats", [0, -1, True, 1.5])
     def test_nonpositive_repeats_raise(self, repeats):
         with pytest.raises(ValueError, match="greater than zero"):
-            self._fake_phase(repeats)
+            self.fake_phase(repeats)
 
     @pytest.mark.parametrize(
         "kwargs,error",
@@ -357,20 +363,20 @@ class TestUpdateSchedule:
     def test_warmup_requires_fake_only_phases(self):
         with pytest.raises(ValueError, match="must not contain a student"):
             UpdateSchedule(
-                phases=(self._normal_phase(), self._fake_phase()),
-                warmup_phases=(self._normal_phase(),),
+                phases=(self.student_phase(), self.fake_phase()),
+                warmup_phases=(self.student_phase(),),
                 warmup_cycles=1,
             )
 
     def test_warmup_cycles_require_warmup_phases(self):
         with pytest.raises(ValueError, match="requires at least one warmup phase"):
-            UpdateSchedule(phases=(self._normal_phase(), self._fake_phase()), warmup_cycles=1)
+            UpdateSchedule(phases=(self.student_phase(), self.fake_phase()), warmup_cycles=1)
 
     def test_warmup_phases_require_positive_cycle_count(self):
         with pytest.raises(ValueError, match="require warmup_cycles"):
             UpdateSchedule(
-                phases=(self._normal_phase(), self._fake_phase()),
-                warmup_phases=(self._fake_phase(),),
+                phases=(self.student_phase(), self.fake_phase()),
+                warmup_phases=(self.fake_phase(),),
             )
 
 

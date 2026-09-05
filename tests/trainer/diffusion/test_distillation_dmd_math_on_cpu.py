@@ -153,9 +153,6 @@ class TestSurrogate:
         target = (x_g - g_norm).detach()
         n = x_g.numel()
 
-        def loss_fn(x):
-            return 0.5 * torch.mean((x - target) ** 2)
-
         eps = 1e-6
         numerical = torch.zeros_like(x_g)
         flat = x_g.reshape(-1)
@@ -164,7 +161,9 @@ class TestSurrogate:
             plus[i] += eps
             minus = flat.clone()
             minus[i] -= eps
-            numerical.reshape(-1)[i] = (loss_fn(plus.view_as(x_g)) - loss_fn(minus.view_as(x_g))) / (2 * eps)
+            loss_plus = 0.5 * torch.mean((plus.view_as(x_g) - target) ** 2)
+            loss_minus = 0.5 * torch.mean((minus.view_as(x_g) - target) ** 2)
+            numerical.reshape(-1)[i] = (loss_plus - loss_minus) / (2 * eps)
 
         analytic = g_norm / n
         assert torch.allclose(numerical, analytic, atol=1e-7)

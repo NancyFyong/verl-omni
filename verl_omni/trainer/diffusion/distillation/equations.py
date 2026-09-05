@@ -163,7 +163,7 @@ def dmd_surrogate_loss(
 
 
 def fake_score_target(noise: Tensor, x_g: Tensor) -> Tensor:
-    """Fake-score epsilon-prediction target ``v_target = epsilon - x_g``.
+    """Rectified-flow fake-score target ``v_target = epsilon - x_g``.
 
     The fake score is trained to denoise the generated clean latent with
     ``x_sigma = (1 - sigma) * x_g + sigma * epsilon``.
@@ -177,7 +177,7 @@ def fake_score_loss(
     x_g: Tensor,
     gradient_mask: Optional[Tensor] = None,
 ) -> tuple[Tensor, int]:
-    """Fake-score denoising MSE against the epsilon target.
+    """Fake-score denoising MSE against the rectified-flow velocity target.
 
     ``L_fake = mean((model_output - (epsilon - x_g))^2)``. With a mask, the loss
     divides by the number of active elements after applying the mask.

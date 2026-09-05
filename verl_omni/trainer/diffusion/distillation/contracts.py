@@ -70,7 +70,7 @@ class FrozenDict(Mapping[str, Any]):
 
     def __init__(self, values: Mapping[str, Any] | None = None) -> None:
         values = values or {}
-        self._data = {key: _freeze(value) for key, value in values.items()}
+        self._data = {key: freeze_value(value) for key, value in values.items()}
 
     def __getitem__(self, key: str) -> Any:
         return self._data[key]
@@ -91,15 +91,16 @@ class FrozenDict(Mapping[str, Any]):
         return FrozenDict, (self._data,)
 
 
-def _freeze(value: Any) -> Any:
+def freeze_value(value: Any) -> Any:
+    """Recursively freeze plan mappings and collections."""
     if isinstance(value, FrozenDict):
         return value
     if isinstance(value, Mapping):
         return FrozenDict(value)
     if isinstance(value, list | tuple):
-        return tuple(_freeze(item) for item in value)
+        return tuple(freeze_value(item) for item in value)
     if isinstance(value, set | frozenset):
-        return frozenset(_freeze(item) for item in value)
+        return frozenset(freeze_value(item) for item in value)
     return value
 
 
@@ -278,8 +279,8 @@ class UpdatePhaseSpec:
     def __post_init__(self) -> None:
         if self.kind not in {"student", "fake_score"}:
             raise ValueError(f"Invalid phase kind {self.kind!r}; expected 'student' or 'fake_score'.")
-        if self.repeats <= 0:
-            raise ValueError(f"Phase repeats must be greater than zero, got {self.repeats}.")
+        if isinstance(self.repeats, bool) or not isinstance(self.repeats, int) or self.repeats <= 0:
+            raise ValueError(f"Phase repeats must be an integer greater than zero, got {self.repeats}.")
         if self.batch_policy not in {"fresh", "reuse_student"}:
             raise ValueError(f"Invalid batch_policy {self.batch_policy!r}; expected 'fresh' or 'reuse_student'.")
         if not self.trainable_roles:
@@ -350,10 +351,12 @@ class UpdateSchedule:
         if not self.phases:
             raise ValueError("UpdateSchedule must contain normal-cycle phases.")
         student_indices = [index for index, phase in enumerate(self.phases) if phase.kind == "student"]
-        if student_indices != [0]:
-            raise ValueError("A normal cycle must contain exactly one student phase and it must be first.")
-        if self.warmup_cycles < 0:
-            raise ValueError(f"warmup_cycles must be non-negative, got {self.warmup_cycles}.")
+        if student_indices != [0] or self.phases[0].repeats != 1:
+            raise ValueError(
+                "A normal cycle must contain exactly one student phase with repeats=1 and it must be first."
+            )
+        if isinstance(self.warmup_cycles, bool) or not isinstance(self.warmup_cycles, int) or self.warmup_cycles < 0:
+            raise ValueError(f"warmup_cycles must be a non-negative integer, got {self.warmup_cycles}.")
         if self.warmup_cycles > 0 and not self.warmup_phases:
             raise ValueError("warmup_cycles > 0 requires at least one warmup phase.")
         if self.warmup_cycles == 0 and self.warmup_phases:

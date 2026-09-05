@@ -26,33 +26,33 @@ from verl_omni.trainer.diffusion.distillation.ray_trainer import DistillationRay
 from verl_omni.trainer.main_diffusion import _get_trainer_cls
 
 
-class _Algo:
+class FakeAlgorithmConfig:
     def __init__(self, trainer_type):
         self.trainer_type = trainer_type
 
 
-class _Config:
+class FakeTrainerConfig:
     def __init__(self, trainer_type):
-        self.algorithm = _Algo(trainer_type)
+        self.algorithm = FakeAlgorithmConfig(trainer_type)
 
 
 class TestTrainerRouting:
     def test_distillation_routes_to_distillation_trainer(self):
-        assert _get_trainer_cls(_Config("distillation")) is DistillationRayTrainer
+        assert _get_trainer_cls(FakeTrainerConfig("distillation")) is DistillationRayTrainer
 
     def test_policy_gradient_is_unchanged(self):
         from verl_omni.trainer.diffusion.ray_diffusion_trainer import PolicyGradientRayTrainer
 
-        assert _get_trainer_cls(_Config("policy_gradient")) is PolicyGradientRayTrainer
+        assert _get_trainer_cls(FakeTrainerConfig("policy_gradient")) is PolicyGradientRayTrainer
 
     def test_direct_preference_is_unchanged(self):
         from verl_omni.trainer.diffusion.ray_diffusion_trainer import DirectPreferenceRayTrainer
 
-        assert _get_trainer_cls(_Config("direct_preference")) is DirectPreferenceRayTrainer
+        assert _get_trainer_cls(FakeTrainerConfig("direct_preference")) is DirectPreferenceRayTrainer
 
     def test_unknown_trainer_type_lists_distillation(self):
         with pytest.raises(ValueError, match="distillation"):
-            _get_trainer_cls(_Config("bogus"))
+            _get_trainer_cls(FakeTrainerConfig("bogus"))
 
 
 class TestAlgorithmConfig:
@@ -72,7 +72,7 @@ class TestAlgorithmConfig:
             DiffusionAlgoConfig(trainer_type="bogus")
 
 
-def _runtime_config():
+def runtime_config():
     return OmegaConf.create(
         {
             "algorithm": {"trainer_type": "distillation"},
@@ -101,7 +101,7 @@ def _runtime_config():
 
 class TestPR1DataPlaneBoundary:
     def test_production_constructor_reaches_explicit_pr2_boundary(self):
-        config = _runtime_config()
+        config = runtime_config()
         trainer = DistillationRayTrainer(
             config=config,
             tokenizer=object(),
@@ -119,13 +119,13 @@ class TestPR1DataPlaneBoundary:
             trainer.init_workers()
 
     def test_constructor_rejects_opd_switch(self):
-        config = _runtime_config()
+        config = runtime_config()
         config.distillation.enabled = True
         with pytest.raises(ValueError, match="must keep the OPD"):
             DistillationRayTrainer(config=config)
 
     def test_config_and_capabilities_build_a_plan(self):
-        config = _runtime_config()
+        config = runtime_config()
         trainer = DistillationRayTrainer(config=config, capabilities=frozenset({"distribution_matching"}))
         assert trainer.plan is not None
         assert trainer.plan.name == "dmd2"
