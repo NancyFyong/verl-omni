@@ -322,7 +322,9 @@ def qwen_process_group():
 
 
 @pytest.mark.parametrize("strategy", ["fsdp", "fsdp2"])
-def test_qwen_image_dmd2_phase_runner_on_fsdp(strategy, qwen_process_group):
+@pytest.mark.parametrize("algorithm", ["dmd", "dmd2"])
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_qwen_image_distillation_phase_runner_on_fsdp(strategy, algorithm, batch_size, qwen_process_group):
     model_path = os.environ.get("QWEN_IMAGE_MODEL_PATH", os.path.expanduser("~/models/tiny-random/Qwen-Image"))
     if not os.path.isfile(os.path.join(model_path, "model_index.json")):
         pytest.skip(f"Tiny Qwen-Image checkpoint not found at {model_path}.")
@@ -338,11 +340,12 @@ def test_qwen_image_dmd2_phase_runner_on_fsdp(strategy, qwen_process_group):
     engine.ulysses_device_mesh = None
     engine.ulysses_sequence_parallel_size = 1
     plan = build_plan(
-        "dmd2",
+        algorithm,
         {
             "model_path": model_path,
             "conditioning_provider": "local_frozen_encoder",
-            "fake_update_ratio": 1,
+            "fake_update_ratio": 2,
+            "regression_type": "decoded_lpips",
             "rng_seed": 3,
         },
         frozenset({"distribution_matching"}),
@@ -361,12 +364,22 @@ def test_qwen_image_dmd2_phase_runner_on_fsdp(strategy, qwen_process_group):
         ),
     )
     runner = QwenImageDMDPhaseRunner(model_config, plan)
-    batch = TensorDict({"dummy_tensor": torch.zeros(1, 1, device="cuda")}, batch_size=[1])
+    batch = TensorDict({"dummy_tensor": torch.zeros(batch_size, 1, device="cuda")}, batch_size=[batch_size])
     tu.assign_non_tensor_stack(
         batch,
         "raw_prompt",
-        [[{"role": "user", "content": "cat" if rank % 2 == 0 else "a red apple on a wooden table"}]],
+        [
+            [{"role": "user", "content": "cat" if (rank + row) % 2 == 0 else "a red apple on a wooden table"}]
+            for row in range(batch_size)
+        ],
     )
+    if algorithm == "dmd":
+        pytest.importorskip("piq")
+        batch["reference_noise"] = torch.randn(batch_size, 16, 64, device="cuda")
+        batch["teacher_target_latents"] = torch.zeros(batch_size, 16, 64, device="cuda")
+        tu.assign_non_tensor_stack(
+            batch, "teacher_sampling_manifest", [{"scheduler": "tiny-qwen", "sample": row} for row in range(batch_size)]
+        )
     for kind, role in (("student", "student"), ("fake_score", "fake_score"), ("fake_score", "fake_score")) * 3:
         request = PhaseRequest(
             kind=kind,

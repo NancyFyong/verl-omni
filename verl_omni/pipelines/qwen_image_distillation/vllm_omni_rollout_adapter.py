@@ -15,9 +15,12 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import torch
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
@@ -32,11 +35,29 @@ __all__ = ["QwenImageDMDPipeline"]
 class QwenImageDMDPipeline(QwenImagePipelineWithLogProb):
     """Qwen-Image rollout with the same fixed-shift schedule used for DMD training."""
 
+    supports_request_batch = True
+    supports_step_execution = False
     rollout_timestep_shift = 3.0
+
+    def prepare_latents(self, batch_size, num_channels_latents, height, width, dtype, device, generator, latents=None):
+        """Reuse Qwen packing and request-local generators with training-matched fp32 noise."""
+        return super().prepare_latents(
+            batch_size, num_channels_latents, height, width, torch.float32, device, generator, latents
+        )
+
+    def prepare_encode(self, state, **kwargs):
+        """Reject step mode until its DMD defaults and per-request schedules are validated."""
+        raise NotImplementedError("Qwen DMD request batching requires step_execution=false.")
 
     def forward(self, req: OmniDiffusionRequest | DiffusionRequestBatch, *args, **kwargs):
         """Apply one batch-consistent DMD rollout shift before normal Qwen generation."""
         requests = req.requests if isinstance(req, DiffusionRequestBatch) else [req]
+        if not requests:
+            raise ValueError("Qwen DMD request batches cannot be empty.")
+        if len(requests) > 1:
+            key = build_request_batch_sampling_params_key(requests[0])
+            if any(build_request_batch_sampling_params_key(request) != key for request in requests[1:]):
+                raise ValueError("Packed Qwen DMD requests must have compatible sampling parameters.")
         extra_args = [request.sampling_params.extra_args or {} for request in requests]
         shifts = {
             3.0 if values.get("rollout_timestep_shift") is None else float(values["rollout_timestep_shift"])
@@ -45,8 +66,8 @@ class QwenImageDMDPipeline(QwenImagePipelineWithLogProb):
         if len(shifts) != 1:
             raise ValueError("Packed Qwen DMD requests must use the same rollout_timestep_shift.")
         shift = shifts.pop()
-        if shift < 1:
-            raise ValueError(f"rollout_timestep_shift must be at least 1, got {shift}.")
+        if not math.isfinite(shift) or shift < 1:
+            raise ValueError(f"rollout_timestep_shift must be finite and at least 1, got {shift}.")
         default_noise_level = float(kwargs.get("noise_level", 0.0))
         noise_levels = {
             default_noise_level if values.get("noise_level") is None else float(values["noise_level"])

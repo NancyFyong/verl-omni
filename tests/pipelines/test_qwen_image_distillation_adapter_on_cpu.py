@@ -19,7 +19,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from tensordict import TensorDict
+from tensordict import NonTensorData, TensorDict
 from verl.utils import tensordict_utils as tu
 
 from verl_omni.pipelines.model_base import DiffusionModelBase, DistributionMatchingModelAdapter
@@ -44,7 +44,7 @@ class ToyQwenTransformer(torch.nn.Module):
 
     def forward(self, hidden_states, encoder_hidden_states, **kwargs):
         del kwargs
-        condition = encoder_hidden_states.float().mean().to(hidden_states.dtype)
+        condition = encoder_hidden_states.float().mean(dim=(1, 2)).reshape(-1, 1, 1).to(hidden_states.dtype)
         return (hidden_states * self.scale + condition,)
 
 
@@ -183,6 +183,14 @@ def broadcast_selected_exit(value, src):
     value.fill_(1)
 
 
+def constant_noise(shape, device, runtime, stream):
+    return torch.full(shape, 0.3, device=device)
+
+
+def constant_score_sigma(generated, runtime):
+    return torch.full((generated.shape[0],), 0.5, device=generated.device)
+
+
 def capture_qwen_forward(self, req, *args, **kwargs):
     return self.rollout_timestep_shift, kwargs
 
@@ -226,6 +234,24 @@ class TestQwenImageConditionProvider:
         with pytest.raises(ValueError, match="single user message"):
             provider.tokenize_rows(pipeline, [row], torch.device("cpu"))
         pipeline.tokenizer.assert_not_called()
+
+    @pytest.mark.parametrize("chat", [False, True])
+    def test_cached_negative_condition_expands_to_each_physical_batch_size(self, chat):
+        provider = QwenImageConditionProvider("/unused", "local_frozen_encoder", 8, " ")
+        provider.pipeline = ToyConditionPipeline()
+        provider.encode_ids = Mock(wraps=provider.encode_ids)
+        for batch_size in (1, 3, 2, 1):
+            batch = tu.get_tensordict({"dummy_tensor": torch.zeros(batch_size, 1)})
+            prompt = [{"role": "user", "content": "cat"}] if chat else "cat"
+            tu.assign_non_tensor_stack(batch, "raw_prompt", [prompt] * batch_size)
+            positive, negative = provider.encode(
+                batch, device=torch.device("cpu"), dtype=torch.float32, require_negative=True
+            )
+            assert positive.tensors["prompt_embeds"].shape[0] == batch_size
+            assert negative.tensors["prompt_embeds"].shape[0] == batch_size
+            assert negative.masks["prompt_embeds"].shape[0] == batch_size
+            assert not negative.tensors["prompt_embeds"].requires_grad
+        assert provider.encode_ids.call_count == 5
 
     def test_raw_chat_is_rendered_once_and_negative_prompt_is_encoded(self):
         provider = QwenImageConditionProvider("/unused", "local_frozen_encoder", 8, " ")
@@ -455,14 +481,15 @@ class TestQwenImageDMDPhaseRunner:
 
         torch.testing.assert_close(training_x0, inference)
 
-    def test_decoded_lpips_regression_retains_student_gradient(self, monkeypatch):
+    @pytest.mark.parametrize("batch_size", [1, 3])
+    def test_decoded_lpips_regression_retains_student_gradient(self, monkeypatch, batch_size):
         runner = QwenImageDMDPhaseRunner(
             model_config("dmd"),
             make_plan("dmd", regression_type="decoded_lpips"),
         )
 
         monkeypatch.setattr(runner, "ensure_vae_and_lpips", Mock(return_value=(ToyVAE(), ToyLPIPS())))
-        prediction = torch.randn(1, 1, 4, requires_grad=True)
+        prediction = torch.randn(batch_size, 1, 4, requires_grad=True)
         target = torch.zeros_like(prediction)
 
         loss = runner.decoded_lpips_loss(prediction, target, None, height=16, width=16)
@@ -495,10 +522,58 @@ class TestQwenImageDMDPhaseRunner:
         actual_values = {key: value for key, value in actual.metrics.items() if not key.startswith("perf/")}
         assert actual_values == expected_values
 
-    def test_rejects_physical_batch_larger_than_one(self):
-        runner = QwenImageDMDPhaseRunner(model_config(), make_plan(fake_update_ratio=1))
-        with pytest.raises(ValueError, match="physical micro-batch size 1"):
-            runner.compute_phase(phase_request("student"), phase_batch(batch_size=2), ToyRuntime())
+    @pytest.mark.parametrize("algorithm", ["dmd", "dmd2"])
+    @pytest.mark.parametrize("kind", ["student", "fake_score"])
+    @pytest.mark.parametrize("batch_size", [2, 3])
+    def test_physical_batch_preserves_role_gradient_ownership(self, algorithm, kind, batch_size):
+        runtime = ToyRuntime()
+        runner = QwenImageDMDPhaseRunner(model_config(algorithm), make_plan(algorithm, regression_type="latent_mse"))
+        batch = phase_batch(batch_size, regression=algorithm == "dmd")
+        if algorithm == "dmd":
+            tu.assign_non_tensor_stack(batch, "teacher_sampling_manifest", [{"pair": i} for i in range(batch_size)])
+        result = runner.compute_phase(phase_request(kind), batch, runtime)
+        result.losses[kind].backward()
+        assert result.losses[kind].isfinite()
+        for role, module in runtime.modules.items():
+            assert (module.scale.grad is not None) == (role == kind)
+
+    def test_mixed_resolution_batch_fails_closed(self):
+        runner = QwenImageDMDPhaseRunner(model_config(), make_plan())
+        batch = phase_batch(2)
+        batch["height"] = torch.tensor([16, 32])
+        with pytest.raises(ValueError, match="homogeneous height"):
+            runner.compute_phase(phase_request("student"), batch, ToyRuntime())
+
+    @pytest.mark.parametrize("manifests", [[{"pair": 0}, {}], [{"pair": 0}], {"pair": 0}])
+    def test_original_dmd_requires_provenance_for_every_batch_row(self, manifests):
+        runner = QwenImageDMDPhaseRunner(model_config("dmd"), make_plan("dmd", regression_type="latent_mse"))
+        batch = phase_batch(2, regression=True)
+        batch["teacher_sampling_manifest"] = NonTensorData(manifests, batch_size=batch.batch_size)
+        with pytest.raises(ValueError, match="provenance"):
+            runner.compute_phase(phase_request("student"), batch, ToyRuntime())
+
+    @pytest.mark.parametrize("kind", ["student", "fake_score"])
+    @pytest.mark.parametrize("cfg_norm", ["none", "layer_norm"])
+    def test_batched_loss_and_gradient_match_microbatch_accumulation(self, kind, cfg_norm, monkeypatch):
+        plan = make_plan(teacher_cfg_norm=cfg_norm)
+        batch = phase_batch(3)
+        batch["prompt_embeds"] = torch.arange(18).reshape(3, 2, 3).float() / 18
+        full_runtime, accumulated_runtime = ToyRuntime(), ToyRuntime()
+        full_runner, accumulated_runner = [QwenImageDMDPhaseRunner(model_config(), plan) for _ in range(2)]
+        for runner in (full_runner, accumulated_runner):
+            monkeypatch.setattr(runner, "sample_noise", constant_noise)
+            monkeypatch.setattr(runner, "sample_score_sigma", constant_score_sigma)
+            monkeypatch.setattr(runner, "sample_rollout_exit", Mock(return_value=1))
+        full = full_runner.compute_phase(phase_request(kind), batch, full_runtime)
+        full.losses[kind].backward()
+        loss = 0.0
+        for micro_batch in batch.split(2, dim=0):
+            result = accumulated_runner.compute_phase(phase_request(kind), micro_batch, accumulated_runtime)
+            weight = micro_batch.batch_size[0] / batch.batch_size[0]
+            (result.losses[kind] * weight).backward()
+            loss += float(result.losses[kind].detach()) * weight
+        assert float(full.losses[kind].detach()) == pytest.approx(loss)
+        torch.testing.assert_close(full_runtime.modules[kind].scale.grad, accumulated_runtime.modules[kind].scale.grad)
 
     def test_precomputed_provider_requires_negative_condition(self):
         batch = phase_batch()

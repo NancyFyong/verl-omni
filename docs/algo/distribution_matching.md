@@ -2,7 +2,7 @@
 
 Last updated: 09/05/2026.
 
-VeRL-Omni supports Qwen-Image training with DMD and the distribution-only
+verl-omni supports Qwen-Image training with DMD and the distribution-only
 profile of DMD2. The implementation follows the multi-role design in
 [RFC #519](https://github.com/verl-project/verl-omni/issues/519): a trainable
 student, a frozen real-score teacher, a trainable fake-score model, and a
@@ -73,7 +73,9 @@ generic chat template can leave short prompts with no encoded tokens.
 A registered vLLM-Omni adapter uses the same sigma construction for
 non-autograd inference. It requires deterministic sampling (`noise_level=0`)
 and defaults to no inference CFG. A non-default training shift must also be set
-as `actor_rollout_ref.rollout.algo.rollout_timestep_shift`.
+as `actor_rollout_ref.rollout.algo.rollout_timestep_shift`. Request batching
+reuses the vLLM-Omni scheduler and request collation with an explicit capability
+flag. Use `step_execution=false`; unvalidated stepwise DMD execution is rejected.
 
 ## DMD and DMD2 profiles
 
@@ -122,6 +124,20 @@ distillation.enabled=false
 distillation.distribution_matching.recipe=dmd2
 distillation.distribution_matching.profile=distribution_only
 ```
+
+Same-resolution physical batches and sample-weighted gradient accumulation use
+the existing worker loop, with independent student/fake micro-batch sizes. Each
+original-DMD sample must retain its own regression provenance. One physical batch
+shares a synchronized rollout exit, so batch-size comparisons must account for
+changes in sampled forward counts.
+
+Profiling uses the existing `DistProfiler` and `Tracking` components. Metrics keep
+every repeated phase, reset at cycle boundaries, sum elapsed host intervals and
+counts, and preserve peak memory across ranks. The driver reports cycle wall time
+and separate student/fake sample throughput; nested host intervals must not be
+summed into a GPU-time estimate. Logging steps include warmup cycles, while
+`training/global_step` retains student-update semantics. See the example README
+for metric definitions and controlled profiling commands.
 
 The runnable LoRA recipe is
 `examples/distillation_trainer/qwen_image/run_qwen_image_dmd2_lora.sh`.
