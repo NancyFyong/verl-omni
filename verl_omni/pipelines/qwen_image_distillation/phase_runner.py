@@ -30,7 +30,7 @@ from verl_omni.pipelines.qwen_image_flow_grpo.common import (
     build_img_shapes,
 )
 from verl_omni.trainer.diffusion.distillation.contracts import ConditionBundle, DistillationPlan, PhaseRequest
-from verl_omni.trainer.diffusion.distillation.equations import (
+from verl_omni.trainer.diffusion.distillation.utils import (
     consistency_renoise_step,
     dmd_gradient,
     dmd_surrogate_loss,

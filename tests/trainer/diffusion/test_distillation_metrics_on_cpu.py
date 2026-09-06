@@ -20,7 +20,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from verl_omni.trainer.diffusion.distillation.contracts import PhaseResult
-from verl_omni.trainer.diffusion.distillation.control_plane import FakeBatchProvider, FakePhaseExecutor
+from verl_omni.trainer.diffusion.distillation.controller import FakeBatchProvider, FakePhaseExecutor
 from verl_omni.trainer.diffusion.distillation.ray_trainer import DistillationRayTrainer
 from verl_omni.trainer.diffusion.distillation.recipes import build_plan
 
@@ -68,8 +68,8 @@ class TestDistillationMetrics:
     def test_every_repeated_phase_is_recorded_and_cycle_timings_are_summed(self):
         trainer = make_trainer()
         trainer.fit(num_cycles=1)
-        assert len(trainer.control_plane.metrics) == 3
-        metrics = trainer.flatten_metrics(trainer.control_plane.metrics)
+        assert len(trainer.controller.metrics) == 3
+        metrics = trainer.flatten_metrics(trainer.controller.metrics)
         assert metrics["student/loss"] == 1.0
         assert metrics["fake_score/loss"] == 1.5
         assert metrics["perf/condition_encode_s"] == 0.75
@@ -92,7 +92,7 @@ class TestDistillationMetrics:
 
         trainer = make_trainer()
         trainer.fit(num_cycles=1)
-        metrics = trainer.flatten_metrics(trainer.control_plane.metrics)
+        metrics = trainer.flatten_metrics(trainer.controller.metrics)
         assert all(type(value) is float for value in metrics.values())
         tracker = Tracking(project_name="test", experiment_name="metrics", default_backend=["console"], config={})
         tracker.log(data=metrics, step=1)
@@ -103,20 +103,20 @@ class TestDistillationMetrics:
     def test_metrics_do_not_leak_into_the_next_cycle(self):
         trainer = make_trainer()
         trainer.fit(num_cycles=1)
-        trainer.control_plane.metrics["system"] = {"perf/checkpoint_s": 12.0}
+        trainer.controller.metrics["system"] = {"perf/checkpoint_s": 12.0}
         trainer.fit(num_cycles=1)
-        assert "perf/checkpoint_s" not in trainer.flatten_metrics(trainer.control_plane.metrics)
-        assert len(trainer.control_plane.metrics) == 3
+        assert "perf/checkpoint_s" not in trainer.flatten_metrics(trainer.controller.metrics)
+        assert len(trainer.controller.metrics) == 3
 
     def test_failed_cycle_preserves_previous_metrics_but_is_not_loggable_as_success(self):
         trainer = make_trainer()
         trainer.fit(num_cycles=1)
-        before = dict(trainer.control_plane.metrics)
-        trainer.executor._fail_on = "fake_score"
+        before = dict(trainer.controller.metrics)
+        trainer.executor.fail_on = "fake_score"
         with pytest.raises(RuntimeError, match="failed on phase"):
             trainer.fit(num_cycles=1)
-        assert trainer.control_plane.metrics == before
-        assert trainer.control_plane.counters.global_step == 1
+        assert trainer.controller.metrics == before
+        assert trainer.controller.counters.global_step == 1
 
     def test_tracking_receives_cycle_latency_samples_and_nonstale_checkpoint_time(self, monkeypatch):
         trainer, tracker = production_trainer(monkeypatch)
@@ -138,7 +138,7 @@ class TestDistillationMetrics:
     def test_profile_is_stopped_when_phase_execution_fails(self, monkeypatch):
         trainer, tracker = production_trainer(monkeypatch)
         trainer.config.global_profiler.steps = [1]
-        trainer.executor._fail_on = "fake_score"
+        trainer.executor.fail_on = "fake_score"
         with pytest.raises(RuntimeError, match="failed on phase"):
             trainer.fit(num_cycles=1)
         trainer.distillation_worker_group.stop_profile.assert_called_once()

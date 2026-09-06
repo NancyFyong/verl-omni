@@ -32,8 +32,8 @@ from verl_omni.pipelines.qwen_image_distillation.phase_runner import (
 from verl_omni.pipelines.qwen_image_distillation.vllm_omni_rollout_adapter import QwenImageDMDPipeline
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 from verl_omni.trainer.diffusion.distillation.contracts import PhaseRequest
-from verl_omni.trainer.diffusion.distillation.equations import ode_euler_step
 from verl_omni.trainer.diffusion.distillation.recipes import build_plan
+from verl_omni.trainer.diffusion.distillation.utils import ode_euler_step
 
 
 class ToyQwenTransformer(torch.nn.Module):
