@@ -80,7 +80,7 @@ def test_native_qwen_dmd_request_batch_matches_serial(num_outputs):
     from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 
     from verl_omni.pipelines.model_base import VllmOmniPipelineBase
-    from verl_omni.pipelines.qwen_image_distillation.phase_runner import QwenImageConditionProvider
+    from verl_omni.pipelines.qwen_image_distillation.diffusers_training_adapter import QwenImageConditionProvider
 
     tokenizer = AutoTokenizer.from_pretrained(os.path.join(model_path, "tokenizer"), local_files_only=True)
     template = QwenImagePipeline(tokenizer=tokenizer, text_encoder=None, vae=None, transformer=None, scheduler=None)

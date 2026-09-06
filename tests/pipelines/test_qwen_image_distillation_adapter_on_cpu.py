@@ -23,9 +23,9 @@ from tensordict import NonTensorData, TensorDict
 from verl.utils import tensordict_utils as tu
 
 from verl_omni.pipelines.model_base import DiffusionModelBase, DistributionMatchingModelAdapter
-from verl_omni.pipelines.qwen_image_distillation.diffusers_training_adapter import QwenImageDistributionMatching
-from verl_omni.pipelines.qwen_image_distillation.phase_runner import (
+from verl_omni.pipelines.qwen_image_distillation.diffusers_training_adapter import (
     QwenImageConditionProvider,
+    QwenImageDistributionMatching,
     QwenImageDMDPhaseRunner,
     build_qwen_dmd_sigmas,
 )

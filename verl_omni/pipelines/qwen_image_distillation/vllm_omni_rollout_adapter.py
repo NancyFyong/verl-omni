@@ -24,7 +24,7 @@ from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_samp
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
-from verl_omni.pipelines.qwen_image_distillation.phase_runner import build_qwen_dmd_sigmas
+from verl_omni.pipelines.qwen_image_distillation.diffusers_training_adapter import build_qwen_dmd_sigmas
 from verl_omni.pipelines.qwen_image_flow_grpo.vllm_omni_rollout_adapter import QwenImagePipelineWithLogProb
 
 __all__ = ["QwenImageDMDPipeline"]

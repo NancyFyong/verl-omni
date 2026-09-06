@@ -329,7 +329,7 @@ def test_qwen_image_distillation_phase_runner_on_fsdp(strategy, algorithm, batch
     if not os.path.isfile(os.path.join(model_path, "model_index.json")):
         pytest.skip(f"Tiny Qwen-Image checkpoint not found at {model_path}.")
 
-    from verl_omni.pipelines.qwen_image_distillation.phase_runner import QwenImageDMDPhaseRunner
+    from verl_omni.pipelines.qwen_image_distillation.diffusers_training_adapter import QwenImageDMDPhaseRunner
 
     world_size = dist.get_world_size()
     rank = dist.get_rank()
