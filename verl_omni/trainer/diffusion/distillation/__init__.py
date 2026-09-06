@@ -13,14 +13,14 @@
 # limitations under the License.
 """Distribution-matching distillation runtime (DMD, DMD2, CausVid, Self-Forcing).
 
-The package separates immutable plans, pure utils, and the control-plane
-state machine from the lazily imported Ray/FSDP data plane. Architecture-owned
+The package separates immutable plans, pure tensor utilities, and the trainer
+controller from the lazily imported Ray/FSDP data plane. Architecture-owned
 phase runners plug into the generic runtime without adding model branches here.
 """
 
 from importlib import import_module
 
-from verl_omni.trainer.diffusion.distillation import contracts, controller, utils, recipes
+from verl_omni.trainer.diffusion.distillation import contracts, controller, recipes, utils
 from verl_omni.trainer.diffusion.distillation.contracts import (
     CanonicalPrediction,
     ConditionBundle,

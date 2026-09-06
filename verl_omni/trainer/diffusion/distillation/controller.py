@@ -200,8 +200,8 @@ class DistillationTrainerController:
 
     def state_dict(self) -> dict[str, Any]:
         """Return completed-cycle driver state for atomic checkpointing."""
-        if self._failed:
-            raise RuntimeError("Cannot checkpoint a failed control plane; restore the last completed cycle instead.")
+        if self.failed:
+            raise RuntimeError("Cannot checkpoint a failed controller; restore the last completed cycle instead.")
         return {
             "global_step": self.counters.global_step,
             "optimizer_steps": dict(self.counters.optimizer_steps),
@@ -209,12 +209,12 @@ class DistillationTrainerController:
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        """Restore validated counters into a fresh control plane."""
-        if self._failed:
-            raise RuntimeError("Cannot restore into a failed control plane; construct a new driver.")
+        """Restore validated counters into a fresh controller."""
+        if self.failed:
+            raise RuntimeError("Cannot restore into a failed controller; construct a new driver.")
         required = {"global_step", "optimizer_steps", "completed_cycles"}
         if set(state) != required:
-            raise ValueError(f"Control-plane state must contain exactly {sorted(required)}, got {sorted(state)}.")
+            raise ValueError(f"Controller state must contain exactly {sorted(required)}, got {sorted(state)}.")
         global_step = state["global_step"]
         completed_cycles = state["completed_cycles"]
         optimizer_steps = state["optimizer_steps"]
@@ -240,7 +240,7 @@ class DistillationTrainerController:
             optimizer_steps=dict(optimizer_steps),
             completed_cycles=completed_cycles,
         )
-        self._metrics = {}
+        self.phase_metrics = {}
 
     def reset(self) -> None:
         """Reset a healthy driver; failed drivers must be reconstructed from checkpoint."""

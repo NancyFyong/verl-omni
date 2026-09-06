@@ -116,7 +116,7 @@ class TestDistillationCheckpoint:
         trainer = DistillationRayTrainer(
             plan=plan, executor=executor, batch_provider=FakeBatchProvider(10), hooks=hooks
         )
-        trainer._controller = controller
+        trainer.controller_instance = controller
         trainer._production = True
         trainer.global_steps = controller.counters.global_step
         trainer.train_dataloader = StatefulLoader()
