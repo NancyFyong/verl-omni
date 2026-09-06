@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pure, deterministic distillation trainer control plane.
+"""Pure, deterministic distillation trainer controller.
 
-The control plane receives an immutable :class:`DistillationPlan` and talks to a
+The controller receives an immutable :class:`DistillationPlan` and talks to a
 single :class:`DistillationPhaseExecutor`. It never imports a model pipeline,
 manipulates latents, selects a PEFT adapter, or computes a DMD loss. Keeping the
 controller free of Ray types makes its state machine testable in a CPU process
@@ -52,7 +52,7 @@ from verl_omni.trainer.diffusion.distillation.contracts import (
 )
 
 __all__ = [
-    "DistillationTrainerControlPlane",
+    "DistillationTrainerController",
     "BatchProvider",
     "DistillationTrainerHooks",
     "DistillationPhaseExecutor",
@@ -82,7 +82,7 @@ class DistillationTrainerHooks(Protocol):
     def after_completed_step(self, counters: TrainerCounters, metrics: dict, executor: Any) -> None: ...
 
 
-class DistillationTrainerControlPlane:
+class DistillationTrainerController:
     """Pure driver over a plan and an executor. No Ray, model, or FSDP types."""
 
     def __init__(
@@ -97,8 +97,8 @@ class DistillationTrainerControlPlane:
         self.batch_provider = batch_provider
         self.hooks = hooks
         self.counters = TrainerCounters()
-        self._metrics: dict[str, dict] = {}
-        self._failed = False
+        self.phase_metrics: dict[str, dict] = {}
+        self.failed = False
 
     def run(self, num_cycles: int) -> None:
         """Drive ``num_cycles`` update cycles through the executor."""
@@ -107,9 +107,9 @@ class DistillationTrainerControlPlane:
 
     def run_cycle(self) -> UpdateCycle:
         """Run one cycle transactionally and become terminal after a failure."""
-        if self._failed:
+        if self.failed:
             raise RuntimeError(
-                "This control plane previously failed during a cycle and cannot be retried in-process; "
+                "This controller previously failed during a cycle and cannot be retried in-process; "
                 "restore the last completed-cycle checkpoint into a new driver."
             )
 
@@ -118,7 +118,7 @@ class DistillationTrainerControlPlane:
             optimizer_steps=dict(self.counters.optimizer_steps),
             completed_cycles=self.counters.completed_cycles,
         )
-        before_metrics = dict(self._metrics)
+        before_metrics = dict(self.phase_metrics)
         try:
             cycle = self.plan.update_schedule.next_cycle(self.counters)
             student_step_reported = self.drive_requests(cycle.requests)
@@ -139,8 +139,8 @@ class DistillationTrainerControlPlane:
             return cycle
         except Exception:
             self.counters = before_counters
-            self._metrics = before_metrics
-            self._failed = True
+            self.phase_metrics = before_metrics
+            self.failed = True
             raise
 
     def drive_requests(self, requests: tuple[PhaseRequest, ...]) -> bool:
@@ -183,7 +183,7 @@ class DistillationTrainerControlPlane:
         """Record validated role counters and the latest phase metrics."""
         for role, steps in result.optimizer_steps.items():
             self.counters.optimizer_steps[role] = self.counters.optimizer_steps.get(role, 0) + steps
-        self._metrics[request.kind] = dict(result.metrics)
+        self.phase_metrics[request.kind] = dict(result.metrics)
 
     def assert_progress(self, before: TrainerCounters) -> None:
         """A cycle must advance global_step or at least one role optimizer counter."""
@@ -196,14 +196,14 @@ class DistillationTrainerControlPlane:
     @property
     def metrics(self) -> dict[str, dict]:
         """Metrics recorded for the most recent phase of each kind."""
-        return self._metrics
+        return self.phase_metrics
 
     def reset(self) -> None:
         """Reset a healthy driver; failed drivers must be reconstructed from checkpoint."""
-        if self._failed:
-            raise RuntimeError("A failed control plane cannot be reset in-process; construct a new driver.")
+        if self.failed:
+            raise RuntimeError("A failed controller cannot be reset in-process; construct a new driver.")
         self.counters = TrainerCounters()
-        self._metrics = {}
+        self.phase_metrics = {}
 
 
 @runtime_checkable
@@ -219,15 +219,15 @@ class FakeBatchProvider:
     """Minimal batch provider that yields synthetic batches on request."""
 
     def __init__(self, num_batches: int = 1, batch_size: int = 1) -> None:
-        self._num = num_batches
-        self._batch_size = batch_size
-        self._sent = 0
+        self.num_batches = num_batches
+        self.batch_size = batch_size
+        self.sent_batches = 0
 
     def next(self, request: PhaseRequest) -> Any:
         """Return a synthetic batch for the requested phase, advancing a counter."""
-        if self._sent >= self._num:
+        if self.sent_batches >= self.num_batches:
             raise StopIteration("No more batches.")
-        self._sent += 1
+        self.sent_batches += 1
         return {"phase_kind": request.kind, "global_step": request.global_step, "repeat": request.repeat_index}
 
 
@@ -240,8 +240,8 @@ class FakePhaseExecutor:
     """
 
     def __init__(self, skip_student: bool = False, fail_on: str | None = None) -> None:
-        self._skip_student = skip_student
-        self._fail_on = fail_on
+        self.skip_student = skip_student
+        self.fail_on = fail_on
         self.executed: list[PhaseRequest] = []
 
     def execute_phase(self, request: PhaseRequest, batch: Any) -> PhaseResult:
@@ -249,9 +249,9 @@ class FakePhaseExecutor:
         if batch.get("phase_kind") != request.kind:
             raise ValueError(f"Batch phase {batch.get('phase_kind')!r} does not match request {request.kind!r}.")
         self.executed.append(request)
-        if request.kind == self._fail_on:
+        if request.kind == self.fail_on:
             raise RuntimeError(f"FakePhaseExecutor failed on phase {request.kind} (global_step={request.global_step}).")
-        if request.kind == "student" and self._skip_student:
+        if request.kind == "student" and self.skip_student:
             return PhaseResult(metrics={"fake/student": float(request.global_step)}, optimizer_steps={})
         metrics = {f"fake/{request.kind}": float(request.global_step)}
         optimizer_steps = {role: 1 for role in request.trainable_roles}

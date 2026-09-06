@@ -15,15 +15,16 @@
 
 These architecture-neutral types make up a validated
 :class:`~verl_omni.trainer.diffusion.distillation.recipes.DistillationPlan`.
-They carry no Ray, model-pipeline, or FSDP dependency. The generic equations in
-``equations.py`` operate on unpacked tensors; :class:`LatentBundle` is only a
-transport container used across role boundaries.
+They carry no Ray, model-pipeline, or FSDP dependency. The generic tensor
+utilities operate on unpacked tensors; :class:`LatentBundle` is only a transport
+container used across role boundaries.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Literal, Optional, Protocol, runtime_checkable
 
 from torch import Tensor
@@ -66,29 +67,29 @@ __all__ = [
 class FrozenDict(Mapping[str, Any]):
     """Small recursively immutable, pickle-friendly mapping for plan specs."""
 
-    __slots__ = ("_data",)
+    __slots__ = ("data",)
 
     def __init__(self, values: Mapping[str, Any] | None = None) -> None:
         values = values or {}
-        self._data = {key: freeze_value(value) for key, value in values.items()}
+        self.data = MappingProxyType({key: freeze_value(value) for key, value in values.items()})
 
     def __getitem__(self, key: str) -> Any:
-        return self._data[key]
+        return self.data[key]
 
     def __iter__(self) -> Iterator[str]:
-        return iter(self._data)
+        return iter(self.data)
 
     def __len__(self) -> int:
-        return len(self._data)
+        return len(self.data)
 
     def __repr__(self) -> str:
-        return f"FrozenDict({self._data!r})"
+        return f"FrozenDict({self.data!r})"
 
     def __hash__(self) -> int:
-        return hash(tuple(sorted(self._data.items())))
+        return hash(tuple(sorted(self.data.items())))
 
     def __reduce__(self):
-        return FrozenDict, (self._data,)
+        return FrozenDict, (dict(self.data),)
 
 
 def freeze_value(value: Any) -> Any:

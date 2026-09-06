@@ -77,7 +77,7 @@ class DistillationRegistry:
     """Minimal name-to-class registry with duplicate rejection."""
 
     def __init__(self) -> None:
-        self._registry: dict[str, type] = {}
+        self.registered_classes: dict[str, type] = {}
 
     def register(self, name: str, subclass: type | None = None):
         """Register a class directly or return its registration decorator."""
@@ -85,22 +85,24 @@ class DistillationRegistry:
             raise ValueError("Registry names must not be empty.")
         if subclass is None:
             return partial(self.register, name)
-        if name in self._registry:
+        if name in self.registered_classes:
             raise ValueError(f"Duplicate registration for {name!r}.")
-        self._registry[name] = subclass
+        self.registered_classes[name] = subclass
         return subclass
 
     def get(self, name: str) -> type:
         """Resolve a registered class by name."""
         try:
-            return self._registry[name]
+            return self.registered_classes[name]
         except KeyError:
-            raise KeyError(f"No {self.kind} registered for {name!r}. Registered: {sorted(self._registry)}") from None
+            raise KeyError(
+                f"No {self.kind} registered for {name!r}. Registered: {sorted(self.registered_classes)}"
+            ) from None
 
     @property
     def names(self) -> tuple[str, ...]:
         """Return the registered names in stable order."""
-        return tuple(sorted(self._registry))
+        return tuple(sorted(self.registered_classes))
 
     @property
     def kind(self) -> str:

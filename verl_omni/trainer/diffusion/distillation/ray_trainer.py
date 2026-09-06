@@ -25,7 +25,7 @@ from typing import Any, Optional
 
 from verl_omni.trainer.diffusion.diffusion_trainer_utils import validate_distillation_config
 from verl_omni.trainer.diffusion.distillation.contracts import DistillationPlan
-from verl_omni.trainer.diffusion.distillation.control_plane import DistillationTrainerControlPlane
+from verl_omni.trainer.diffusion.distillation.controller import DistillationTrainerController
 from verl_omni.trainer.diffusion.distillation.recipes import build_plan_from_config
 
 __all__ = ["DistillationRayTrainer"]
@@ -80,7 +80,7 @@ class DistillationRayTrainer:
         self.executor = executor
         self.batch_provider = batch_provider
         self.hooks = hooks
-        self._control_plane: Optional[DistillationTrainerControlPlane] = None
+        self.controller_instance: Optional[DistillationTrainerController] = None
 
     def init_workers(self) -> None:
         """Validate the PR 1 boundary before PR 2 supplies role-group workers."""
@@ -92,24 +92,25 @@ class DistillationRayTrainer:
         if self.plan is None:
             raise ValueError("A validated DistillationPlan is required when an executor is bound.")
 
-    def build_control_plane(self) -> DistillationTrainerControlPlane:
-        """Construct the pure control plane from a plan and bound collaborators."""
+    def build_controller(self) -> DistillationTrainerController:
+        """Construct the pure controller from a plan and bound collaborators."""
         self.init_workers()
         assert self.plan is not None
-        self._control_plane = DistillationTrainerControlPlane(
+        self.controller_instance = DistillationTrainerController(
             plan=self.plan,
             executor=self.executor,
             batch_provider=self.batch_provider,
             hooks=self.hooks,
         )
-        return self._control_plane
+        return self.controller_instance
 
     @property
-    def control_plane(self) -> DistillationTrainerControlPlane:
-        if self._control_plane is None:
-            return self.build_control_plane()
-        return self._control_plane
+    def controller(self) -> DistillationTrainerController:
+        """Return the lazily constructed distillation trainer controller."""
+        if self.controller_instance is None:
+            return self.build_controller()
+        return self.controller_instance
 
     def fit(self, num_cycles: int = 0) -> None:
-        """Drive the injected CPU control plane; production data plane arrives in PR 2."""
-        self.control_plane.run(num_cycles)
+        """Drive the injected CPU controller; production data plane arrives in PR 2."""
+        self.controller.run(num_cycles)

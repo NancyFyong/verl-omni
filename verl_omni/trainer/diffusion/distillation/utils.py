@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pure DMD-family math used by the distillation trainer.
+"""Pure tensor utilities used by the DMD-family distillation trainer.
 
 This module is independent of Ray and model libraries: it implements only the
 detached-normalized distribution-matching gradient, the surrogate student loss,
@@ -25,7 +25,7 @@ Why this is a separate module (and not part of ``recipes.py`` or
   execution state machine). It carries no equations.
 - ``recipes.py`` holds *declarations* (which objective, which rollout strategy,
   which initialization, how roles map onto groups). It never computes a quantity.
-- ``equations.py`` holds the only *executable equations* in the package. Every value
+- ``utils.py`` holds the only *executable equations* in the package. Every value
   is a pure function of its tensors; nothing here reads config, weights, or the
   prompt. Keeping these functions together means they can be unit-tested as
   algebraic identities and finite-difference checks without building a plan or an

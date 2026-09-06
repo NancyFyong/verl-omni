@@ -13,12 +13,12 @@
 # limitations under the License.
 """Distribution-matching distillation runtime (DMD, DMD2, CausVid, Self-Forcing).
 
-PR 1 provides the architecture-neutral trainer control plane, the immutable
-execution contracts, the recipe/objective/rollout registries, and pure DMD
-equations. It defines no model pipeline, Ray worker, FSDP model, or GPU runtime.
+PR 1 provides the architecture-neutral trainer controller, immutable execution
+contracts, recipe/objective/rollout registries, and pure DMD tensor utilities. It
+defines no model pipeline, Ray worker, FSDP model, or GPU runtime.
 """
 
-from verl_omni.trainer.diffusion.distillation import contracts, control_plane, equations, ray_trainer, recipes
+from verl_omni.trainer.diffusion.distillation import contracts, controller, ray_trainer, recipes, utils
 from verl_omni.trainer.diffusion.distillation.contracts import (
     CanonicalPrediction,
     ConditionBundle,
@@ -47,10 +47,10 @@ from verl_omni.trainer.diffusion.distillation.contracts import (
     validate_export_role,
     validate_role_layout,
 )
-from verl_omni.trainer.diffusion.distillation.control_plane import (
+from verl_omni.trainer.diffusion.distillation.controller import (
     BatchProvider,
     DistillationPhaseExecutor,
-    DistillationTrainerControlPlane,
+    DistillationTrainerController,
     DistillationTrainerHooks,
     FakeBatchProvider,
     FakeDistillationHooks,
@@ -62,9 +62,9 @@ from verl_omni.trainer.diffusion.distillation.recipes import build_plan, build_p
 __all__ = [
     # submodules
     "contracts",
-    "equations",
+    "utils",
     "recipes",
-    "control_plane",
+    "controller",
     "ray_trainer",
     # contracts
     "FrozenDict",
@@ -94,8 +94,8 @@ __all__ = [
     "TeacherScoreProvider",
     "RoleCheckpointManifest",
     "DistillationCheckpointState",
-    # control plane / executor
-    "DistillationTrainerControlPlane",
+    # controller / executor
+    "DistillationTrainerController",
     "BatchProvider",
     "DistillationTrainerHooks",
     "DistillationPhaseExecutor",

@@ -139,8 +139,8 @@ class TestPR1DataPlaneBoundary:
         with pytest.raises(NotImplementedError, match="PR 2"):
             trainer.fit(num_cycles=1)
 
-    def test_control_plane_binds_when_collaborators_are_supplied(self):
-        from verl_omni.trainer.diffusion.distillation.control_plane import (
+    def test_controller_binds_when_collaborators_are_supplied(self):
+        from verl_omni.trainer.diffusion.distillation.controller import (
             FakeBatchProvider,
             FakePhaseExecutor,
         )
@@ -153,4 +153,4 @@ class TestPR1DataPlaneBoundary:
             batch_provider=FakeBatchProvider(num_batches=100),
         )
         trainer.fit(num_cycles=2)
-        assert trainer.control_plane.counters.global_step == 2
+        assert trainer.controller.counters.global_step == 2
