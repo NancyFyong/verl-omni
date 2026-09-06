@@ -23,6 +23,8 @@ from verl.utils.tokenizer import normalize_token_ids
 from verl_omni.agent_loop.single_turn_agent_loop import DiffusionSingleTurnAgentLoop
 from verl_omni.agent_loop.utils import messages_to_text as _messages_to_text
 
+from .dataset import ensure_ltx_media_processor
+
 
 @register("ltx2_diffusion_single_turn_agent")
 class LTX2DiffusionSingleTurnAgentLoop(DiffusionSingleTurnAgentLoop):
@@ -48,7 +50,7 @@ class LTX2DiffusionSingleTurnAgentLoop(DiffusionSingleTurnAgentLoop):
         self.rollout_config = self.config.actor_rollout_ref.rollout
         self.server_manager = server_manager
         self.tokenizer = tokenizer
-        self.processor = processor
+        self.processor = ensure_ltx_media_processor(processor)
         self.dataset_cls = dataset_cls
         self.data_config = data_config.config
         self.apply_chat_template_kwargs = self.data_config.get("apply_chat_template_kwargs", {})
@@ -56,6 +58,10 @@ class LTX2DiffusionSingleTurnAgentLoop(DiffusionSingleTurnAgentLoop):
         self.extra_tokenizer_map = extra_tokenizer_map or {}
         self.system_prompt = []
         self.loop = get_event_loop()
+
+    def _assert_mm_supported(self, has_multi_modal: bool) -> None:
+        """Allow separately transported LTX first-frame images."""
+        del has_multi_modal
 
     async def ct_build_initial_tokens(
         self,
@@ -66,7 +72,11 @@ class LTX2DiffusionSingleTurnAgentLoop(DiffusionSingleTurnAgentLoop):
         audios: list[Any] | None = None,
     ) -> list[int]:
         """Encode raw text with special tokens and right-side truncation."""
-        del tools, images, videos, audios
+        del tools
+        if videos or audios:
+            raise ValueError("LTX-2.3 TI2VA accepts one image but no reference video or audio.")
+        if images is not None and len(images) != 1:
+            raise ValueError(f"LTX-2.3 TI2VA expects exactly one image, got {len(images)}.")
         text = _messages_to_text(messages)
         prompt_length = self.rollout_config.prompt_length
         tokenized = await self.loop.run_in_executor(

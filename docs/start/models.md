@@ -1,6 +1,6 @@
 # Supported Models
 
-Last updated: 08/27/2026.
+Last updated: 09/06/2026.
 
 VeRL-Omni supports RL post-training for generative models across image, video,
 audio, and omni modalities. This page catalogues every model with a ready-to-run
@@ -133,7 +133,7 @@ The HPSv3 reward is the only validated configuration. Other reward functions
 |----------|--------|
 | **Hugging Face ID** | `dg845/LTX-2.3-Diffusers` |
 | **Architecture** | LTX-2 DiT; checkpoint `_class_name` is `LTX2Pipeline` (rollout uses vLLM-Omni `LTX23Pipeline`) |
-| **Modality** | Text → Video + Audio |
+| **Modality** | Text → Video + Audio; Text + first-frame image → Video + Audio |
 | **Pipeline** | Flow-matching with joint audio-video CPS transitions |
 | **Default recipe** | `sde_window_size=3`, `sde_window_range=[0,10]`, `sde_contiguous=False` |
 
@@ -144,8 +144,9 @@ For dataset layout and launch overrides, see
 
 | Trainer | Example script | GPU config |
 |---------|---------------|------------|
-| Flow-GRPO (LoRA) | `examples/flowgrpo_trainer/ltx2/run_ltx2_3_t2av_lora.sh` | 8×GPU (TP=2) |
-| Flow-GRPO (LoRA, NPU) | `examples/flowgrpo_trainer/ltx2/run_ltx2_3_t2av_lora_npu.sh` | 16×NPU (TP=4) |
+| Flow-GRPO (T2AV LoRA) | `examples/flowgrpo_trainer/ltx2/run_ltx2_3_t2av_lora.sh` | 8×GPU (TP=2) |
+| Flow-GRPO (TI2VA LoRA) | `examples/flowgrpo_trainer/ltx2/run_ltx2_3_ti2va_lora.sh` | 8×GPU (TP=2) |
+| Flow-GRPO (T2AV LoRA, NPU) | `examples/flowgrpo_trainer/ltx2/run_ltx2_3_t2av_lora_npu.sh` | 16×NPU (TP=4) |
 
 **Reward models:** CLAP (`laion/larger_clap_general`) and ImageBind (local
 `.pth`, CC-BY-NC-SA 4.0) for audio-video alignment.
