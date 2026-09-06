@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU contract tests for the Qwen-Image DMD/DMD2 phase runner."""
+"""CPU contract tests for the Qwen-Image DMD/DMD2 computer."""
 
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -26,7 +26,7 @@ from verl_omni.pipelines.model_base import DiffusionModelBase, DistributionMatch
 from verl_omni.pipelines.qwen_image_distillation.diffusers_training_adapter import (
     QwenImageConditionProvider,
     QwenImageDistributionMatching,
-    QwenImageDMDPhaseRunner,
+    QwenImageDMDComputer,
     build_qwen_dmd_sigmas,
 )
 from verl_omni.pipelines.qwen_image_distillation.vllm_omni_rollout_adapter import QwenImageDMDPipeline
@@ -278,41 +278,41 @@ class TestQwenImageConditionProvider:
         assert negative.tensors["prompt_embeds"][0, 0, 0].item() == 35
 
 
-class TestQwenImageDMDPhaseRunner:
+class TestQwenImageDMDComputer:
     def test_rollout_exit_is_broadcast_across_sharded_and_sequence_parallel_ranks(self, monkeypatch):
         runtime = ToyRuntime()
-        runner = QwenImageDMDPhaseRunner(model_config(), make_plan())
+        computer = QwenImageDMDComputer(model_config(), make_plan())
         broadcast = Mock(side_effect=broadcast_selected_exit)
         monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
         monkeypatch.setattr(torch.distributed, "broadcast", broadcast)
-        assert runner.sample_rollout_exit(4, torch.device("cpu"), runtime) == 1
+        assert computer.sample_rollout_exit(4, torch.device("cpu"), runtime) == 1
         broadcast.assert_called_once()
 
     def test_continuous_score_sampling_is_uniform_inside_bounds_without_shift(self, monkeypatch):
-        runner = QwenImageDMDPhaseRunner(
+        computer = QwenImageDMDComputer(
             model_config(),
             make_plan(score_discrete_steps=0, score_sigma_min=0.2, score_sigma_max=0.6, score_timestep_shift=8.0),
         )
         monkeypatch.setattr(torch, "rand", Mock(return_value=torch.tensor([0.0, 0.25, 0.5, 0.75])))
-        sigma = runner.sample_score_sigma(torch.zeros(4, 1, 4), ToyRuntime())
+        sigma = computer.sample_score_sigma(torch.zeros(4, 1, 4), ToyRuntime())
         torch.testing.assert_close(sigma, torch.tensor([0.2, 0.3, 0.4, 0.5]))
 
     def test_training_and_inference_shifts_must_match(self):
         config = model_config()
         config.algo = SimpleNamespace(rollout_timestep_shift=4.0)
         with pytest.raises(ValueError, match="must match"):
-            QwenImageDMDPhaseRunner(config, make_plan(fake_update_ratio=1))
+            QwenImageDMDComputer(config, make_plan(fake_update_ratio=1))
 
     def test_student_phase_keeps_only_student_gradient(self, monkeypatch):
         runtime = ToyRuntime()
-        runner = QwenImageDMDPhaseRunner(model_config(), make_plan(fake_update_ratio=1))
+        computer = QwenImageDMDComputer(model_config(), make_plan(fake_update_ratio=1))
         monkeypatch.setattr(
-            runner,
+            computer,
             "rollout_sigmas",
             lambda scheduler, height, width, device: torch.tensor([1.0, 0.5, 0.0], device=device),
         )
 
-        computation = runner.compute_phase(phase_request("student"), phase_batch(), runtime)
+        computation = computer.compute_phase(phase_request("student"), phase_batch(), runtime)
         computation.losses["student"].backward()
 
         assert computation.losses["student"].requires_grad
@@ -323,9 +323,9 @@ class TestQwenImageDMDPhaseRunner:
 
     def test_fake_phase_detaches_student_rollout(self, monkeypatch):
         runtime = ToyRuntime()
-        runner = QwenImageDMDPhaseRunner(model_config(), make_plan(fake_update_ratio=1))
+        computer = QwenImageDMDComputer(model_config(), make_plan(fake_update_ratio=1))
         monkeypatch.setattr(
-            runner,
+            computer,
             "rollout_sigmas",
             lambda scheduler, height, width, device: torch.tensor([1.0, 0.5, 0.0], device=device),
         )
@@ -333,7 +333,7 @@ class TestQwenImageDMDPhaseRunner:
         batch = phase_batch()
         del batch["negative_prompt_embeds"]
         del batch["negative_prompt_embeds_mask"]
-        computation = runner.compute_phase(phase_request("fake_score"), batch, runtime)
+        computation = computer.compute_phase(phase_request("fake_score"), batch, runtime)
         computation.losses["fake_score"].backward()
 
         assert runtime.modules["fake_score"].scale.grad is not None
@@ -342,12 +342,12 @@ class TestQwenImageDMDPhaseRunner:
 
     def test_original_dmd_adds_paired_latent_regression(self):
         runtime = ToyRuntime()
-        runner = QwenImageDMDPhaseRunner(
+        computer = QwenImageDMDComputer(
             model_config("dmd"),
             make_plan("dmd", regression_type="latent_mse", regression_loss_weight=2.0),
         )
 
-        computation = runner.compute_phase(phase_request("student"), phase_batch(regression=True), runtime)
+        computation = computer.compute_phase(phase_request("student"), phase_batch(regression=True), runtime)
 
         assert computation.losses["student"].requires_grad
         assert computation.metrics["regression/loss"] >= 0
@@ -356,9 +356,9 @@ class TestQwenImageDMDPhaseRunner:
     def test_four_step_rollout_matches_reference_linear_shift(self):
         config = model_config()
         config.pipeline.num_inference_steps = 4
-        runner = QwenImageDMDPhaseRunner(config, make_plan(fake_update_ratio=1))
+        computer = QwenImageDMDComputer(config, make_plan(fake_update_ratio=1))
 
-        sigmas = runner.rollout_sigmas(None, 16, 16, torch.device("cpu"))
+        sigmas = computer.rollout_sigmas(None, 16, 16, torch.device("cpu"))
 
         torch.testing.assert_close(sigmas, torch.tensor([1.0, 0.9, 0.75, 0.5, 0.0]))
         torch.testing.assert_close(sigmas, build_qwen_dmd_sigmas(4, 3.0))
@@ -428,9 +428,9 @@ class TestQwenImageDMDPhaseRunner:
 
     def test_training_rollout_matches_vllm_deterministic_latents(self, monkeypatch):
         runtime = ToyRuntime()
-        runner = QwenImageDMDPhaseRunner(model_config(), make_plan(fake_update_ratio=1))
-        monkeypatch.setattr(runner, "sample_rollout_exit", lambda high, device, runtime: high - 1)
-        condition, _ = runner.condition_provider.encode(
+        computer = QwenImageDMDComputer(model_config(), make_plan(fake_update_ratio=1))
+        monkeypatch.setattr(computer, "sample_rollout_exit", lambda high, device, runtime: high - 1)
+        condition, _ = computer.condition_provider.encode(
             phase_batch(),
             device=torch.device("cpu"),
             dtype=torch.float32,
@@ -438,7 +438,7 @@ class TestQwenImageDMDPhaseRunner:
         )
         initial = torch.randn(1, 1, 4)
 
-        training_x0, _, _, _ = runner.rollout(
+        training_x0, _, _, _ = computer.rollout(
             runtime,
             condition,
             initial.clone(),
@@ -461,7 +461,7 @@ class TestQwenImageDMDPhaseRunner:
         inference = initial.clone()
         for index, timestep in enumerate(timesteps):
             sigma = scheduler.sigmas[index].reshape(1)
-            velocity = runner.predict_velocity(
+            velocity = computer.predict_velocity(
                 runtime,
                 "student",
                 inference,
@@ -483,16 +483,16 @@ class TestQwenImageDMDPhaseRunner:
 
     @pytest.mark.parametrize("batch_size", [1, 3])
     def test_decoded_lpips_regression_retains_student_gradient(self, monkeypatch, batch_size):
-        runner = QwenImageDMDPhaseRunner(
+        computer = QwenImageDMDComputer(
             model_config("dmd"),
             make_plan("dmd", regression_type="decoded_lpips"),
         )
 
-        monkeypatch.setattr(runner, "ensure_vae_and_lpips", Mock(return_value=(ToyVAE(), ToyLPIPS())))
+        monkeypatch.setattr(computer, "ensure_vae_and_lpips", Mock(return_value=(ToyVAE(), ToyLPIPS())))
         prediction = torch.randn(batch_size, 1, 4, requires_grad=True)
         target = torch.zeros_like(prediction)
 
-        loss = runner.decoded_lpips_loss(prediction, target, None, height=16, width=16)
+        loss = computer.decoded_lpips_loss(prediction, target, None, height=16, width=16)
         loss.backward()
 
         assert loss.ndim == 0
@@ -501,18 +501,18 @@ class TestQwenImageDMDPhaseRunner:
 
     def test_rng_state_round_trip_replays_next_phase(self, monkeypatch):
         plan = make_plan(fake_update_ratio=1)
-        runner = QwenImageDMDPhaseRunner(model_config(), plan)
-        restored = QwenImageDMDPhaseRunner(model_config(), plan)
-        for instance in (runner, restored):
+        computer = QwenImageDMDComputer(model_config(), plan)
+        restored = QwenImageDMDComputer(model_config(), plan)
+        for instance in (computer, restored):
             monkeypatch.setattr(
                 instance,
                 "rollout_sigmas",
                 lambda scheduler, height, width, device: torch.tensor([1.0, 0.5, 0.0], device=device),
             )
         runtime = ToyRuntime()
-        runner.compute_phase(phase_request("fake_score"), phase_batch(), runtime)
-        state = runner.state_dict()
-        expected = runner.compute_phase(phase_request("fake_score"), phase_batch(), runtime)
+        computer.compute_phase(phase_request("fake_score"), phase_batch(), runtime)
+        state = computer.state_dict()
+        expected = computer.compute_phase(phase_request("fake_score"), phase_batch(), runtime)
 
         restored.load_state_dict(state)
         actual = restored.compute_phase(phase_request("fake_score"), phase_batch(), runtime)
@@ -527,30 +527,30 @@ class TestQwenImageDMDPhaseRunner:
     @pytest.mark.parametrize("batch_size", [2, 3])
     def test_physical_batch_preserves_role_gradient_ownership(self, algorithm, kind, batch_size):
         runtime = ToyRuntime()
-        runner = QwenImageDMDPhaseRunner(model_config(algorithm), make_plan(algorithm, regression_type="latent_mse"))
+        computer = QwenImageDMDComputer(model_config(algorithm), make_plan(algorithm, regression_type="latent_mse"))
         batch = phase_batch(batch_size, regression=algorithm == "dmd")
         if algorithm == "dmd":
             tu.assign_non_tensor_stack(batch, "teacher_sampling_manifest", [{"pair": i} for i in range(batch_size)])
-        result = runner.compute_phase(phase_request(kind), batch, runtime)
+        result = computer.compute_phase(phase_request(kind), batch, runtime)
         result.losses[kind].backward()
         assert result.losses[kind].isfinite()
         for role, module in runtime.modules.items():
             assert (module.scale.grad is not None) == (role == kind)
 
     def test_mixed_resolution_batch_fails_closed(self):
-        runner = QwenImageDMDPhaseRunner(model_config(), make_plan())
+        computer = QwenImageDMDComputer(model_config(), make_plan())
         batch = phase_batch(2)
         batch["height"] = torch.tensor([16, 32])
         with pytest.raises(ValueError, match="homogeneous height"):
-            runner.compute_phase(phase_request("student"), batch, ToyRuntime())
+            computer.compute_phase(phase_request("student"), batch, ToyRuntime())
 
     @pytest.mark.parametrize("manifests", [[{"pair": 0}, {}], [{"pair": 0}], {"pair": 0}])
     def test_original_dmd_requires_provenance_for_every_batch_row(self, manifests):
-        runner = QwenImageDMDPhaseRunner(model_config("dmd"), make_plan("dmd", regression_type="latent_mse"))
+        computer = QwenImageDMDComputer(model_config("dmd"), make_plan("dmd", regression_type="latent_mse"))
         batch = phase_batch(2, regression=True)
         batch["teacher_sampling_manifest"] = NonTensorData(manifests, batch_size=batch.batch_size)
         with pytest.raises(ValueError, match="provenance"):
-            runner.compute_phase(phase_request("student"), batch, ToyRuntime())
+            computer.compute_phase(phase_request("student"), batch, ToyRuntime())
 
     @pytest.mark.parametrize("kind", ["student", "fake_score"])
     @pytest.mark.parametrize("cfg_norm", ["none", "layer_norm"])
@@ -559,16 +559,16 @@ class TestQwenImageDMDPhaseRunner:
         batch = phase_batch(3)
         batch["prompt_embeds"] = torch.arange(18).reshape(3, 2, 3).float() / 18
         full_runtime, accumulated_runtime = ToyRuntime(), ToyRuntime()
-        full_runner, accumulated_runner = [QwenImageDMDPhaseRunner(model_config(), plan) for _ in range(2)]
-        for runner in (full_runner, accumulated_runner):
-            monkeypatch.setattr(runner, "sample_noise", constant_noise)
-            monkeypatch.setattr(runner, "sample_score_sigma", constant_score_sigma)
-            monkeypatch.setattr(runner, "sample_rollout_exit", Mock(return_value=1))
-        full = full_runner.compute_phase(phase_request(kind), batch, full_runtime)
+        full_computer, accumulated_computer = [QwenImageDMDComputer(model_config(), plan) for _ in range(2)]
+        for computer in (full_computer, accumulated_computer):
+            monkeypatch.setattr(computer, "sample_noise", constant_noise)
+            monkeypatch.setattr(computer, "sample_score_sigma", constant_score_sigma)
+            monkeypatch.setattr(computer, "sample_rollout_exit", Mock(return_value=1))
+        full = full_computer.compute_phase(phase_request(kind), batch, full_runtime)
         full.losses[kind].backward()
         loss = 0.0
         for micro_batch in batch.split(2, dim=0):
-            result = accumulated_runner.compute_phase(phase_request(kind), micro_batch, accumulated_runtime)
+            result = accumulated_computer.compute_phase(phase_request(kind), micro_batch, accumulated_runtime)
             weight = micro_batch.batch_size[0] / batch.batch_size[0]
             (result.losses[kind] * weight).backward()
             loss += float(result.losses[kind].detach()) * weight
@@ -578,9 +578,9 @@ class TestQwenImageDMDPhaseRunner:
     def test_precomputed_provider_requires_negative_condition(self):
         batch = phase_batch()
         del batch["negative_prompt_embeds"]
-        runner = QwenImageDMDPhaseRunner(model_config(), make_plan(fake_update_ratio=1))
+        computer = QwenImageDMDComputer(model_config(), make_plan(fake_update_ratio=1))
         with pytest.raises(ValueError, match="negative_prompt_embeds"):
-            runner.compute_phase(phase_request("student"), batch, ToyRuntime())
+            computer.compute_phase(phase_request("student"), batch, ToyRuntime())
 
     def test_runner_rejects_dmd2_adversarial_profile(self):
         plan = build_plan(
@@ -589,4 +589,4 @@ class TestQwenImageDMDPhaseRunner:
             frozenset({"distribution_matching", "adversarial"}),
         )
         with pytest.raises(NotImplementedError, match="adversarial profile"):
-            QwenImageDMDPhaseRunner(model_config(), plan)
+            QwenImageDMDComputer(model_config(), plan)

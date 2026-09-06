@@ -324,12 +324,12 @@ def qwen_process_group():
 @pytest.mark.parametrize("strategy", ["fsdp", "fsdp2"])
 @pytest.mark.parametrize("algorithm", ["dmd", "dmd2"])
 @pytest.mark.parametrize("batch_size", [1, 2])
-def test_qwen_image_distillation_phase_runner_on_fsdp(strategy, algorithm, batch_size, qwen_process_group):
+def test_qwen_image_dm_computer_on_fsdp(strategy, algorithm, batch_size, qwen_process_group):
     model_path = os.environ.get("QWEN_IMAGE_MODEL_PATH", os.path.expanduser("~/models/tiny-random/Qwen-Image"))
     if not os.path.isfile(os.path.join(model_path, "model_index.json")):
         pytest.skip(f"Tiny Qwen-Image checkpoint not found at {model_path}.")
 
-    from verl_omni.pipelines.qwen_image_distillation.diffusers_training_adapter import QwenImageDMDPhaseRunner
+    from verl_omni.pipelines.qwen_image_distillation.diffusers_training_adapter import QwenImageDMDComputer
 
     world_size = dist.get_world_size()
     rank = dist.get_rank()
@@ -363,7 +363,7 @@ def test_qwen_image_distillation_phase_runner_on_fsdp(strategy, algorithm, batch
             guidance_scale=None,
         ),
     )
-    runner = QwenImageDMDPhaseRunner(model_config, plan)
+    computer = QwenImageDMDComputer(model_config, plan)
     batch = TensorDict({"dummy_tensor": torch.zeros(batch_size, 1, device="cuda")}, batch_size=[batch_size])
     tu.assign_non_tensor_stack(
         batch,
@@ -390,7 +390,7 @@ def test_qwen_image_distillation_phase_runner_on_fsdp(strategy, algorithm, batch
             update_ema=kind == "student",
         )
         runtime.zero_grad(request.trainable_roles)
-        computation = runner.compute_phase(request, batch, runtime)
+        computation = computer.compute_phase(request, batch, runtime)
         exits = torch.tensor([computation.metrics["rollout/exit_index"]], device="cuda")
         gathered = [torch.zeros_like(exits) for _ in range(world_size)]
         dist.all_gather(gathered, exits)

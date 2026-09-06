@@ -287,7 +287,7 @@ class TestRoleRuntime:
             )
 
 
-class ToyPhaseRunner:
+class ToyDMComputer:
     def compute_phase(self, request, batch, runtime):
         role = request.trainable_roles[0]
         parameter = runtime.engine_for_role(role).parameters[role]
@@ -326,7 +326,7 @@ class TestWorkerMetrics:
         )
         worker = object.__new__(DiffusionDistillationWorker)
         worker.runtime = runtime
-        worker.phase_runner = ToyPhaseRunner()
+        worker.dm_computer = ToyDMComputer()
         device = Mock()
         device.max_memory_allocated.return_value = 2 * 1024**3
         device.max_memory_reserved.return_value = 3 * 1024**3

@@ -54,7 +54,7 @@ if TYPE_CHECKING:
         DistillationRoleRuntime,
     )
 
-__all__ = ["QwenImageDistributionMatching", "QwenImageDMDPhaseRunner", "build_qwen_dmd_sigmas"]
+__all__ = ["QwenImageDistributionMatching", "QwenImageDMDComputer", "build_qwen_dmd_sigmas"]
 
 
 def build_qwen_dmd_sigmas(
@@ -292,7 +292,7 @@ class QwenImageConditionProvider:
         return positive, negative
 
 
-class QwenImageDMDPhaseRunner:
+class QwenImageDMDComputer:
     """Differentiable Qwen-Image phase program for DMD and distribution-only DMD2."""
 
     STREAM_OFFSETS = {
@@ -305,7 +305,7 @@ class QwenImageDMDPhaseRunner:
 
     def __init__(self, model_config: DiffusionModelConfig, plan: DistillationPlan) -> None:
         if plan.name not in {"dmd", "dmd2"}:
-            raise ValueError(f"QwenImageDmdPhaseRunner does not implement recipe {plan.name!r}.")
+            raise ValueError(f"QwenImageDMDComputer does not implement recipe {plan.name!r}.")
         if plan.objective.get("adversarial", False):
             raise NotImplementedError("The Qwen DMD2 adversarial profile is not supported by this phase runner.")
         self.model_config = model_config
@@ -1024,10 +1024,10 @@ class QwenImageDistributionMatching(QwenImage, DistributionMatchingModelAdapter)
     """Qwen-Image architecture adapter for DMD and DMD2."""
 
     @classmethod
-    def build_distillation_phase_runner(
+    def build_distribution_matching_computer(
         cls,
         model_config: DiffusionModelConfig,
         plan: DistillationPlan,
-    ) -> QwenImageDMDPhaseRunner:
+    ) -> QwenImageDMDComputer:
         """Build the architecture-owned Qwen DMD phase program."""
-        return QwenImageDMDPhaseRunner(model_config, plan)
+        return QwenImageDMDComputer(model_config, plan)
