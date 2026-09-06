@@ -24,6 +24,8 @@ import pytest
 import torch
 
 from verl_omni.trainer.diffusion.distillation.utils import (
+    adversarial_discriminator_loss,
+    adversarial_generator_loss,
     consistency_renoise_step,
     dmd_gradient,
     dmd_surrogate_loss,
@@ -37,6 +39,24 @@ from verl_omni.trainer.diffusion.distillation.utils import (
     timestep_shift,
     velocity_to_x0,
 )
+
+
+class TestAdversarialLosses:
+    def test_non_saturating_losses_match_dmd2_reference(self):
+        fake_logits = torch.tensor([[-2.0], [1.0]], requires_grad=True)
+        real_logits = torch.tensor([[2.0], [-1.0]], requires_grad=True)
+        generator = adversarial_generator_loss(fake_logits)
+        discriminator = adversarial_discriminator_loss(fake_logits, real_logits)
+        torch.testing.assert_close(generator, torch.nn.functional.softplus(-fake_logits).mean())
+        torch.testing.assert_close(
+            discriminator,
+            torch.nn.functional.softplus(fake_logits).mean() + torch.nn.functional.softplus(-real_logits).mean(),
+        )
+
+    def test_generator_loss_propagates_only_through_fake_logits(self):
+        fake_logits = torch.tensor([[0.0]], requires_grad=True)
+        adversarial_generator_loss(fake_logits).backward()
+        torch.testing.assert_close(fake_logits.grad, torch.tensor([[-0.5]]))
 
 
 class TestCanonicalConversion:

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -26,6 +27,7 @@ def default_fake_score_optimizer() -> FSDPOptimizerConfig:
 __all__ = [
     "DiffusionDistillationTeacherModelConfig",
     "DiffusionDistributionMatchingConfig",
+    "DiffusionAdversarialConfig",
     "DiffusionDistillationConfig",
 ]
 
@@ -54,6 +56,31 @@ class DiffusionDistillationTeacherModelConfig(BaseConfig):
             raise ValueError("model_path must be specified for distillation teacher model config.")
         if self.key is None:
             raise ValueError("key must be specified for distillation teacher model config.")
+
+
+@dataclass
+class DiffusionAdversarialConfig(BaseConfig):
+    """DMD2 non-saturating GAN settings, active only for the paper profile."""
+
+    # Classify re-noised latents or clean latents at timestep zero.
+    mode: str = "diffusion_gan"
+    # Exclusive upper bound of uniform integer discriminator timesteps.
+    max_timestep: int = 1000
+    # Weight of the student's non-saturating generator loss.
+    generator_weight: float = 5e-3
+    # Weight of the discriminator's real/fake classification loss.
+    discriminator_weight: float = 1e-2
+
+    def __post_init__(self):
+        valid_modes = {"diffusion_gan", "cls_on_clean_image"}
+        if self.mode not in valid_modes:
+            raise ValueError(f"Invalid adversarial mode: {self.mode}. Must be one of {sorted(valid_modes)}")
+        if isinstance(self.max_timestep, bool) or not isinstance(self.max_timestep, int) or self.max_timestep <= 0:
+            raise ValueError("adversarial.max_timestep must be a positive integer")
+        for name in ("generator_weight", "discriminator_weight"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"adversarial.{name} must be finite and positive, got {value}")
 
 
 @dataclass
@@ -87,11 +114,15 @@ class DiffusionDistributionMatchingConfig(BaseConfig):
     fake_score_micro_batch_size_per_gpu: int = 1
     # Independent fake-score optimizer and scheduler configuration.
     fake_score_optim: FSDPOptimizerConfig = field(default_factory=default_fake_score_optimizer)
+    # Independently owned discriminator optimizer; never shares trainable fake-score parameters.
+    discriminator_optim: FSDPOptimizerConfig = field(default_factory=default_fake_score_optimizer)
+    # DMD2 paper-profile generator/discriminator regularization.
+    adversarial: DiffusionAdversarialConfig = field(default_factory=DiffusionAdversarialConfig)
     # EMA decay applied after successful student optimizer steps.
     ema_decay: float = 0.999
     # First completed student step that updates EMA.
     ema_start_step: int = 0
-    # Conditioning source used by architecture phase runners.
+    # Conditioning source used by architecture-owned computation.
     conditioning_provider: str = "local_frozen_encoder"
     # Negative prompt used by the guided frozen teacher.
     negative_prompt: str = " "

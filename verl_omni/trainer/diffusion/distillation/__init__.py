@@ -15,7 +15,7 @@
 
 The package separates immutable plans, pure tensor utilities, and the trainer
 controller from the lazily imported Ray/FSDP data plane. Architecture-owned
-phase runners plug into the generic runtime without adding model branches here.
+computers plug into the generic runtime without adding model branches here.
 """
 
 from importlib import import_module

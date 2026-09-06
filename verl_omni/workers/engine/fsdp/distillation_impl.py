@@ -30,6 +30,7 @@ from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig
 from verl.workers.config.optimizer import build_optimizer
 from verl.workers.engine.base import EngineRegistry
 
+from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.trainer.diffusion.distillation.contracts import RoleBinding, RoleGroupSpec
 from verl_omni.workers.config import DiffusionModelConfig
 
@@ -57,6 +58,7 @@ class DistillationRoleGroupEngine(DiffusersFSDPEngine):
         role_bindings: tuple[RoleBinding, ...],
         optimizer_configs: Mapping[str, FSDPOptimizerConfig],
     ) -> None:
+        self.model_adapter = DiffusionModelBase.get_class(model_config)
         self.role_group = role_group
         self.role_bindings = {binding.role: binding for binding in role_bindings}
         self.optimizer_configs = dict(optimizer_configs)
@@ -101,12 +103,27 @@ class DistillationRoleGroupEngine(DiffusersFSDPEngine):
                 for binding in self.role_bindings.values():
                     if binding.trainable and binding.adapter not in {None, "default"}:
                         self.copy_adapter(source="default", target=binding.adapter)
+        if "fake_score" in self.role_bindings and "discriminator" in self.role_bindings:
+            fake_score = self.role_bindings["fake_score"]
+            discriminator = self.role_bindings["discriminator"]
+            if fake_score.adapter and discriminator.adapter:
+                self.copy_adapter(source=fake_score.adapter, target=discriminator.adapter)
         if "student" in self.role_bindings and "student_ema" in self.role_bindings:
             student = self.role_bindings["student"]
             ema = self.role_bindings["student_ema"]
             if student.adapter and ema.adapter:
                 self.copy_adapter(source=student.adapter, target=ema.adapter)
         self.activate_role(self._primary_role or next(iter(self.role_bindings)))
+
+    def _build_module(self):
+        module = super()._build_module()
+        return self.model_adapter.configure_distillation_module(module, tuple(self.role_bindings))
+
+    def _build_lora_module(self, module):
+        module = super()._build_lora_module(module)
+        if "discriminator" in self.role_bindings:
+            self.model_adapter.configure_role_parameters(module, "discriminator")
+        return module
 
     def _build_model_optimizer(self) -> None:
         super()._build_model_optimizer()
@@ -122,7 +139,7 @@ class DistillationRoleGroupEngine(DiffusersFSDPEngine):
             if not binding.trainable:
                 continue
             with self.use_role(role):
-                parameters = tuple(parameter for parameter in self.module.parameters() if parameter.requires_grad)
+                parameters = self.model_adapter.distillation_role_parameters(self.module, role)
             if not parameters:
                 raise ValueError(f"Trainable role {role!r} resolved no trainable parameters.")
             overlap = {owned_parameters[id(parameter)] for parameter in parameters if id(parameter) in owned_parameters}
@@ -194,6 +211,8 @@ class DistillationRoleGroupEngine(DiffusersFSDPEngine):
                 f"Shared-base role {role!r} requires adapter {binding.adapter!r}, but the model has no PEFT adapters."
             )
 
+        if hasattr(self, "model_adapter"):
+            self.model_adapter.configure_role_parameters(self.peft_model(), role)
         self._active_role = role
         if role in self.optimizers:
             self.optimizer = self.optimizers[role]
@@ -201,19 +220,39 @@ class DistillationRoleGroupEngine(DiffusersFSDPEngine):
             self.optimizer_config = self.optimizer_configs[role]
 
     @contextmanager
-    def use_role(self, role: str, *, grad_enabled: Optional[bool] = None) -> Iterator[torch.nn.Module]:
-        """Activate one role with explicit train/eval and autograd state."""
+    def use_role(
+        self, role: str, *, grad_enabled: Optional[bool] = None, input_grad_only: bool = False
+    ) -> Iterator[torch.nn.Module]:
+        """Activate a role; input-only gradients keep its parameters and checkpoint replay frozen."""
+        if input_grad_only and grad_enabled is False:
+            raise ValueError("input_grad_only conflicts with grad_enabled=False.")
         previous_role = self._active_role
         previous_training = self.module.training
         binding = self.role_bindings[role]
         effective_grad = binding.trainable if grad_enabled is None else binding.trainable and grad_enabled
         self.activate_role(role)
-        self.module.train(effective_grad)
-        grad_context = nullcontext() if effective_grad else torch.no_grad()
+        self.module.train(effective_grad and not input_grad_only)
+        frozen_parameters = []
+        checkpointed_modules = []
+        if input_grad_only:
+            frozen_parameters = [parameter for parameter in self.module.parameters() if parameter.requires_grad]
+            checkpointed_modules = [
+                module for module in self.module.modules() if getattr(module, "gradient_checkpointing", False)
+            ]
+            for parameter in frozen_parameters:
+                parameter.requires_grad_(False)
+            # Replay after switching back to the student would select the wrong adapter.
+            for module in checkpointed_modules:
+                module.gradient_checkpointing = False
+        grad_context = torch.enable_grad() if input_grad_only else nullcontext() if effective_grad else torch.no_grad()
         try:
             with grad_context:
                 yield self.module
         finally:
+            for parameter in frozen_parameters:
+                parameter.requires_grad_(True)
+            for module in checkpointed_modules:
+                module.gradient_checkpointing = True
             self.module.train(previous_training)
             if previous_role is not None:
                 self.activate_role(previous_role)
@@ -255,13 +294,19 @@ class DistillationRoleGroupEngine(DiffusersFSDPEngine):
             loss.backward(retain_graph=retain_graph)
 
     def assert_gradient_isolation(self, active_roles: set[str]) -> None:
-        """Reject gradients on optimizer-owned parameters outside the active phase."""
+        """Reject nonzero gradients outside the phase while allowing FSDP zero placeholders."""
         leaked_roles = []
         for role, parameters in self._role_parameters.items():
             if role in active_roles:
                 continue
-            if any(parameter.grad is not None for parameter in parameters):
-                leaked_roles.append(role)
+            for parameter in parameters:
+                gradient = parameter.grad
+                if gradient is None:
+                    continue
+                local_gradient = gradient.to_local() if hasattr(gradient, "to_local") else gradient
+                if torch.count_nonzero(local_gradient).item():
+                    leaked_roles.append(role)
+                    break
         if leaked_roles:
             raise RuntimeError(f"Gradient leaked into inactive distillation roles: {sorted(leaked_roles)}.")
 
@@ -271,7 +316,21 @@ class DistillationRoleGroupEngine(DiffusersFSDPEngine):
         if role is None or role not in self.optimizers:
             raise ValueError(f"No trainable active role for optimizer step: {role!r}.")
         self.activate_role(role)
-        grad_norm = super().optimizer_step()
+        inactive_gradients = [
+            (parameter, parameter.grad)
+            for other_role, parameters in self._role_parameters.items()
+            if other_role != role
+            for parameter in parameters
+            if parameter.grad is not None
+        ]
+        for parameter, _ in inactive_gradients:
+            parameter.grad = None
+        try:
+            # Reuse backend-specific global clipping without including another optimizer's gradients.
+            grad_norm = super().optimizer_step()
+        finally:
+            for parameter, gradient in inactive_gradients:
+                parameter.grad = gradient
         stepped = math.isfinite(grad_norm)
         if stepped:
             self.lr_schedulers[role].step()
@@ -349,10 +408,15 @@ class DistillationRoleGroupEngine(DiffusersFSDPEngine):
         if role not in {"student", "student_ema"}:
             raise ValueError(f"Only student or student_ema can be exported, got {role!r}.")
         binding = self.role_bindings[role]
-        return self.get_per_tensor_param(
+        tensors, peft_config = self.get_per_tensor_param(
             base_sync_done=base_sync_done,
             adapter_name=binding.adapter,
         )
+        prefixes = getattr(getattr(self, "model_adapter", None), "discriminator_parameter_prefixes", ())
+        filtered_tensors = (
+            (name, tensor) for name, tensor in tensors if not any(prefix in name for prefix in prefixes)
+        )
+        return filtered_tensors, peft_config
 
     def additional_state_path(self, local_path: str) -> str:
         """Locate this rank's secondary optimizer and scheduler state."""
@@ -423,17 +487,17 @@ class DistillationRoleGroupEngine(DiffusersFSDPEngine):
         torch.distributed.barrier()
 
     def forward_backward_batch(self, data: TensorDict, loss_function, forward_only: bool = False):
-        """Reject PPO-shaped execution; distillation phases use the phase runner."""
+        """Reject PPO-shaped execution; distillation uses its architecture computer."""
         raise NotImplementedError("DistillationRoleGroupEngine is driven through DiffusionDistillationWorker phases.")
 
     def prepare_model_inputs(self, micro_batch: TensorDict, step: int):
-        """Keep model-specific preparation in the architecture phase runner."""
-        raise NotImplementedError("Architecture-owned distillation phase runners prepare model inputs.")
+        """Keep model-specific preparation in the architecture computer."""
+        raise NotImplementedError("Architecture-owned distribution-matching computers prepare model inputs.")
 
     def prepare_model_outputs(self, output, micro_batch: TensorDict):
-        """Keep model-specific output conversion in the phase runner."""
-        raise NotImplementedError("Architecture-owned distillation phase runners prepare model outputs.")
+        """Keep model-specific output conversion in the architecture computer."""
+        raise NotImplementedError("Architecture-owned distribution-matching computers prepare model outputs.")
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only, step):
         """Reject the PPO step interface for multi-role computation."""
-        raise NotImplementedError("Architecture-owned distillation phase runners execute forwards.")
+        raise NotImplementedError("Architecture-owned distribution-matching computers execute forwards.")

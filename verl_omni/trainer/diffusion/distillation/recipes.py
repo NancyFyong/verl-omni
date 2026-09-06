@@ -504,6 +504,15 @@ class DMD2Recipe(DistillationRecipeBase):
                 name="dmd2",
                 profile=profile,
                 adversarial=adversarial,
+                adversarial_config={
+                    key: get_config_or_default(get_config_value(config, "adversarial"), key, default)
+                    for key, default in {
+                        "mode": "diffusion_gan",
+                        "max_timestep": 1000,
+                        "generator_weight": 5e-3,
+                        "discriminator_weight": 1e-2,
+                    }.items()
+                },
             ),
             rollout=dmd_rollout(config, rollout),
             initialization={"stage": "base"},
@@ -640,6 +649,7 @@ def build_plan_from_config(config, capabilities) -> DistillationPlan:
         "regression_type",
         "regression_loss_weight",
         "rng_seed",
+        "adversarial",
     )
     for optional_key in optional_keys:
         value = get_config_value(distribution_matching, optional_key)

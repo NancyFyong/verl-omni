@@ -159,6 +159,21 @@ class TestRuntimeValidation:
         with pytest.raises(ValueError, match="must match"):
             trainer.validate_runtime_config()
 
+    def test_adversarial_profile_rejects_lora_on_classifier_projection(self):
+        from verl_omni.trainer.diffusion.distillation.recipes import build_plan
+
+        trainer = object.__new__(DistillationRayTrainer)
+        trainer.plan = build_plan(
+            "dmd2",
+            {"model_path": "/m", "profile": "paper"},
+            frozenset({"distribution_matching", "adversarial"}),
+        )
+        trainer.config = self.trainer_config()
+        trainer.config.distillation.distribution_matching.recipe = "dmd2"
+        trainer.config.actor_rollout_ref.model.target_modules = "all-linear"
+        with pytest.raises(ValueError, match="exclude proj_out/classifier"):
+            trainer.validate_runtime_config()
+
     def test_shared_base_requires_lora(self):
         from verl_omni.trainer.diffusion.distillation.recipes import build_plan
 
@@ -241,6 +256,7 @@ class TestDataPlaneBoundary:
         }
         config.distillation.distribution_matching.role_storage = "shared_base_adapters"
         config.distillation.distribution_matching.fake_score_optim = {"total_training_steps": -1}
+        config.distillation.distribution_matching.discriminator_optim = {"total_training_steps": -1}
         plan = build_plan(
             "dmd2",
             {"model_path": "/m", "fake_update_ratio": 2},
@@ -264,6 +280,42 @@ class TestDataPlaneBoundary:
         worker_group.init_model.assert_called_once()
         assert isinstance(trainer.executor, DiffusionDistillationWorkerGroup)
         assert config.distillation.distribution_matching.fake_score_optim.total_training_steps == 8
+
+    def test_paper_profile_configures_discriminator_scheduler_horizon(self, monkeypatch):
+        from verl.trainer.ppo.ray_trainer import Role
+
+        from verl_omni.trainer.diffusion.distillation.recipes import build_plan
+        from verl_omni.trainer.diffusion.ray_diffusion_trainer import BaseRayDiffusionTrainer
+
+        config = runtime_config()
+        config.trainer = {"device": "cuda", "ray_master_port_range": None, "n_gpus_per_node": 1, "nnodes": 1}
+        config.data = {"train_batch_size": 1}
+        config.actor_rollout_ref.model.lora_rank = 8
+        config.actor_rollout_ref.model.target_modules = ["to_q"]
+        config.actor_rollout_ref.actor.strategy = "fsdp2"
+        config.actor_rollout_ref.actor.fsdp_config = {
+            "use_orig_params": False,
+            "ulysses_sequence_parallel_size": 1,
+        }
+        config.distillation.distribution_matching.role_storage = "shared_base_adapters"
+        config.distillation.distribution_matching.fake_score_optim = {"total_training_steps": -1}
+        config.distillation.distribution_matching.discriminator_optim = {"total_training_steps": -1}
+        plan = build_plan(
+            "dmd2",
+            {"model_path": "/m", "profile": "paper", "fake_update_ratio": 2},
+            frozenset({"distribution_matching", "adversarial"}),
+        )
+        monkeypatch.setattr(BaseRayDiffusionTrainer, "__init__", initialize_fake_base_trainer)
+        trainer = DistillationRayTrainer(
+            config=config,
+            plan=plan,
+            role_worker_mapping={Role.Actor: object},
+            resource_pool_manager=SimpleNamespace(create_resource_pool=Mock(), get_resource_pool=Mock()),
+            ray_worker_group_cls=Mock(return_value=SimpleNamespace(init_model=Mock())),
+        )
+        trainer.configure_role_steps()
+        assert config.distillation.distribution_matching.fake_score_optim.total_training_steps == 8
+        assert config.distillation.distribution_matching.discriminator_optim.total_training_steps == 8
 
     def test_controller_binds_when_collaborators_are_supplied(self):
         from verl_omni.trainer.diffusion.distillation.controller import (

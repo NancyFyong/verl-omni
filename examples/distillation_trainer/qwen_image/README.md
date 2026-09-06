@@ -37,6 +37,23 @@ and provide `prompt_embeds`, `prompt_embeds_mask`, `negative_prompt_embeds`, and
 
 Original DMD additionally requires paired `reference_noise`, either `teacher_target_latents` or normalized `[0, 1]` `teacher_target_pixels`, and a non-empty `teacher_sampling_manifest`. Use `data.custom_cls.path=pkg://verl_omni.utils.dataset.qwen_image_distillation_dataset` and `data.custom_cls.name=QwenImageDMDPairDataset` to convert inline arrays, serialized tensor bytes, or absolute `.pt` paths into fp32 tensors. Its default `decoded_lpips` regression is paper-oriented; `latent_mse` is available only as a non-paper diagnostic.
 
+The DMD2 adversarial profile instead uses `QwenImageDMDRealDataset`. Every row
+must contain exactly one of:
+
+- `real_pixels`: finite RGB `[3, H, W]` values in `[0, 1]`; or
+- `real_latents`: normalized Qwen VAE latents, plus a
+  `real_latent_manifest` containing `normalization: qwen_image` and the SHA-256
+  of the canonical VAE `config.json`.
+
+Precomputed latents avoid a frozen VAE encode in every fake/discriminator phase.
+Generate the manifest fingerprint with
+`qwen_vae_config_sha256(model_path)` from
+`verl_omni.pipelines.qwen_image_distillation`; do not hash arbitrary serialized
+weights or a differently formatted JSON file. The student and fake samples still
+come from prompt-only differentiable rollout;
+real data is used only by the discriminator. This is DMD2 adversarial training,
+not original DMD trajectory regression.
+
 ## Run DMD2
 
 ```bash
@@ -48,6 +65,23 @@ bash examples/distillation_trainer/qwen_image/run_qwen_image_dmd2_lora.sh
 ```
 
 The reference-aligned defaults are four student denoising steps, rollout and score-noise time shifts of `3.0`, score sigma range `[0.02, 0.98]`, teacher CFG `4.0` with per-token norm preservation, student LR `1e-4`, fake-score LR `2e-5`, and two fake-score updates after each student update.
+
+For the full DMD2 adversarial profile, use:
+
+```bash
+MODEL_PATH=/path/to/Qwen-Image \
+TRAIN_FILES=/path/to/train-with-real-latents.parquet \
+VAL_FILES=/path/to/test-with-real-latents.parquet \
+NUM_GPUS=8 \
+bash examples/distillation_trainer/qwen_image/run_qwen_image_dmd2_adversarial_lora.sh
+```
+
+That recipe adds a separately optimized discriminator adapter and classifier
+head. It defaults to noisy-domain `diffusion_gan`; set
+`distillation.distribution_matching.adversarial.mode=cls_on_clean_image` for
+timestep-zero classification. The generator and discriminator weights default
+to `5e-3` and `1e-2`, respectively. The LoRA target list must exclude
+`proj_out` and the classifier; `all-linear` fails during trainer validation.
 
 Physical micro-batches support multiple samples at the same resolution. The existing worker splits each rank-local batch, sample-weights gradients (including a smaller final micro-batch), and steps each role optimizer once. Student and fake-score micro-batch sizes are independent. Original DMD additionally requires one provenance manifest per sample. Mixed-resolution micro-batches fail closed.
 

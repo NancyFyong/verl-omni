@@ -269,11 +269,63 @@ class DistributionMatchingModelAdapter:
         return frozenset({"distribution_matching"})
 
     @classmethod
+    def configure_distillation_module(cls, module, roles):
+        """Prepare architecture-owned role components before LoRA and FSDP wrapping."""
+        return module
+
+    @classmethod
+    def configure_role_parameters(cls, module, role):
+        """Select role-only module behavior before a role forward."""
+
+    @classmethod
+    def distillation_role_parameters(cls, module, role):
+        """Return the trainable parameters owned by one semantic role."""
+        del role
+        return tuple(parameter for parameter in module.parameters() if parameter.requires_grad)
+
+    @classmethod
     def build_distribution_matching_computer(cls, model_config, plan):
         """Build the architecture-owned phase computation used by the worker."""
         raise NotImplementedError(
             f"{cls.__name__} declares distribution-matching support but builds no distribution-matching computer."
         )
+
+
+class DiffusionAdversarialAdapter(DistributionMatchingModelAdapter):
+    """Opt-in diffusion-feature classifier with independently owned parameters."""
+
+    discriminator_parameter_prefixes: tuple[str, ...] = ()
+
+    @classmethod
+    def distillation_capabilities(cls) -> frozenset[str]:
+        return super().distillation_capabilities() | {"adversarial"}
+
+    @classmethod
+    def configure_distillation_module(cls, module, roles):
+        if "discriminator" in roles:
+            cls.build_discriminator_head(module)
+        return module
+
+    @classmethod
+    def build_discriminator_head(cls, module):
+        """Attach the architecture-specific classifier before FSDP wrapping."""
+        raise NotImplementedError(f"{cls.__name__} must provide a discriminator head.")
+
+    @classmethod
+    def configure_role_parameters(cls, module, role):
+        if role == "discriminator":
+            for name, parameter in module.named_parameters():
+                if any(prefix in name for prefix in cls.discriminator_parameter_prefixes):
+                    parameter.requires_grad_(True)
+
+    @classmethod
+    def distillation_role_parameters(cls, module, role):
+        parameters = []
+        for name, parameter in module.named_parameters():
+            is_discriminator = any(prefix in name for prefix in cls.discriminator_parameter_prefixes)
+            if parameter.requires_grad and (role == "discriminator" or not is_discriminator):
+                parameters.append(parameter)
+        return tuple(parameters)
 
 
 class DiffusionI2IModelBase(DiffusionModelBase):

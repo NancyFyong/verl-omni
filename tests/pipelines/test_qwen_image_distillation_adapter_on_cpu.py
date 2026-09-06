@@ -27,13 +27,14 @@ from verl_omni.pipelines.qwen_image_distillation.diffusers_training_adapter impo
     QwenImageConditionProvider,
     QwenImageDistributionMatching,
     QwenImageDMDComputer,
+    QwenImageDMDProjection,
     build_qwen_dmd_sigmas,
 )
 from verl_omni.pipelines.qwen_image_distillation.vllm_omni_rollout_adapter import QwenImageDMDPipeline
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 from verl_omni.trainer.diffusion.distillation.contracts import PhaseRequest
 from verl_omni.trainer.diffusion.distillation.recipes import build_plan
-from verl_omni.trainer.diffusion.distillation.utils import ode_euler_step
+from verl_omni.trainer.diffusion.distillation.utils import adversarial_generator_loss, ode_euler_step
 
 
 class ToyQwenTransformer(torch.nn.Module):
@@ -46,6 +47,12 @@ class ToyQwenTransformer(torch.nn.Module):
         del kwargs
         condition = encoder_hidden_states.float().mean(dim=(1, 2)).reshape(-1, 1, 1).to(hidden_states.dtype)
         return (hidden_states * self.scale + condition,)
+
+
+class ToyQwenDiscriminator(ToyQwenTransformer):
+    def forward(self, hidden_states, **kwargs):
+        del kwargs
+        return (hidden_states.float().mean(dim=(1, 2), keepdim=False).unsqueeze(1) * self.scale,)
 
 
 class ToyEngine:
@@ -63,6 +70,7 @@ class ToyRuntime:
             "student": ToyQwenTransformer(0.2),
             "fake_score": ToyQwenTransformer(0.4),
             "teacher_score": ToyQwenTransformer(0.7, trainable=False),
+            "discriminator": ToyQwenDiscriminator(0.3),
         }
         self.engines = {role: ToyEngine(module) for role, module in self.modules.items()}
 
@@ -73,11 +81,18 @@ class ToyRuntime:
         return self.engines[role].scheduler
 
     @contextmanager
-    def use_role(self, role: str, *, grad_enabled=None):
+    def use_role(self, role: str, *, grad_enabled=None, input_grad_only=False):
         module = self.modules[role]
         enabled = bool(grad_enabled and module.scale.requires_grad)
-        with torch.set_grad_enabled(enabled):
-            yield module
+        previous = module.scale.requires_grad
+        if input_grad_only:
+            module.scale.requires_grad_(False)
+            enabled = True
+        try:
+            with torch.set_grad_enabled(enabled):
+                yield module
+        finally:
+            module.scale.requires_grad_(previous)
 
 
 def model_config(algorithm: str = "dmd2"):
@@ -134,6 +149,30 @@ def phase_request(kind: str) -> PhaseRequest:
         trainable_roles=(role,),
         update_ema=kind == "student",
     )
+
+
+class TestQwenImageDMDProjection:
+    def test_preserves_velocity_projection_and_adds_separate_classifier(self):
+        torch.manual_seed(3)
+        module = torch.nn.Module()
+        module.proj_out = torch.nn.Linear(4, 2)
+        hidden = torch.randn(2, 3, 4)
+        expected = module.proj_out(hidden)
+        QwenImageDistributionMatching.build_discriminator_head(module)
+        assert isinstance(module.proj_out, QwenImageDMDProjection)
+        torch.testing.assert_close(module.proj_out(hidden), expected)
+        QwenImageDistributionMatching.configure_role_parameters(module, "discriminator")
+        logits = module.proj_out(hidden)
+        assert logits.shape == (2, 1)
+        assert all(parameter.requires_grad for parameter in module.proj_out.classifier.parameters())
+        QwenImageDistributionMatching.configure_role_parameters(module, "student")
+        assert all(parameter.requires_grad for parameter in module.proj_out.classifier.parameters())
+        assert not module.proj_out.classify
+        student_parameters = {
+            id(parameter) for parameter in QwenImageDistributionMatching.distillation_role_parameters(module, "student")
+        }
+        assert all(id(parameter) not in student_parameters for parameter in module.proj_out.classifier.parameters())
+        torch.testing.assert_close(module.proj_out(hidden), expected)
 
 
 class ToyPromptTokenizer:
@@ -582,11 +621,67 @@ class TestQwenImageDMDComputer:
         with pytest.raises(ValueError, match="negative_prompt_embeds"):
             computer.compute_phase(phase_request("student"), batch, ToyRuntime())
 
-    def test_runner_rejects_dmd2_adversarial_profile(self):
+    def test_discriminator_input_only_mode_preserves_generated_gradient(self):
         plan = build_plan(
             "dmd2",
-            {"model_path": "/unused", "conditioning_provider": "precomputed", "profile": "paper"},
+            {
+                "model_path": "/unused",
+                "conditioning_provider": "precomputed",
+                "profile": "paper",
+                "adversarial": {"mode": "cls_on_clean_image"},
+            },
             frozenset({"distribution_matching", "adversarial"}),
         )
-        with pytest.raises(NotImplementedError, match="adversarial profile"):
-            QwenImageDMDComputer(model_config(), plan)
+        computer = QwenImageDMDComputer(model_config(), plan)
+        runtime = ToyRuntime()
+        generated = torch.randn(1, 1, 4, requires_grad=True)
+        condition = QwenImageConditionProvider.make_condition(torch.ones(1, 2, 3), torch.ones(1, 2))
+        loss = adversarial_generator_loss(
+            computer.discriminator_logits(generated, runtime, condition, height=16, width=16, input_grad_only=True)
+        )
+        loss.backward()
+        assert generated.grad is not None and torch.count_nonzero(generated.grad)
+        assert runtime.modules["discriminator"].scale.grad is None
+
+    def test_dmd2_adversarial_profile_owns_student_and_discriminator_gradients(self, monkeypatch):
+        plan = build_plan(
+            "dmd2",
+            {
+                "model_path": "/unused",
+                "conditioning_provider": "precomputed",
+                "profile": "paper",
+                "adversarial": {"mode": "cls_on_clean_image"},
+            },
+            frozenset({"distribution_matching", "adversarial"}),
+        )
+        computer = QwenImageDMDComputer(model_config(), plan)
+        runtime = ToyRuntime()
+        batch = phase_batch()
+        batch["real_latents"] = torch.zeros(1, 1, 4)
+        computer.vae_fingerprint = "fixture"
+        tu.assign_non_tensor_stack(
+            batch,
+            "real_latent_manifest",
+            [{"normalization": "qwen_image", "vae_config_sha256": "fixture"}],
+        )
+        monkeypatch.setattr(computer, "sample_noise", constant_noise)
+        monkeypatch.setattr(computer, "sample_score_sigma", constant_score_sigma)
+        student = computer.compute_phase(PhaseRequest("student", 0, 0, "fresh", ("student",), True), batch, runtime)
+        student.losses["student"].backward()
+        assert runtime.modules["student"].scale.grad is not None
+        assert runtime.modules["discriminator"].scale.grad is None
+        for module in runtime.modules.values():
+            module.scale.grad = None
+        fake_request = PhaseRequest("fake_score", 0, 0, "fresh", ("fake_score", "discriminator"), False)
+        computations = computer.iter_role_computations(fake_request, batch, runtime)
+        fake_role, fake = next(computations)
+        assert fake_role == "fake_score"
+        fake.losses["fake_score"].backward()
+        discriminator_role, discriminator = next(computations)
+        assert discriminator_role == "discriminator"
+        discriminator.losses["discriminator"].backward()
+        with pytest.raises(StopIteration):
+            next(computations)
+        assert runtime.modules["student"].scale.grad is None
+        assert runtime.modules["fake_score"].scale.grad is not None
+        assert runtime.modules["discriminator"].scale.grad is not None

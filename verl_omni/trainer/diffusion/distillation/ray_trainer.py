@@ -202,8 +202,15 @@ class DistillationRayTrainer(BaseRayDiffusionTrainer):
             raise ValueError(f"Distillation role groups require strategy 'fsdp' or 'fsdp2', got {strategy!r}.")
         if any(group.placement != "colocated" for group in self.plan.role_layout.groups):
             raise NotImplementedError("The current runtime supports colocated role groups only.")
-        if any(binding.role == "discriminator" for binding in self.plan.role_layout.bindings):
-            raise NotImplementedError("The DMD2 adversarial discriminator data plane lands in PR 4.")
+        has_discriminator = any(binding.role == "discriminator" for binding in self.plan.role_layout.bindings)
+        target_modules = self.config.actor_rollout_ref.model.get("target_modules")
+        if has_discriminator and (
+            target_modules == "all-linear"
+            or target_modules is not None
+            and not isinstance(target_modules, str)
+            and any("proj_out" in target for target in target_modules)
+        ):
+            raise ValueError("DMD2 adversarial LoRA must exclude proj_out/classifier; select attention targets.")
         if distribution_matching.role_storage == "shared_base_adapters":
             model_config = self.config.actor_rollout_ref.model
             lora_rank = model_config.get("lora_rank", model_config.get("lora", {}).get("rank", 0))
@@ -225,7 +232,7 @@ class DistillationRayTrainer(BaseRayDiffusionTrainer):
             )
 
     def configure_role_steps(self) -> None:
-        """Set the fake-score scheduler horizon in its own optimizer-step units."""
+        """Set fake-score and discriminator horizons in optimizer-step units."""
         distribution_matching = self.config.distillation.distribution_matching
         fake_repeats = sum(phase.repeats for phase in self.plan.update_schedule.phases if phase.kind == "fake_score")
         warmup_fake_repeats = sum(
@@ -235,6 +242,9 @@ class DistillationRayTrainer(BaseRayDiffusionTrainer):
         fake_total_steps += self.plan.update_schedule.warmup_cycles * warmup_fake_repeats
         with open_dict(distribution_matching.fake_score_optim):
             distribution_matching.fake_score_optim.total_training_steps = fake_total_steps
+        if any(binding.role == "discriminator" for binding in self.plan.role_layout.bindings):
+            with open_dict(distribution_matching.discriminator_optim):
+                distribution_matching.discriminator_optim.total_training_steps = fake_total_steps
 
     def init_workers(self) -> None:
         """Create the colocated multi-role Ray worker group or validate injected fakes."""

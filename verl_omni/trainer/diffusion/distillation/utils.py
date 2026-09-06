@@ -63,7 +63,22 @@ __all__ = [
     "standard_cfg",
     "legacy_cfg",
     "timestep_shift",
+    "adversarial_generator_loss",
+    "adversarial_discriminator_loss",
 ]
+
+
+def adversarial_generator_loss(fake_logits: Tensor) -> Tensor:
+    """Non-saturating generator loss; logits must retain the generated-input graph."""
+    return torch.nn.functional.softplus(-fake_logits.float()).mean()
+
+
+def adversarial_discriminator_loss(fake_logits: Tensor, real_logits: Tensor) -> Tensor:
+    """Logistic discriminator loss; callers detach real/generated inputs, not logits."""
+    return (
+        torch.nn.functional.softplus(fake_logits.float()).mean()
+        + torch.nn.functional.softplus(-real_logits.float()).mean()
+    )
 
 
 def epsilon_to_x0(noisy: Tensor, epsilon: Tensor, sigma: Tensor, a_fn, b_fn) -> Tensor:

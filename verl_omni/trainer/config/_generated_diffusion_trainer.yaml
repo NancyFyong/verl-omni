@@ -528,6 +528,17 @@ distillation:
       zero_indexed_step: true
       warmup_style: null
       override_optimizer_config: null
+    discriminator_optim:
+      _target_: verl.workers.config.FSDPOptimizerConfig
+      lr: 2.0e-05
+      total_training_steps: -1
+      lr_scheduler_type: constant
+    adversarial:
+      _target_: verl_omni.workers.config.diffusion.DiffusionAdversarialConfig
+      mode: diffusion_gan
+      max_timestep: 1000
+      generator_weight: 0.005
+      discriminator_weight: 0.01
     ema_decay: 0.999
     ema_start_step: 0
     conditioning_provider: local_frozen_encoder

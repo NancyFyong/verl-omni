@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Dataset adapter for original-DMD Qwen-Image regression pairs."""
+"""Qwen-Image datasets for original-DMD pairs and DMD2 adversarial real samples."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ import numpy as np
 import torch
 from verl.utils.dataset.rl_dataset import RLHFDataset
 
-__all__ = ["QwenImageDMDPairDataset"]
+__all__ = ["QwenImageDMDPairDataset", "QwenImageDMDRealDataset"]
 
 
 def load_float_tensor(value: Any, field: str) -> torch.Tensor:
@@ -42,8 +42,8 @@ def load_float_tensor(value: Any, field: str) -> torch.Tensor:
         tensor = torch.as_tensor(np.asarray(value))
     if not isinstance(tensor, torch.Tensor):
         raise TypeError(f"DMD field {field!r} must resolve to a tensor, got {type(tensor)}.")
-    if tensor.numel() == 0:
-        raise ValueError(f"DMD field {field!r} must not be empty.")
+    if tensor.numel() == 0 or not torch.isfinite(tensor).all():
+        raise ValueError(f"DMD field {field!r} must be non-empty and finite.")
     return tensor.detach().float()
 
 
@@ -54,6 +54,32 @@ def is_present(value: Any) -> bool:
     if isinstance(value, float) and np.isnan(value):
         return False
     return True
+
+
+class QwenImageDMDRealDataset(RLHFDataset):
+    """Read real RGB [C, H, W] in [0, 1] or provenance-tracked normalized latents."""
+
+    def __getitem__(self, item: int) -> dict[str, Any]:
+        row = super().__getitem__(item)
+        has_latents = is_present(row.get("real_latents"))
+        has_pixels = is_present(row.get("real_pixels"))
+        if has_latents == has_pixels:
+            raise ValueError("DMD2 adversarial rows require exactly one of real_latents or real_pixels.")
+        field = "real_latents" if has_latents else "real_pixels"
+        value = load_float_tensor(row[field], field)
+        if has_latents:
+            manifest = row.get("real_latent_manifest")
+            if (
+                not isinstance(manifest, dict)
+                or manifest.get("normalization") != "qwen_image"
+                or not isinstance(manifest.get("vae_config_sha256"), str)
+                or not manifest["vae_config_sha256"]
+            ):
+                raise ValueError("real_latent_manifest requires normalization=qwen_image and vae_config_sha256.")
+        elif value.ndim != 3 or value.shape[0] != 3 or torch.any((value < 0) | (value > 1)):
+            raise ValueError("real_pixels must have shape [3, H, W] and values in [0, 1].")
+        row[field] = value
+        return row
 
 
 class QwenImageDMDPairDataset(RLHFDataset):

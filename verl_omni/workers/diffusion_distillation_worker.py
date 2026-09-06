@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from dataclasses import asdict, dataclass
@@ -53,6 +53,7 @@ from verl_omni.workers.engine.fsdp.distillation_impl import DistillationRoleGrou
 __all__ = [
     "DistillationPhaseComputation",
     "DistributionMatchingComputer",
+    "MultiRoleDistributionMatchingComputer",
     "DistillationRoleRuntime",
     "DiffusionDistillationWorker",
     "DiffusionDistillationWorkerGroup",
@@ -72,7 +73,7 @@ def resolve_profiler_configs(omega_profiler_config):
 
 @dataclass
 class DistillationPhaseComputation:
-    """Scalar role losses and detached metrics produced by an architecture runner."""
+    """Scalar role losses and detached metrics produced by an architecture computer."""
 
     losses: dict[str, torch.Tensor]
     metrics: dict[str, float]
@@ -97,6 +98,20 @@ class DistributionMatchingComputer(Protocol):
 
     def load_state_dict(self, state: dict) -> None:
         """Restore architecture-owned RNG and rollout state."""
+        ...
+
+
+@runtime_checkable
+class MultiRoleDistributionMatchingComputer(Protocol):
+    """Architecture computation that yields role graphs before another FSDP forward."""
+
+    def iter_role_computations(
+        self,
+        request: PhaseRequest,
+        batch: TensorDict,
+        runtime: DistillationRoleRuntime,
+    ) -> Iterator[tuple[str, DistillationPhaseComputation]]:
+        """Yield each role loss in request order for immediate backward."""
         ...
 
 
@@ -145,10 +160,10 @@ class DistillationRoleRuntime:
         return self.engines[binding.group]
 
     @contextmanager
-    def use_role(self, role: str, *, grad_enabled: Optional[bool] = None):
-        """Yield a role model with explicit gradient intent and restore it afterward."""
+    def use_role(self, role: str, *, grad_enabled: Optional[bool] = None, input_grad_only: bool = False):
+        """Yield a role model with explicit parameter/input gradient ownership."""
         engine = self.engine_for_role(role)
-        with engine.use_role(role, grad_enabled=grad_enabled) as module:
+        with engine.use_role(role, grad_enabled=grad_enabled, input_grad_only=input_grad_only) as module:
             yield module
 
     def scheduler_for_role(self, role: str):
@@ -181,7 +196,7 @@ class DistillationRoleRuntime:
         request: PhaseRequest,
         computation: DistillationPhaseComputation,
     ) -> str:
-        """Require one graph-bearing scalar loss owned by the requested role."""
+        """Require one graph-bearing scalar loss for immediate role-local backward."""
         if not isinstance(computation, DistillationPhaseComputation):
             raise TypeError(f"compute_phase must return DistillationPhaseComputation, got {type(computation)}.")
         expected_roles = set(request.trainable_roles)
@@ -191,9 +206,7 @@ class DistillationRoleRuntime:
                 f"got {sorted(computation.losses)}."
             )
         if len(request.trainable_roles) != 1:
-            raise NotImplementedError(
-                "Multi-role optimizer phases are not supported by the current distillation runtime."
-            )
+            raise ValueError("Backward requests must contain exactly one trainable role.")
         role = request.trainable_roles[0]
         loss = computation.losses[role]
         if loss.ndim != 0:
@@ -217,33 +230,31 @@ class DistillationRoleRuntime:
         self.engine_for_role(role).backward_role(role, computation.losses[role] * weight)
 
     def step_phase(self, request: PhaseRequest) -> tuple[dict[str, int], dict[str, float]]:
-        """Step the phase optimizer once after all micro-batches were accumulated."""
-        if len(request.trainable_roles) != 1:
-            raise NotImplementedError(
-                "Multi-role optimizer phases are not supported by the current distillation runtime."
-            )
-        role = request.trainable_roles[0]
+        """Step each requested optimizer once after all micro-batches were accumulated."""
         for role_engine in self.engines.values():
             if hasattr(role_engine, "assert_gradient_isolation"):
-                role_engine.assert_gradient_isolation({role})
-        engine = self.engine_for_role(role)
-        optimizer_start = time.perf_counter()
-        with torch.profiler.record_function(f"distillation/{role}_optimizer"):
-            stepped, grad_norm = engine.optimizer_step(role)
-        metrics = {
-            f"{role}/grad_norm": grad_norm,
-            f"perf/{role}_optimizer_s": time.perf_counter() - optimizer_start,
-        }
-        if stepped and getattr(engine, "lr_schedulers", {}).get(role) is not None:
-            metrics[f"{role}/lr"] = float(engine.lr_schedulers[role].get_last_lr()[0])
-        if not stepped:
-            return {}, metrics
+                role_engine.assert_gradient_isolation(set(request.trainable_roles))
+        optimizer_steps = {}
+        metrics = {}
+        for role in request.trainable_roles:
+            engine = self.engine_for_role(role)
+            optimizer_start = time.perf_counter()
+            with torch.profiler.record_function(f"distillation/{role}_optimizer"):
+                stepped, grad_norm = engine.optimizer_step(role)
+            metrics[f"{role}/grad_norm"] = grad_norm
+            metrics[f"perf/{role}_optimizer_s"] = time.perf_counter() - optimizer_start
+            if not stepped:
+                # A partial update is terminal to the controller; recovery reloads a complete checkpoint.
+                return optimizer_steps, metrics
+            optimizer_steps[role] = 1
+            if getattr(engine, "lr_schedulers", {}).get(role) is not None:
+                metrics[f"{role}/lr"] = float(engine.lr_schedulers[role].get_last_lr()[0])
         if request.update_ema and request.global_step + 1 >= self.ema_start_step:
             ema_start = time.perf_counter()
             self.update_ema()
             metrics["ema/decay"] = self.ema_decay
             metrics["perf/ema_update_s"] = time.perf_counter() - ema_start
-        return {role: 1}, metrics
+        return optimizer_steps, metrics
 
     def backward_and_step(
         self,
@@ -253,9 +264,9 @@ class DistillationRoleRuntime:
         """Convenience path for a one-micro-batch phase."""
         self.backward_micro_batch(request, computation, weight=1.0)
         optimizer_steps, metrics = self.step_phase(request)
-        role = request.trainable_roles[0]
         metrics.update(computation.metrics)
-        metrics[f"{role}/loss"] = float(computation.losses[role].detach().float().item())
+        for role, loss in computation.losses.items():
+            metrics[f"{role}/loss"] = float(loss.detach().float().item())
         return optimizer_steps, metrics
 
     def initialize_ema(self) -> None:
@@ -341,15 +352,17 @@ class DiffusionDistillationWorker(Worker, DistProfilerExtension):
                 configs[binding.role] = deepcopy(student_optimizer_config)
             elif binding.role == "fake_score":
                 configs[binding.role] = deepcopy(distillation_config.fake_score_optim)
+            elif binding.role == "discriminator":
+                configs[binding.role] = deepcopy(distillation_config.discriminator_optim)
             else:
                 raise NotImplementedError(f"No optimizer config is defined for role {binding.role!r}.")
         return configs
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self) -> None:
-        """Allocate every physical group once and bind the architecture phase runner."""
+        """Allocate every physical group once and bind the architecture computer."""
         model_config: DiffusionModelConfig = omega_conf_to_dataclass(self.config.actor_rollout_ref.model)
-        # DMD losses live in the phase runner, so instantiate only the actor sub-configs the role engine consumes.
+        # DMD losses live in the architecture computer, so instantiate only the actor sub-configs the engine consumes.
         actor_config = self.config.actor_rollout_ref.actor
         actor_engine_config = omega_conf_to_dataclass(actor_config.fsdp_config)
         object.__setattr__(actor_engine_config, "strategy", actor_config.strategy)
@@ -470,17 +483,54 @@ class DiffusionDistillationWorker(Worker, DistProfilerExtension):
                 weight = micro_batch.batch_size[0] / total_samples
                 micro_batch = micro_batch.to(get_device_id())
                 forward_start = time.perf_counter()
-                computation = self.dm_computer.compute_phase(request, micro_batch, self.runtime)
-                forward_duration += time.perf_counter() - forward_start
-                backward_start = time.perf_counter()
-                self.runtime.backward_micro_batch(request, computation, weight=weight)
-                backward_duration += time.perf_counter() - backward_start
-                for name, value in computation.metrics.items():
-                    is_duration = name.startswith("perf/") and name.endswith("_s") and not name.endswith("_per_s")
-                    metric_weight = 1.0 if is_duration or name.endswith(("/active_elements", "/nonfinite")) else weight
-                    accumulated_metrics[name] = accumulated_metrics.get(name, 0.0) + float(value) * metric_weight
-                for role, loss in computation.losses.items():
-                    accumulated_losses[role] = accumulated_losses.get(role, 0.0) + float(loss.detach().float()) * weight
+                if len(request.trainable_roles) == 1:
+                    role = request.trainable_roles[0]
+                    computations = iter(((role, self.dm_computer.compute_phase(request, micro_batch, self.runtime)),))
+                else:
+                    if not isinstance(self.dm_computer, MultiRoleDistributionMatchingComputer):
+                        raise TypeError(
+                            "Multi-role phases require iter_role_computations() on the architecture computer."
+                        )
+                    computations = self.dm_computer.iter_role_computations(request, micro_batch, self.runtime)
+                pending_forward_duration = time.perf_counter() - forward_start
+                observed_roles = []
+                while True:
+                    forward_start = time.perf_counter()
+                    try:
+                        role, computation = next(computations)
+                    except StopIteration:
+                        break
+                    forward_duration += pending_forward_duration + time.perf_counter() - forward_start
+                    pending_forward_duration = 0.0
+                    if role not in request.trainable_roles or role in observed_roles:
+                        raise ValueError(f"Architecture computer yielded invalid phase role {role!r}.")
+                    role_request = PhaseRequest(
+                        kind=request.kind,
+                        global_step=request.global_step,
+                        repeat_index=request.repeat_index,
+                        batch_policy=request.batch_policy,
+                        trainable_roles=(role,),
+                        update_ema=False,
+                    )
+                    backward_start = time.perf_counter()
+                    self.runtime.backward_micro_batch(role_request, computation, weight=weight)
+                    backward_duration += time.perf_counter() - backward_start
+                    observed_roles.append(role)
+                    for name, value in computation.metrics.items():
+                        is_duration = name.startswith("perf/") and name.endswith("_s") and not name.endswith("_per_s")
+                        metric_weight = (
+                            1.0 if is_duration or name.endswith(("/active_elements", "/nonfinite")) else weight
+                        )
+                        accumulated_metrics[name] = accumulated_metrics.get(name, 0.0) + float(value) * metric_weight
+                    for loss_role, loss in computation.losses.items():
+                        accumulated_losses[loss_role] = (
+                            accumulated_losses.get(loss_role, 0.0) + float(loss.detach().float()) * weight
+                        )
+                if tuple(observed_roles) != request.trainable_roles:
+                    raise ValueError(
+                        "Architecture computer role order does not match the phase request: "
+                        f"expected {request.trainable_roles}, got {tuple(observed_roles)}."
+                    )
             optimizer_steps, step_metrics = self.runtime.step_phase(request)
             metrics = {**accumulated_metrics, **step_metrics}
             metrics.update({f"{role}/loss": loss for role, loss in accumulated_losses.items()})
@@ -491,7 +541,9 @@ class DiffusionDistillationWorker(Worker, DistProfilerExtension):
             metrics["memory/max_reserved_gb"] = device_module.max_memory_reserved() / (1024**3)
             metrics.update(self.runtime.group_metrics())
             engine = self.runtime.engine_for_role(request.trainable_roles[0])
-            metrics[f"training/{request.kind}_samples"] = float(total_samples * engine.get_data_parallel_size())
+            global_samples = float(total_samples * engine.get_data_parallel_size())
+            for role in request.trainable_roles:
+                metrics[f"training/{role}_samples"] = global_samples
             metrics[f"batch/{request.kind}_micro_batches"] = float(
                 (total_samples + micro_batch_size - 1) // micro_batch_size
             )
@@ -547,11 +599,11 @@ class DiffusionDistillationWorker(Worker, DistProfilerExtension):
             engine.load_role_group_checkpoint(os.path.join(local_path, "role_groups", group_name))
         computer_state_path = os.path.join(local_path, f"dm_computer_rank_{self.rank}.pt")
         if not os.path.isfile(computer_state_path):
-            raise FileNotFoundError(f"Missing phase-runner state: {computer_state_path}")
+            raise FileNotFoundError(f"Missing distribution-matching computer state: {computer_state_path}")
         computer_state = torch.load(computer_state_path, map_location="cpu", weights_only=False)
         if computer_state:
             if not hasattr(self.dm_computer, "load_state_dict"):
-                raise ValueError("Checkpoint contains phase-runner state, but the active runner cannot restore it.")
+                raise ValueError("Checkpoint contains computer state, but the active computer cannot restore it.")
             self.dm_computer.load_state_dict(computer_state)
 
 

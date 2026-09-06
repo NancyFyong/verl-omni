@@ -14,6 +14,7 @@
 """CPU tests for the generic multi-role distillation data plane."""
 
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -74,7 +75,7 @@ class ToyRoleEngine:
         self.optimizers = {
             role: torch.optim.SGD([parameter], lr=0.1)
             for role, parameter in self.parameters.items()
-            if role in {"student", "fake_score"}
+            if role in {"student", "fake_score", "discriminator"}
         }
         self.scheduler = object()
         self.model_config = object()
@@ -90,7 +91,8 @@ class ToyRoleEngine:
         return 2
 
     @contextmanager
-    def use_role(self, role):
+    def use_role(self, role, *, grad_enabled=None, input_grad_only=False):
+        del grad_enabled, input_grad_only
         previous = self.active_role
         self.active_role = role
         try:
@@ -269,22 +271,28 @@ class TestRoleRuntime:
                 ),
             )
 
-    def test_pr2_rejects_multi_optimizer_adversarial_phase(self):
+    def test_adversarial_phase_steps_each_optimizer_once_after_accumulation(self):
         plan = build_plan("dmd2", {"model_path": "/m", "profile": "paper"}, _CAPABILITIES | {"adversarial"})
         engine = ToyRoleEngine(("student", "teacher_score", "fake_score", "student_ema", "discriminator"))
         runtime = DistillationRoleRuntime(plan, {"base": engine}, ema_decay=0.9, ema_start_step=0)
         request = plan.update_schedule.next_cycle(SimpleNamespace(global_step=0, completed_cycles=0)).requests[-1]
-        with pytest.raises(NotImplementedError, match="Multi-role optimizer phases"):
-            runtime.backward_and_step(
-                request,
-                DistillationPhaseComputation(
-                    losses={
-                        "fake_score": engine.parameters["fake_score"].square(),
-                        "discriminator": engine.parameters["discriminator"].square(),
-                    },
-                    metrics={},
-                ),
-            )
+        before = {role: value.detach().clone() for role, value in engine.parameters.items()}
+        for _ in range(2):
+            for role in request.trainable_roles:
+                role_request = replace(request, trainable_roles=(role,))
+                runtime.backward_micro_batch(
+                    role_request,
+                    DistillationPhaseComputation(losses={role: engine.parameters[role].square()}, metrics={}),
+                    weight=0.5,
+                )
+        steps, metrics = runtime.step_phase(request)
+        assert steps == {"fake_score": 1, "discriminator": 1}
+        for role in request.trainable_roles:
+            torch.testing.assert_close(engine.parameters[role], before[role] * 0.8)
+            assert metrics[f"{role}/grad_norm"] == pytest.approx(2 * before[role].item())
+        for role in ("student", "student_ema", "teacher_score"):
+            torch.testing.assert_close(engine.parameters[role], before[role])
+            assert engine.parameters[role].grad is None
 
 
 class ToyDMComputer:
@@ -301,6 +309,29 @@ class ToyDMComputer:
         )
 
 
+class ToyMultiRoleComputer:
+    def __init__(self):
+        self.events = []
+
+    def iter_role_computations(self, request, batch, runtime):
+        fake_parameter = runtime.engine_for_role("fake_score").parameters["fake_score"]
+        yield (
+            "fake_score",
+            DistillationPhaseComputation(
+                losses={"fake_score": (fake_parameter - batch["target"]).square().mean()}, metrics={}
+            ),
+        )
+        assert fake_parameter.grad is not None
+        self.events.append("fake_score_backward")
+        discriminator = runtime.engine_for_role("discriminator").parameters["discriminator"]
+        yield (
+            "discriminator",
+            DistillationPhaseComputation(
+                losses={"discriminator": (discriminator + batch["target"]).square().mean()}, metrics={}
+            ),
+        )
+
+
 def simulate_dp_reduce(values, op, group):
     assert group == "dp"
     # Sorted names: loss, peak memory, host time; simulate a slower second rank.
@@ -313,6 +344,28 @@ def simulate_dp_reduce(values, op, group):
 
 
 class TestWorkerMetrics:
+    def test_multi_role_computations_are_backpropagated_before_the_next_forward(self, monkeypatch):
+        plan = build_plan("dmd2", {"model_path": "/m", "profile": "paper"}, _CAPABILITIES | {"adversarial"})
+        engine = ToyRoleEngine(("student", "teacher_score", "fake_score", "student_ema", "discriminator"))
+        runtime = DistillationRoleRuntime(plan, {"base": engine}, ema_decay=0.9, ema_start_step=0)
+        worker = object.__new__(DiffusionDistillationWorker)
+        worker.runtime = runtime
+        worker.dm_computer = ToyMultiRoleComputer()
+        device = Mock()
+        device.max_memory_allocated.return_value = 0
+        device.max_memory_reserved.return_value = 0
+        monkeypatch.setattr(
+            "verl_omni.workers.diffusion_distillation_worker.get_torch_device", Mock(return_value=device)
+        )
+        monkeypatch.setattr("verl_omni.workers.diffusion_distillation_worker.get_device_id", Mock(return_value="cpu"))
+        batch = tu.get_tensordict({"target": torch.tensor([0.0])})
+        request = plan.update_schedule.next_cycle(SimpleNamespace(global_step=0, completed_cycles=0)).requests[-1]
+        tu.assign_non_tensor(batch, phase_request=request)
+        result = worker.execute_phase(batch)
+        assert worker.dm_computer.events == ["fake_score_backward"]
+        assert tu.get(result, "optimizer_steps") == {"fake_score": 1, "discriminator": 1}
+        assert tu.get(result, "metrics")["training/discriminator_samples"] == 2
+
     @pytest.mark.parametrize("micro_batch_size", [1, 2, 3])
     def test_existing_worker_accumulation_keeps_loss_weights_but_sums_elapsed_time(self, monkeypatch, micro_batch_size):
         plan = build_plan("dmd2", {"model_path": "/m"}, _CAPABILITIES)
@@ -406,6 +459,14 @@ class TestRoleEngineValidation:
         with pytest.raises(ValueError, match="must match trainable roles"):
             engine.validate_constructor_inputs(SimpleNamespace(strategy="fsdp2", use_orig_params=False))
 
+    def test_zero_gradient_placeholder_for_inactive_role_is_allowed(self):
+        engine = self.uninitialized_engine()
+        student = torch.nn.Parameter(torch.tensor(1.0))
+        fake_score = torch.nn.Parameter(torch.tensor(2.0))
+        fake_score.grad = torch.tensor(0.0)
+        engine._role_parameters = {"student": (student,), "fake_score": (fake_score,)}
+        engine.assert_gradient_isolation({"student"})
+
     def test_gradient_leak_into_inactive_role_is_rejected(self):
         engine = self.uninitialized_engine()
         student = torch.nn.Parameter(torch.tensor(1.0))
@@ -448,10 +509,39 @@ class TestRoleContext:
         assert engine.module.active_adapter == "student"
         assert engine._active_role == "student"
 
+    def test_input_grad_only_freezes_parameters_and_restores_on_error(self):
+        engine = self.make_engine()
+        engine.module.gradient_checkpointing = True
+        inputs = torch.tensor(2.0, requires_grad=True)
+        with engine.use_role("student", input_grad_only=True) as module:
+            assert torch.is_grad_enabled()
+            assert not module.weight.requires_grad
+            assert not module.gradient_checkpointing
+            loss = (module.weight * inputs).square()
+        loss.backward()
+        assert inputs.grad.item() == pytest.approx(4.0)
+        assert engine.module.weight.grad is None
+        assert engine.module.weight.requires_grad
+        assert engine.module.gradient_checkpointing
+        with pytest.raises(RuntimeError, match="boom"):
+            with engine.use_role("student", input_grad_only=True):
+                raise RuntimeError("boom")
+        assert engine.module.weight.requires_grad
+        assert engine.module.gradient_checkpointing
+
     def test_non_student_export_is_rejected(self):
         engine = self.make_engine()
         with pytest.raises(ValueError, match="Only student or student_ema"):
             engine.iter_export_tensors("teacher_score", base_sync_done=False)
+
+    def test_export_excludes_architecture_training_only_parameters(self):
+        engine = self.make_engine()
+        engine.model_adapter = SimpleNamespace(discriminator_parameter_prefixes=("classifier.",))
+        engine.get_per_tensor_param = Mock(
+            return_value=(iter((("classifier.weight", torch.tensor(1.0)), ("student.weight", torch.tensor(2.0)))), {})
+        )
+        tensors, _ = engine.iter_export_tensors("student", base_sync_done=False)
+        assert list(tensors) == [("student.weight", torch.tensor(2.0))]
 
     def test_export_uses_the_semantic_roles_adapter(self):
         engine = self.make_engine()

@@ -19,7 +19,11 @@ import pytest
 import torch
 from verl.utils.dataset.rl_dataset import RLHFDataset
 
-from verl_omni.utils.dataset.qwen_image_distillation_dataset import QwenImageDMDPairDataset, load_float_tensor
+from verl_omni.utils.dataset.qwen_image_distillation_dataset import (
+    QwenImageDMDPairDataset,
+    QwenImageDMDRealDataset,
+    load_float_tensor,
+)
 
 
 class TestDMDTensorLoading:
@@ -33,9 +37,58 @@ class TestDMDTensorLoading:
         torch.testing.assert_close(nested, torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
         torch.testing.assert_close(serialized, torch.tensor([5.0]))
 
-    def test_rejects_empty_tensor(self):
-        with pytest.raises(ValueError, match="must not be empty"):
-            load_float_tensor([], "value")
+    @pytest.mark.parametrize("value", [[], [float("nan")]])
+    def test_rejects_empty_or_nonfinite_tensor(self, value):
+        with pytest.raises(ValueError, match="non-empty and finite"):
+            load_float_tensor(value, "value")
+
+
+class TestQwenImageDMDRealDataset:
+    @staticmethod
+    def make_dataset():
+        return object.__new__(QwenImageDMDRealDataset)
+
+    @pytest.mark.parametrize(
+        "row,field",
+        [
+            ({"real_pixels": torch.zeros(3, 8, 8)}, "real_pixels"),
+            (
+                {
+                    "real_latents": torch.zeros(4, 2),
+                    "real_latent_manifest": {
+                        "normalization": "qwen_image",
+                        "vae_config_sha256": "abc",
+                    },
+                },
+                "real_latents",
+            ),
+        ],
+    )
+    def test_accepts_exactly_one_valid_real_representation(self, monkeypatch, row, field):
+        monkeypatch.setattr(RLHFDataset, "__getitem__", lambda self, item: dict(row))
+        output = self.make_dataset()[0]
+        assert output[field].dtype == torch.float32
+
+    @pytest.mark.parametrize(
+        "row,error",
+        [
+            ({}, "exactly one"),
+            ({"real_pixels": torch.zeros(3, 2, 2), "real_latents": torch.zeros(1)}, "exactly one"),
+            ({"real_pixels": torch.full((3, 2, 2), 2.0)}, "values in"),
+            ({"real_latents": torch.zeros(1)}, "real_latent_manifest"),
+            (
+                {
+                    "real_latents": torch.zeros(1),
+                    "real_latent_manifest": {"normalization": "other", "vae_config_sha256": "abc"},
+                },
+                "real_latent_manifest",
+            ),
+        ],
+    )
+    def test_rejects_invalid_real_rows(self, monkeypatch, row, error):
+        monkeypatch.setattr(RLHFDataset, "__getitem__", lambda self, item: dict(row))
+        with pytest.raises(ValueError, match=error):
+            self.make_dataset()[0]
 
 
 class TestQwenImageDMDPairDataset:

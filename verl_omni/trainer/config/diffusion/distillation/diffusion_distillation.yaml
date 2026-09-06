@@ -132,6 +132,39 @@ distribution_matching:
     # Optional optimizer implementation overrides
     override_optimizer_config: null
 
+  # Independent discriminator optimizer; defaults mirror fake-score settings
+  discriminator_optim:
+
+    # Target optimizer configuration class
+    _target_: verl.workers.config.FSDPOptimizerConfig
+
+    # Discriminator learning rate
+    lr: 2.0e-5
+
+    # Total discriminator updates, populated by the trainer
+    total_training_steps: -1
+
+    # Learning-rate scheduler type
+    lr_scheduler_type: constant
+
+  # DMD2 paper-profile non-saturating generator/discriminator losses
+  adversarial:
+
+    # Target adversarial configuration class
+    _target_: verl_omni.workers.config.diffusion.DiffusionAdversarialConfig
+
+    # diffusion_gan re-noises inputs; cls_on_clean_image uses timestep zero
+    mode: diffusion_gan
+
+    # Exclusive upper bound of integer discriminator timesteps
+    max_timestep: 1000
+
+    # Generator adversarial loss weight
+    generator_weight: 5.0e-3
+
+    # Discriminator classification loss weight
+    discriminator_weight: 1.0e-2
+
   # EMA decay after a completed student optimizer step
   ema_decay: 0.999
 

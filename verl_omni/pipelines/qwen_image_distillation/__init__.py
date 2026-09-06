@@ -16,6 +16,7 @@ from .diffusers_training_adapter import (
     QwenImageDistributionMatching,
     QwenImageDMDComputer,
     build_qwen_dmd_sigmas,
+    qwen_vae_config_sha256,
 )
 from .vllm_omni_rollout_adapter import QwenImageDMDPipeline
 
@@ -24,4 +25,5 @@ __all__ = [
     "QwenImageDMDComputer",
     "QwenImageDMDPipeline",
     "build_qwen_dmd_sigmas",
+    "qwen_vae_config_sha256",
 ]

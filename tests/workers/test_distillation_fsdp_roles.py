@@ -14,6 +14,7 @@
 """Small GPU tests for role switching on FSDP1 and FSDP2 LoRA modules."""
 
 import os
+import shutil
 import tempfile
 from datetime import timedelta
 from types import SimpleNamespace
@@ -39,6 +40,11 @@ class TinyCheckpointManager:
         self.optimizer = optimizer
         self.scheduler = scheduler
 
+    @staticmethod
+    def checkpoint_path(local_path):
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        return os.path.join(local_path, f"primary_rank_{rank}.pt")
+
     def save_checkpoint(self, local_path, **kwargs):
         os.makedirs(local_path, exist_ok=True)
         torch.save(
@@ -47,11 +53,11 @@ class TinyCheckpointManager:
                 "optimizer": self.optimizer.state_dict(),
                 "scheduler": self.scheduler.state_dict(),
             },
-            os.path.join(local_path, "primary.pt"),
+            self.checkpoint_path(local_path),
         )
 
     def load_checkpoint(self, local_path, **kwargs):
-        state = torch.load(os.path.join(local_path, "primary.pt"), weights_only=False)
+        state = torch.load(self.checkpoint_path(local_path), weights_only=False)
         self.module.load_state_dict(state["model"])
         self.optimizer.load_state_dict(state["optimizer"])
         self.scheduler.load_state_dict(state["scheduler"])
@@ -104,7 +110,7 @@ def wrap_independent_model(strategy, role):
     return model
 
 
-def engine_shell(module):
+def engine_shell(module, adversarial=False):
     engine = object.__new__(DistillationRoleGroupEngine)
     engine.module = module
     engine.role_group = RoleGroupSpec(
@@ -116,15 +122,29 @@ def engine_shell(module):
         "fake_score": RoleBinding("fake_score", "base", "fake_score", True, "fake_score_optim"),
         "student_ema": RoleBinding("student_ema", "base", "student_ema", False, None),
     }
+    if adversarial:
+        from verl_omni.pipelines.qwen_image_distillation.diffusers_training_adapter import (
+            QwenImageDistributionMatching,
+        )
+
+        engine.model_adapter = QwenImageDistributionMatching
+        engine.role_bindings["discriminator"] = RoleBinding(
+            "discriminator", "base", "discriminator", True, "discriminator_optim"
+        )
     engine.optimizers = {}
     engine.lr_schedulers = {}
     engine.optimizer_configs = {}
     engine._active_role = "student"
     engine._primary_role = "student"
     role_parameters = {}
-    for role in ("student", "fake_score"):
+    trainable_roles = ("student", "fake_score") + (("discriminator",) if adversarial else ())
+    for role in trainable_roles:
         with engine.use_role(role):
-            role_parameters[role] = tuple(parameter for parameter in module.parameters() if parameter.requires_grad)
+            role_parameters[role] = (
+                engine.model_adapter.distillation_role_parameters(module, role)
+                if adversarial
+                else tuple(parameter for parameter in module.parameters() if parameter.requires_grad)
+            )
     engine._role_parameters = role_parameters
     engine.optimizers = {role: torch.optim.AdamW(parameters, lr=0.1) for role, parameters in role_parameters.items()}
     engine.lr_schedulers = {
@@ -166,6 +186,21 @@ def adapter_snapshot(engine, role):
             (parameter.full_tensor() if isinstance(parameter, DTensor) else parameter).detach().cpu().clone()
             for parameter in parameters
         )
+
+
+def role_snapshot(engine, role):
+    values = []
+    binding = engine.role_bindings[role]
+    with engine._adapter_state_context(), torch.no_grad():
+        parameters = list(engine._active_adapter_trainable_params(binding.adapter))
+        if role == "discriminator":
+            parameters.extend(
+                parameter for name, parameter in engine.module.named_parameters() if "proj_out.classifier." in name
+            )
+        for parameter in parameters:
+            value = parameter.full_tensor() if isinstance(parameter, DTensor) else parameter
+            values.append(value.detach().cpu().clone())
+    return tuple(values)
 
 
 def assert_tensors_equal(left, right):
@@ -274,7 +309,7 @@ def test_distillation_role_switch_preserves_graph_ema_and_state(strategy):
             dist.destroy_process_group()
 
 
-def wrap_qwen_image_model(strategy, model_path):
+def wrap_qwen_image_model(strategy, model_path, adversarial=False):
     from diffusers import QwenImageTransformer2DModel
 
     model = QwenImageTransformer2DModel.from_pretrained(
@@ -282,11 +317,22 @@ def wrap_qwen_image_model(strategy, model_path):
         subfolder="transformer",
         torch_dtype=torch.float32,
     ).cuda()
+    if adversarial:
+        from verl_omni.pipelines.qwen_image_distillation.diffusers_training_adapter import (
+            QwenImageDistributionMatching,
+        )
+
+        QwenImageDistributionMatching.build_discriminator_head(model)
     adapter_config = LoraConfig(r=2, lora_alpha=2, target_modules=["to_q", "to_k", "to_v", "to_out.0"])
     model.add_adapter(adapter_config, adapter_name="student")
     model.add_adapter(adapter_config, adapter_name="fake_score")
     model.add_adapter(adapter_config, adapter_name="student_ema")
+    if adversarial:
+        model.add_adapter(adapter_config, adapter_name="discriminator")
     model.set_adapter("student")
+    if adversarial:
+        QwenImageDistributionMatching.configure_role_parameters(model, "discriminator")
+        model.set_adapter("student")
     if strategy == "fsdp":
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
@@ -404,3 +450,103 @@ def test_qwen_image_dm_computer_on_fsdp(strategy, algorithm, batch_size, qwen_pr
     assert exported
     assert peft_config["r"] == 2
     assert all(name.startswith("transformer.") for name, _ in exported)
+
+
+@pytest.mark.parametrize("strategy", ["fsdp", "fsdp2"])
+def test_qwen_image_dmd2_adversarial_roles_and_checkpoint(strategy, qwen_process_group):
+    model_path = os.environ.get("QWEN_IMAGE_MODEL_PATH", os.path.expanduser("~/models/tiny-random/Qwen-Image"))
+    if not os.path.isfile(os.path.join(model_path, "model_index.json")):
+        pytest.skip(f"Tiny Qwen-Image checkpoint not found at {model_path}.")
+
+    from verl_omni.pipelines.qwen_image_distillation.diffusers_training_adapter import QwenImageDMDComputer
+
+    torch.manual_seed(11)
+    engine = engine_shell(wrap_qwen_image_model(strategy, model_path, adversarial=True), adversarial=True)
+    engine.scheduler = SimpleNamespace(config={"num_train_timesteps": 1000})
+    engine.model_config = SimpleNamespace(fsdp_layer_prefixes=["transformer_blocks."])
+    engine.ulysses_device_mesh = None
+    engine.ulysses_sequence_parallel_size = 1
+    plan = build_plan(
+        "dmd2",
+        {
+            "model_path": model_path,
+            "profile": "paper",
+            "conditioning_provider": "local_frozen_encoder",
+            "fake_update_ratio": 1,
+            "adversarial": {"mode": "cls_on_clean_image"},
+            "rng_seed": 5,
+        },
+        frozenset({"distribution_matching", "adversarial"}),
+    )
+    runtime = DistillationRoleRuntime(plan, {"base": engine}, ema_decay=0.9, ema_start_step=0)
+    model_config = SimpleNamespace(
+        path=model_path,
+        local_path=model_path,
+        target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+        transformer_config={"in_channels": 64},
+        pipeline=SimpleNamespace(
+            height=64,
+            width=64,
+            num_inference_steps=4,
+            max_sequence_length=64,
+            guidance_scale=None,
+        ),
+    )
+    computer = QwenImageDMDComputer(model_config, plan)
+    computer.vae_fingerprint = "fixture"
+    batch = TensorDict(
+        {"dummy_tensor": torch.zeros(1, 1, device="cuda"), "real_latents": torch.zeros(1, 16, 64, device="cuda")},
+        batch_size=[1],
+    )
+    tu.assign_non_tensor_stack(batch, "raw_prompt", [[{"role": "user", "content": "cat"}]])
+    tu.assign_non_tensor_stack(
+        batch,
+        "real_latent_manifest",
+        [{"normalization": "qwen_image", "vae_config_sha256": "fixture"}],
+    )
+
+    before = {role: role_snapshot(engine, role) for role in ("student", "fake_score", "discriminator")}
+    student_request = PhaseRequest("student", 0, 0, "fresh", ("student",), True)
+    runtime.zero_grad(student_request.trainable_roles)
+    student = computer.compute_phase(student_request, batch, runtime)
+    runtime.backward_micro_batch(student_request, student, weight=1.0)
+    steps, _ = runtime.step_phase(student_request)
+    assert steps == {"student": 1}
+    assert_tensors_equal(role_snapshot(engine, "fake_score"), before["fake_score"])
+    assert_tensors_equal(role_snapshot(engine, "discriminator"), before["discriminator"])
+
+    fake_request = PhaseRequest("fake_score", 1, 0, "fresh", ("fake_score", "discriminator"), False)
+    runtime.zero_grad(fake_request.trainable_roles)
+    observed_roles = []
+    for role, computation in computer.iter_role_computations(fake_request, batch, runtime):
+        observed_roles.append(role)
+        role_request = PhaseRequest("fake_score", 1, 0, "fresh", (role,), False)
+        runtime.backward_micro_batch(role_request, computation, weight=1.0)
+    assert tuple(observed_roles) == fake_request.trainable_roles
+    steps, _ = runtime.step_phase(fake_request)
+    assert steps == {"fake_score": 1, "discriminator": 1}
+    assert any(
+        not torch.equal(old, new)
+        for old, new in zip(before["fake_score"], role_snapshot(engine, "fake_score"), strict=True)
+    )
+    discriminator_after = role_snapshot(engine, "discriminator")
+    assert any(not torch.equal(old, new) for old, new in zip(before["discriminator"], discriminator_after, strict=True))
+    exported, _ = runtime.export_tensors(base_sync_done=True)
+    assert all("classifier" not in name for name, _ in exported)
+
+    checkpoint_paths = [tempfile.mkdtemp(prefix="qwen_dmd2_adversarial_") if dist.get_rank() == 0 else None]
+    dist.broadcast_object_list(checkpoint_paths, src=0)
+    checkpoint_path = checkpoint_paths[0]
+    try:
+        saved = {role: role_snapshot(engine, role) for role in ("student", "fake_score", "discriminator")}
+        engine.save_role_group_checkpoint(checkpoint_path, global_step=1)
+        with torch.no_grad():
+            for parameter in engine.parameters_for_role("discriminator"):
+                parameter.add_(1)
+        engine.load_role_group_checkpoint(checkpoint_path)
+        for role, expected in saved.items():
+            assert_tensors_equal(role_snapshot(engine, role), expected)
+    finally:
+        dist.barrier()
+        if dist.get_rank() == 0:
+            shutil.rmtree(checkpoint_path)

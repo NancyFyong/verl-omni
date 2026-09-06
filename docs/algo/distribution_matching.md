@@ -1,9 +1,9 @@
 # Distribution-Matching Distillation
 
-Last updated: 09/05/2026.
+Last updated: 09/06/2026.
 
-verl-omni supports Qwen-Image training with DMD and the distribution-only
-profile of DMD2. The implementation follows the multi-role design in
+verl-omni supports Qwen-Image training with original DMD and the distribution-only
+and adversarial profiles of DMD2. The implementation follows the multi-role design in
 [RFC #519](https://github.com/verl-project/verl-omni/issues/519): a trainable
 student, a frozen real-score teacher, a trainable fake-score model, and a
 student EMA are coordinated by the dedicated `distillation` trainer.
@@ -96,19 +96,32 @@ frozen checkpoint VAE and applies PIQ LPIPS. It is the paper-oriented mode and
 requires the `distillation` dependency extra. `regression_type=latent_mse` is a
 non-paper diagnostic variant.
 
-The DMD2 adversarial classifier profile is not part of this integration and
-fails closed. It belongs to the later adversarial-runtime stage.
+`recipe=dmd2`, `profile=paper` adds the DMD2 non-saturating adversarial objective.
+The student loss adds `softplus(-D(x_fake))`; each fake phase independently steps
+the fake-score denoising optimizer and the discriminator optimizer with
+`softplus(D(x_fake.detach())) + softplus(-D(x_real.detach()))`. The discriminator
+uses its own LoRA adapter and classifier head while reusing only the frozen Qwen
+base. Student adversarial evaluation freezes discriminator parameters but retains
+gradients to `x_fake`.
+
+The `diffusion_gan` mode re-noises real and generated latents at a uniformly
+sampled integer timestep below `adversarial.max_timestep`; the
+`cls_on_clean_image` mode classifies clean latents at timestep zero. Each row must
+provide exactly one of `real_latents` plus a matching VAE-normalization manifest,
+or finite RGB `real_pixels` in `[0, 1]`. This profile remains distinct from
+original DMD: it does not add paired trajectory/LPIPS regression.
 
 ## Role storage and checkpoints
 
-The recommended LoRA layout stores `student`, `fake_score`, and `student_ema`
-as named adapters over one frozen Qwen base. `teacher_score` disables adapters.
-Student and fake-score optimizers and schedulers are independent, and EMA is
-updated only after a successful student optimizer step. FSDP1 requires
+The recommended LoRA layout stores `student`, `fake_score`, `student_ema`, and,
+for the adversarial profile, `discriminator` as named adapters over one frozen
+Qwen base. `teacher_score` disables adapters. Student, fake-score, and optional
+discriminator optimizers and schedulers are independent, and EMA is updated only
+after a successful student optimizer step. FSDP1 requires
 `use_orig_params=true`; FSDP2 is the recommended backend.
 
 Composite checkpoints save the physical model once together with every role's
-optimizer and scheduler, EMA state, phase-runner RNG streams, control-plane
+optimizer and scheduler, EMA state, distribution-matching RNG streams, controller
 counters, dataloader state, and driver RNG. Only the semantic `student` or
 `student_ema` role can be exported to inference.
 

@@ -86,7 +86,7 @@ class QwenImageDMDPipeline(QwenImagePipelineWithLogProb):
             self.rollout_timestep_shift = previous_shift
 
     def prepare_timesteps(self, num_inference_steps, sigmas, image_seq_len):
-        """Build the fixed linear-shift schedule shared with the training phase runner."""
+        """Build the fixed linear-shift schedule shared with the training adapter."""
         del image_seq_len
         if num_inference_steps <= 0:
             raise ValueError(f"num_inference_steps must be positive, got {num_inference_steps}.")

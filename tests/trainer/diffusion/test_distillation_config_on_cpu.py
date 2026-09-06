@@ -21,6 +21,7 @@ from hydra import compose, initialize_config_dir
 
 import verl_omni
 from verl_omni.workers.config.diffusion import (
+    DiffusionAdversarialConfig,
     DiffusionDistillationConfig,
     DiffusionDistillationTeacherModelConfig,
     DiffusionDistributionMatchingConfig,
@@ -52,6 +53,11 @@ class TestDistributionMatchingConfig:
         assert config.distribution_matching.score_discrete_steps == 1000
         assert config.distribution_matching.regression_type == "decoded_lpips"
         assert config.distribution_matching.fake_score_optim.lr == pytest.approx(2e-5)
+        assert config.distribution_matching.discriminator_optim.lr == pytest.approx(2e-5)
+        assert config.distribution_matching.adversarial.mode == "diffusion_gan"
+        assert config.distribution_matching.adversarial.max_timestep == 1000
+        assert config.distribution_matching.adversarial.generator_weight == pytest.approx(5e-3)
+        assert config.distribution_matching.adversarial.discriminator_weight == pytest.approx(1e-2)
 
     @pytest.mark.parametrize(
         "kwargs,error",
@@ -89,6 +95,19 @@ class TestDistributionMatchingConfig:
     def test_invalid_values_fail_closed(self, kwargs, error):
         with pytest.raises(ValueError, match=error):
             DiffusionDistributionMatchingConfig(**kwargs)
+
+    @pytest.mark.parametrize(
+        "kwargs,error",
+        [
+            ({"mode": "other"}, "Invalid adversarial mode"),
+            ({"max_timestep": 0}, "positive integer"),
+            ({"generator_weight": 0.0}, "finite and positive"),
+            ({"discriminator_weight": float("inf")}, "finite and positive"),
+        ],
+    )
+    def test_invalid_adversarial_values_fail_closed(self, kwargs, error):
+        with pytest.raises(ValueError, match=error):
+            DiffusionAdversarialConfig(**kwargs)
 
     def test_dmd_requires_at_least_one_objective_weight(self):
         with pytest.raises(ValueError, match="at least one positive"):
@@ -254,6 +273,27 @@ class TestDistillationConfigComposition:
         assert config.distribution_matching.fake_update_ratio == 2
         assert config.distribution_matching.rollout_strategy == "consistency_renoise"
         assert config.distribution_matching.fake_score_optim.lr == pytest.approx(2e-5)
+        assert config.distribution_matching.discriminator_optim.lr == pytest.approx(2e-5)
+
+    def test_composed_paper_profile_carries_adversarial_contract(self):
+        from verl_omni.trainer.diffusion.distillation.recipes import build_plan_from_config
+
+        cfg = self._compose(
+            [
+                "algorithm.trainer_type=distillation",
+                "algorithm.sample_source=offline",
+                "actor_rollout_ref.model.path=/m",
+                "distillation.distribution_matching.profile=paper",
+                "distillation.distribution_matching.data_mode=prompt_and_real_latent",
+                "distillation.distribution_matching.adversarial.mode=cls_on_clean_image",
+                "distillation.distribution_matching.adversarial.generator_weight=0.003",
+            ]
+        )
+        plan = build_plan_from_config(cfg, frozenset({"distribution_matching", "adversarial"}))
+        assert plan.objective["adversarial"] is True
+        assert plan.objective["adversarial_config"]["mode"] == "cls_on_clean_image"
+        assert plan.objective["adversarial_config"]["generator_weight"] == pytest.approx(0.003)
+        assert plan.update_schedule.phases[1].trainable_roles == ("fake_score", "discriminator")
 
     def test_composed_config_builds_validated_plan(self):
         from verl_omni.trainer.diffusion.distillation.recipes import build_plan_from_config

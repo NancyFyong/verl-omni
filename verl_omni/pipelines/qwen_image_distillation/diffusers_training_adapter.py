@@ -19,16 +19,18 @@ following LightX2V's public DMD equations.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 from tensordict import TensorDict
 from verl.utils import tensordict_utils as tu
 
-from verl_omni.pipelines.model_base import DiffusionModelBase, DistributionMatchingModelAdapter
+from verl_omni.pipelines.model_base import DiffusionAdversarialAdapter, DiffusionModelBase
 from verl_omni.pipelines.qwen_image_flow_grpo.common import (
     QWEN_IMAGE_VAE_SCALE_FACTOR,
     QwenImageTokenIdPromptMixin,
@@ -37,6 +39,8 @@ from verl_omni.pipelines.qwen_image_flow_grpo.common import (
 from verl_omni.pipelines.qwen_image_flow_grpo.diffusers_training_adapter import QwenImage
 from verl_omni.trainer.diffusion.distillation.contracts import ConditionBundle, DistillationPlan, PhaseRequest
 from verl_omni.trainer.diffusion.distillation.utils import (
+    adversarial_discriminator_loss,
+    adversarial_generator_loss,
     consistency_renoise_step,
     dmd_gradient,
     dmd_surrogate_loss,
@@ -46,7 +50,7 @@ from verl_omni.trainer.diffusion.distillation.utils import (
     timestep_shift,
     velocity_to_x0,
 )
-from verl_omni.workers.config import DiffusionModelConfig
+from verl_omni.workers.config import DiffusionAdversarialConfig, DiffusionModelConfig
 
 if TYPE_CHECKING:
     from verl_omni.workers.diffusion_distillation_worker import (
@@ -54,7 +58,20 @@ if TYPE_CHECKING:
         DistillationRoleRuntime,
     )
 
-__all__ = ["QwenImageDistributionMatching", "QwenImageDMDComputer", "build_qwen_dmd_sigmas"]
+__all__ = [
+    "QwenImageDistributionMatching",
+    "QwenImageDMDComputer",
+    "build_qwen_dmd_sigmas",
+    "qwen_vae_config_sha256",
+]
+
+
+def qwen_vae_config_sha256(model_path: str) -> str:
+    """Fingerprint the canonical Qwen VAE config used to normalize cached latents."""
+    from diffusers import AutoencoderKLQwenImage
+
+    config = AutoencoderKLQwenImage.load_config(model_path, subfolder="vae")
+    return hashlib.sha256(json.dumps(dict(config), sort_keys=True).encode()).hexdigest()
 
 
 def build_qwen_dmd_sigmas(
@@ -77,6 +94,41 @@ def build_qwen_dmd_sigmas(
     )
     shifted = timestep_shift(raw * 1000.0, 1000, shift) / 1000.0
     return torch.cat((shifted, shifted.new_zeros(1)))
+
+
+class QwenImageDMDProjection(torch.nn.Linear):
+    """Preserve denoiser projection keys and classify pooled final DiT features."""
+
+    def __init__(self, projection: torch.nn.Linear):
+        super().__init__(
+            projection.in_features,
+            projection.out_features,
+            bias=projection.bias is not None,
+            device=projection.weight.device,
+            dtype=projection.weight.dtype,
+        )
+        self.weight = projection.weight
+        self.bias = projection.bias
+        self.classifier = torch.nn.Sequential(
+            torch.nn.LayerNorm(projection.in_features),
+            torch.nn.Linear(projection.in_features, 1),
+        ).to(device=projection.weight.device, dtype=projection.weight.dtype)
+        with torch.no_grad():
+            values = torch.arange(
+                1,
+                projection.in_features + 1,
+                device=projection.weight.device,
+                dtype=torch.float32,
+            ).sin_()
+            self.classifier[-1].weight.copy_(values.mul(projection.in_features**-0.5).unsqueeze(0))
+            self.classifier[-1].bias.zero_()
+        self.classify = False
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return [B, 1] logits or unchanged [B, tokens, channels] velocity."""
+        if self.classify:
+            return self.classifier(hidden_states.mean(dim=1))
+        return super().forward(hidden_states)
 
 
 class QwenImageConditionProvider:
@@ -293,7 +345,7 @@ class QwenImageConditionProvider:
 
 
 class QwenImageDMDComputer:
-    """Differentiable Qwen-Image phase program for DMD and distribution-only DMD2."""
+    """Differentiable Qwen-Image computation for original DMD and both DMD2 profiles."""
 
     STREAM_OFFSETS = {
         "initial_noise": 0,
@@ -301,13 +353,16 @@ class QwenImageDMDComputer:
         "rollout_transition": 2,
         "score_sigma": 3,
         "score_noise": 4,
+        "adversarial_sigma": 5,
+        "adversarial_noise": 6,
+        "adversarial_vae": 7,
     }
 
     def __init__(self, model_config: DiffusionModelConfig, plan: DistillationPlan) -> None:
         if plan.name not in {"dmd", "dmd2"}:
             raise ValueError(f"QwenImageDMDComputer does not implement recipe {plan.name!r}.")
-        if plan.objective.get("adversarial", False):
-            raise NotImplementedError("The Qwen DMD2 adversarial profile is not supported by this phase runner.")
+        self.adversarial = bool(plan.objective.get("adversarial", False))
+        self.adversarial_config = DiffusionAdversarialConfig(**dict(plan.objective.get("adversarial_config", {})))
         self.model_config = model_config
         self.plan = plan
         self.height = int(model_config.pipeline.height)
@@ -342,6 +397,7 @@ class QwenImageDMDComputer:
         self._pending_generator_states: dict[str, torch.Tensor] = {}
         self._vae = None
         self._lpips = None
+        self.vae_fingerprint = None
         self.validate_config()
 
     def validate_config(self) -> None:
@@ -386,6 +442,14 @@ class QwenImageDMDComputer:
             raise ValueError(f"Unsupported Qwen conditioning provider {self.condition_provider.provider!r}.")
         if self.plan.name == "dmd" and self.strategy != "one_step":
             raise ValueError("The Qwen original-DMD profile requires rollout_strategy='one_step'.")
+        targets = getattr(self.model_config, "target_modules", None)
+        if self.adversarial and (
+            targets == "all-linear"
+            or targets is not None
+            and not isinstance(targets, str)
+            and any("proj_out" in target for target in targets)
+        ):
+            raise ValueError("Qwen DMD2 adversarial LoRA must exclude proj_out/classifier; select attention targets.")
 
     @staticmethod
     def module_dtype(module: torch.nn.Module) -> torch.dtype:
@@ -411,7 +475,10 @@ class QwenImageDMDComputer:
         engine = runtime.engine_for_role("student")
         rank = int(engine.get_data_parallel_rank()) if hasattr(engine, "get_data_parallel_rank") else 0
         generator = torch.Generator(device=device)
-        generator.manual_seed(self.rng_seed + rank * len(self.STREAM_OFFSETS) + self.STREAM_OFFSETS[name])
+        offset = self.STREAM_OFFSETS[name]
+        # Preserve pre-adversarial checkpoint replay for the five original streams.
+        seed_offset = rank * 5 + offset if offset < 5 else 2**32 + rank * 3 + offset - 5
+        generator.manual_seed(self.rng_seed + seed_offset)
         pending = self._pending_generator_states.pop(name, None)
         if pending is not None:
             generator.set_state(pending)
@@ -505,11 +572,12 @@ class QwenImageDMDComputer:
         height: int,
         width: int,
         grad_enabled: bool,
+        input_grad_only: bool = False,
     ) -> torch.Tensor:
-        """Predict Qwen flow velocity with explicit role and gradient ownership."""
+        """Predict Qwen velocity or discriminator logits with explicit gradient ownership."""
         with (
             torch.profiler.record_function(f"distillation/{role}_forward"),
-            runtime.use_role(role, grad_enabled=grad_enabled) as module,
+            runtime.use_role(role, grad_enabled=grad_enabled, input_grad_only=input_grad_only) as module,
         ):
             module.eval()
             timestep = sigma.reshape(-1)
@@ -533,6 +601,10 @@ class QwenImageDMDComputer:
                 img_shapes=build_img_shapes(height, width, latents.shape[0], QWEN_IMAGE_VAE_SCALE_FACTOR),
                 return_dict=False,
             )[0]
+        if role == "discriminator":
+            if output.shape != (latents.shape[0], 1):
+                raise ValueError(f"Qwen discriminator must return [B, 1] logits, got {tuple(output.shape)}.")
+            return output.float()
         if output.shape != latents.shape:
             raise ValueError(
                 f"Qwen DMD transformer output shape {tuple(output.shape)} does not match latent shape "
@@ -751,6 +823,15 @@ class QwenImageDMDComputer:
             total = total + self.regression_loss_weight * regression_loss
             metrics["regression/loss"] = float(regression_loss.detach())
             metrics["perf/regression_s"] = time.perf_counter() - regression_start
+        if self.adversarial:
+            adversarial_start = time.perf_counter()
+            logits = self.discriminator_logits(
+                generated, runtime, condition, height=height, width=width, input_grad_only=True
+            )
+            generator_loss = adversarial_generator_loss(logits)
+            total = total + self.adversarial_config.generator_weight * generator_loss
+            metrics["adversarial/generator_loss"] = float(generator_loss.detach())
+            metrics["perf/generator_adversarial_s"] = time.perf_counter() - adversarial_start
         return total, metrics
 
     def fake_loss(
@@ -793,7 +874,7 @@ class QwenImageDMDComputer:
         )
         fake_duration = time.perf_counter() - fake_start
         loss, active = fake_score_loss(fake_velocity, score_noise, generated)
-        return loss, {
+        metrics = {
             "fake_score/denoising_loss": float(loss.detach()),
             "fake_score/active_elements": float(active),
             "rollout/exit_index": float(exit_index),
@@ -803,12 +884,127 @@ class QwenImageDMDComputer:
             "perf/student_rollout_s": rollout_duration,
             "perf/fake_score_model_s": fake_duration,
         }
+        return loss, metrics, generated
+
+    def discriminator_loss(
+        self,
+        batch: TensorDict,
+        generated: torch.Tensor,
+        runtime: DistillationRoleRuntime,
+        condition: ConditionBundle,
+        *,
+        height: int,
+        width: int,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Classify matched real and detached generated samples for one optimizer."""
+        discriminator_start = time.perf_counter()
+        real = self.real_latents(batch, generated, runtime, height=height, width=width)
+        fake_logits = self.discriminator_logits(generated.detach(), runtime, condition, height=height, width=width)
+        real_logits = self.discriminator_logits(real.detach(), runtime, condition, height=height, width=width)
+        loss = adversarial_discriminator_loss(fake_logits, real_logits)
+        return self.adversarial_config.discriminator_weight * loss, {
+            "adversarial/discriminator_loss": float(loss.detach()),
+            "adversarial/real_logit": float(real_logits.detach().mean()),
+            "adversarial/fake_logit": float(fake_logits.detach().mean()),
+            "perf/discriminator_s": time.perf_counter() - discriminator_start,
+        }
+
+    def discriminator_logits(
+        self,
+        latents: torch.Tensor,
+        runtime: DistillationRoleRuntime,
+        condition: ConditionBundle,
+        *,
+        height: int,
+        width: int,
+        input_grad_only: bool = False,
+    ) -> torch.Tensor:
+        """Classify clean or re-noised latents; generator inputs retain their graph."""
+        sigma = latents.new_zeros(latents.shape[0], dtype=torch.float32)
+        if self.adversarial_config.mode == "diffusion_gan":
+            steps = int(runtime.scheduler_for_role("student").config.get("num_train_timesteps", 1000))
+            if self.adversarial_config.max_timestep > steps:
+                raise ValueError("adversarial.max_timestep exceeds the scheduler training horizon.")
+            sigma = (
+                torch.randint(
+                    self.adversarial_config.max_timestep,
+                    (latents.shape[0],),
+                    device=latents.device,
+                    generator=self.generator_for_stream("adversarial_sigma", latents.device, runtime),
+                ).float()
+                / steps
+            )
+            noise = self.sample_noise(tuple(latents.shape), latents.device, runtime, "adversarial_noise")
+            expanded = self.expand_sigma(sigma, latents)
+            latents = (1 - expanded) * latents.float() + expanded * noise
+        return self.predict_velocity(
+            runtime,
+            "discriminator",
+            latents,
+            sigma,
+            condition,
+            height=height,
+            width=width,
+            grad_enabled=True,
+            input_grad_only=input_grad_only,
+        )
+
+    def real_latents(
+        self,
+        batch: TensorDict,
+        generated: torch.Tensor,
+        runtime: DistillationRoleRuntime,
+        *,
+        height: int,
+        width: int,
+    ) -> torch.Tensor:
+        """Load normalized real latents or encode [0, 1] RGB with the frozen Qwen VAE."""
+        latents = tu.get(batch, "real_latents")
+        pixels = tu.get(batch, "real_pixels")
+        if (latents is None) == (pixels is None):
+            raise ValueError("DMD2 adversarial batches require exactly one of real_latents or real_pixels.")
+        if latents is not None:
+            manifests = tu.get(batch, "real_latent_manifest")
+            if isinstance(manifests, Mapping) and batch.batch_size[0] == 1:
+                manifests = [manifests]
+            if self.vae_fingerprint is None:
+                self.vae_fingerprint = qwen_vae_config_sha256(self.model_config.local_path or self.model_config.path)
+            if (
+                not isinstance(manifests, list)
+                or len(manifests) != batch.batch_size[0]
+                or any(
+                    not isinstance(item, Mapping)
+                    or item.get("normalization") != "qwen_image"
+                    or item.get("vae_config_sha256") != self.vae_fingerprint
+                    for item in manifests
+                )
+            ):
+                raise ValueError("real_latent_manifest must match Qwen normalization and the VAE config for every row.")
+            return self.coerce_packed(latents, generated.shape, "real_latents", generated.device).detach()
+        if not isinstance(pixels, torch.Tensor) or pixels.shape != (generated.shape[0], 3, height, width):
+            raise ValueError("real_pixels must have shape [B, 3, height, width].")
+        pixels = pixels.detach().to(device=generated.device, dtype=torch.float32)
+        if not torch.isfinite(pixels).all() or torch.any((pixels < 0) | (pixels > 1)):
+            raise ValueError("real_pixels must contain finite RGB values in [0, 1].")
+        vae = self.ensure_vae(generated.device)
+        with torch.no_grad():
+            encoded = (
+                vae.encode(pixels.mul(2).sub(1).unsqueeze(2))
+                .latent_dist.sample(generator=self.generator_for_stream("adversarial_vae", generated.device, runtime))
+                .float()
+            )
+            shape = (1, vae.config.z_dim, 1, 1, 1)
+            mean = encoded.new_tensor(vae.config.latents_mean).view(shape)
+            std = encoded.new_tensor(vae.config.latents_std).view(shape)
+            return self.coerce_packed((encoded - mean) / std, generated.shape, "real_latents", generated.device)
 
     def coerce_packed(self, value: Any, expected_shape: torch.Size, key: str, device: torch.device) -> torch.Tensor:
         """Validate and pack a reference noise or teacher-target tensor."""
         if not isinstance(value, torch.Tensor):
             raise ValueError(f"Qwen DMD regression requires tensor batch field {key!r}.")
         value = value.to(device=device, dtype=torch.float32)
+        if not torch.isfinite(value).all():
+            raise ValueError(f"Qwen DMD {key} must contain finite values.")
         if value.ndim == 4:
             value = value.unsqueeze(2)
         if value.ndim == 5:
@@ -871,8 +1067,8 @@ class QwenImageDMDComputer:
             return torch.mean((prediction.float() - target.detach().float()) ** 2)
         return self.decoded_lpips_loss(prediction, target_latents, target_pixels, height=height, width=width)
 
-    def ensure_vae_and_lpips(self, device: torch.device):
-        """Load frozen VAE and perceptual-loss modules only for original DMD."""
+    def ensure_vae(self, device: torch.device):
+        """Load the frozen VAE independently of optional perceptual-loss dependencies."""
         if self._vae is None:
             from diffusers import AutoencoderKLQwenImage
 
@@ -884,6 +1080,11 @@ class QwenImageDMDComputer:
             ).to(device)
             self._vae.requires_grad_(False)
             self._vae.eval()
+        return self._vae
+
+    def ensure_vae_and_lpips(self, device: torch.device):
+        """Load frozen VAE and perceptual-loss modules for original DMD."""
+        self.ensure_vae(device)
         if self._lpips is None:
             try:
                 import piq
@@ -900,7 +1101,7 @@ class QwenImageDMDComputer:
         """Undo Qwen latent normalization and decode differentiably to RGB."""
         from diffusers import QwenImagePipeline
 
-        vae, _ = self.ensure_vae_and_lpips(packed.device)
+        vae = self.ensure_vae(packed.device)
         latent = QwenImagePipeline._unpack_latents(
             packed,
             height=height,
@@ -923,7 +1124,8 @@ class QwenImageDMDComputer:
         width: int,
     ) -> torch.Tensor:
         """Apply perceptual regression with gradients only through the prediction."""
-        _, lpips = self.ensure_vae_and_lpips(prediction.device)
+        vae, lpips = self.ensure_vae_and_lpips(prediction.device)
+        self._vae = vae
         prediction_pixels = self.decode_latents(prediction, height=height, width=width)
         if target_pixels is not None:
             target = target_pixels.to(device=prediction.device, dtype=torch.float32)
@@ -947,17 +1149,13 @@ class QwenImageDMDComputer:
                 target = self.decode_latents(target, height=height, width=width)
         return lpips(prediction_pixels, target.detach()).mean()
 
-    def compute_phase(
+    def prepare_phase_inputs(
         self,
         request: PhaseRequest,
         batch: TensorDict,
         runtime: DistillationRoleRuntime,
-    ) -> DistillationPhaseComputation:
-        """Build the requested role loss and detached metrics for one micro-batch."""
-        from verl_omni.workers.diffusion_distillation_worker import DistillationPhaseComputation
-
-        if request.kind not in {"student", "fake_score"}:
-            raise ValueError(f"Unsupported Qwen DMD phase {request.kind!r}.")
+    ) -> tuple[int, int, tuple[int, ...], ConditionBundle, Optional[ConditionBundle], float]:
+        """Resolve homogeneous geometry and frozen prompt conditioning once per micro-batch."""
         with runtime.use_role("student", grad_enabled=False) as module:
             height, width, _, latent_shape = self.latent_geometry(batch, module)
             dtype = self.module_dtype(module)
@@ -972,7 +1170,24 @@ class QwenImageDMDComputer:
         condition = self.prepare_condition_for_sequence_parallel(runtime, condition)
         if negative_condition is not None:
             negative_condition = self.prepare_condition_for_sequence_parallel(runtime, negative_condition)
-        condition_duration = time.perf_counter() - condition_start
+        return height, width, latent_shape, condition, negative_condition, time.perf_counter() - condition_start
+
+    def compute_phase(
+        self,
+        request: PhaseRequest,
+        batch: TensorDict,
+        runtime: DistillationRoleRuntime,
+    ) -> DistillationPhaseComputation:
+        """Build one role loss; multi-role phases use :meth:`iter_role_computations`."""
+        from verl_omni.workers.diffusion_distillation_worker import DistillationPhaseComputation
+
+        if request.kind not in {"student", "fake_score"}:
+            raise ValueError(f"Unsupported Qwen DMD phase {request.kind!r}.")
+        if len(request.trainable_roles) != 1:
+            raise ValueError("Multi-role Qwen DMD2 phases require iter_role_computations().")
+        height, width, latent_shape, condition, negative_condition, condition_duration = self.prepare_phase_inputs(
+            request, batch, runtime
+        )
         if request.kind == "student":
             if negative_condition is None:
                 raise ValueError("Qwen DMD student phases require negative teacher conditioning.")
@@ -987,7 +1202,10 @@ class QwenImageDMDComputer:
             )
             metrics["perf/condition_encode_s"] = condition_duration
             return DistillationPhaseComputation(losses={"student": loss}, metrics=metrics)
-        loss, metrics = self.fake_loss(
+        role = request.trainable_roles[0]
+        if role != "fake_score":
+            raise ValueError("Discriminator computation must be paired through iter_role_computations().")
+        loss, metrics, _ = self.fake_loss(
             runtime,
             condition,
             height=height,
@@ -995,7 +1213,40 @@ class QwenImageDMDComputer:
             latent_shape=latent_shape,
         )
         metrics["perf/condition_encode_s"] = condition_duration
-        return DistillationPhaseComputation(losses={"fake_score": loss}, metrics=metrics)
+        return DistillationPhaseComputation(losses={role: loss}, metrics=metrics)
+
+    def iter_role_computations(
+        self,
+        request: PhaseRequest,
+        batch: TensorDict,
+        runtime: DistillationRoleRuntime,
+    ) -> Iterator[tuple[str, DistillationPhaseComputation]]:
+        """Yield fake-score then discriminator graphs for immediate FSDP backward."""
+        from verl_omni.workers.diffusion_distillation_worker import DistillationPhaseComputation
+
+        if not self.adversarial or request.kind != "fake_score":
+            raise ValueError("Multi-role computation is available only for DMD2 adversarial fake phases.")
+        if request.trainable_roles != ("fake_score", "discriminator"):
+            raise ValueError("DMD2 adversarial fake phases require fake_score then discriminator roles.")
+        height, width, latent_shape, condition, _, condition_duration = self.prepare_phase_inputs(
+            request, batch, runtime
+        )
+        fake_loss, fake_metrics, generated = self.fake_loss(
+            runtime,
+            condition,
+            height=height,
+            width=width,
+            latent_shape=latent_shape,
+        )
+        fake_metrics["perf/condition_encode_s"] = condition_duration
+        yield "fake_score", DistillationPhaseComputation(losses={"fake_score": fake_loss}, metrics=fake_metrics)
+        discriminator_loss, discriminator_metrics = self.discriminator_loss(
+            batch, generated, runtime, condition, height=height, width=width
+        )
+        yield (
+            "discriminator",
+            DistillationPhaseComputation(losses={"discriminator": discriminator_loss}, metrics=discriminator_metrics),
+        )
 
     def state_dict(self) -> dict:
         """Return independent worker-local RNG stream states."""
@@ -1006,10 +1257,10 @@ class QwenImageDMDComputer:
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         """Restore worker-local rollout and score-noise RNG streams."""
         if state.get("version") != 1 or state.get("rng_seed") != self.rng_seed:
-            raise ValueError("Qwen DMD phase-runner checkpoint is incompatible with the active RNG configuration.")
+            raise ValueError("Qwen DMD computer checkpoint is incompatible with the active RNG configuration.")
         generator_states = state.get("generator_states")
         if not isinstance(generator_states, Mapping) or set(generator_states) - set(self.STREAM_OFFSETS):
-            raise ValueError("Qwen DMD phase-runner checkpoint contains invalid RNG streams.")
+            raise ValueError("Qwen DMD computer checkpoint contains invalid RNG streams.")
         self._generators.clear()
         self._pending_generator_states.clear()
         for name, generator_state in generator_states.items():
@@ -1020,8 +1271,26 @@ class QwenImageDMDComputer:
 
 @DiffusionModelBase.register("QwenImagePipeline", algorithm="dmd")
 @DiffusionModelBase.register("QwenImagePipeline", algorithm="dmd2")
-class QwenImageDistributionMatching(QwenImage, DistributionMatchingModelAdapter):
+class QwenImageDistributionMatching(QwenImage, DiffusionAdversarialAdapter):
     """Qwen-Image architecture adapter for DMD and DMD2."""
+
+    discriminator_parameter_prefixes = ("proj_out.classifier.",)
+
+    @classmethod
+    def build_discriminator_head(cls, module):
+        """Reuse final normalized DiT features without rewriting transformer forward."""
+        if isinstance(module.proj_out, QwenImageDMDProjection):
+            return
+        if not isinstance(module.proj_out, torch.nn.Linear):
+            raise TypeError(f"Qwen DMD2 discriminator expects a linear proj_out, got {type(module.proj_out)}.")
+        module.proj_out = QwenImageDMDProjection(module.proj_out)
+
+    @classmethod
+    def configure_role_parameters(cls, module, role):
+        """Activate the discriminator head only for its independently optimized role."""
+        super().configure_role_parameters(module, role)
+        if isinstance(module.proj_out, QwenImageDMDProjection):
+            module.proj_out.classify = role == "discriminator"
 
     @classmethod
     def build_distribution_matching_computer(
