@@ -291,6 +291,20 @@ class DistributionMatchingModelAdapter:
         )
 
 
+class AutoregressiveDistillationAdapter:
+    """Optional capability contract for causal blockwise diffusion adapters."""
+
+    @classmethod
+    def allocate_cache(cls, module, **kwargs):
+        """Allocate architecture-specific inference cache state."""
+        raise NotImplementedError
+
+    @classmethod
+    def causal_forward(cls, module, **kwargs):
+        """Configure and execute one full-sequence or incremental causal forward."""
+        raise NotImplementedError
+
+
 class DiffusionAdversarialAdapter(DistributionMatchingModelAdapter):
     """Opt-in diffusion-feature classifier with independently owned parameters."""
 

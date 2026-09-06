@@ -54,6 +54,12 @@ class TestDistributionMatchingConfig:
         assert config.distribution_matching.regression_type == "decoded_lpips"
         assert config.distribution_matching.fake_score_optim.lr == pytest.approx(2e-5)
         assert config.distribution_matching.discriminator_optim.lr == pytest.approx(2e-5)
+        assert config.distribution_matching.frames_per_block == 3
+        assert config.distribution_matching.trajectory_manifest_sha256 is None
+        assert config.distribution_matching.ode_loss_weight == pytest.approx(1.0)
+        assert config.distribution_matching.ode_num_train_timesteps == 1000
+        assert config.distribution_matching.causal_denoising_timesteps == [1000, 750, 500, 250]
+        assert config.distribution_matching.causal_timestep_shift == pytest.approx(8.0)
         assert config.distribution_matching.adversarial.mode == "diffusion_gan"
         assert config.distribution_matching.adversarial.max_timestep == 1000
         assert config.distribution_matching.adversarial.generator_weight == pytest.approx(5e-3)
@@ -90,6 +96,15 @@ class TestDistributionMatchingConfig:
             ({"regression_type": "pixel_mse"}, "regression_type"),
             ({"regression_loss_weight": -1.0}, "regression_loss_weight"),
             ({"rng_seed": -1}, "rng_seed"),
+            ({"frames_per_block": 0}, "frames_per_block"),
+            ({"ode_loss_weight": 0.0}, "ode_loss_weight"),
+            ({"ode_num_train_timesteps": 0}, "ode_num_train_timesteps"),
+            ({"recipe": "ode_regression"}, "trajectory_manifest_sha256"),
+            ({"recipe": "ode_regression", "trajectory_manifest_sha256": "abc"}, "trajectory_manifest_sha256"),
+            ({"causal_denoising_timesteps": []}, "causal_denoising_timesteps"),
+            ({"causal_denoising_timesteps": [500, 750]}, "causal_denoising_timesteps"),
+            ({"causal_denoising_timesteps": [1001]}, "causal_denoising_timesteps"),
+            ({"causal_timestep_shift": 0.5}, "causal_timestep_shift"),
         ],
     )
     def test_invalid_values_fail_closed(self, kwargs, error):

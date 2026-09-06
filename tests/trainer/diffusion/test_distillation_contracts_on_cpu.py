@@ -35,6 +35,7 @@ from verl_omni.trainer.diffusion.distillation.contracts import (
 from verl_omni.trainer.diffusion.distillation.recipes import (
     DistillationRegistry,
     build_plan,
+    build_plan_from_config,
     initialization_registry,
     objective_registry,
     recipe_registry,
@@ -199,7 +200,7 @@ class TestExportRole:
 
 class TestRegistry:
     def test_all_recipe_and_strategy_names_are_registered(self):
-        assert set(recipe_registry.names) == {"dmd", "dmd2", "causvid", "self_forcing"}
+        assert set(recipe_registry.names) == {"dmd", "dmd2", "ode_regression", "causvid", "self_forcing"}
         assert set(objective_registry.names) == {"dmd", "dmd2", "ode_regression"}
         assert set(initialization_registry.names) == {"base", "ode_regression"}
         assert set(rollout_registry.names) == {
@@ -207,6 +208,7 @@ class TestRegistry:
             "consistency_renoise",
             "ode_euler",
             "one_step",
+            "ode_trajectory",
             "self_forced",
             "teacher_forced_causal",
         }
@@ -264,6 +266,44 @@ class TestRecipePlans:
         assert fake_phase.trainable_roles == ("fake_score", "discriminator")
         assert plan.objective["adversarial"] is True
 
+    def test_ode_regression_uses_only_causal_student_and_ema(self):
+        plan = build_plan(
+            "ode_regression",
+            {
+                "model_path": "/bidirectional",
+                "causal_model_path": "/causal",
+                "trajectory_manifest_sha256": "a" * 64,
+                "frames_per_block": 3,
+            },
+            ALL_CAPS | {"ode_regression"},
+        )
+        assert plan.role_layout.groups[0].model_ref == "/causal"
+        assert {binding.role for binding in plan.role_layout.bindings} == {"student", "student_ema"}
+        assert [phase.kind for phase in plan.update_schedule.phases] == ["student"]
+        assert plan.rollout["strategy"] == "ode_trajectory"
+        assert plan.rollout["frames_per_block"] == 3
+        assert plan.rollout["denoising_timesteps"] == (1000, 750, 500, 250)
+        assert plan.rollout["timestep_shift"] == pytest.approx(8.0)
+        assert plan.data_requirements["trajectory_manifest_sha256"] == "a" * 64
+
+    def test_ode_regression_requires_manifest_fingerprint(self):
+        with pytest.raises(ValueError, match="trajectory_manifest_sha256"):
+            build_plan("ode_regression", {"model_path": "/m"}, ALL_CAPS | {"ode_regression"})
+
+    @pytest.mark.parametrize(
+        "override,error",
+        [
+            ({"profile": "paper"}, "profile override"),
+            ({"rollout_strategy": "ode_euler"}, "rollout_strategy"),
+            ({"data_mode": "prompts"}, "data_mode"),
+            ({"fake_update_ratio": 1}, "fake-score"),
+        ],
+    )
+    def test_ode_regression_rejects_unrelated_recipe_overrides(self, override, error):
+        config = {"model_path": "/m", "trajectory_manifest_sha256": "a" * 64, **override}
+        with pytest.raises(ValueError, match=error):
+            build_plan("ode_regression", config, ALL_CAPS | {"ode_regression"})
+
     def test_dmd2_distribution_only_has_no_discriminator(self):
         plan = build_plan("dmd2", {"profile": "distribution_only", "model_path": "/m"}, ALL_CAPS)
         roles = {binding.role for binding in plan.role_layout.bindings}
@@ -271,12 +311,33 @@ class TestRecipePlans:
         assert "discriminator" not in roles
         assert fake_phase.trainable_roles == ("fake_score",)
 
+    def test_config_builder_forwards_asymmetric_causal_model_paths(self):
+        config = {
+            "actor_rollout_ref": {"model": {"path": "/fallback"}},
+            "distillation": {
+                "distribution_matching": {
+                    "recipe": "causvid",
+                    "causal_model_path": "/causal",
+                    "bidirectional_model_path": "/bidir",
+                }
+            },
+        }
+        plan = build_plan_from_config(config, ALL_CAPS)
+        groups = {group.name: group.model_ref for group in plan.role_layout.groups}
+        assert groups == {"causal_base": "/causal", "bidirectional_base": "/bidir"}
+
     def test_causal_recipes_use_separate_causal_and_bidirectional_groups(self):
         for name in ("causvid", "self_forcing"):
-            plan = build_plan(name, {"model_path": "/m"}, ALL_CAPS)
-            groups = {group.name for group in plan.role_layout.groups}
+            plan = build_plan(
+                name,
+                {"model_path": "/fallback", "causal_model_path": "/causal", "bidirectional_model_path": "/bidir"},
+                ALL_CAPS,
+            )
+            groups = {group.name: group for group in plan.role_layout.groups}
             role_groups = {binding.role: binding.group for binding in plan.role_layout.bindings}
-            assert groups == {"causal_base", "bidirectional_base"}
+            assert set(groups) == {"causal_base", "bidirectional_base"}
+            assert groups["causal_base"].model_ref == "/causal"
+            assert groups["bidirectional_base"].model_ref == "/bidir"
             assert role_groups["student"] == role_groups["student_ema"] == "causal_base"
             assert role_groups["teacher_score"] == role_groups["fake_score"] == "bidirectional_base"
 

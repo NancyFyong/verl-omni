@@ -54,6 +54,12 @@ distribution_matching:
   # Registered recipe name
   recipe: dmd2
 
+  # Optional causal student checkpoint; null uses actor_rollout_ref.model.path
+  causal_model_path: null
+
+  # Optional bidirectional score checkpoint for later asymmetric DMD stages
+  bidirectional_model_path: null
+
   # Optional recipe profile; null selects the recipe default
   profile: null
 
@@ -212,3 +218,21 @@ distribution_matching:
 
   # Base seed for worker-local rollout and score-noise generators
   rng_seed: 0
+
+  # Number of latent frames sharing one causal block timestep
+  frames_per_block: 3
+
+  # Required canonical trajectory-manifest SHA-256 for ode_regression
+  trajectory_manifest_sha256: null
+
+  # ODE clean-latent regression weight
+  ode_loss_weight: 1.0
+
+  # Raw Wan training-timestep scale
+  ode_num_train_timesteps: 1000
+
+  # Unshifted few-step causal Wan inference timesteps
+  causal_denoising_timesteps: [1000, 750, 500, 250]
+
+  # Rational time shift for exported causal Wan schedules
+  causal_timestep_shift: 8.0

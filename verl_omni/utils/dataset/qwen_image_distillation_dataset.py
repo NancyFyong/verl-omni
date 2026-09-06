@@ -15,45 +15,14 @@
 
 from __future__ import annotations
 
-import io
-import os
 from typing import Any
 
-import numpy as np
 import torch
 from verl.utils.dataset.rl_dataset import RLHFDataset
 
-__all__ = ["QwenImageDMDPairDataset", "QwenImageDMDRealDataset"]
+from verl_omni.utils.dataset.distillation import is_present, load_float_tensor
 
-
-def load_float_tensor(value: Any, field: str) -> torch.Tensor:
-    """Load a non-empty detached fp32 tensor without arbitrary pickle execution."""
-    if isinstance(value, torch.Tensor):
-        tensor = value
-    elif isinstance(value, bytes | bytearray | memoryview):
-        buffer = io.BytesIO(bytes(value))
-        tensor = torch.load(buffer, map_location="cpu", weights_only=True)
-    elif isinstance(value, str):
-        path = os.path.expanduser(value)
-        if not os.path.isfile(path):
-            raise FileNotFoundError(f"DMD tensor path for {field!r} does not exist: {path}")
-        tensor = torch.load(path, map_location="cpu", weights_only=True)
-    else:
-        tensor = torch.as_tensor(np.asarray(value))
-    if not isinstance(tensor, torch.Tensor):
-        raise TypeError(f"DMD field {field!r} must resolve to a tensor, got {type(tensor)}.")
-    if tensor.numel() == 0 or not torch.isfinite(tensor).all():
-        raise ValueError(f"DMD field {field!r} must be non-empty and finite.")
-    return tensor.detach().float()
-
-
-def is_present(value: Any) -> bool:
-    """Treat missing parquet cells and NaN placeholders as absent targets."""
-    if value is None:
-        return False
-    if isinstance(value, float) and np.isnan(value):
-        return False
-    return True
+__all__ = ["QwenImageDMDPairDataset", "QwenImageDMDRealDataset", "is_present", "load_float_tensor"]
 
 
 class QwenImageDMDRealDataset(RLHFDataset):

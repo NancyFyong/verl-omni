@@ -28,6 +28,7 @@ from . import (
     qwen_image_mix_grpo,
     sd3_dpo,
     sd3_flow_grpo,
+    wan21_distillation,
     wan22_dance_grpo,
 )
 from .bagel_flow_grpo import *  # noqa: F401, F403
@@ -45,6 +46,7 @@ from .qwen_image_flow_grpo import *  # noqa: F401, F403
 from .qwen_image_mix_grpo import *  # noqa: F401, F403
 from .sd3_dpo import *  # noqa: F401, F403
 from .sd3_flow_grpo import *  # noqa: F401, F403
+from .wan21_distillation import *  # noqa: F401, F403
 from .wan22_dance_grpo import *  # noqa: F401, F403
 
 __all__ = list(qwen3_omni.__all__)
@@ -58,6 +60,7 @@ __all__ += list(minimax_h3_diffusion_nft.__all__)
 __all__ += list(minimax_h3_flow_grpo.__all__)
 __all__ += list(sd3_dpo.__all__)
 __all__ += list(sd3_flow_grpo.__all__)
+__all__ += list(wan21_distillation.__all__)
 __all__ += list(wan22_dance_grpo.__all__)
 __all__ += list(qwen_image_dpo.__all__)
 __all__ += list(qwen_image_dual_grpo.__all__)

@@ -36,6 +36,7 @@ __all__ = [
     "DMD2Recipe",
     "CausVidRecipe",
     "SelfForcingRecipe",
+    "ODERegressionRecipe",
     "build_plan",
     "build_plan_from_config",
     "DistillationRecipeBase",
@@ -58,6 +59,7 @@ __all__ = [
     "ConsistencyRenoiseRollout",
     "TeacherForcedCausalRollout",
     "SelfForcedRollout",
+    "ODETrajectoryRollout",
     "BackwardSimulatedRollout",
     "BaseInitialization",
     "ODERegressionInitialization",
@@ -219,6 +221,13 @@ class SelfForcedRollout(RolloutStrategyBase):
     name = "self_forced"
 
 
+@rollout_registry.register("ode_trajectory")
+class ODETrajectoryRollout(RolloutStrategyBase):
+    """Select blockwise states from a precomputed teacher ODE trajectory."""
+
+    name = "ode_trajectory"
+
+
 @rollout_registry.register("backward_simulated")
 class BackwardSimulatedRollout(RolloutStrategyBase):
     """Inference-time backward-simulated multi-step student input."""
@@ -273,6 +282,24 @@ def shared_base_layout(model_ref: str, with_discriminator: bool = False) -> Role
     return RoleLayoutSpec(
         groups=(RoleGroupSpec(name=group_name, model_ref=model_ref),),
         bindings=tuple(bindings),
+        score_transport=ScoreTransportSpec(),
+    )
+
+
+def causal_ode_layout(model_ref: str) -> RoleLayoutSpec:
+    """Build a causal student/EMA group for standalone ODE initialization."""
+    return RoleLayoutSpec(
+        groups=(RoleGroupSpec(name="causal_base", model_ref=model_ref),),
+        bindings=(
+            RoleBinding(
+                role="student",
+                group="causal_base",
+                adapter="student",
+                trainable=True,
+                optimizer_key="student",
+            ),
+            RoleBinding(role="student_ema", group="causal_base", adapter="student_ema"),
+        ),
         score_transport=ScoreTransportSpec(),
     )
 
@@ -521,6 +548,74 @@ class DMD2Recipe(DistillationRecipeBase):
         )
 
 
+@recipe_registry.register("ode_regression")
+class ODERegressionRecipe(DistillationRecipeBase):
+    """Initialize a causal student from precomputed deterministic ODE trajectories."""
+
+    @classmethod
+    def build_plan(cls, config, capabilities) -> DistillationPlan:
+        model_ref = get_config_value(config, "causal_model_path") or get_config_value(config, "model_path", "") or ""
+        profile = get_config_value(config, "profile")
+        if profile is not None:
+            raise ValueError("ODE regression does not accept a profile override.")
+        rollout_override = get_config_value(config, "rollout_strategy")
+        if rollout_override not in {None, "ode_trajectory"}:
+            raise ValueError("ODE regression rollout_strategy must be 'ode_trajectory' when specified.")
+        data_mode = get_config_value(config, "data_mode")
+        if data_mode not in {None, "ode_trajectory"}:
+            raise ValueError("ODE regression data_mode must be 'ode_trajectory' when specified.")
+        if get_config_value(config, "fake_update_ratio") is not None or get_config_value(
+            config, "fake_warmup_cycles", 0
+        ):
+            raise ValueError("ODE regression does not run fake-score phases.")
+        manifest_sha256 = get_config_value(config, "trajectory_manifest_sha256")
+        if (
+            not isinstance(manifest_sha256, str)
+            or len(manifest_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in manifest_sha256)
+        ):
+            raise ValueError("ODE regression requires a lowercase hexadecimal trajectory_manifest_sha256.")
+        frames_per_block = get_config_or_default(config, "frames_per_block", 3)
+        if isinstance(frames_per_block, bool) or not isinstance(frames_per_block, int) or frames_per_block <= 0:
+            raise ValueError("ODE regression frames_per_block must be a positive integer.")
+        export_role = require_choice(
+            "export_role", get_config_or_default(config, "export_role", "student_ema"), {"student", "student_ema"}
+        )
+        return DistillationPlan(
+            name="ode_regression",
+            version=1,
+            role_layout=apply_role_storage(
+                causal_ode_layout(model_ref),
+                get_config_or_default(config, "role_storage", "shared_base_adapters"),
+            ),
+            data_requirements={
+                "mode": "ode_trajectory",
+                "conditioning_provider": get_config_or_default(config, "conditioning_provider", "precomputed"),
+                "trajectory_manifest_sha256": manifest_sha256,
+            },
+            objective={
+                "name": "ode_regression",
+                "loss_weight": float(get_config_or_default(config, "ode_loss_weight", 1.0)),
+                "num_train_timesteps": get_config_or_default(config, "ode_num_train_timesteps", 1000),
+            },
+            rollout={
+                "strategy": "ode_trajectory",
+                "frames_per_block": frames_per_block,
+                "rng_seed": get_config_or_default(config, "rng_seed", 0),
+                "denoising_timesteps": tuple(
+                    get_config_or_default(config, "causal_denoising_timesteps", [1000, 750, 500, 250])
+                ),
+                "timestep_shift": float(get_config_or_default(config, "causal_timestep_shift", 8.0)),
+            },
+            initialization={"stage": "ode_regression", "requires_provenance": True},
+            update_schedule=UpdateSchedule(
+                phases=(UpdatePhaseSpec(kind="student", trainable_roles=("student",), update_ema=True),)
+            ),
+            export=ExportSpec(role=export_role, checkpoint_engine_backend="naive"),
+            required_capabilities=frozenset({"distribution_matching", "autoregressive", "ode_regression"}),
+        )
+
+
 @recipe_registry.register("causvid")
 class CausVidRecipe(DistillationRecipeBase):
     """ODE-initialized causal student versus bidirectional score models."""
@@ -650,6 +745,14 @@ def build_plan_from_config(config, capabilities) -> DistillationPlan:
         "regression_loss_weight",
         "rng_seed",
         "adversarial",
+        "causal_model_path",
+        "bidirectional_model_path",
+        "frames_per_block",
+        "trajectory_manifest_sha256",
+        "ode_loss_weight",
+        "ode_num_train_timesteps",
+        "causal_denoising_timesteps",
+        "causal_timestep_shift",
     )
     for optional_key in optional_keys:
         value = get_config_value(distribution_matching, optional_key)

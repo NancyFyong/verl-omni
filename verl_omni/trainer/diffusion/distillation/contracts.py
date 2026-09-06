@@ -477,7 +477,9 @@ def validate_distillation_plan(plan: DistillationPlan) -> None:
         raise ValueError(f"Every role group must define model_ref; missing for {sorted(missing_model_refs)}.")
 
     binding_roles = {binding.role for binding in plan.role_layout.bindings}
-    required_roles = {"student", "student_ema", "teacher_score", "fake_score"}
+    required_roles = {"student", "student_ema"}
+    if plan.objective.get("name") in {"dmd", "dmd2"}:
+        required_roles.update({"teacher_score", "fake_score"})
     missing_roles = required_roles - binding_roles
     if missing_roles:
         raise ValueError(f"DistillationPlan is missing required role bindings: {sorted(missing_roles)}.")

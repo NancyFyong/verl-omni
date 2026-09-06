@@ -3,10 +3,11 @@
 Last updated: 09/06/2026.
 
 verl-omni supports Qwen-Image training with original DMD and the distribution-only
-and adversarial profiles of DMD2. The implementation follows the multi-role design in
-[RFC #519](https://github.com/verl-project/verl-omni/issues/519): a trainable
-student, a frozen real-score teacher, a trainable fake-score model, and a
-student EMA are coordinated by the dedicated `distillation` trainer.
+and adversarial profiles of DMD2. It also supports standalone ODE-regression
+initialization of a causal Wan 2.1 student. The implementation follows the
+multi-role design in [RFC #519](https://github.com/verl-project/verl-omni/issues/519):
+trainable and frozen semantic roles are coordinated by the dedicated
+`distillation` trainer.
 
 This path is not policy-gradient RL and does not use a vLLM-Omni rollout to
 build the differentiable student graph. Sampling for training runs inside the
@@ -111,11 +112,50 @@ provide exactly one of `real_latents` plus a matching VAE-normalization manifest
 or finite RGB `real_pixels` in `[0, 1]`. This profile remains distinct from
 original DMD: it does not add paired trajectory/LPIPS regression.
 
+## Wan 2.1 causal ODE initialization
+
+`recipe=ode_regression` trains only a causal `student` and its `student_ema`.
+It is an initialization stage for later CausVid-style distribution matching;
+it does not instantiate a teacher-score or fake-score role and must not be
+reported as DMD training.
+
+The first supported checkpoint family is `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`.
+Model dimensions are loaded from the checkpoint rather than hardcoded. The
+architecture adapter preserves Diffusers parameter keys and installs
+parameter-free causal behavior:
+
+- full-sequence training uses block-prefix attention, where a motion block can
+  see itself and committed earlier blocks but not future blocks;
+- temporal RoPE positions retain their absolute frame offsets;
+- incremental execution caches self-attention and cross-attention K/V per layer;
+- a block updates all layer caches atomically only after a successful forward;
+- cached prior context is detached, and context parallelism is rejected until a
+  cache-ownership contract exists.
+
+Every dataset row carries a deterministic ODE trajectory with layout
+`[steps, latent_frames, channels, latent_height, latent_width]`, the matching
+raw timestep vector, and a final clean latent equal to the last trajectory
+state. A canonical manifest fingerprints the frozen teacher, revision,
+scheduler, guidance, negative prompt, VAE, tokenizer, latent geometry, dtype,
+and seed policy. Training selects one trajectory state per temporal block,
+converts Wan's `noise - x0` velocity to canonical `x0`, and masks zero-timestep
+positions from the MSE reduction.
+
+The default exported causal schedule starts from unshifted timesteps
+`[1000, 750, 500, 250]` and applies the rational shift `8.0` exactly once.
+FSDP1/FSDP2 training, EMA, checkpoint/resume, and semantic student/EMA LoRA
+export use the shared multi-role runtime. Ulysses sequence parallelism and
+vLLM-Omni causal serving are not supported in this stage.
+
+See `examples/distillation_trainer/wan21/README.md` for the trajectory contract
+and launch command.
+
 ## Role storage and checkpoints
 
-The recommended LoRA layout stores `student`, `fake_score`, `student_ema`, and,
+The recommended Qwen LoRA layout stores `student`, `fake_score`, `student_ema`, and,
 for the adversarial profile, `discriminator` as named adapters over one frozen
-Qwen base. `teacher_score` disables adapters. Student, fake-score, and optional
+base. `teacher_score` disables adapters. Standalone Wan ODE initialization uses
+only `student` and `student_ema` adapters over one causal base. Student, fake-score, and optional
 discriminator optimizers and schedulers are independent, and EMA is updated only
 after a successful student optimizer step. FSDP1 requires
 `use_orig_params=true`; FSDP2 is the recommended backend.
@@ -152,7 +192,10 @@ summed into a GPU-time estimate. Logging steps include warmup cycles, while
 `training/global_step` retains student-update semantics. See the example README
 for metric definitions and controlled profiling commands.
 
-The runnable LoRA recipe is
-`examples/distillation_trainer/qwen_image/run_qwen_image_dmd2_lora.sh`.
-See its adjacent README for data fields, installation, and the complete launch
+Runnable LoRA recipes are:
+
+- `examples/distillation_trainer/qwen_image/run_qwen_image_dmd2_lora.sh`;
+- `examples/distillation_trainer/wan21/run_wan21_ode_lora.sh`.
+
+See each adjacent README for data fields, installation, and the complete launch
 command.

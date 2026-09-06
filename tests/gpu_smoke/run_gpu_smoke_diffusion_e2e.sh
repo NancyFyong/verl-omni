@@ -73,4 +73,8 @@ run_test 12 "Qwen-Image DMD2 adversarial e2e" \
     env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" NUM_GPUS="${NUM_GPUS}" \
     bash tests/special_e2e/run_dmd2_adversarial_qwen_image.sh "${diffusion_trainer_args[@]}"
 
+run_test 13 "Wan 2.1 causal ODE regression e2e" \
+    env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" NUM_GPUS="${NUM_GPUS}" \
+    bash tests/special_e2e/run_ode_regression_wan21.sh "${diffusion_trainer_args[@]}"
+
 gpu_smoke_summary

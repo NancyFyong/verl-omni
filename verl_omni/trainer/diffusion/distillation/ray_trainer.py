@@ -223,6 +223,8 @@ class DistillationRayTrainer(BaseRayDiffusionTrainer):
         sequence_parallel_size = self.config.actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size
         if world_size % sequence_parallel_size != 0:
             raise ValueError("Trainer world size must be divisible by the Ulysses sequence-parallel size.")
+        if "autoregressive" in self.plan.required_capabilities and sequence_parallel_size != 1:
+            raise NotImplementedError("Causal distillation does not yet support Ulysses sequence parallelism.")
         data_parallel_size = world_size // sequence_parallel_size
         global_batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
         if global_batch_size % data_parallel_size != 0:
@@ -240,9 +242,11 @@ class DistillationRayTrainer(BaseRayDiffusionTrainer):
         )
         fake_total_steps = self.total_training_steps * fake_repeats
         fake_total_steps += self.plan.update_schedule.warmup_cycles * warmup_fake_repeats
-        with open_dict(distribution_matching.fake_score_optim):
-            distribution_matching.fake_score_optim.total_training_steps = fake_total_steps
-        if any(binding.role == "discriminator" for binding in self.plan.role_layout.bindings):
+        bound_roles = {binding.role for binding in self.plan.role_layout.bindings}
+        if "fake_score" in bound_roles:
+            with open_dict(distribution_matching.fake_score_optim):
+                distribution_matching.fake_score_optim.total_training_steps = fake_total_steps
+        if "discriminator" in bound_roles:
             with open_dict(distribution_matching.discriminator_optim):
                 distribution_matching.discriminator_optim.total_training_steps = fake_total_steps
 

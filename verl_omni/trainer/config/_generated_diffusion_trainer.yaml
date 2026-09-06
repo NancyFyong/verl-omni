@@ -500,6 +500,8 @@ distillation:
   distribution_matching:
     _target_: verl_omni.workers.config.diffusion.DiffusionDistributionMatchingConfig
     recipe: dmd2
+    causal_model_path: null
+    bidirectional_model_path: null
     profile: null
     fake_update_ratio: null
     fake_warmup_cycles: 0
@@ -555,6 +557,16 @@ distillation:
     regression_type: decoded_lpips
     regression_loss_weight: 1.0
     rng_seed: 0
+    frames_per_block: 3
+    trajectory_manifest_sha256: null
+    ode_loss_weight: 1.0
+    ode_num_train_timesteps: 1000
+    causal_denoising_timesteps:
+    - 1000
+    - 750
+    - 500
+    - 250
+    causal_timestep_shift: 8.0
 algorithm:
   _target_: verl_omni.trainer.config.DiffusionAlgoConfig
   trainer_type: policy_gradient

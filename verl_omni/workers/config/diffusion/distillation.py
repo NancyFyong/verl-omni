@@ -94,6 +94,10 @@ class DiffusionDistributionMatchingConfig(BaseConfig):
 
     # Registered recipe name.
     recipe: str = "dmd2"
+    # Optional causal student checkpoint; defaults to actor_rollout_ref.model.path.
+    causal_model_path: Optional[str] = None
+    # Optional bidirectional score checkpoint for later asymmetric DMD stages.
+    bidirectional_model_path: Optional[str] = None
     # Optional recipe profile; null selects the recipe default.
     profile: Optional[str] = None
     # Optional fake-score phase count; null selects the recipe default.
@@ -149,9 +153,21 @@ class DiffusionDistributionMatchingConfig(BaseConfig):
     regression_loss_weight: float = 1.0
     # Base seed for worker-local rollout and score-noise generators.
     rng_seed: int = 0
+    # Number of latent frames that share one causal denoising state.
+    frames_per_block: int = 3
+    # Expected canonical SHA-256 of every ODE trajectory manifest.
+    trajectory_manifest_sha256: Optional[str] = None
+    # ODE clean-latent regression weight.
+    ode_loss_weight: float = 1.0
+    # Raw Wan training-timestep scale used to convert timesteps to sigmas.
+    ode_num_train_timesteps: int = 1000
+    # Unshifted few-step causal Wan inference timesteps.
+    causal_denoising_timesteps: list[int] = field(default_factory=lambda: [1000, 750, 500, 250])
+    # Rational time shift for exported causal Wan schedules.
+    causal_timestep_shift: float = 8.0
 
     def __post_init__(self):
-        valid_recipes = {"dmd", "dmd2", "causvid", "self_forcing"}
+        valid_recipes = {"dmd", "dmd2", "ode_regression", "causvid", "self_forcing"}
         if self.recipe not in valid_recipes:
             raise ValueError(f"Invalid recipe: {self.recipe}. Must be one of {sorted(valid_recipes)}")
         valid_profiles = {"distribution_only", "paper"}
@@ -165,6 +181,7 @@ class DiffusionDistributionMatchingConfig(BaseConfig):
             "backward_simulated",
             "consistency_renoise",
             "ode_euler",
+            "ode_trajectory",
             "one_step",
             "self_forced",
             "teacher_forced_causal",
@@ -173,7 +190,7 @@ class DiffusionDistributionMatchingConfig(BaseConfig):
             raise ValueError(
                 f"Invalid rollout_strategy: {self.rollout_strategy}. Must be one of {sorted(valid_rollout_strategies)}"
             )
-        valid_data_modes = {"prompts", "prompt_and_real_latent", "regression_pairs"}
+        valid_data_modes = {"ode_trajectory", "prompts", "prompt_and_real_latent", "regression_pairs"}
         if self.data_mode is not None and self.data_mode not in valid_data_modes:
             raise ValueError(f"Invalid data_mode: {self.data_mode}. Must be one of {sorted(valid_data_modes)}")
         valid_export_roles = {"student", "student_ema"}
@@ -241,6 +258,44 @@ class DiffusionDistributionMatchingConfig(BaseConfig):
             raise ValueError("DMD requires at least one positive objective weight")
         if self.rng_seed < 0:
             raise ValueError(f"rng_seed must be non-negative, got {self.rng_seed}")
+        if (
+            isinstance(self.frames_per_block, bool)
+            or not isinstance(self.frames_per_block, int)
+            or self.frames_per_block <= 0
+        ):
+            raise ValueError(f"frames_per_block must be a positive integer, got {self.frames_per_block}")
+        if not math.isfinite(self.ode_loss_weight) or self.ode_loss_weight <= 0:
+            raise ValueError(f"ode_loss_weight must be finite and positive, got {self.ode_loss_weight}")
+        if (
+            isinstance(self.ode_num_train_timesteps, bool)
+            or not isinstance(self.ode_num_train_timesteps, int)
+            or self.ode_num_train_timesteps <= 0
+        ):
+            raise ValueError("ode_num_train_timesteps must be a positive integer")
+        if self.recipe == "ode_regression" and (
+            not isinstance(self.trajectory_manifest_sha256, str)
+            or len(self.trajectory_manifest_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in self.trajectory_manifest_sha256)
+        ):
+            raise ValueError("ode_regression requires a lowercase hexadecimal trajectory_manifest_sha256")
+        if (
+            not self.causal_denoising_timesteps
+            or any(
+                isinstance(timestep, bool)
+                or not isinstance(timestep, int)
+                or not 0 < timestep <= self.ode_num_train_timesteps
+                for timestep in self.causal_denoising_timesteps
+            )
+            or any(
+                left <= right
+                for left, right in zip(
+                    self.causal_denoising_timesteps, self.causal_denoising_timesteps[1:], strict=False
+                )
+            )
+        ):
+            raise ValueError("causal_denoising_timesteps must be strictly descending positive integers in range")
+        if not math.isfinite(self.causal_timestep_shift) or self.causal_timestep_shift < 1:
+            raise ValueError("causal_timestep_shift must be finite and at least 1")
 
 
 @dataclass
