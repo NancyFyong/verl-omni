@@ -52,7 +52,7 @@ from verl_omni.workers.engine.fsdp.distillation_impl import DistillationRoleGrou
 
 __all__ = [
     "DistillationPhaseComputation",
-    "DistillationPhaseRunner",
+    "DistributionMatchingComputer",
     "DistillationRoleRuntime",
     "DiffusionDistillationWorker",
     "DiffusionDistillationWorkerGroup",
@@ -79,7 +79,7 @@ class DistillationPhaseComputation:
 
 
 @runtime_checkable
-class DistillationPhaseRunner(Protocol):
+class DistributionMatchingComputer(Protocol):
     """Architecture-owned differentiable computation for one generic phase."""
 
     def compute_phase(
@@ -313,7 +313,7 @@ class DiffusionDistillationWorker(Worker, DistProfilerExtension):
             DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config),
         )
         self.runtime: Optional[DistillationRoleRuntime] = None
-        self.phase_runner: Optional[DistillationPhaseRunner] = None
+        self.dm_computer: Optional[DistributionMatchingComputer] = None
 
     def build_optimizer_configs(
         self,
@@ -415,10 +415,10 @@ class DiffusionDistillationWorker(Worker, DistProfilerExtension):
                 "fake_score": distillation_config.fake_score_micro_batch_size_per_gpu,
             },
         )
-        self.phase_runner = adapter_cls.build_distillation_phase_runner(model_config, self.plan)
-        if not isinstance(self.phase_runner, DistillationPhaseRunner):
+        self.dm_computer = adapter_cls.build_distribution_matching_computer(model_config, self.plan)
+        if not isinstance(self.dm_computer, DistributionMatchingComputer):
             raise TypeError(
-                "build_distillation_phase_runner() must return an object implementing "
+                "build_distribution_matching_computer() must return an object implementing "
                 "compute_phase(), state_dict(), and load_state_dict()."
             )
         first_engine = next(iter(engines.values()))
@@ -432,7 +432,7 @@ class DiffusionDistillationWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="distillation_phase")
     def execute_phase(self, data: TensorDict) -> TensorDict:
         """Resolve rank failures before lazy collect metadata RPCs can wait behind peer collectives."""
-        if self.runtime is None or self.phase_runner is None:
+        if self.runtime is None or self.dm_computer is None:
             raise RuntimeError("init_model() must be called before execute_phase().")
         request = tu.pop(data, key="phase_request")
         if not isinstance(request, PhaseRequest):
@@ -459,7 +459,7 @@ class DiffusionDistillationWorker(Worker, DistProfilerExtension):
                 weight = micro_batch.batch_size[0] / total_samples
                 micro_batch = micro_batch.to(get_device_id())
                 forward_start = time.perf_counter()
-                computation = self.phase_runner.compute_phase(request, micro_batch, self.runtime)
+                computation = self.dm_computer.compute_phase(request, micro_batch, self.runtime)
                 forward_duration += time.perf_counter() - forward_start
                 backward_start = time.perf_counter()
                 self.runtime.backward_micro_batch(request, computation, weight=weight)
@@ -491,8 +491,8 @@ class DiffusionDistillationWorker(Worker, DistProfilerExtension):
         os.makedirs(local_path, exist_ok=True)
         for group_name, engine in self.runtime.engines.items():
             engine.save_role_group_checkpoint(os.path.join(local_path, "role_groups", group_name), global_step)
-        runner_state = self.phase_runner.state_dict() if hasattr(self.phase_runner, "state_dict") else {}
-        torch.save(runner_state, os.path.join(local_path, f"phase_runner_rank_{self.rank}.pt"))
+        computer_state = self.dm_computer.state_dict() if hasattr(self.dm_computer, "state_dict") else {}
+        torch.save(computer_state, os.path.join(local_path, f"dm_computer_rank_{self.rank}.pt"))
         if self.rank == 0:
             with open(os.path.join(local_path, "worker_manifest.json"), "w", encoding="utf-8") as file:
                 json.dump(
@@ -526,14 +526,14 @@ class DiffusionDistillationWorker(Worker, DistProfilerExtension):
             raise ValueError("Checkpoint role layout does not match the active distillation plan.")
         for group_name, engine in self.runtime.engines.items():
             engine.load_role_group_checkpoint(os.path.join(local_path, "role_groups", group_name))
-        runner_state_path = os.path.join(local_path, f"phase_runner_rank_{self.rank}.pt")
-        if not os.path.isfile(runner_state_path):
-            raise FileNotFoundError(f"Missing phase-runner state: {runner_state_path}")
-        runner_state = torch.load(runner_state_path, map_location="cpu", weights_only=False)
-        if runner_state:
-            if not hasattr(self.phase_runner, "load_state_dict"):
+        computer_state_path = os.path.join(local_path, f"dm_computer_rank_{self.rank}.pt")
+        if not os.path.isfile(computer_state_path):
+            raise FileNotFoundError(f"Missing phase-runner state: {computer_state_path}")
+        computer_state = torch.load(computer_state_path, map_location="cpu", weights_only=False)
+        if computer_state:
+            if not hasattr(self.dm_computer, "load_state_dict"):
                 raise ValueError("Checkpoint contains phase-runner state, but the active runner cannot restore it.")
-            self.phase_runner.load_state_dict(runner_state)
+            self.dm_computer.load_state_dict(computer_state)
 
 
 class DiffusionDistillationWorkerGroup:

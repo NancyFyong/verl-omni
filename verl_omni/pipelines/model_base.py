@@ -269,10 +269,10 @@ class DistributionMatchingModelAdapter:
         return frozenset({"distribution_matching"})
 
     @classmethod
-    def build_distillation_phase_runner(cls, model_config, plan):
+    def build_distribution_matching_computer(cls, model_config, plan):
         """Build the architecture-owned phase computation used by the worker."""
         raise NotImplementedError(
-            f"{cls.__name__} declares distribution-matching support but does not build a phase runner."
+            f"{cls.__name__} declares distribution-matching support but builds no distribution-matching computer."
         )
 
 
