@@ -117,7 +117,7 @@ def runtime_config():
                     "diffusion_loss": {"loss_mode": "flow_grpo"},
                     "use_distill_loss": False,
                 },
-                "model": {"path": "/m"},
+                "model": {"path": "/m", "algorithm": "dmd2"},
             },
             "distillation": {
                 "enabled": False,
@@ -142,11 +142,22 @@ class TestRuntimeValidation:
             {
                 "distillation": {"distribution_matching": {"role_storage": role_storage}},
                 "actor_rollout_ref": {
-                    "model": {"lora_rank": lora_rank},
+                    "model": {"algorithm": "dmd2", "lora_rank": lora_rank},
                     "actor": {"strategy": strategy, "fsdp_config": {"use_orig_params": use_orig}},
                 },
             }
         )
+
+    def test_model_algorithm_must_match_recipe(self):
+        from verl_omni.trainer.diffusion.distillation.recipes import build_plan
+
+        trainer = object.__new__(DistillationRayTrainer)
+        trainer.plan = build_plan("dmd2", {"model_path": "/m"}, frozenset({"distribution_matching"}))
+        trainer.config = self.trainer_config()
+        trainer.config.actor_rollout_ref.model.algorithm = "dmd"
+        trainer.config.distillation.distribution_matching.recipe = "dmd2"
+        with pytest.raises(ValueError, match="must match"):
+            trainer.validate_runtime_config()
 
     def test_shared_base_requires_lora(self):
         from verl_omni.trainer.diffusion.distillation.recipes import build_plan

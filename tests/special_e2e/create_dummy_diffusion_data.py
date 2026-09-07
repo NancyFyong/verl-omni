@@ -41,7 +41,7 @@ USER_PROMPTS = [
 ]
 
 
-def build_rows(split: str, n: int, data_sources: list[str]):
+def build_rows(split: str, n: int, data_sources: list[str], *, user_prompt_only: bool = False):
     rows = []
     for i in range(n):
         prompt_text = USER_PROMPTS[i % len(USER_PROMPTS)]
@@ -60,6 +60,9 @@ def build_rows(split: str, n: int, data_sources: list[str]):
                 "extra_info": {"split": split, "index": i},
             }
         )
+        if user_prompt_only:
+            rows[-1]["prompt"] = [{"role": "user", "content": prompt_text}]
+            rows[-1]["negative_prompt"] = [{"role": "user", "content": " "}]
     return rows
 
 
@@ -77,13 +80,16 @@ def main():
         default="jpeg_compressibility",
         help="Comma-separated data_source values assigned to rows in round-robin order",
     )
+    parser.add_argument(
+        "--user_prompt_only", action="store_true", help="Let the model supply its fixed system template"
+    )
     args = parser.parse_args()
     data_sources = args.data_sources.split(",")
 
     os.makedirs(args.local_save_dir, exist_ok=True)
 
-    train_df = pd.DataFrame(build_rows("train", args.train_size, data_sources))
-    val_df = pd.DataFrame(build_rows("test", args.val_size, data_sources))
+    train_df = pd.DataFrame(build_rows("train", args.train_size, data_sources, user_prompt_only=args.user_prompt_only))
+    val_df = pd.DataFrame(build_rows("test", args.val_size, data_sources, user_prompt_only=args.user_prompt_only))
 
     train_path = os.path.join(args.local_save_dir, "train.parquet")
     val_path = os.path.join(args.local_save_dir, "test.parquet")
