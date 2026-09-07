@@ -255,25 +255,38 @@ def test_ref2va_rollout_keeps_all_reference_rows_fixed(monkeypatch):
 
 
 def test_ref2va_actor_replays_full_layout_and_scores_only_targets(monkeypatch):
+    from verl_omni.workers.engine.fsdp.diffusers_impl import PPODiffusersFSDPEngine
+
     pipeline, _ = _run_ref_rollout(monkeypatch)
     trajectory = pipeline._flow_grpo_trajectory
-    trajectory["condition_video_rows"] = torch.nn.functional.pad(trajectory["condition_video_rows"], (0, 0, 0, 3))
-    trajectory["condition_audio_rows"] = torch.nn.functional.pad(trajectory["condition_audio_rows"], (0, 0, 0, 2))
+    video_rows = trajectory["condition_video_rows"][0]
+    audio_rows = trajectory["condition_audio_rows"][0]
+    trajectory["condition_video_rows"] = torch.nested.as_nested_tensor([video_rows], layout=torch.jagged)
+    trajectory["condition_video_rows_mask"] = torch.nested.as_nested_tensor(
+        [torch.ones(video_rows.shape[0], dtype=torch.bool)], layout=torch.jagged
+    )
+    trajectory["condition_audio_rows"] = torch.nested.as_nested_tensor([audio_rows], layout=torch.jagged)
+    trajectory["condition_audio_rows_mask"] = torch.nested.as_nested_tensor(
+        [torch.ones(audio_rows.shape[0], dtype=torch.bool)], layout=torch.jagged
+    )
     micro_batch = TensorDict(trajectory, batch_size=[1])
 
-    model_inputs, negative_inputs = MiniMaxH3FlowGRPO.prepare_model_inputs(
-        module=MagicMock(),
-        model_config=MagicMock(),
-        latents=trajectory["all_latents"],
-        timesteps=trajectory["all_timesteps"],
-        prompt_embeds=trajectory["prompt_embeds"],
-        prompt_embeds_mask=trajectory["prompt_embeds_mask"],
-        negative_prompt_embeds=None,
-        negative_prompt_embeds_mask=None,
-        micro_batch=micro_batch,
-        step=0,
+    engine = object.__new__(PPODiffusersFSDPEngine)
+    engine.module = MagicMock()
+    engine.model_config = SimpleNamespace(
+        architecture="MiniMaxH3Pipeline",
+        algorithm="flow_grpo",
+        external_lib=None,
     )
+    engine.use_ulysses_sp = False
+    engine.ulysses_sequence_parallel_size = 1
 
+    assert micro_batch["condition_video_rows"].is_nested
+    assert micro_batch["condition_audio_rows"].is_nested
+    model_inputs, negative_inputs = engine.prepare_model_inputs(micro_batch=micro_batch, step=0)
+
+    assert not micro_batch["condition_video_rows"].is_nested
+    assert not micro_batch["condition_audio_rows"].is_nested
     assert negative_inputs is None
     assert model_inputs["hidden_states"].shape == (1, 24, H3_VIDEO_WIDTH)
     assert model_inputs["audio_hidden_states"].shape == (1, 16, H3_AUDIO_WIDTH)
