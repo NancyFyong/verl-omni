@@ -745,10 +745,16 @@ def test_diffusion_strategy_preserves_engine_argument_preparation(monkeypatch):
     }
 
 
-@pytest.mark.parametrize("multistage", [False, True])
-def test_diffusion_strategy_emits_canonical_prompt(multistage):
-    defaults = ["ar-stage", "diffusion-stage"] if multistage else ["diffusion-stage"]
-    server = SimpleNamespace(engine=SimpleNamespace(default_sampling_params_list=defaults))
+@pytest.mark.parametrize("num_stages", [1, 2])
+@pytest.mark.parametrize("first_stage_type", ["llm", "diffusion"])
+def test_diffusion_strategy_emits_canonical_prompt(num_stages, first_stage_type):
+    defaults = [object() for _ in range(num_stages)]
+    server = SimpleNamespace(
+        engine=SimpleNamespace(
+            default_sampling_params_list=defaults,
+            engine=SimpleNamespace(get_stage_metadata=lambda stage_id: SimpleNamespace(stage_type=first_stage_type)),
+        )
+    )
     strategy = DiffusionStrategy(server)
     prompt_mask = torch.tensor([True, False])
 
@@ -763,13 +769,16 @@ def test_diffusion_strategy_emits_canonical_prompt(multistage):
     )
     prompt, params = strategy.preprocess_input(request, {"pipeline_private_arg": 7}, None)
 
-    key = "prompt_token_ids" if multistage else "prompt_ids"
+    ar_entrance = first_stage_type != "diffusion"
+    key = "prompt_token_ids" if ar_entrance else "prompt_ids"
     assert prompt[key] == [1, 2]
-    assert ("prompt_ids" if multistage else "prompt_token_ids") not in prompt
+    assert ("prompt_ids" if ar_entrance else "prompt_token_ids") not in prompt
     assert prompt["prompt_mask"] is prompt_mask
-    if multistage:
+    if ar_entrance:
         assert prompt["modalities"] == ["image"]
-        assert params[0] == "ar-stage"
+    else:
+        assert "modalities" not in prompt
+    assert params[:-1] == defaults[:-1]
     assert prompt["negative_prompt_ids"] == [3, 4]
     assert "extra_prompt_ids" not in prompt
     assert "negative_extra_prompt_ids" not in prompt

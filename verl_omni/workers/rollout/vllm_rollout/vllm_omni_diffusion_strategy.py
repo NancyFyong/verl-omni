@@ -141,8 +141,8 @@ class DiffusionStrategy(OmniStrategyBase):
     ) -> tuple[dict[str, Any], list[Any]]:
         default_params_list = self.server.engine.default_sampling_params_list
         custom_prompt = dict(request.to_diffusion_prompt())
-        if len(default_params_list) > 1:
-            # The initial AR stage uses vLLM token preprocessing, not OmniCustomPrompt.
+        if self.server.engine.engine.get_stage_metadata(0).stage_type != "diffusion":
+            # Match AsyncOmniEngine's stage-0 preprocessing gate, independently of stage count.
             custom_prompt["prompt_token_ids"] = custom_prompt.pop("prompt_ids")
             custom_prompt["modalities"] = ["image"]
 
