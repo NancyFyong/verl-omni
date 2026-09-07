@@ -40,6 +40,7 @@ from verl_omni.trainer.diffusion.distillation.contracts import PhaseRequest
 from verl_omni.trainer.diffusion.distillation.recipes import build_plan
 from verl_omni.utils.dataset.distillation import canonical_manifest_sha256
 from verl_omni.workers.config import DiffusionModelConfig
+from verl_omni.workers.diffusion_distillation_worker import DistillationRoleRuntime
 
 
 def tiny_wan() -> WanTransformer3DModel:
@@ -165,6 +166,32 @@ class TestWanCausalAttention:
         keys = set(model.state_dict())
         configure_causal_wan(model)
         assert set(model.state_dict()) == keys
+
+    def test_causal_conversion_preserves_selected_attention_backend(self):
+        from diffusers.models.attention_dispatch import AttentionBackendName
+        from diffusers.models.transformers.transformer_wan import WanAttnProcessor
+
+        model = tiny_wan()
+        for block in model.blocks:
+            block.attn1.set_processor(WanAttnProcessor())
+            block.attn2.set_processor(WanAttnProcessor())
+        model.set_attention_backend("native")
+        configure_causal_wan(model)
+        for block in model.blocks:
+            assert block.attn1.processor._attention_backend == AttentionBackendName.NATIVE
+            assert block.attn2.processor._attention_backend == AttentionBackendName.NATIVE
+
+    @pytest.mark.parametrize("commit_cache", [False, True])
+    def test_cached_forward_rejects_multiple_blocks_before_mutation(self, commit_cache):
+        model = tiny_wan()
+        cache = allocate_wan_cache(model, batch_size=1, latent_height=4, latent_width=4, max_frames=4)
+        with pytest.raises(ValueError, match="exactly one.*block"):
+            with wan_causal_forward(model, num_frames=4, frames_per_block=2, cache=cache, commit_cache=commit_cache):
+                pass
+        assert cache.committed_frames == 0
+        assert cache.key_values == [None, None]
+        assert cache.cross_key_values == [None, None]
+        assert model.rope.start_frame == 0
 
     def test_future_blocks_do_not_change_prefix_output(self):
         model = tiny_wan()
@@ -330,6 +357,36 @@ class TestWanODEComputer:
         computation.losses["student"].backward()
         assert 0 < computation.metrics["ode/active_elements"] <= 384
         assert any(parameter.grad is not None for parameter in model.parameters())
+
+    def test_ode_gradients_match_physical_and_micro_batched_execution(self):
+        computer, row = self.build_computer_and_batch()
+        batch = torch.cat([row, row], dim=0)
+        request = PhaseRequest("student", 0, 0, "fresh", ("student",), False)
+        gradients = []
+        active_counts = []
+        for micro_batch_size in (2, 1):
+            computer.load_state_dict({"version": 1, "rng_seed": 3, "generator_state": None})
+            model = tiny_wan()
+            toy = ToyWanRuntime(model)
+            engine = toy.engine
+            engine.use_role = toy.use_role
+            engine.backward_role = lambda role, loss: loss.backward()
+            engine.parameters_for_role = lambda role, model=model: tuple(model.parameters())
+            engine.get_data_parallel_group = lambda: None
+            engine.update_role_ema = lambda *args: None
+            group_name = computer.plan.role_layout.groups[0].name
+            runtime = DistillationRoleRuntime(computer.plan, {group_name: engine}, ema_decay=0.9, ema_start_step=0)
+            for micro_batch in batch.split(micro_batch_size):
+                computation = computer.compute_phase(request, micro_batch, runtime)
+                active_counts.append(computation.metrics["ode/active_elements"])
+                assert computation.loss_normalizer == computation.metrics["ode/active_elements"]
+                runtime.backward_micro_batch(request, computation, weight=len(micro_batch) / len(batch))
+            runtime.normalize_role_gradients("student")
+            gradients.append([parameter.grad.clone() for parameter in model.parameters() if parameter.grad is not None])
+        assert active_counts[1] != active_counts[2]
+        assert active_counts[0] == sum(active_counts[1:])
+        for full_gradient, accumulated_gradient in zip(*gradients, strict=True):
+            torch.testing.assert_close(full_gradient, accumulated_gradient, atol=1e-6, rtol=1e-5)
 
     def test_manifest_mismatch_fails_before_forward(self):
         computer, batch = self.build_computer_and_batch()

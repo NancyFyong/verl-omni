@@ -1,5 +1,7 @@
 # Wan 2.1 causal ODE initialization
 
+Last updated: 09/07/2026.
+
 This recipe initializes a causal Wan 2.1 T2V student from deterministic teacher
 ODE trajectories. It is the initialization stage used before CausVid-style DMD;
 it does not run teacher/fake-score distribution matching itself.

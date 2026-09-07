@@ -291,6 +291,7 @@ class WanODEComputer:
         weighted_loss = self.loss_weight * loss
         return DistillationPhaseComputation(
             losses={"student": weighted_loss},
+            loss_normalizer=active,
             metrics={
                 "ode/loss": float(loss.detach()),
                 "ode/active_elements": float(active),

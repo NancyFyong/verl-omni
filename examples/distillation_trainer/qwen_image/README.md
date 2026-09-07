@@ -1,5 +1,7 @@
 # Qwen-Image DMD/DMD2
 
+Last updated: 09/07/2026.
+
 This example trains a few-step Qwen-Image generator with the distribution-matching runtime introduced by RFC #519.
 Sampling is **offline and differentiable inside the FSDP actor**; it does not use vLLM-Omni for the training rollout.
 

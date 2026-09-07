@@ -48,6 +48,7 @@ class QwenImageDMDRealDataset(RLHFDataset):
         elif value.ndim != 3 or value.shape[0] != 3 or torch.any((value < 0) | (value > 1)):
             raise ValueError("real_pixels must have shape [3, H, W] and values in [0, 1].")
         row[field] = value
+        row.pop("real_pixels" if has_latents else "real_latents", None)
         return row
 
 
@@ -69,5 +70,6 @@ class QwenImageDMDPairDataset(RLHFDataset):
         row["reference_noise"] = load_float_tensor(row["reference_noise"], "reference_noise")
         target_key = "teacher_target_latents" if has_latents else "teacher_target_pixels"
         row[target_key] = load_float_tensor(row[target_key], target_key)
+        row.pop("teacher_target_pixels" if has_latents else "teacher_target_latents", None)
         row["pair_id"] = str(row.get("pair_id", row.get("index", item)))
         return row

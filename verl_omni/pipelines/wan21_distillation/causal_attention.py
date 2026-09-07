@@ -358,10 +358,15 @@ def configure_causal_wan(module: torch.nn.Module) -> torch.nn.Module:
     if not isinstance(transformer.rope, WanOffsetRotaryEmbedding):
         transformer.rope = WanOffsetRotaryEmbedding(transformer.rope)
     for index, block in enumerate(transformer.blocks):
-        if not isinstance(block.attn1.processor, WanCausalSelfAttentionProcessor):
-            block.attn1.set_processor(WanCausalSelfAttentionProcessor(index))
-        if not isinstance(block.attn2.processor, WanCausalCrossAttentionProcessor):
-            block.attn2.set_processor(WanCausalCrossAttentionProcessor(index))
+        for attention, processor_type in (
+            (block.attn1, WanCausalSelfAttentionProcessor),
+            (block.attn2, WanCausalCrossAttentionProcessor),
+        ):
+            if not isinstance(attention.processor, processor_type):
+                processor = processor_type(index)
+                processor._attention_backend = attention.processor._attention_backend
+                processor._parallel_config = attention.processor._parallel_config
+                attention.set_processor(processor)
     return module
 
 
@@ -374,12 +379,14 @@ def wan_causal_forward(
     cache: Optional[WanCausalCache] = None,
     commit_cache: bool = False,
 ):
-    """Configure one full or incremental causal Wan forward and atomically commit K/V."""
+    """Configure a full forward or exactly one cached block, atomically committing K/V."""
     transformer = unwrap_wan(module)
     configure_causal_wan(transformer)
     if not isinstance(transformer.rope, WanOffsetRotaryEmbedding):
         raise TypeError("Causal Wan RoPE adapter was not installed.")
     if cache is not None:
+        if num_frames != frames_per_block:
+            raise ValueError("Cached Wan forward requires exactly one temporal block.")
         if cache.layer_count != len(transformer.blocks):
             raise ValueError("Wan cache layer count does not match the transformer.")
         if cache.committed_frames + num_frames > cache.max_frames:

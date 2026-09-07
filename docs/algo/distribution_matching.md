@@ -1,6 +1,6 @@
 # Distribution-Matching Distillation
 
-Last updated: 09/06/2026.
+Last updated: 09/07/2026.
 
 verl-omni supports Qwen-Image training with original DMD and the distribution-only
 and adversarial profiles of DMD2. It also supports standalone ODE-regression
@@ -127,7 +127,8 @@ parameter-free causal behavior:
 - full-sequence training uses block-prefix attention, where a motion block can
   see itself and committed earlier blocks but not future blocks;
 - temporal RoPE positions retain their absolute frame offsets;
-- incremental execution caches self-attention and cross-attention K/V per layer;
+- incremental execution processes exactly one temporal block per call and caches
+  self-attention and cross-attention K/V per layer;
 - a block updates all layer caches atomically only after a successful forward;
 - cached prior context is detached, and context parallelism is rejected until a
   cache-ownership contract exists.
@@ -139,7 +140,11 @@ state. A canonical manifest fingerprints the frozen teacher, revision,
 scheduler, guidance, negative prompt, VAE, tokenizer, latent geometry, dtype,
 and seed policy. Training selects one trajectory state per temporal block,
 converts Wan's `noise - x0` velocity to canonical `x0`, and masks zero-timestep
-positions from the MSE reduction.
+positions from the MSE reduction. The loss is the global mean over active latent
+elements, not the mean of per-sample means. The computer supplies its active-element
+count as `loss_normalizer`; the runtime accumulates numerator gradients and divides
+by the DP-averaged count before gradient clipping and the optimizer step. Reported
+losses use the same denominator, independently of micro-batch partitioning.
 
 The default exported causal schedule starts from unshifted timesteps
 `[1000, 750, 500, 250]` and applies the rational shift `8.0` exactly once.
