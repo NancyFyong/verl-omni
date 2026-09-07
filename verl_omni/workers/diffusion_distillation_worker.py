@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from collections.abc import Iterator, Mapping
@@ -73,10 +74,15 @@ def resolve_profiler_configs(omega_profiler_config):
 
 @dataclass
 class DistillationPhaseComputation:
-    """Scalar role losses and detached metrics produced by an architecture computer."""
+    """Role means and metrics; an explicit denominator opts into global element reduction.
+
+    Without ``loss_normalizer``, losses are sample means. Otherwise each scalar
+    is a numerator divided by this count, shared by its ``*/loss`` metrics.
+    """
 
     losses: dict[str, torch.Tensor]
     metrics: dict[str, float]
+    loss_normalizer: Optional[float] = None
 
 
 @runtime_checkable
@@ -133,6 +139,7 @@ class DistillationRoleRuntime:
         self.ema_decay = ema_decay
         self.ema_start_step = ema_start_step
         self.micro_batch_sizes = dict(micro_batch_sizes or {"student": 1, "fake_score": 1})
+        self._loss_normalizers: dict[str, Optional[float]] = {}
         expected_groups = {group.name for group in plan.role_layout.groups}
         missing_groups = expected_groups - set(self.engines)
         extra_groups = set(self.engines) - expected_groups
@@ -190,6 +197,7 @@ class DistillationRoleRuntime:
         """Clear gradient state for each requested trainable role."""
         for role in roles:
             self.engine_for_role(role).optimizer_zero_grad(role)
+            self._loss_normalizers.pop(role, None)
 
     def validate_computation(
         self,
@@ -227,7 +235,33 @@ class DistillationRoleRuntime:
         if not 0.0 < weight <= 1.0:
             raise ValueError(f"Micro-batch weight must be in (0, 1], got {weight}.")
         role = self.validate_computation(request, computation)
-        self.engine_for_role(role).backward_role(role, computation.losses[role] * weight)
+        normalizer = computation.loss_normalizer
+        if normalizer is not None and (
+            isinstance(normalizer, bool) or not math.isfinite(normalizer) or normalizer <= 0
+        ):
+            raise ValueError(f"Loss normalizer must be finite and positive, got {normalizer}.")
+        previous = self._loss_normalizers.get(role)
+        if role in self._loss_normalizers and (previous is None) != (normalizer is None):
+            raise ValueError(f"Role {role!r} cannot mix sample and element loss reductions in one phase.")
+        self._loss_normalizers[role] = None if normalizer is None else (previous or 0.0) + normalizer
+        self.engine_for_role(role).backward_role(
+            role, computation.losses[role] * (weight if normalizer is None else normalizer)
+        )
+
+    def normalize_role_gradients(self, role: str) -> None:
+        """Divide accumulated numerator gradients by the matching DP-averaged count."""
+        normalizer = self._loss_normalizers.pop(role, None)
+        if normalizer is None:
+            return
+        engine = self.engine_for_role(role)
+        group = engine.get_data_parallel_group()
+        if group is not None:
+            count = torch.tensor(normalizer, dtype=torch.float32, device=get_device_id())
+            torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.AVG, group=group)
+            normalizer = float(count.item())
+        for parameter in engine.parameters_for_role(role):
+            if parameter.grad is not None:
+                parameter.grad.div_(normalizer)
 
     def step_phase(self, request: PhaseRequest) -> tuple[dict[str, int], dict[str, float]]:
         """Step each requested optimizer once after all micro-batches were accumulated."""
@@ -238,6 +272,7 @@ class DistillationRoleRuntime:
         metrics = {}
         for role in request.trainable_roles:
             engine = self.engine_for_role(role)
+            self.normalize_role_gradients(role)
             optimizer_start = time.perf_counter()
             with torch.profiler.record_function(f"distillation/{role}_optimizer"):
                 stepped, grad_norm = engine.optimizer_step(role)
@@ -473,6 +508,7 @@ class DiffusionDistillationWorker(Worker, DistProfilerExtension):
         micro_batch_size = self.runtime.micro_batch_size(request.kind)
         accumulated_metrics: dict[str, float] = {}
         accumulated_losses: dict[str, float] = {}
+        loss_denominators: dict[str, float] = {}
         with ExitStack() as stack:
             for engine in self.runtime.engines.values():
                 context = engine.train_mode() if engine.optimizers else engine.eval_mode()
@@ -516,16 +552,24 @@ class DiffusionDistillationWorker(Worker, DistProfilerExtension):
                     self.runtime.backward_micro_batch(role_request, computation, weight=weight)
                     backward_duration += time.perf_counter() - backward_start
                     observed_roles.append(role)
+                    normalizer = computation.loss_normalizer
+                    loss_weight = weight if normalizer is None else normalizer
                     for name, value in computation.metrics.items():
                         is_duration = name.startswith("perf/") and name.endswith("_s") and not name.endswith("_per_s")
                         metric_weight = (
                             1.0 if is_duration or name.endswith(("/active_elements", "/nonfinite")) else weight
                         )
+                        if normalizer is not None and name.endswith("/loss"):
+                            metric_weight = normalizer
+                            loss_denominators[name] = loss_denominators.get(name, 0.0) + normalizer
                         accumulated_metrics[name] = accumulated_metrics.get(name, 0.0) + float(value) * metric_weight
                     for loss_role, loss in computation.losses.items():
                         accumulated_losses[loss_role] = (
-                            accumulated_losses.get(loss_role, 0.0) + float(loss.detach().float()) * weight
+                            accumulated_losses.get(loss_role, 0.0) + float(loss.detach().float()) * loss_weight
                         )
+                        if normalizer is not None:
+                            name = f"{loss_role}/loss"
+                            loss_denominators[name] = loss_denominators.get(name, 0.0) + normalizer
                 if tuple(observed_roles) != request.trainable_roles:
                     raise ValueError(
                         "Architecture computer role order does not match the phase request: "
@@ -549,6 +593,8 @@ class DiffusionDistillationWorker(Worker, DistProfilerExtension):
             )
             metrics[f"batch/{request.kind}_micro_batch_size"] = float(min(total_samples, micro_batch_size))
             metrics = self.runtime.reduce_metrics(metrics)
+            for name, denominator in self.runtime.reduce_metrics(loss_denominators).items():
+                metrics[name] /= denominator
         return tu.get_tensordict(
             tensor_dict={},
             non_tensor_dict={"metrics": metrics, "optimizer_steps": optimizer_steps},

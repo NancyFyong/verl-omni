@@ -109,6 +109,9 @@ class ToyRoleEngine:
         assert self.active_role is None
         loss.backward(retain_graph=retain_graph)
 
+    def parameters_for_role(self, role):
+        return (self.parameters[role],)
+
     def optimizer_step(self, role=None):
         parameter = self.parameters[role]
         grad_norm = float(parameter.grad.detach().abs())
@@ -124,6 +127,87 @@ class ToyRoleEngine:
         target_parameter = next(iter(self.parameters.values()))
         with torch.no_grad():
             target_parameter.lerp_(source_parameter, 1.0 - decay)
+
+
+class TestElementNormalizedRuntime:
+    @staticmethod
+    def make_runtime():
+        plan = build_plan("dmd2", {"model_path": "/m"}, _CAPABILITIES)
+        engine = ToyRoleEngine(("student", "teacher_score", "fake_score", "student_ema"))
+        runtime = DistillationRoleRuntime(plan, {"base": engine}, ema_decay=0.5, ema_start_step=0)
+        return runtime, engine, PhaseRequest("student", 0, 0, "fresh", ("student",), False)
+
+    @pytest.mark.parametrize("micro_batch_size", [1, 2])
+    def test_element_mean_is_independent_of_micro_batch_size(self, micro_batch_size):
+        runtime, engine, request = self.make_runtime()
+        parameter = engine.parameters["student"]
+        targets = torch.tensor([1.0, 4.0])
+        counts = torch.tensor([2.0, 6.0])
+        runtime.zero_grad(("student",))
+        for target, count in zip(targets.split(micro_batch_size), counts.split(micro_batch_size), strict=True):
+            loss = ((parameter - target).square() * count).sum() / count.sum()
+            computation = DistillationPhaseComputation({"student": loss}, {}, loss_normalizer=float(count.sum()))
+            runtime.backward_micro_batch(request, computation, weight=target.numel() / targets.numel())
+        runtime.step_phase(request)
+        torch.testing.assert_close(parameter, torch.tensor(1.45))
+        torch.testing.assert_close(parameter.grad, torch.tensor(-4.5))
+
+    def test_denominator_is_averaged_over_the_same_dp_group_as_gradients(self, monkeypatch):
+        import verl_omni.workers.diffusion_distillation_worker as worker_module
+
+        runtime, engine, request = self.make_runtime()
+        group = object()
+        monkeypatch.setattr(engine, "get_data_parallel_group", lambda: group)
+        monkeypatch.setattr(worker_module, "get_device_id", lambda: "cpu")
+        parameter = engine.parameters["student"]
+        computation = DistillationPhaseComputation({"student": (parameter - 3).square()}, {}, loss_normalizer=2)
+        runtime.backward_micro_batch(request, computation, weight=1.0)
+        # FSDP averages this rank's numerator gradient (-8) and its peer's (24).
+        parameter.grad.fill_(8.0)
+
+        def average_counts(value, *, op, group):
+            assert group is engine.get_data_parallel_group()
+            assert op == torch.distributed.ReduceOp.AVG
+            torch.testing.assert_close(value, torch.tensor(2.0, dtype=value.dtype))
+            value.fill_(4.0)  # mean of the two ranks' counts: (2 + 6) / 2
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", average_counts)
+        runtime.step_phase(request)
+        torch.testing.assert_close(parameter, torch.tensor(0.8))
+
+    @pytest.mark.parametrize("normalizer", [0, -1, float("nan"), float("inf"), True])
+    def test_invalid_normalizers_fail_before_backward(self, normalizer):
+        runtime, engine, request = self.make_runtime()
+        computation = DistillationPhaseComputation(
+            {"student": engine.parameters["student"].square()}, {}, loss_normalizer=normalizer
+        )
+        with pytest.raises(ValueError, match="normalizer"):
+            runtime.backward_micro_batch(request, computation, weight=1.0)
+        assert engine.parameters["student"].grad is None
+
+    @pytest.mark.parametrize("first,second", [(None, 2), (2, None)])
+    def test_mixed_reductions_fail_and_zero_grad_resets_phase(self, first, second):
+        runtime, engine, request = self.make_runtime()
+        parameter = engine.parameters["student"]
+        runtime.backward_micro_batch(
+            request,
+            DistillationPhaseComputation({"student": parameter.square()}, {}, loss_normalizer=first),
+            weight=0.5,
+        )
+        with pytest.raises(ValueError, match="reduction"):
+            runtime.backward_micro_batch(
+                request,
+                DistillationPhaseComputation({"student": parameter.square()}, {}, loss_normalizer=second),
+                weight=0.5,
+            )
+        runtime.zero_grad(("student",))
+        runtime.backward_micro_batch(
+            request,
+            DistillationPhaseComputation({"student": parameter.square()}, {}, loss_normalizer=second),
+            weight=1.0,
+        )
+        runtime.step_phase(request)
+        torch.testing.assert_close(parameter, torch.tensor(0.8))
 
 
 class TestRoleRuntime:
@@ -309,6 +393,17 @@ class ToyDMComputer:
         )
 
 
+class ToyElementMeanComputer:
+    def compute_phase(self, request, batch, runtime):
+        role = request.trainable_roles[0]
+        parameter = runtime.engine_for_role(role).parameters[role]
+        count = float(batch["count"].sum())
+        loss = ((parameter - batch["target"]).square() * batch["count"]).sum() / count
+        return DistillationPhaseComputation(
+            {role: loss}, {"ode/loss": float(loss.detach()), "ode/active_elements": count}, loss_normalizer=count
+        )
+
+
 class ToyMultiRoleComputer:
     def __init__(self):
         self.events = []
@@ -344,6 +439,35 @@ def simulate_dp_reduce(values, op, group):
 
 
 class TestWorkerMetrics:
+    @pytest.mark.parametrize("micro_batch_size", [1, 2, 3])
+    def test_element_reduction_normalizes_worker_loss_metrics_and_gradients(self, monkeypatch, micro_batch_size):
+        plan = build_plan("dmd2", {"model_path": "/m"}, _CAPABILITIES)
+        engine = ToyRoleEngine(("student", "teacher_score", "fake_score", "student_ema"))
+        worker = object.__new__(DiffusionDistillationWorker)
+        worker.runtime = DistillationRoleRuntime(
+            plan,
+            {"base": engine},
+            ema_decay=0.9,
+            ema_start_step=0,
+            micro_batch_sizes={"student": micro_batch_size, "fake_score": 1},
+        )
+        worker.dm_computer = ToyElementMeanComputer()
+        device = Mock()
+        device.max_memory_allocated.return_value = 0
+        device.max_memory_reserved.return_value = 0
+        monkeypatch.setattr("verl_omni.workers.diffusion_distillation_worker.get_torch_device", lambda: device)
+        monkeypatch.setattr("verl_omni.workers.diffusion_distillation_worker.get_device_id", lambda: "cpu")
+        batch = tu.get_tensordict({"target": torch.tensor([0.0, 2.0, 6.0]), "count": torch.tensor([2.0, 3.0, 5.0])})
+        tu.assign_non_tensor(batch, phase_request=PhaseRequest("student", 0, 0, "fresh", ("student",), False))
+        result = worker.execute_phase(batch)
+        metrics = tu.get(result, "metrics")
+        assert metrics["student/loss"] == pytest.approx(13.0)
+        assert metrics["ode/loss"] == pytest.approx(13.0)
+        assert metrics["ode/active_elements"] == 10
+        assert metrics["student/grad_norm"] == pytest.approx(5.2)
+        torch.testing.assert_close(engine.parameters["student"], torch.tensor(1.52))
+        assert tu.get(result, "optimizer_steps") == {"student": 1}
+
     def test_multi_role_computations_are_backpropagated_before_the_next_forward(self, monkeypatch):
         plan = build_plan("dmd2", {"model_path": "/m", "profile": "paper"}, _CAPABILITIES | {"adversarial"})
         engine = ToyRoleEngine(("student", "teacher_score", "fake_score", "student_ema", "discriminator"))
