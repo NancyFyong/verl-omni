@@ -74,5 +74,6 @@ class QwenImageDMDPairDataset(RLHFDataset):
         row["reference_noise"] = load_float_tensor(row["reference_noise"], "reference_noise")
         target_key = "teacher_target_latents" if has_latents else "teacher_target_pixels"
         row[target_key] = load_float_tensor(row[target_key], target_key)
+        row.pop("teacher_target_pixels" if has_latents else "teacher_target_latents", None)
         row["pair_id"] = str(row.get("pair_id", row.get("index", item)))
         return row

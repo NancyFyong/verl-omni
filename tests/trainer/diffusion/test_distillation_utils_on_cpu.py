@@ -243,6 +243,38 @@ class TestFakeScore:
         assert output.grad is not None
 
 
+@pytest.mark.parametrize("loss_kind", ["dmd", "fake_score"])
+@pytest.mark.parametrize("mask_shape", [(2, 3), (2, 3, 1), (2, 3, 4)])
+def test_mask_representation_preserves_loss_and_gradients(loss_kind, mask_shape):
+    prediction = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4).requires_grad_()
+    frame_mask = torch.tensor([[True, False, False], [False, True, True]])
+    full_mask = frame_mask[..., None].expand_as(prediction)
+    mask = frame_mask if len(mask_shape) == 2 else frame_mask[..., None].expand(mask_shape)
+    if loss_kind == "dmd":
+        loss, active = dmd_surrogate_loss(prediction, torch.ones_like(prediction), mask)
+        expected_gradient = full_mask.float() / full_mask.sum()
+        expected_loss = 0.5
+    else:
+        loss, active = fake_score_loss(prediction, torch.zeros_like(prediction), torch.zeros_like(prediction), mask)
+        expected_gradient = 2 * prediction.detach() * full_mask / full_mask.sum()
+        expected_loss = prediction.detach()[full_mask].square().mean()
+    assert active == int(full_mask.sum())
+    torch.testing.assert_close(loss, torch.as_tensor(expected_loss))
+    loss.backward()
+    torch.testing.assert_close(prediction.grad, expected_gradient)
+
+
+@pytest.mark.parametrize("loss_kind", ["dmd", "fake_score"])
+def test_incompatible_gradient_mask_is_rejected(loss_kind):
+    value = torch.zeros(2, 3, 4)
+    mask = torch.ones(2, 5, dtype=torch.bool)
+    with pytest.raises(ValueError, match="mask shape.*not broadcastable"):
+        if loss_kind == "dmd":
+            dmd_surrogate_loss(value, value, mask)
+        else:
+            fake_score_loss(value, value, value, mask)
+
+
 class TestODERegression:
     def test_masked_mse_uses_only_nonzero_timestep_positions(self):
         prediction = torch.tensor([[1.0, 3.0], [5.0, 7.0]], requires_grad=True)

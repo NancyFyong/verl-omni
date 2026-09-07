@@ -17,8 +17,10 @@ import io
 
 import pytest
 import torch
-from verl.utils.dataset.rl_dataset import RLHFDataset
+from verl.utils import tensordict_utils as tu
+from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 
+from verl_omni.trainer.diffusion.distillation.ray_trainer import DistillationBatchProvider
 from verl_omni.utils.dataset.qwen_image_distillation_dataset import QwenImageDMDPairDataset, load_float_tensor
 
 
@@ -58,6 +60,22 @@ class TestQwenImageDMDPairDataset:
         assert output["teacher_target_latents"].dtype == torch.float32
         assert output["pair_id"] == "7"
         assert output["teacher_sampling_manifest"] == {"model": "teacher"}
+
+    @pytest.mark.parametrize("target_key", ["teacher_target_latents", "teacher_target_pixels"])
+    @pytest.mark.parametrize("null_value", [None, float("nan")])
+    def test_nullable_target_survives_worker_transport(self, monkeypatch, target_key, null_value):
+        inactive_key = "teacher_target_pixels" if target_key == "teacher_target_latents" else "teacher_target_latents"
+        row = {
+            "reference_noise": [[0.0, 1.0]],
+            target_key: [[2.0, 3.0]],
+            inactive_key: null_value,
+            "teacher_sampling_manifest": {"teacher": "fixture", "steps": 20},
+        }
+        monkeypatch.setattr(RLHFDataset, "__getitem__", lambda self, item: dict(row))
+        dataset = self.make_dataset()
+        batch = DistillationBatchProvider([collate_fn([dataset[0], dataset[1]])]).fresh_batch()
+        assert tu.get(batch, inactive_key) is None
+        torch.testing.assert_close(tu.get(batch, target_key), torch.tensor([[[2.0, 3.0]], [[2.0, 3.0]]]))
 
     @pytest.mark.parametrize(
         "row,error",

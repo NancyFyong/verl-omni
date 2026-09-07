@@ -1,0 +1,1 @@
+../../../examples/distillation_trainer/qwen_image/README.md
