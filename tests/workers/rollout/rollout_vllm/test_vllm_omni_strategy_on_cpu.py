@@ -745,8 +745,10 @@ def test_diffusion_strategy_preserves_engine_argument_preparation(monkeypatch):
     }
 
 
-def test_diffusion_strategy_preserves_multistage_prompt_shape():
-    server = SimpleNamespace(engine=SimpleNamespace(default_sampling_params_list=["ar-stage", "diffusion-stage"]))
+@pytest.mark.parametrize("multistage", [False, True])
+def test_diffusion_strategy_emits_canonical_prompt(multistage):
+    defaults = ["ar-stage", "diffusion-stage"] if multistage else ["diffusion-stage"]
+    server = SimpleNamespace(engine=SimpleNamespace(default_sampling_params_list=defaults))
     strategy = DiffusionStrategy(server)
     prompt_mask = torch.tensor([True, False])
 
@@ -761,16 +763,22 @@ def test_diffusion_strategy_preserves_multistage_prompt_shape():
     )
     prompt, params = strategy.preprocess_input(request, {"pipeline_private_arg": 7}, None)
 
-    assert prompt["prompt_token_ids"] == [1, 2]
+    key = "prompt_token_ids" if multistage else "prompt_ids"
+    assert prompt[key] == [1, 2]
+    assert ("prompt_ids" if multistage else "prompt_token_ids") not in prompt
     assert prompt["prompt_mask"] is prompt_mask
-    assert prompt["modalities"] == ["image"]
+    if multistage:
+        assert prompt["modalities"] == ["image"]
+        assert params[0] == "ar-stage"
     assert prompt["negative_prompt_ids"] == [3, 4]
-    assert prompt["extra_prompt_ids"] == {"encoder": [5]}
-    assert prompt["negative_extra_prompt_ids"] == {"encoder": [6]}
+    assert "extra_prompt_ids" not in prompt
+    assert "negative_extra_prompt_ids" not in prompt
     assert prompt["multi_modal_data"] == {"image": ["image"]}
-    assert prompt["extra_args"] == {"multi_modal_data": {"image": ["image"]}}
+    assert prompt["extra_args"] == {
+        "extra_prompt_ids": {"encoder": [5]},
+        "negative_extra_prompt_ids": {"encoder": [6]},
+    }
     assert prompt["mm_processor_kwargs"] == {"video_fps": 24, "audio_sample_rate": 32_000}
-    assert params[0] == "ar-stage"
     assert params[-1].extra_args == {"pipeline_private_arg": 7}
 
 
