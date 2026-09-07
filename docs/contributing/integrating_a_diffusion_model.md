@@ -496,6 +496,11 @@ Every registered diffusion adapter declares one; see
 [`rollout_media.py`](../../verl_omni/pipelines/rollout_media.py) and the
 `test_diffusion_io_spec_on_cpu.py` completeness test.
 
+The in-progress named-artifact migration is documented in
+[Named diffusion media artifacts](diffusion_media_artifacts.md). MiniMax H3 NFT
+uses that contract; other adapters still use the legacy declaration above. Do not
+infer an unverified VAE layout to opt an adapter into the new path.
+
 (request-level-batching)=
 ### 4.3 Request-level batching (optional)
 

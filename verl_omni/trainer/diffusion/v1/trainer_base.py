@@ -17,6 +17,7 @@ import math
 import os
 import uuid
 from abc import ABC, abstractmethod
+from dataclasses import replace
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from numbers import Integral
@@ -57,6 +58,7 @@ from verl.utils.skip import SkipManager
 from verl.utils.tracking import Tracking, ValidationGenerationsLogger
 from verl.workers.rollout.llm_server import LLMServerManager
 
+from verl_omni.pipelines.rollout_artifacts import MediaArtifact, previews_from_batch, validate_previews
 from verl_omni.pipelines.rollout_media import (
     resolve_batch_media_kind,
     resolve_is_video,
@@ -136,6 +138,8 @@ def _copy_media_to_cpu(value):
     """Return an independent CPU snapshot safe for background media export."""
     if isinstance(value, torch.Tensor):
         return value.detach().to(device="cpu", copy=True)
+    if isinstance(value, MediaArtifact):
+        return replace(value, data=_copy_media_to_cpu(value.data))
     if isinstance(value, list):
         return [_copy_media_to_cpu(item) for item in value]
     if isinstance(value, tuple):
@@ -1329,6 +1333,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         sample_audios: list = []
         sample_audio_sample_rates: list = []
         sample_media_kinds: list = []
+        sample_previews: list = []
         sample_gts: list = []
         sample_scores: list[float] = []
         sample_turns: list = []
@@ -1390,6 +1395,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             )
             sample_inputs.extend(input_texts)
             sample_outputs.append(output_images)
+            sample_previews.extend(previews_from_batch(data) or [None] * len(output_images))
             tool_extra = data.non_tensor_batch.get("tool_extra_fields")
             sample_audios.extend(_resolve_rollout_media_field(data, tool_extra, "audio"))
             sample_audio_sample_rates.extend(_resolve_rollout_media_field(data, tool_extra, "audio_sample_rate"))
@@ -1427,6 +1433,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             audios=sample_audios,
             audio_sample_rates=sample_audio_sample_rates,
             media_kinds=sample_media_kinds,
+            previews=sample_previews,
         )
 
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
@@ -1443,6 +1450,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 audios=sample_audios,
                 audio_sample_rates=sample_audio_sample_rates,
                 media_kind=resolve_batch_media_kind(sample_media_kinds),
+                previews=sample_previews,
             )
 
         data_sources_arr = np.concatenate(data_sources, axis=0) if data_sources else np.array([])
@@ -1456,6 +1464,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         audios=None,
         audio_sample_rates=None,
         media_kinds=None,
+        previews=None,
     ):
         """Use the shared image/video W&B path with declared media metadata."""
         return BaseRayDiffusionTrainer._maybe_log_val_generations(
@@ -1466,6 +1475,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             audios=audios,
             audio_sample_rates=audio_sample_rates,
             media_kinds=media_kinds,
+            previews=previews,
         )
 
     def _dump_generations(
@@ -1481,16 +1491,20 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         audios=None,
         audio_sample_rates=None,
         media_kind=None,
+        previews=None,
     ):
         """Validate media synchronously, then submit best-effort I/O with a step snapshot."""
-        _validate_generation_outputs(outputs)
-        resolve_is_video(outputs.ndim, media_kind)
-        dump_ndim = outputs.ndim - 1 if outputs.ndim == 6 and outputs.shape[1] == 1 else outputs.ndim
-        validate_visual_media_batch_rank(dump_ndim, media_kind)
+        previews = validate_previews(previews, len(inputs))
+        if previews is None:
+            _validate_generation_outputs(outputs)
+            resolve_is_video(outputs.ndim, media_kind)
+            dump_ndim = outputs.ndim - 1 if outputs.ndim == 6 and outputs.shape[1] == 1 else outputs.ndim
+            validate_visual_media_batch_rank(dump_ndim, media_kind)
         global_step = self.global_steps
         outputs_to_dump = _copy_media_to_cpu(outputs)
         audios_to_dump = _copy_media_to_cpu(audios)
         audio_sample_rates_to_dump = _copy_media_to_cpu(audio_sample_rates)
+        previews_to_dump = _copy_media_to_cpu(previews)
         future = self._dump_executor.submit(
             dump_generations,
             global_step,
@@ -1505,6 +1519,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             audios_to_dump,
             audio_sample_rates_to_dump,
             media_kind,
+            previews_to_dump,
         )
         self._dump_futures.append((future, global_step))
         self._drain_dump_futures()
@@ -1532,8 +1547,11 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             audios = _resolve_rollout_media_field(data, tool_extra, "audio")
             audio_sample_rates = _resolve_rollout_media_field(data, tool_extra, "audio_sample_rate")
             media_kinds = _resolve_rollout_media_field(data, tool_extra, "media_kind")
+            previews = previews_from_batch(data)
 
             sort_idx = sort_diffusion_tq_keys(list(batch_meta.keys))
+            if previews is not None:
+                previews = [previews[i] for i in sort_idx]
             inputs = [inputs[i] for i in sort_idx]
             outputs = outputs[torch.tensor(sort_idx)]
             gts = [gts[i] for i in sort_idx]
@@ -1554,6 +1572,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 audios=audios,
                 audio_sample_rates=audio_sample_rates,
                 media_kind=resolve_batch_media_kind(media_kinds),
+                previews=previews,
             )
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns) -> dict:

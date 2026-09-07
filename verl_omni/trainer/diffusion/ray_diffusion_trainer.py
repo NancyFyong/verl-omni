@@ -54,6 +54,7 @@ from verl.utils.py_functional import rename_dict
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.llm_server import LLMServerManager
 
+from verl_omni.pipelines.rollout_artifacts import previews_from_batch, validate_previews
 from verl_omni.pipelines.rollout_media import (
     resolve_batch_media_kind,
     resolve_is_video,
@@ -244,6 +245,7 @@ def dump_generations(
     audios=None,
     audio_sample_rates=None,
     media_kind=None,
+    previews=None,
 ):
     """Dump samples to disk as media files plus a JSONL index.
 
@@ -253,18 +255,24 @@ def dump_generations(
     Failed video exports are preserved as ``{i}.pt`` fallback payloads when possible.
     Media failures are recorded in JSONL; filesystem failures warn and skip the dump.
     """
-    _validate_generation_outputs(outputs)
+    previews = validate_previews(previews, len(inputs))
+    if previews is not None:
+        outputs = torch.stack([preview.data for preview in previews])
+        media_kind = previews[0].spec.modality
+        n_full = len(previews)
+    else:
+        _validate_generation_outputs(outputs)
+        n_full = outputs.shape[0]
     visual_folder = os.path.join(dump_path, f"{global_steps}")
 
-    n_full = outputs.shape[0]
     n = n_full if max_samples is None else min(max_samples, n_full)
-    if outputs.ndim == 6:
+    if previews is None and outputs.ndim == 6:
         # Per-sample batch dim from single-seq rollouts: [N, 1, T, C, H, W].
         outputs = outputs.squeeze(1)
     # Prefer the adapter-declared media kind over legacy rank/layout inference.
     validate_visual_media_batch_rank(outputs.ndim, media_kind)
     is_video = resolve_is_video(outputs.ndim, media_kind)
-    if is_video and outputs.ndim == 5 and outputs.shape[1] == 3 and outputs.shape[2] != 3:
+    if previews is None and is_video and outputs.ndim == 5 and outputs.shape[1] == 3 and outputs.shape[2] != 3:
         # Channels-first [N, C, T, H, W] -> [N, T, C, H, W]. Layout normalization
         # is still heuristic; declaring/normalizing it is deferred to the layout PR.
         outputs = outputs.permute(0, 2, 1, 3, 4)
@@ -286,7 +294,7 @@ def dump_generations(
             video_path = os.path.join(visual_folder, f"{i}.mp4")
             try:
                 _export_video(
-                    outputs[i],
+                    previews[i] if previews is not None else outputs[i],
                     video_path,
                     fps=fps,
                     audio=audios[i],
@@ -559,6 +567,7 @@ class BaseRayDiffusionTrainer(ABC):
         audios=None,
         audio_sample_rates=None,
         media_kind=None,
+        previews=None,
     ):
         """Dump media with the shared exporter at the current training step."""
         return dump_generations(
@@ -574,6 +583,7 @@ class BaseRayDiffusionTrainer(ABC):
             audios=audios,
             audio_sample_rates=audio_sample_rates,
             media_kind=media_kind,
+            previews=previews,
         )
 
     def _log_rollout_data(
@@ -619,6 +629,7 @@ class BaseRayDiffusionTrainer(ABC):
                 audios=audios_to_dump,
                 audio_sample_rates=audio_rates_to_dump,
                 media_kind=media_kind,
+                previews=previews_from_batch(batch),
             )
 
     def _maybe_log_val_generations(
@@ -629,6 +640,7 @@ class BaseRayDiffusionTrainer(ABC):
         audios=None,
         audio_sample_rates=None,
         media_kinds=None,
+        previews=None,
     ):
         """Log a table of validation samples to the configured logger (wandb or swanlab)."""
 
@@ -636,7 +648,12 @@ class BaseRayDiffusionTrainer(ABC):
 
         if generations_to_log == 0 or len(inputs) == 0:
             return
-        _validate_generation_outputs(outputs)
+        previews = validate_previews(previews, len(inputs))
+        if previews is not None:
+            outputs = previews
+            media_kinds = [preview.spec.modality for preview in previews]
+        else:
+            _validate_generation_outputs(outputs)
 
         import shutil
 
@@ -672,7 +689,10 @@ class BaseRayDiffusionTrainer(ABC):
                 media_kinds=[sample[5] for sample in samples],
             )
         else:
-            samples = [(input_, output, score) for input_, output, score, *_ in samples]
+            samples = [
+                (input_, output.data if previews is not None else output, score)
+                for input_, output, score, *_ in samples
+            ]
 
         # Log to each configured logger
         try:
@@ -722,6 +742,7 @@ class BaseRayDiffusionTrainer(ABC):
         sample_audios = []
         sample_audio_sample_rates = []
         sample_media_kinds = []
+        sample_previews = []
         sample_gts = []
         sample_scores = []
         sample_turns = []
@@ -778,6 +799,7 @@ class BaseRayDiffusionTrainer(ABC):
             # Store generated outputs
             output_images = test_output_gen_batch.batch["responses"]
             sample_outputs.append(output_images)
+            sample_previews.extend(previews_from_batch(test_output_gen_batch) or [None] * len(output_images))
             tool_extra = test_output_gen_batch.non_tensor_batch.get("tool_extra_fields")
             sample_audios.extend(_resolve_rollout_media_field(test_output_gen_batch, tool_extra, "audio"))
             sample_audio_sample_rates.extend(
@@ -823,6 +845,7 @@ class BaseRayDiffusionTrainer(ABC):
             audios=sample_audios,
             audio_sample_rates=sample_audio_sample_rates,
             media_kinds=sample_media_kinds,
+            previews=sample_previews,
         )
 
         # dump generations
@@ -840,6 +863,7 @@ class BaseRayDiffusionTrainer(ABC):
                 audios=sample_audios,
                 audio_sample_rates=sample_audio_sample_rates,
                 media_kind=resolve_batch_media_kind(sample_media_kinds),
+                previews=sample_previews,
             )
 
         for key_info, lst in reward_extra_infos_dict.items():

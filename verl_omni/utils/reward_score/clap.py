@@ -53,6 +53,14 @@ def _get_batching_state() -> _BatchingState:
 
 
 def _get_audio(extra_info: dict) -> tuple[torch.Tensor, int]:
+    if "media_artifacts" in extra_info:
+        from verl_omni.pipelines.rollout_artifacts import select_artifact
+
+        artifact = select_artifact(
+            extra_info["media_artifacts"], name="audio", modality="audio", representation="decoded"
+        )
+        artifact = artifact.normalized(context="CLAP", name="audio")
+        return artifact.data.detach().float().cpu().mean(dim=0), artifact.spec.sample_rate
     audio = extra_info.get("audio")
     if audio is None:
         raise KeyError("CLAP reward requires decoded audio in extra_info['audio'].")
