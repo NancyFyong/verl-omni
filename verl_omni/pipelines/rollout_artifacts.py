@@ -14,14 +14,14 @@
 """Named per-sample media and its lossless TensorDict/engine projections.
 
 Decoded axes normalize once; native latent axes and floating dtype never change.
-These types are separate from the legacy primary/auxiliary ``DiffusionIOSpec``
-while adapters migrate. No model or GPU runtime is imported here.
+Adapters declare available names in ``DiffusionIOSpec``. No model or GPU runtime
+is imported here.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Literal
 
@@ -33,6 +33,11 @@ ARTIFACT_PREFIX = "media_artifact__"
 ARTIFACT_SPECS = "media_artifact_specs"
 PRIMARY_ARTIFACT = "primary_artifact"
 PREVIEW_ARTIFACT = "preview_artifact"
+ARTIFACT_CONTEXT = "media_artifact_context"
+
+
+class ArtifactContractError(ValueError):
+    """A schema/selection failure, never an optional scorer or observability failure."""
 
 
 @dataclass(frozen=True)
@@ -52,12 +57,13 @@ class MediaArtifact:
 
     spec: ArtifactSpec
     data: torch.Tensor
+    context: str = ""
 
     def validate(self, *, context: str, name: str) -> None:
         """Fail closed on incorrect metadata, layout, shape or dtype."""
         spec, data = self.spec, self.data
-        prefix = f"{context}, artifact={name!r}"
-        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name):
+        prefix = f"{self.context or context}, artifact={name!r}"
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name):
             raise ValueError(f"{prefix}: expected an identifier artifact name")
         if spec.modality not in ("image", "video", "audio") or spec.representation not in ("latent", "decoded"):
             raise ValueError(f"{prefix}: invalid modality/representation {spec}")
@@ -85,6 +91,8 @@ class MediaArtifact:
                 raise ValueError(f"{prefix}: expected uint8 decoded pixels, got {data.dtype}")
             if "C" in spec.layout and spec.modality != "audio" and data.shape[spec.layout.index("C")] not in (1, 3, 4):
                 raise ValueError(f"{prefix}: expected 1/3/4 image channels, got shape={tuple(data.shape)}")
+        if spec.modality == "video" and spec.representation == "decoded" and spec.fps is None:
+            raise ArtifactContractError(f"{prefix}: decoded video requires explicit fps")
         if spec.fps is not None and (
             spec.modality != "video"
             or isinstance(spec.fps, bool)
@@ -107,7 +115,22 @@ class MediaArtifact:
             data = self.data.unsqueeze(0)
         else:
             data = self.data.permute(*(self.spec.layout.index(axis) for axis in target)).contiguous()
-        return MediaArtifact(replace(self.spec, layout=target), data)
+        return replace(self, spec=replace(self.spec, layout=target), data=data)
+
+
+def requested_artifact_names(requested: Any, *, context: str) -> list[str]:
+    """Validate output selection without interpreting strings/dicts as name sequences."""
+    if requested is None:
+        return []
+    if (
+        isinstance(requested, str)
+        or not isinstance(requested, Sequence)
+        or any(not isinstance(name, str) for name in requested)
+    ):
+        raise ArtifactContractError(f"{context}: requested_outputs must be a sequence of artifact names")
+    if len(set(requested)) != len(requested):
+        raise ArtifactContractError(f"{context}: duplicate requested_outputs")
+    return list(requested)
 
 
 def validate_artifacts(
@@ -127,21 +150,16 @@ def validate_artifacts(
             raise ValueError(f"{context}: undeclared artifact={name!r}")
         if artifact.spec != specs[name]:
             raise ValueError(f"{context}, artifact={name!r}: expected {specs[name]}, got {artifact.spec}")
+        artifact = replace(artifact, context=artifact.context or context)
         artifacts[name] = artifact.normalized(context=context, name=name)
     missing = specs.keys() - artifacts.keys()
     if missing:
         raise ValueError(f"{context}: declared artifacts missing: {sorted(missing)}")
     if primary not in artifacts:
         raise ValueError(f"{context}: primary artifact={primary!r} is absent")
-    if requested is not None:
-        if isinstance(requested, str):
-            raise TypeError(f"{context}: requested_outputs must be a sequence of artifact names, not str")
-        requested = list(requested)
-        if len(set(requested)) != len(requested):
-            raise ValueError(f"{context}: duplicate requested_outputs")
-        absent = set(requested) - artifacts.keys()
-        if absent:
-            raise ValueError(f"{context}: requested artifacts absent: {sorted(absent)}")
+    absent = set(requested_artifact_names(requested, context=context)) - artifacts.keys()
+    if absent:
+        raise ArtifactContractError(f"{context}: requested artifacts absent: {sorted(absent)}")
     return artifacts
 
 
@@ -162,11 +180,17 @@ def artifact_fields(artifacts: Mapping[str, MediaArtifact], primary: str, previe
         ARTIFACT_SPECS: {name: asdict(artifact.spec) for name, artifact in artifacts.items()},
         PRIMARY_ARTIFACT: primary,
         PREVIEW_ARTIFACT: preview,
+        ARTIFACT_CONTEXT: artifacts[primary].context,
     }
 
 
 def artifacts_from_fields(fields: Mapping[str, Any], *, context: str) -> dict[str, MediaArtifact]:
     """Restore one sample without inferring representation or dropping unknown names."""
+    origin = fields.get(ARTIFACT_CONTEXT)
+    if origin is not None and not isinstance(origin, str):
+        raise ArtifactContractError(f"{context}: artifact context must be a string")
+    if origin:
+        context = f"{origin}, {context}"
     raw_specs = fields.get(ARTIFACT_SPECS)
     tensors = {key[len(ARTIFACT_PREFIX) :]: value for key, value in fields.items() if key.startswith(ARTIFACT_PREFIX)}
     if raw_specs is None:
@@ -190,10 +214,39 @@ def artifacts_from_fields(fields: Mapping[str, Any], *, context: str) -> dict[st
     )
 
 
+def validate_visual_batch(outputs: torch.Tensor, media_kind: str, *, fps: float, context: str) -> None:
+    """Validate the canonical batched tensor API before starting best-effort media I/O."""
+    if media_kind not in ("image", "video"):
+        raise ArtifactContractError(f"{context}: expected visual media_kind, got {media_kind!r}")
+    layout = "CHW" if media_kind == "image" else "TCHW"
+    if outputs.ndim != len(layout) + 1:
+        raise ArtifactContractError(
+            f"{context}: expected canonical batched {media_kind}, got shape={tuple(outputs.shape)}"
+        )
+    spec = ArtifactSpec(media_kind, "decoded", layout, fps=fps if media_kind == "video" else None)
+    for index, output in enumerate(outputs):
+        MediaArtifact(spec, output).validate(context=context, name=f"preview_{index}")
+
+
+def validate_audio(audio: Any, sample_rate: Any, *, context: str) -> None:
+    """Validate the explicitly CT audio projection; no batch/axis or sample-rate fallback."""
+    if audio is not None:
+        if isinstance(sample_rate, torch.Tensor):
+            sample_rate = sample_rate.item()
+        artifact = MediaArtifact(
+            ArtifactSpec("audio", "decoded", "CT", sample_rate=sample_rate), torch.as_tensor(audio)
+        )
+        artifact.validate(context=context, name="audio")
+
+
 def validate_previews(previews: list[MediaArtifact] | None, count: int) -> list[MediaArtifact] | None:
     """Validate export selection synchronously, before best-effort I/O starts."""
-    if previews is None or all(preview is None for preview in previews):
+    if previews is None:
         return None
+    if not previews:
+        return []
+    if len(previews) == count and all(preview is None for preview in previews):
+        return []
     if len(previews) != count:
         raise ValueError(f"Expected {count} previews, got {len(previews)}")
     for i, preview in enumerate(previews):
@@ -219,7 +272,12 @@ def previews_from_batch(batch: Any) -> list[MediaArtifact] | None:
         fields = dict(row.non_tensor_batch)
         fields.update({key: value for key, value in row.batch.items() if key.startswith(ARTIFACT_PREFIX)})
         artifacts = artifacts_from_fields(fields, context=f"media export sample={i}")
-        name = fields.get(PREVIEW_ARTIFACT)
+        if PREVIEW_ARTIFACT not in fields:
+            raise ValueError(f"media export sample={i}: missing explicit preview selector")
+        name = fields[PREVIEW_ARTIFACT]
+        if name is None:
+            previews.append(None)
+            continue
         if name not in artifacts:
             raise ValueError(f"media export sample={i}: requested decoded preview {name!r} is absent")
         artifact = artifacts[name]
@@ -233,10 +291,16 @@ def select_artifact(
     artifacts: Mapping[str, MediaArtifact], *, name: str, modality: str, representation: str
 ) -> MediaArtifact:
     """Select exactly the requested stream; never substitute a latent for a preview."""
+    context = next((item.context for item in artifacts.values() if item.context), "artifact consumer")
     if name not in artifacts:
-        raise ValueError(f"Requested artifact={name!r} is absent; available={sorted(artifacts)}")
+        raise ArtifactContractError(f"{context}: Requested artifact={name!r} is absent; available={sorted(artifacts)}")
     artifact = artifacts[name]
-    artifact.validate(context="artifact consumer", name=name)
+    try:
+        artifact.validate(context="artifact consumer", name=name)
+    except (TypeError, ValueError) as error:
+        raise ArtifactContractError(str(error)) from error
     if (artifact.spec.modality, artifact.spec.representation) != (modality, representation):
-        raise ValueError(f"artifact={name!r}: expected {modality}/{representation}, got {artifact.spec}")
+        raise ArtifactContractError(
+            f"{context}, artifact={name!r}: expected {modality}/{representation}, got {artifact.spec}"
+        )
     return artifact

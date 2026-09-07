@@ -30,12 +30,13 @@ class TestResolveIsVideo:
         assert resolve_is_video(ndim=2, media_kind="audio") is False
 
     def test_unknown_media_kind_is_rejected(self):
-        with pytest.raises(ValueError, match="Unsupported media kind"):
+        with pytest.raises(ValueError, match="Explicit media_kind required"):
             resolve_is_video(ndim=5, media_kind="depth")
 
-    def test_falls_back_to_rank_when_undeclared(self):
-        assert resolve_is_video(ndim=5, media_kind=None) is True
-        assert resolve_is_video(ndim=4, media_kind=None) is False
+    @pytest.mark.parametrize("rank", [4, 5])
+    def test_never_falls_back_to_rank_when_undeclared(self, rank):
+        with pytest.raises(ValueError, match="Explicit media_kind required"):
+            resolve_is_video(ndim=rank, media_kind=None)
 
 
 if __name__ == "__main__":

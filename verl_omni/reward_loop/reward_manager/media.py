@@ -19,8 +19,10 @@ import numpy as np
 import torch
 
 from verl_omni.pipelines.rollout_artifacts import (
+    ARTIFACT_CONTEXT,
     ARTIFACT_PREFIX,
     ARTIFACT_SPECS,
+    PREVIEW_ARTIFACT,
     PRIMARY_ARTIFACT,
     artifacts_from_fields,
 )
@@ -47,7 +49,16 @@ def _reward_extra_info(data_item) -> dict:
         for key in fields
         if key.startswith(ARTIFACT_PREFIX)
     }
-    generated_media_keys = {"audio", "audio_sample_rate", "media_kind", ARTIFACT_SPECS, PRIMARY_ARTIFACT, *artifact_keys}
+    generated_media_keys = {
+        "audio",
+        "audio_sample_rate",
+        "media_kind",
+        ARTIFACT_SPECS,
+        PRIMARY_ARTIFACT,
+        PREVIEW_ARTIFACT,
+        ARTIFACT_CONTEXT,
+        *artifact_keys,
+    }
     for key in generated_media_keys:
         extra_info.pop(key, None)
     extra_info.update({key: value for key, value in tool_extra_fields.items() if key not in generated_media_keys})

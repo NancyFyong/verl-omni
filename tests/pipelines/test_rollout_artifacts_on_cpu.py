@@ -13,7 +13,7 @@
 # limitations under the License.
 """Named media is shape-declared, lossless and independent of tuple position."""
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 
 import pytest
@@ -166,7 +166,16 @@ def test_named_empty_payload_is_not_misreported_as_abort():
     final = SimpleNamespace(
         images=[],
         request_id="missing-output",
-        multimodal_output={"metadata": {"media_artifacts": {"primary": "video_preview", "specs": {}}}},
+        multimodal_output={
+            "metadata": {
+                "media_artifacts": {
+                    "primary": "video_preview",
+                    "preview": "video_preview",
+                    "audio": None,
+                    "specs": {"video_preview": asdict(ArtifactSpec("video", "decoded", "TCHW", fps=24))},
+                }
+            }
+        },
     )
     with pytest.raises(ValueError, match="missing-output.*named artifact payload"):
         DiffusionStrategy(SimpleNamespace(global_steps=1)).process_output(final, None, {})
@@ -186,7 +195,14 @@ def test_media_only_postprocessor_does_not_touch_named_payloads():
 def test_requested_outputs_survive_sampling_lowering(nested):
     from verl_omni.pipelines.rollout_request import OmniRolloutRequest
 
-    strategy = DiffusionStrategy(SimpleNamespace(engine=SimpleNamespace(default_sampling_params_list=[None])))
+    strategy = DiffusionStrategy(
+        SimpleNamespace(
+            engine=SimpleNamespace(
+                default_sampling_params_list=[None],
+                engine=SimpleNamespace(get_stage_metadata=lambda index: SimpleNamespace(stage_type="diffusion")),
+            )
+        )
+    )
     sampling = {"requested_outputs": ["video_preview", "video_latent"]}
     _, params = strategy.preprocess_input(
         OmniRolloutRequest.from_generate_kwargs(prompt_ids=[1]), {"extra_args": sampling} if nested else sampling, None

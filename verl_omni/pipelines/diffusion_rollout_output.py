@@ -23,13 +23,14 @@ from __future__ import annotations
 import functools
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, replace
-from typing import Any
+from typing import Any, Literal
 
+import torch
 from vllm_omni.diffusion.data import DiffusionOutput
 
 from verl_omni.pipelines.rollout_artifacts import ArtifactSpec, MediaArtifact, select_artifact, validate_artifacts
 
-_MEDIA_KEYS = ("image", "video", "output", "audio")
+_MEDIA_KEYS = frozenset(("image", "video", "output", "audio"))
 
 
 def rollout_output(
@@ -115,6 +116,7 @@ def with_media_artifacts(
         ):
             raise ValueError(f"{context}: preview artifact={preview!r} must be decoded visual media")
     metadata["media_artifacts"] = {
+        "context": context,
         "primary": primary,
         "audio": audio,
         "preview": preview,
@@ -127,6 +129,104 @@ def with_media_artifacts(
             "payload": {modality: {name: artifact.data for name, artifact in normalized.items()}},
             "metadata": metadata,
         },
+    )
+
+
+def with_batched_media_artifacts(
+    base: DiffusionOutput,
+    *,
+    data: Mapping[str, torch.Tensor],
+    specs: Mapping[str, ArtifactSpec],
+    primary: str,
+    context: str,
+    preview: str | None = None,
+    audio: str | None = None,
+    requested: list[str] | None = None,
+) -> DiffusionOutput:
+    """Normalize explicit B-prefixed tensors and retain the sample list for request splitting."""
+    if primary not in data:
+        raise ValueError(f"{context}: missing primary artifact={primary!r}")
+    batch_size = data[primary].shape[0]
+    if batch_size < 1:
+        raise ValueError(f"{context}: expected a nonempty artifact batch")
+    for name, tensor in data.items():
+        if name not in specs:
+            raise ValueError(f"{context}: undeclared artifact={name!r}")
+        if tensor.ndim != len(specs[name].layout) + 1 or tensor.shape[0] != batch_size:
+            raise ValueError(
+                f"{context}, artifact={name!r}: expected B{specs[name].layout}, B={batch_size}, got {tensor.shape}"
+            )
+    samples = []
+    for index in range(batch_size):
+        result = with_media_artifacts(
+            base,
+            artifacts=[(name, MediaArtifact(specs[name], tensor[index])) for name, tensor in data.items()],
+            specs=specs,
+            primary=primary,
+            preview=preview,
+            audio=audio,
+            context=f"{context}, sample={index}",
+            requested=requested,
+        )
+        samples.append(result.output["payload"][specs[primary].modality])
+    result.output["payload"][specs[primary].modality] = samples
+    return result
+
+
+def wants_decoded_preview(output_type: str, sampling_params: Any, *, modality: str = "image") -> bool:
+    """Honor explicit preview requests even when the primary output is latent."""
+    requested = (sampling_params.extra_args or {}).get("requested_outputs") or []
+    return output_type != "latent" or f"{modality}_preview" in requested
+
+
+def quantize_pixels(decoded: torch.Tensor, pixel_range: str, *, context: str) -> torch.Tensor:
+    """Quantize an explicitly declared VAE range, never infer encoding from dtype or extrema."""
+    if pixel_range == "uint8":
+        if decoded.dtype != torch.uint8:
+            raise ValueError(f"{context}: expected uint8 pixels, got {decoded.dtype}")
+        return decoded
+    if pixel_range not in ("minus_one_one", "zero_one") or not decoded.is_floating_point():
+        raise ValueError(f"{context}: invalid floating pixel encoding {pixel_range!r}, dtype={decoded.dtype}")
+    if not torch.isfinite(decoded).all():
+        raise ValueError(f"{context}: nonfinite decoded pixels")
+    # Match VaeImageProcessor's denormalization before float32 quantization.
+    pixels = decoded / 2 + 0.5 if pixel_range == "minus_one_one" else decoded
+    return pixels.float().clamp(0, 1).mul(255).round().to(torch.uint8)
+
+
+def with_visual_artifacts(
+    base: DiffusionOutput,
+    *,
+    decoded: torch.Tensor | None,
+    latents: torch.Tensor,
+    latent_layout: str,
+    output_type: str,
+    context: str,
+    requested: list[str] | None = None,
+    modality: Literal["image", "video"] = "image",
+    decoded_layout: str = "CHW",
+    pixel_range: Literal["minus_one_one", "zero_one", "uint8"] = "minus_one_one",
+    fps: float | None = None,
+) -> DiffusionOutput:
+    """Adapter boundary for explicit batched VAE pixels plus unchanged native latents.
+
+    The caller declares the pixel range and every axis; neither dtype nor shape
+    is used to infer representation. Training/replay tensors in ``base`` are untouched.
+    """
+    latent_name, preview_name = f"{modality}_latent", f"{modality}_preview"
+    data = {latent_name: latents}
+    specs = {latent_name: ArtifactSpec(modality, "latent", latent_layout)}
+    if decoded is not None:
+        data[preview_name] = quantize_pixels(decoded, pixel_range, context=context)
+        specs[preview_name] = ArtifactSpec(modality, "decoded", decoded_layout, fps=fps)
+    return with_batched_media_artifacts(
+        base,
+        data=data,
+        specs=specs,
+        primary=latent_name if output_type == "latent" else preview_name,
+        preview=preview_name if decoded is not None else None,
+        context=context,
+        requested=requested,
     )
 
 
@@ -144,8 +244,8 @@ def wrap_rollout_postprocessor(postprocess: Callable[..., Any]) -> Callable[...,
             return data  # Named tensors are already decoded/normalized by the adapter.
         if len(payload) != 1:
             raise ValueError("A media-only postprocessor cannot consume multiple payload keys; use named artifacts.")
-        media_key = next((key for key in _MEDIA_KEYS if key in payload), None)
-        if media_key is None:
+        (media_key,) = payload
+        if media_key not in _MEDIA_KEYS:
             raise ValueError("Diffusion output envelope has no media payload.")
 
         processed = postprocess(payload[media_key], **kwargs)
@@ -186,7 +286,7 @@ def _unwrap_output(output: Any, default_key: str) -> tuple[Any, str, dict[str, A
     payload = output["payload"]
     if len(payload) != 1:
         raise ValueError("Cannot unwrap multiple diffusion payload keys without dropping media; use named artifacts.")
-    for key in _MEDIA_KEYS:
-        if key in payload:
-            return payload[key], key, dict(output.get("metadata") or {})
-    raise ValueError("Diffusion output envelope has no media payload.")
+    (key,) = payload
+    if key not in _MEDIA_KEYS:
+        raise ValueError("Diffusion output envelope has no media payload.")
+    return payload[key], key, dict(output.get("metadata") or {})
