@@ -13,7 +13,9 @@
 # limitations under the License.
 """Contract tests for the typed rollout request (verl_omni/pipelines/rollout_request.py)."""
 
+import numpy as np
 import pytest
+import torch
 
 from verl_omni.pipelines.rollout_request import (
     MediaInput,
@@ -105,6 +107,26 @@ class TestConditionImagesFromPayload:
             "additional_information": {"condition_images": (image,)},
         }
         assert condition_images_from_payload(payload) == [image]
+
+    @pytest.mark.parametrize("as_array", [np.asarray, torch.tensor], ids=["numpy", "torch"])
+    def test_equal_array_aliases_are_accepted(self, as_array):
+        image = as_array([[1, 2], [3, 4]])
+        duplicate = as_array([[1, 2], [3, 4]])
+        result = condition_images_from_payload(
+            {"images": image, "extra_args": {"multi_modal_data": {"image": [duplicate]}}}
+        )
+        assert len(result) == 1
+        assert result[0] is image
+
+    @pytest.mark.parametrize("as_array", [np.asarray, torch.tensor], ids=["numpy", "torch"])
+    @pytest.mark.parametrize(
+        "image, other",
+        [([[1, 2], [3, 4]], [[1, 2], [3, 5]]), ([[1, 1]], [[1]]), ([[1]], [1])],
+        ids=["values", "broadcast-size", "broadcast-rank"],
+    )
+    def test_different_array_aliases_are_rejected(self, as_array, image, other):
+        with pytest.raises(ValueError, match="Conflicting condition-image aliases"):
+            condition_images_from_payload({"images": as_array(image), "image": as_array(other)})
 
     def test_conflicting_aliases_are_rejected(self):
         payload = {

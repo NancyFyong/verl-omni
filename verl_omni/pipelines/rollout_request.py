@@ -174,6 +174,18 @@ def _alias_values_match(left: Any, right: Any) -> bool:
         return left.keys() == right.keys() and all(_alias_values_match(left[key], right[key]) for key in left)
     if isinstance(left, list | tuple) and isinstance(right, list | tuple):
         return len(left) == len(right) and all(_alias_values_match(a, b) for a, b in zip(left, right, strict=True))
+    import numpy as np
+    import torch
+
+    if isinstance(left, np.ndarray) or isinstance(right, np.ndarray):
+        return isinstance(left, np.ndarray) and isinstance(right, np.ndarray) and np.array_equal(left, right)
+    if isinstance(left, torch.Tensor) or isinstance(right, torch.Tensor):
+        return (
+            isinstance(left, torch.Tensor)
+            and isinstance(right, torch.Tensor)
+            and left.device == right.device
+            and torch.equal(left, right)
+        )
     try:
         result = left == right
         return result if isinstance(result, bool) else bool(result)
