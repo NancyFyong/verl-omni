@@ -136,6 +136,18 @@ def dmd_gradient(
     return g_normalized, normalizer, nonfinite
 
 
+def _expand_loss_mask(mask: Tensor, prediction: Tensor) -> Tensor:
+    """Expand a prefix or broadcastable mask to individual loss elements."""
+    shape = tuple(mask.shape)
+    mask = mask.bool()
+    if mask.ndim < prediction.ndim and prediction.shape[: mask.ndim] == mask.shape:
+        mask = mask.reshape(*mask.shape, *((1,) * (prediction.ndim - mask.ndim)))
+    try:
+        return torch.broadcast_to(mask, prediction.shape)
+    except RuntimeError as exc:
+        raise ValueError(f"Loss mask shape {shape} is not broadcastable to {tuple(prediction.shape)}.") from exc
+
+
 def dmd_surrogate_loss(
     x_g: Tensor,
     g_normalized: Tensor,
@@ -143,8 +155,9 @@ def dmd_surrogate_loss(
 ) -> tuple[Tensor, int]:
     """Surrogate objective ``L_DMD = 0.5 * mean((x_g - stop_gradient(x_g - g_norm))^2)``.
 
-    Only the surrogate loss is masked by ``gradient_mask``. An all-masked loss is
-    an error, not zero. Returns ``(loss, active_elements)``.
+    Only the surrogate loss is masked by ``gradient_mask``. Prefix masks expand
+    over trailing dimensions. An all-masked loss is an error, not zero.
+    Returns ``(loss, active_elements)``.
     """
     x_g = x_g.float()
     g_normalized = g_normalized.float()
@@ -153,7 +166,7 @@ def dmd_surrogate_loss(
         loss = 0.5 * torch.mean((x_g - target) ** 2)
         active = x_g.numel()
     else:
-        mask = gradient_mask.bool()
+        mask = _expand_loss_mask(gradient_mask, x_g)
         active = int(mask.sum().item())
         if active == 0:
             raise ValueError("all-masked DMD loss is an error, not zero.")
@@ -188,7 +201,7 @@ def fake_score_loss(
         loss = torch.mean((model_output - target) ** 2)
         active = model_output.numel()
     else:
-        mask = gradient_mask.bool()
+        mask = _expand_loss_mask(gradient_mask, model_output)
         active = int(mask.sum().item())
         if active == 0:
             raise ValueError("all-masked fake-score loss is an error, not zero.")
@@ -212,16 +225,7 @@ def ode_regression_loss(
         )
     if valid_mask is None:
         return torch.mean((prediction - target) ** 2), prediction.numel()
-    mask = valid_mask.bool()
-    if mask.shape != prediction.shape:
-        if prediction.shape[: mask.ndim] == mask.shape:
-            mask = mask.reshape(*mask.shape, *((1,) * (prediction.ndim - mask.ndim)))
-        try:
-            mask = torch.broadcast_to(mask, prediction.shape)
-        except RuntimeError as exc:
-            raise ValueError(
-                f"ODE valid_mask shape {tuple(valid_mask.shape)} is not broadcastable to {tuple(prediction.shape)}."
-            ) from exc
+    mask = _expand_loss_mask(valid_mask, prediction)
     active = int(mask.sum().item())
     if active == 0:
         raise ValueError("all-masked ODE regression loss is an error, not zero.")
