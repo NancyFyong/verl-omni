@@ -54,7 +54,12 @@ from verl.utils.py_functional import rename_dict
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.llm_server import LLMServerManager
 
-from verl_omni.pipelines.rollout_artifacts import previews_from_batch, validate_previews
+from verl_omni.pipelines.rollout_artifacts import (
+    previews_from_batch,
+    validate_audio,
+    validate_previews,
+    validate_visual_batch,
+)
 from verl_omni.trainer.config import DiffusionAlgoConfig
 from verl_omni.trainer.diffusion.diffusion_algos import (
     DiffusionAdvantageEstimator,
@@ -380,7 +385,7 @@ class BaseRayDiffusionTrainer(ABC):
         reward_extra_infos_dict,
         dump_path,
         max_samples=None,
-        fps=24,
+        fps=None,
         audios=None,
         audio_sample_rates=None,
         media_kind=None,
@@ -395,6 +400,9 @@ class BaseRayDiffusionTrainer(ABC):
         Media failures are recorded in JSONL; filesystem failures warn and skip the dump.
         """
         previews = validate_previews(previews, len(inputs))
+        if previews == []:
+            sys_logger.warning("Skipping media dump: no decoded preview was requested")
+            return
         if previews is not None:
             retained = previews if max_samples is None else previews[:max_samples]
             outputs = (
@@ -409,15 +417,14 @@ class BaseRayDiffusionTrainer(ABC):
 
         n_full = len(previews) if previews is not None else outputs.shape[0]
         n = n_full if max_samples is None else min(max_samples, n_full)
-        if previews is None and outputs.ndim == 6:
-            # Per-sample batch dim from single-seq rollouts: [N, 1, T, C, H, W].
-            outputs = outputs.squeeze(1)
-        if previews is None and outputs.ndim == 5 and outputs.shape[1] == 3 and outputs.shape[2] != 3:
-            # Channels-first [N, C, T, H, W] -> [N, T, C, H, W]. Layout normalization
-            # is still heuristic; declaring/normalizing it is deferred to the layout PR.
-            outputs = outputs.permute(0, 2, 1, 3, 4)
-        # Prefer the adapter-declared media kind over the tensor rank.
         is_video = resolve_is_video(outputs.ndim, media_kind)
+        if previews is None:
+            validate_visual_batch(outputs, media_kind, fps=fps, context="media dump")
+        if is_video:
+            audios = batch_items(audios, n_full, "audio")
+            audio_sample_rates = batch_items(audio_sample_rates, n_full, "audio_sample_rate")
+            for i in range(n):
+                validate_audio(audios[i], audio_sample_rates[i], context=f"media dump sample={i}")
 
         try:
             os.makedirs(visual_folder, exist_ok=True)
@@ -430,8 +437,6 @@ class BaseRayDiffusionTrainer(ABC):
         video_export_errors = [None] * n
         image_export_errors = [None] * n
         if is_video:
-            audios = batch_items(audios, n_full, "audio")
-            audio_sample_rates = batch_items(audio_sample_rates, n_full, "audio_sample_rate")
             for i in range(n):
                 video_path = os.path.join(visual_folder, f"{i}.mp4")
                 try:
@@ -619,6 +624,8 @@ class BaseRayDiffusionTrainer(ABC):
         import numpy as np
 
         previews = validate_previews(previews, len(inputs))
+        if previews == []:
+            return
         if previews is not None:
             outputs = previews
             media_kinds = [preview.spec.modality for preview in previews]

@@ -13,7 +13,7 @@
 # limitations under the License.
 """CPU tests for ``BaseRayDiffusionTrainer._dump_generations`` media handling.
 
-The dump branches on tensor rank: 5-D video batches ``[N, T, C, H, W]`` are
+The dump reads the declared media kind: video batches ``[N, T, C, H, W]`` are
 written as ``{i}.mp4`` and 4-D image batches ``[N, C, H, W]`` as ``{i}.jpg``,
 while ``max_samples`` bounds how many samples (and JSONL rows) are emitted.
 The method only reads ``self.global_steps``, so a lightweight stub stands in
@@ -38,7 +38,9 @@ import verl_omni.trainer.diffusion.ray_diffusion_trainer as ray_diffusion_traine
 from verl_omni.trainer.diffusion.ray_diffusion_trainer import BaseRayDiffusionTrainer
 
 
-def _dump(dump_path, outputs, *, max_samples=None, global_steps=0, audios=None, audio_sample_rates=None):
+def _dump(
+    dump_path, outputs, *, max_samples=None, global_steps=0, audios=None, audio_sample_rates=None, media_kind="video"
+):
     """Invoke the unbound ``_dump_generations`` with a minimal stub ``self``."""
     n = outputs.shape[0]
     stub = SimpleNamespace(global_steps=global_steps)
@@ -60,6 +62,7 @@ def _dump(dump_path, outputs, *, max_samples=None, global_steps=0, audios=None, 
         str(dump_path),
         max_samples=max_samples,
         fps=8,
+        media_kind=media_kind,
         **kwargs,
     )
 
@@ -130,7 +133,7 @@ class TestDumpGenerations:
     def test_image_batch_writes_one_jpg_per_sample(self, tmp_path):
         # Image regression: the 4-D path must stay byte-for-byte behaviour.
         outputs = torch.randint(256, (2, 3, 16, 16), dtype=torch.uint8)  # [N, C, H, W]
-        _dump(tmp_path, outputs)
+        _dump(tmp_path, outputs, media_kind="image")
 
         visual = os.path.join(str(tmp_path), "0")
         jpgs = sorted(f for f in os.listdir(visual) if f.endswith(".jpg"))
@@ -151,7 +154,7 @@ class TestDumpGenerations:
             return original_save(image, filename, *args, **kwargs)
 
         monkeypatch.setattr(ray_diffusion_trainer.Image.Image, "save", save)
-        _dump(tmp_path, torch.zeros(2, 3, 8, 8, dtype=torch.uint8))
+        _dump(tmp_path, torch.zeros(2, 3, 8, 8, dtype=torch.uint8), media_kind="image")
 
         rows = _read_jsonl(tmp_path)
         assert rows[0]["output"] is None
@@ -170,7 +173,7 @@ class TestDumpGenerations:
             monkeypatch.setattr(ray_diffusion_trainer.os, "makedirs", fail)
         else:
             monkeypatch.setattr(ray_diffusion_trainer, "open", fail, raising=False)
-        _dump(tmp_path, torch.zeros(1, 3, 8, 8, dtype=torch.uint8), global_steps=7)
+        _dump(tmp_path, torch.zeros(1, 3, 8, 8, dtype=torch.uint8), global_steps=7, media_kind="image")
         assert "step 7" in caplog.text
         assert "simulated filesystem failure" in caplog.text
 

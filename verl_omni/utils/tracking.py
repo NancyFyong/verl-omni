@@ -26,7 +26,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from verl_omni.pipelines.rollout_artifacts import MediaArtifact
+from verl_omni.pipelines.rollout_artifacts import ArtifactSpec, MediaArtifact, validate_audio
 from verl_omni.utils.reward_score.reward_utils import normalize_video_tensor
 
 logger = logging.getLogger(__name__)
@@ -53,14 +53,8 @@ def batch_items(values: Any, batch_size: int, name: str) -> list[Any]:
 
 def _write_wav(audio: Any, sample_rate: Any, path: Path) -> None:
     waveform = torch.as_tensor(audio).detach().cpu().float()
-    while waveform.ndim > 2 and waveform.shape[0] == 1:
-        waveform = waveform[0]
-    if waveform.ndim == 1:
-        waveform = waveform.unsqueeze(0)
-    elif waveform.ndim != 2:
-        raise ValueError(f"Expected audio shape [T] or [C, T], got {tuple(waveform.shape)}.")
-    if waveform.shape[0] > 8 and waveform.shape[1] <= 8:
-        waveform = waveform.transpose(0, 1)
+    if waveform.ndim != 2 or any(size <= 0 for size in waveform.shape):
+        raise ValueError(f"Expected canonical audio shape [C, T], got {tuple(waveform.shape)}.")
     if waveform.shape[0] > 2:
         waveform = waveform.mean(dim=0, keepdim=True)
 
@@ -92,25 +86,17 @@ def _video_tensor_to_rgb24(video: torch.Tensor) -> tuple[np.ndarray, int, int]:
 
 
 def resolve_is_video(ndim: int, media_kind: str | None) -> bool:
-    """Decide whether a rollout output is a video.
-
-    Prefers the adapter-declared media kind (from ``DiffusionIOSpec``); the tensor
-    rank is only a fallback for outputs that do not carry a declared kind. This
-    avoids misclassifying, e.g., a short 3-frame video whose rank happens to match
-    an image batch.
-    """
-    if media_kind is not None:
-        if media_kind not in ("image", "video", "audio"):
-            raise ValueError(f"Unsupported media kind: {media_kind!r}")
-        return media_kind == "video"
-    return ndim == 5
+    """Read the declared modality; rank is never a modality discriminator."""
+    if media_kind not in ("image", "video", "audio"):
+        raise ValueError(f"Explicit media_kind required, got {media_kind!r}")
+    return media_kind == "video"
 
 
 def _export_video(
     output: torch.Tensor,
     output_path: str,
     *,
-    fps: int,
+    fps: float | None = None,
     audio: Any = None,
     audio_sample_rate: Any = None,
     ffmpeg_exe: str | None = None,
@@ -122,19 +108,16 @@ def _export_video(
     direct ``stdin.write`` path, which can silently truncate a raw-video frame
     without materializing another full-video ``bytes`` copy.
     """
+    if isinstance(output, MediaArtifact):
+        fps = output.spec.fps
+    if isinstance(fps, bool) or not isinstance(fps, int | float) or not 0 < fps < float("inf"):
+        raise ValueError(f"Video export requires explicit positive finite fps, got {fps!r}")
+    validate_audio(audio, audio_sample_rate, context="video export")
+    frames, width, height = _video_tensor_to_rgb24(output)
     if ffmpeg_exe is None:
         from imageio_ffmpeg import get_ffmpeg_exe
 
         ffmpeg_exe = get_ffmpeg_exe()
-
-    if isinstance(output, MediaArtifact) and output.spec.fps is not None:
-        fps = output.spec.fps
-    else:
-        fps = int(fps)
-    if fps <= 0:
-        raise ValueError(f"fps must be positive, got {fps}.")
-
-    frames, width, height = _video_tensor_to_rgb24(output)
     output_path = Path(output_path)
     audio_path = None
     command = [
@@ -193,17 +176,17 @@ def _export_video(
             audio_path.unlink(missing_ok=True)
 
 
-def wrap_val_samples_for_wandb(samples, fps=24, output_dir=None, media_kinds=None):
+def wrap_val_samples_for_wandb(samples, fps=None, output_dir=None, media_kinds=None):
     """Wrap validation samples and prepare top-level ``wandb`` media.
 
-    Declared ``media_kinds`` decide whether each output is an image or video;
-    tensor rank is retained only as a compatibility fallback. Video outputs in
-    ``[T, C, H, W]``, ``[C, T, H, W]``, or ``[T, H, W, C]`` layouts are encoded
-    to mp4 and passed to ``wandb.Video`` by path. Provide ``output_dir`` to keep
+    Named decoded artifacts carry modality/layout/FPS. The explicit tensor API
+    requires ``media_kinds``, canonical CHW/TCHW and video FPS; it never guesses
+    axes or representation. Videos are passed to ``wandb.Video`` by path.
+    Provide ``output_dir`` to keep
     the media available for asynchronous upload; otherwise a temp dir is
     returned for cleanup. Optional tuple elements four and five carry audio and
-    its sample rate. Media conversion failures are represented in the table and
-    logged instead of propagating into the training loop.
+    its sample rate. Schema errors fail before I/O; encoder/filesystem/W&B
+    failures are represented in the table without failing training.
     """
     import wandb
 
@@ -225,11 +208,14 @@ def wrap_val_samples_for_wandb(samples, fps=24, output_dir=None, media_kinds=Non
             if media_kind == "image":
                 out = out.normalized(context="W&B", name="preview").data
         output_ndim = getattr(out, "ndim", -1)
-        is_video = resolve_is_video(output_ndim, media_kind) if media_kind is not None else output_ndim in (4, 5)
-        if is_video and output_ndim == 5:
-            # Batched video [B, T, C, H, W], [B, C, T, H, W], or [B, T, H, W, C].
-            out = out[0]
+        is_video = resolve_is_video(output_ndim, media_kind)
+        if not isinstance(out, MediaArtifact):
+            MediaArtifact(
+                ArtifactSpec(media_kind, "decoded", "TCHW" if is_video else "CHW", fps=fps if is_video else None),
+                out,
+            ).validate(context="W&B", name="preview")
         if is_video:
+            validate_audio(audio, audio_sample_rate, context="W&B")
             try:
                 if video_dir is None:
                     video_tmp_dir = tempfile.mkdtemp(prefix="val_video_")
@@ -246,8 +232,6 @@ def wrap_val_samples_for_wandb(samples, fps=24, output_dir=None, media_kinds=Non
                 media = f"[validation media unavailable: {type(error).__name__}: {error}]"
         else:
             try:
-                if not isinstance(out, torch.Tensor) or out.dtype != torch.uint8:
-                    raise ValueError(f"Expected a uint8 image tensor, got {getattr(out, 'dtype', type(out))}.")
                 media = wandb.Image(out, file_type="jpg")
             except Exception as error:
                 logger.warning("Could not log validation sample %d image: %s", len(wrapped), error)

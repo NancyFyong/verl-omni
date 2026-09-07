@@ -14,7 +14,7 @@
 """A latent response can be scored while an independently named preview is dumped."""
 
 import sys
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -123,3 +123,77 @@ def test_tracking_explicit_layout_bypasses_legacy_normalizer(monkeypatch):
     frames, width, height = tracking._video_tensor_to_rgb24(preview)
     assert frames.shape == (3, 2, 5, 3) and (width, height) == (5, 2)
     torch.testing.assert_close(torch.from_numpy(frames).permute(0, 3, 1, 2), canonical)
+
+
+@pytest.mark.parametrize("version", [0, 1])
+def test_intentionally_absent_preview_skips_dump_without_using_latents(tmp_path, version):
+    context = SimpleNamespace(global_steps=1, _dump_executor=Mock())
+    dump = v0.BaseRayDiffusionTrainer._dump_generations if version == 0 else V1._dump_generations
+    dump(context, ["one"], torch.zeros(1, 16, 2, 2), [None], [1], {}, str(tmp_path), previews=[None])
+    context._dump_executor.submit.assert_not_called()
+    assert not (tmp_path / "1.jsonl").exists()
+
+
+@pytest.mark.parametrize("version", [0, 1])
+def test_invalid_audio_fails_before_dump_io(tmp_path, version):
+    context = SimpleNamespace(global_steps=1, _dump_executor=Mock())
+    dump = v0.BaseRayDiffusionTrainer._dump_generations if version == 0 else V1._dump_generations
+    with pytest.raises(ValueError, match="expected layout=CT"):
+        dump(
+            context,
+            ["one"],
+            torch.zeros(1, 4, 3, 2, 2, dtype=torch.uint8),
+            [None],
+            [1],
+            {},
+            str(tmp_path),
+            media_kind="video",
+            fps=24,
+            audios=[torch.zeros(1, 2, 8)],
+            audio_sample_rates=[32000],
+        )
+    context._dump_executor.submit.assert_not_called()
+    assert not (tmp_path / "1").exists()
+
+
+@pytest.mark.parametrize("data", [torch.zeros(3, 2, 2), torch.zeros(1, 3, 2, 2, dtype=torch.uint8)])
+def test_wandb_schema_errors_are_not_observability_failures(monkeypatch, data):
+    monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Image=Mock()))
+    with pytest.raises(ValueError, match="artifact='preview'"):
+        tracking.wrap_val_samples_for_wandb([("one", data, 1)], media_kinds=["image"])
+    sys.modules["wandb"].Image.assert_not_called()
+
+
+def test_v1_dump_queue_is_bounded_and_does_not_retain_full_batch_storage(tmp_path, caplog):
+    future = Future()
+    context = SimpleNamespace(global_steps=1, _dump_executor=Mock(), _dump_futures=[])
+    context._dump_executor.submit.return_value = future
+    context._write_generations = V1._write_generations
+    context._drain_dump_futures = lambda: V1._drain_dump_futures(context)
+    context._report_dump_failure = V1._report_dump_failure
+    pixels = torch.zeros(4, 3, 8, 8, dtype=torch.uint8)
+    previews = [MediaArtifact(ArtifactSpec("image", "decoded", "CHW"), row) for row in pixels]
+    args = dict(
+        inputs=[str(i) for i in range(4)],
+        outputs=torch.zeros(4, 16, 2, 2),
+        gts=[None] * 4,
+        scores=[0] * 4,
+        reward_extra_infos_dict={"uid": [str(i) for i in range(4)]},
+        dump_path=str(tmp_path),
+        previews=previews,
+        max_samples=1,
+    )
+    V1._dump_generations(context, **args)
+    queued = context._dump_executor.submit.call_args.args[1:]
+    assert queued[1] is None  # No unused primary/training tensor is retained.
+    assert queued[4]["uid"] == ["0"]
+    assert len(queued[12]) == 1
+    copy = queued[12][0].data
+    assert copy.data_ptr() != pixels[0].data_ptr()
+    assert copy.untyped_storage().nbytes() == pixels[0].numel()
+    V1._dump_generations(context, **args)
+    assert context._dump_executor.submit.call_count == 1
+    assert "previous dump is still running" in caplog.text
+    future.set_result(None)
+    context._drain_dump_futures()
+    assert context._dump_futures == []

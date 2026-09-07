@@ -11,71 +11,37 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Typed, CPU-importable contracts for diffusion rollout media.
-
-These types let a diffusion adapter *declare* what media its pipeline emits
-(primary stream plus any auxiliary streams such as joint audio) instead of the
-rollout strategy hard-coding model-specific conventions like "audio lives at
-tuple position 1" or "the audio sample rate is 32000 Hz". The diffusion
-strategy consults the adapter-owned :class:`DiffusionIOSpec` when it converts an
-engine result into a rollout output, so adding a new combination of existing
-modalities only touches the adapter, not the shared server/strategy code.
-"""
+"""Adapter-owned named diffusion output declarations; no positional media protocol."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import TYPE_CHECKING, Literal
 
-#: Media kinds a diffusion pipeline can emit.
+if TYPE_CHECKING:
+    from verl_omni.pipelines.rollout_artifacts import ArtifactSpec
+
 Modality = Literal["image", "video", "audio"]
 
 
 @dataclass(frozen=True)
-class MediaSpec:
-    """Declaration of a single media stream produced by a diffusion pipeline.
-
-    Attributes:
-        modality: The media kind (``"image"``, ``"video"`` or ``"audio"``).
-        sample_rate: Default audio sample rate in Hz. Audio streams only; used
-            as a fallback when the adapter does not attach a runtime sample rate
-            through the rollout metadata.
-        fps: Default frames-per-second. Video streams only; ``None`` when the
-            pipeline does not declare one.
-
-    The float-latent vs. uint8-pixel distinction is intentionally *not* declared
-    here: it is decided per request by the sampling ``output_type`` (``latent``
-    keeps floats, otherwise pixels are quantized to uint8 in ``[0, 255]``).
-    """
-
-    modality: Modality
-    sample_rate: Optional[int] = None
-    fps: Optional[int] = None
-
-
-@dataclass(frozen=True)
 class DiffusionIOSpec:
-    """Adapter-owned declaration of a diffusion pipeline's rollout outputs.
+    """Available named artifacts, with canonical decoded and native latent axes.
 
-    Attributes:
-        primary: The main media stream. It is carried on
-            ``DiffusionOutput.diffusion_output`` and, when the pipeline emits a
-            media tuple, occupies position 0.
-        auxiliary: At most one audio stream, carried at position 1 of a
-            ``(visual, audio)`` tuple. Other auxiliary combinations are not
-            supported by the current rollout transport.
+    Each request selects its primary and optional preview explicitly. Runtime
+    sample rate/FPS live on the returned artifacts; a declaration can constrain a
+    fixed rate or leave it to a model's runtime decoder configuration.
     """
 
-    primary: MediaSpec
-    auxiliary: tuple[MediaSpec, ...] = ()
+    artifacts: Mapping[str, ArtifactSpec]
 
     def __post_init__(self) -> None:
-        if self.auxiliary and (
-            self.primary.modality not in ("image", "video")
-            or len(self.auxiliary) != 1
-            or self.auxiliary[0].modality != "audio"
+        from verl_omni.pipelines.rollout_artifacts import ArtifactSpec
+
+        if not isinstance(self.artifacts, Mapping) or not self.artifacts:
+            raise ValueError("DiffusionIOSpec requires named artifacts")
+        if any(
+            not isinstance(name, str) or not isinstance(spec, ArtifactSpec) for name, spec in self.artifacts.items()
         ):
-            raise ValueError(
-                "DiffusionIOSpec supports image/video primary media with at most one auxiliary audio stream; "
-                f"got primary={self.primary.modality!r}, auxiliary={tuple(s.modality for s in self.auxiliary)!r}"
-            )
+            raise TypeError("DiffusionIOSpec requires artifact-name to ArtifactSpec declarations")

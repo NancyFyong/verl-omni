@@ -18,7 +18,6 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
-import torchvision.transforms as T
 from verl.utils.import_utils import import_external_libs
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
@@ -29,6 +28,7 @@ from verl_omni.pipelines.rollout_artifacts import (
     ARTIFACT_SPECS,
     PRIMARY_ARTIFACT,
     artifacts_from_fields,
+    requested_artifact_names,
     select_artifact,
     validate_artifacts,
 )
@@ -49,18 +49,11 @@ def _diffusion_output_type(sampling_params: dict[str, Any]) -> str:
     output_type = sampling_params.get("output_type")
     if output_type is None:
         output_type = (sampling_params.get("extra_args") or {}).get("output_type")
-    return output_type or "image"
-
-
-def _pixel_output_to_uint8(output: torch.Tensor) -> torch.Tensor:
-    """Quantize a rollout pixel tensor from float ``[0, 1]`` to uint8 once."""
-    if output.dtype == torch.uint8:
-        return output
-    output = output.detach().to(dtype=torch.float32, copy=True)
-    if not bool(torch.isfinite(output).all()):
-        raise ValueError("Pixel rollout output must contain only finite values")
-    output = output.clamp_(0, 1)
-    return output.mul_(255).round_().to(dtype=torch.uint8)
+    if output_type is None:
+        return "image"
+    if not isinstance(output_type, str) or output_type not in ("image", "pt", "np", "pil", "both", "latent"):
+        raise ValueError(f"Unsupported diffusion output_type: {output_type!r}")
+    return output_type
 
 
 def _rollout_metadata_groups(multimodal_output: Any) -> tuple[Mapping[str, Any], ...]:
@@ -77,15 +70,18 @@ def _rollout_metadata_groups(multimodal_output: Any) -> tuple[Mapping[str, Any],
     return tuple(groups)
 
 
-def _maybe_unbatch(value: Any) -> Any:
-    if value is None:
-        return None
-    if isinstance(value, torch.Tensor):
-        return value[0] if value.dim() > 0 else value
-    if isinstance(value, np.ndarray):
-        return value[0] if value.ndim > 0 else value
+def _unbatch_training_field(value: Any, *, context: str, name: str) -> Any:
+    """Training groups declare B-leading tensors/lists; the RPC returns exactly one sample."""
+    if isinstance(value, torch.Tensor | np.ndarray):
+        if value.ndim == 0:
+            return value
+        if value.shape[0] != 1:
+            raise ValueError(f"{context}, field={name!r}: expected batch size 1, got shape={tuple(value.shape)}")
+        return value[0]
     if isinstance(value, list | tuple):
-        return value[0] if value else None
+        if len(value) != 1:
+            raise ValueError(f"{context}, field={name!r}: expected one batched item, got {len(value)}")
+        return value[0]
     return value
 
 
@@ -100,9 +96,6 @@ class DiffusionStrategy(OmniStrategyBase):
 
     rollout_config_cls = DiffusionRolloutConfig
     model_config_cls = DiffusionModelConfig
-
-    def post_init(self, cuda_visible_devices: str) -> None:
-        self.server._to_tensor = T.PILToTensor()
 
     def worker_extension_cls(self, device_type: str) -> str:
         if device_type == "npu":
@@ -159,6 +152,7 @@ class DiffusionStrategy(OmniStrategyBase):
         if not isinstance(explicit_extra, Mapping):
             raise TypeError("Diffusion sampling extra_args must be a mapping")
         extra_args: dict[str, Any] = dict(explicit_extra)
+        _diffusion_output_type(sampling_params)
         for key, value in sampling_params.items():
             if key == "extra_args":
                 continue
@@ -170,6 +164,11 @@ class DiffusionStrategy(OmniStrategyBase):
                 sampling_kwargs[key] = value
             else:
                 extra_args[key] = value
+        requested = requested_artifact_names(extra_args.get("requested_outputs"), context="diffusion request")
+        if requested:
+            io_spec = self._diffusion_io_spec()
+            if io_spec is not None and (unknown := set(requested) - io_spec.artifacts.keys()):
+                raise ValueError(f"Diffusion request asks for undeclared artifacts: {sorted(unknown)}")
         sampling_kwargs["extra_args"] = extra_args
         if lora_request is not None:
             sampling_kwargs["lora_request"] = lora_request
@@ -196,12 +195,7 @@ class DiffusionStrategy(OmniStrategyBase):
         )
 
     def _diffusion_io_spec(self) -> Optional[DiffusionIOSpec]:
-        """Resolve the adapter-declared media I/O spec for the active pipeline.
-
-        The spec declares primary modality and the optional joint audio stream's
-        sample rate. The current transport fixes audio at tuple position 1. Returns
-        ``None`` when the pipeline (or a bare test server) declares no spec.
-        """
+        """Resolve the adapter's available named artifacts, independent of engine wire layout."""
         model_config = getattr(self.server, "model_config", None)
         if model_config is None:
             return None
@@ -213,23 +207,73 @@ class DiffusionStrategy(OmniStrategyBase):
 
     def process_output(self, final_res: Any, params: Any, sampling_params: dict[str, Any]) -> DiffusionOutput:
         output_type = _diffusion_output_type(sampling_params)
+        req_output = getattr(final_res, "request_output", None) or final_res
+        request_id = getattr(req_output, "request_id", getattr(final_res, "request_id", "unknown"))
+        model_config = getattr(self.server, "model_config", None)
+        context = (
+            f"pipeline={getattr(model_config, 'architecture', 'unknown')}/"
+            f"{getattr(model_config, 'algorithm', 'unknown')}, request_id={request_id}"
+        )
         multimodal = getattr(final_res, "multimodal_output", None)
         metadata = multimodal.get("metadata", {}) if isinstance(multimodal, Mapping) else {}
         artifact_header = metadata.get("media_artifacts") if isinstance(metadata, Mapping) else None
         artifact_payload = None
         if artifact_header is not None:
-            if not isinstance(artifact_header, Mapping) or not {"primary", "specs"} <= artifact_header.keys():
+            if (
+                not isinstance(artifact_header, Mapping)
+                or not {"primary", "specs", "preview", "audio"} <= artifact_header.keys()
+            ):
                 raise ValueError(
                     f"request_id={getattr(final_res, 'request_id', 'unknown')}: invalid media_artifacts header"
                 )
-            if len(final_res.images) == 1:
-                artifact_payload = final_res.images[0]
-            elif not final_res.images:
-                artifact_payload = multimodal.get("audio")
-            if not isinstance(artifact_payload, Mapping):
-                raise ValueError(
-                    f"request_id={getattr(final_res, 'request_id', 'unknown')}: expected one named artifact payload"
-                )
+            artifact_payload = {}
+            sources = []
+            specs = artifact_header["specs"]
+            if not isinstance(specs, Mapping) or artifact_header["primary"] not in specs:
+                raise ValueError(f"{context}: invalid named artifact declarations/primary")
+            for key, value in multimodal.items():
+                if key in {"metadata", "audio_sample_rate", "fps", "trajectory"}:
+                    continue
+                if key in ("image", "video", "audio") and isinstance(value, Mapping | list):
+                    if isinstance(value, list):
+                        if len(value) != 1:
+                            raise ValueError(f"{context}: expected one named artifact payload")
+                        value = value[0]
+                    if not isinstance(value, Mapping):
+                        raise ValueError(f"{context}: invalid named {key} payload")
+                    sources.append(value)
+                elif key in specs:
+                    sources.append({key: value})
+                else:
+                    raise ValueError(f"{context}: undeclared multimodal output {key!r}")
+            images = final_res.images or []
+            if images:
+                if len(images) != 1:
+                    raise ValueError(f"{context}: expected one named artifact payload")
+                image_payload = images[0]
+                if not isinstance(image_payload, Mapping):
+                    primary = artifact_header["primary"]
+                    expected_kind = specs[primary]["modality"]
+                    if getattr(final_res, "final_output_type", None) != expected_kind:
+                        raise ValueError(
+                            f"{context}: images fallback requires explicit final_output_type={expected_kind}"
+                        )
+                    image_payload = {primary: image_payload}
+                sources.append(image_payload)
+            for source in sources:
+                for name, tensor in source.items():
+                    if not isinstance(name, str):
+                        raise ValueError(f"{context}: artifact names must be strings, got {name!r}")
+                    if name in artifact_payload and (
+                        getattr(artifact_payload[name], "dtype", None) != getattr(tensor, "dtype", None)
+                        or not _alias_values_match(artifact_payload[name], tensor)
+                    ):
+                        raise ValueError(f"{context}: conflicting artifact={name!r} in multimodal_output and images")
+                    artifact_payload[name] = tensor
+            if not artifact_payload:
+                raise ValueError(f"{context}: expected one named artifact payload")
+        if artifact_header is None and isinstance(multimodal, Mapping) and multimodal.keys() - {"metadata"}:
+            raise ValueError(f"{context}: named media_artifacts declaration required")
         if artifact_header is None and (final_res is None or not final_res.images):
             finish_reason = "abort"
             if final_res is not None:
@@ -253,15 +297,12 @@ class DiffusionStrategy(OmniStrategyBase):
                 extra_fields={"global_steps": self.server.global_steps},
             )
 
-        diffusion_output = artifact_payload if artifact_header is not None else final_res.images[0]
+        if artifact_header is None:
+            raise ValueError(
+                f"{context}: named media_artifacts declaration required; legacy tensor/tuple output is unsupported"
+            )
+        diffusion_output = artifact_payload
         io_spec = self._diffusion_io_spec()
-        req_output = getattr(final_res, "request_output", None) or final_res
-        request_id = getattr(req_output, "request_id", getattr(final_res, "request_id", "unknown"))
-        model_config = getattr(self.server, "model_config", None)
-        context = (
-            f"pipeline={getattr(model_config, 'architecture', 'unknown')}/"
-            f"{getattr(model_config, 'algorithm', 'unknown')}, request_id={request_id}"
-        )
         artifacts = {}
         primary_artifact = None
         audio_sample_rate: Optional[int] = None
@@ -298,8 +339,18 @@ class DiffusionStrategy(OmniStrategyBase):
                 raise ValueError(
                     f"{context}, artifact={primary_artifact!r}: expected {expected_representation}, got {primary.spec}"
                 )
-            if io_spec is not None and primary.spec.modality != io_spec.primary.modality:
-                raise ValueError(f"{context}: primary artifact modality conflicts with pipeline declaration")
+            if io_spec is not None:
+                for name, artifact in artifacts.items():
+                    expected = io_spec.artifacts.get(name)
+                    if expected is None:
+                        raise ValueError(f"{context}: undeclared artifact={name!r}")
+                    actual = artifact.spec
+                    if (actual.modality, actual.representation, actual.layout) != (
+                        expected.modality,
+                        expected.representation,
+                        expected.layout,
+                    ) or (expected.sample_rate is not None and actual.sample_rate != expected.sample_rate):
+                        raise ValueError(f"{context}, artifact={name!r}: expected {expected}, got {actual}")
             diffusion_output = primary.data
             if artifact_header.get("audio") is not None:
                 audio_artifact = select_artifact(
@@ -307,50 +358,28 @@ class DiffusionStrategy(OmniStrategyBase):
                 )
                 rollout_audio = audio_artifact.data
                 audio_sample_rate = audio_artifact.spec.sample_rate
-        elif isinstance(diffusion_output, dict):
-            if len(diffusion_output) != 1:
-                raise ValueError(f"{context}: multiple legacy media keys require named artifacts")
-            diffusion_output = next(iter(diffusion_output.values()))
-        if not artifacts and isinstance(diffusion_output, tuple | list):
-            expected_streams = 1 + len(io_spec.auxiliary) if io_spec is not None else None
-            if len(diffusion_output) not in (1, 2) or (
-                expected_streams is not None and len(diffusion_output) != expected_streams
-            ):
-                raise ValueError(
-                    f"Unsupported diffusion media tuple ({context}): expected "
-                    f"{expected_streams if expected_streams is not None else '1 or 2'} streams, "
-                    f"got {len(diffusion_output)}"
-                )
-            rollout_audio = diffusion_output[1] if len(diffusion_output) > 1 else None
-            diffusion_output = diffusion_output[0]
-            if io_spec is not None and io_spec.auxiliary:
-                audio_sample_rate = io_spec.auxiliary[0].sample_rate
-        if artifacts:
-            pass  # The adapter has normalized decoded media; native latents retain dtype/layout.
-        elif output_type == "latent":
-            diffusion_output = torch.as_tensor(diffusion_output).float()
-        else:
-            if isinstance(diffusion_output, np.ndarray):
-                diffusion_output = torch.from_numpy(diffusion_output)
-            elif not isinstance(diffusion_output, torch.Tensor):
-                diffusion_output = self.server._to_tensor(diffusion_output)
-            diffusion_output = _pixel_output_to_uint8(diffusion_output)
 
         if sampling_params.get("logprobs", False):
-            log_probs = _maybe_unbatch(final_res.trajectory_log_probs)
+            log_probs = _unbatch_training_field(
+                final_res.trajectory_log_probs, context=context, name="trajectory_log_probs"
+            )
         else:
             log_probs = None
 
         extra_fields: dict[str, Any] = {"global_steps": self.server.global_steps}
         if final_res.trajectory_latents is not None:
-            extra_fields["all_latents"] = _maybe_unbatch(final_res.trajectory_latents)
+            extra_fields["all_latents"] = _unbatch_training_field(
+                final_res.trajectory_latents, context=context, name="trajectory_latents"
+            )
         if final_res.trajectory_timesteps is not None:
-            extra_fields["all_timesteps"] = _maybe_unbatch(final_res.trajectory_timesteps)
+            extra_fields["all_timesteps"] = _unbatch_training_field(
+                final_res.trajectory_timesteps, context=context, name="trajectory_timesteps"
+            )
         for metadata_group in _rollout_metadata_groups(final_res.multimodal_output):
             for key, value in metadata_group.items():
                 if key in extra_fields:
                     raise ValueError(f"Duplicate rollout metadata field: {key}")
-                extra_fields[key] = _maybe_unbatch(value)
+                extra_fields[key] = _unbatch_training_field(value, context=context, name=key)
         if artifacts:
             kind = artifacts[primary_artifact].spec.modality
             if extra_fields.get("media_kind", kind) != kind:
@@ -362,21 +391,8 @@ class DiffusionStrategy(OmniStrategyBase):
                 if extra_fields.get("audio_sample_rate", audio_sample_rate) != audio_sample_rate:
                     raise ValueError(f"{context}: audio_sample_rate conflicts with named audio artifact")
         if rollout_audio is not None:
-            extra_fields["audio"] = rollout_audio if artifacts else _maybe_unbatch(rollout_audio)
-            # The audio sample rate is declared by the adapter's DiffusionIOSpec
-            # (or provided at runtime through rollout metadata); no model-specific
-            # default lives in this shared strategy.
-            if audio_sample_rate is not None:
-                extra_fields.setdefault("audio_sample_rate", audio_sample_rate)
-        # Surface the adapter-declared primary media kind so downstream consumers
-        # read the modality instead of inferring it from the response tensor rank.
-        if io_spec is not None:
-            runtime_kind = extra_fields.get("media_kind")
-            if runtime_kind is not None and runtime_kind != io_spec.primary.modality:
-                raise ValueError(
-                    f"Conflicting media_kind ({context}): expected {io_spec.primary.modality!r}, got {runtime_kind!r}"
-                )
-            extra_fields["media_kind"] = io_spec.primary.modality
+            extra_fields["audio"] = rollout_audio
+            extra_fields["audio_sample_rate"] = audio_sample_rate
 
         if hasattr(req_output, "outputs") and req_output.outputs:
             finish_reason = req_output.outputs[0].finish_reason or "stop"
@@ -391,7 +407,7 @@ class DiffusionStrategy(OmniStrategyBase):
         return DiffusionOutput(
             artifacts=artifacts,
             primary_artifact=primary_artifact,
-            preview_artifact=artifact_header.get("preview") if artifact_header else None,
+            preview_artifact=artifact_header["preview"],
             diffusion_output=diffusion_output,
             log_probs=log_probs,
             stop_reason=stop_reason,

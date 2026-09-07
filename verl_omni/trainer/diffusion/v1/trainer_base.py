@@ -19,6 +19,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pprint import pprint
 from types import SimpleNamespace
 
@@ -57,7 +58,12 @@ from verl.utils.skip import SkipManager
 from verl.utils.tracking import Tracking, ValidationGenerationsLogger
 from verl.workers.rollout.llm_server import LLMServerManager
 
-from verl_omni.pipelines.rollout_artifacts import previews_from_batch, validate_previews
+from verl_omni.pipelines.rollout_artifacts import (
+    previews_from_batch,
+    validate_audio,
+    validate_previews,
+    validate_visual_batch,
+)
 from verl_omni.trainer.diffusion.diffusion_algos import get_diffusion_loss_fn
 from verl_omni.trainer.diffusion.diffusion_metric_utils import (
     compute_data_metrics_diffusion,
@@ -1424,7 +1430,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         reward_extra_infos_dict,
         dump_path,
         max_samples=None,
-        fps=24,
+        fps=None,
         audios=None,
         audio_sample_rates=None,
         media_kind=None,
@@ -1432,14 +1438,49 @@ class PolicyGradientDiffusionTrainerV1(ABC):
     ):
         """Submit a best-effort image/video dump to the background executor."""
         previews = validate_previews(previews, len(inputs))
-        resolve_is_video(outputs.ndim, media_kind)
+        if previews == []:
+            return
+        if previews is None:
+            is_video = resolve_is_video(outputs.ndim, media_kind)
+            validate_visual_batch(outputs, media_kind, fps=fps, context="V1 media dump")
+        else:
+            is_video = previews[0].spec.modality == "video"
+        if is_video:
+            audio_rows = batch_items(audios, len(inputs), "audio")
+            rates = batch_items(audio_sample_rates, len(inputs), "audio_sample_rate")
+            for i, (audio, rate) in enumerate(zip(audio_rows, rates, strict=True)):
+                validate_audio(audio, rate, context=f"V1 media dump sample={i}")
         global_step = self.global_steps
+        self._drain_dump_futures()
+        if self._dump_futures:
+            logger.warning("Skipping media dump at step %s: previous dump is still running", global_step)
+            return
+        count = len(inputs)
+        retained = count if max_samples is None else min(max_samples, count)
+        if retained == 0:
+            return
+        # A row view retains the whole batch storage. Copy only retained previews,
+        # and never queue the unused primary latent/training tensors alongside them.
+        if previews is not None:
+            previews = [replace(item, data=item.data.detach().to("cpu", copy=True)) for item in previews[:retained]]
+            outputs = None
+        else:
+            outputs = outputs[:retained].detach().to("cpu", copy=True)
+        if is_video:
+            audios = [
+                None if audio is None else torch.as_tensor(audio).detach().to("cpu", copy=True)
+                for audio in audio_rows[:retained]
+            ]
+            audio_sample_rates = rates[:retained]
+        reward_extra_infos_dict = {
+            key: value[:retained] if len(value) == count else value for key, value in reward_extra_infos_dict.items()
+        }
         future = self._dump_executor.submit(
             self._write_generations,
-            inputs,
+            inputs[:retained],
             outputs,
-            gts,
-            scores,
+            gts[:retained],
+            scores[:retained],
             reward_extra_infos_dict,
             dump_path,
             global_step,

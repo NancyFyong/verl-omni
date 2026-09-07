@@ -22,7 +22,7 @@ import pytest
 
 pytest.importorskip("verl_omni.pipelines.model_base")
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
-from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
+from verl_omni.pipelines.rollout_media import DiffusionIOSpec
 
 # (adapter module, architecture, algorithm, primary modality)
 _PRIMARY_MODALITY = [
@@ -75,17 +75,10 @@ _JOINT_AUDIO_SAMPLE_RATE = [
 ]
 
 
-@pytest.mark.parametrize(
-    "auxiliary",
-    [
-        (MediaSpec("image"),),
-        (MediaSpec("image"), MediaSpec("audio", sample_rate=48000)),
-        (MediaSpec("audio"), MediaSpec("audio")),
-    ],
-)
-def test_unsupported_auxiliary_declarations_are_rejected(auxiliary):
-    with pytest.raises(ValueError, match="at most one auxiliary audio stream"):
-        DiffusionIOSpec(primary=MediaSpec("video"), auxiliary=auxiliary)
+@pytest.mark.parametrize("artifacts", [{}, (), {"image_preview": object()}])
+def test_invalid_named_declarations_are_rejected(artifacts):
+    with pytest.raises((TypeError, ValueError), match="DiffusionIOSpec requires"):
+        DiffusionIOSpec(artifacts=artifacts)
 
 
 @pytest.mark.parametrize(("module", "architecture", "algorithm", "modality"), _PRIMARY_MODALITY)
@@ -95,7 +88,10 @@ def test_registered_pipeline_declares_primary_modality(module, architecture, alg
     assert cls is not None, f"{architecture}/{algorithm} is not registered"
     spec = getattr(cls, "diffusion_io_spec", None)
     assert spec is not None, f"{architecture}/{algorithm} must declare diffusion_io_spec"
-    assert spec.primary.modality == modality
+    assert isinstance(spec, DiffusionIOSpec)
+    assert spec.artifacts[f"{modality}_preview"].modality == modality
+    assert spec.artifacts[f"{modality}_preview"].representation == "decoded"
+    assert spec.artifacts[f"{modality}_latent"].representation == "latent"
 
 
 @pytest.mark.parametrize(("module", "architecture", "algorithm", "sample_rate"), _JOINT_AUDIO_SAMPLE_RATE)
@@ -104,6 +100,7 @@ def test_joint_pipeline_declares_audio_stream(module, architecture, algorithm, s
     cls = VllmOmniPipelineBase.get_class(architecture, algorithm)
     spec = getattr(cls, "diffusion_io_spec", None)
     assert spec is not None
-    audio = next((stream for stream in spec.auxiliary if stream.modality == "audio"), None)
-    assert audio is not None, f"{architecture}/{algorithm} must declare an auxiliary audio stream"
-    assert audio.sample_rate == sample_rate
+    audio = spec.artifacts["audio"]
+    assert audio.modality == "audio" and audio.representation == "decoded"
+    assert audio.layout == "CT"
+    assert audio.sample_rate == (None if architecture.startswith("LTX") else sample_rate)

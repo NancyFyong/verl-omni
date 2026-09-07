@@ -122,7 +122,13 @@ def _sample(trainer, batch_size):
     return PolicyGradientDiffusionTrainerV1._sample_training_batch(trainer, batch_size)
 
 
-def test_wandb_validation_media_failure_is_best_effort():
+def test_wandb_validation_media_failure_is_best_effort(monkeypatch):
+    import wandb
+
+    def fail(*args, **kwargs):
+        raise OSError("simulated W&B image write failure")
+
+    monkeypatch.setattr(wandb, "Image", fail)
     calls = []
     trainer = SimpleNamespace(
         config=OmegaConf.create(
@@ -143,13 +149,13 @@ def test_wandb_validation_media_failure_is_best_effort():
     PolicyGradientDiffusionTrainerV1._maybe_log_val_generations(
         trainer,
         inputs=["prompt"],
-        outputs=torch.zeros(1, 3, 8, 8),
+        outputs=torch.zeros(1, 3, 8, 8, dtype=torch.uint8),
         scores=[0.0],
         media_kinds=["image"],
     )
 
     assert calls[0][1] == [
-        ("prompt", "[validation media unavailable: ValueError: Expected a uint8 image tensor, got torch.float32.]", 0.0)
+        ("prompt", "[validation media unavailable: OSError: simulated W&B image write failure]", 0.0)
     ]
 
 

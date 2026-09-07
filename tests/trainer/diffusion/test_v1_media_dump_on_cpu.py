@@ -84,13 +84,18 @@ def test_v1_video_dump_reuses_shared_export_and_honors_max_samples(monkeypatch, 
     assert rows == [{"input": "first", "output": str(tmp_path / "7/0.mp4"), "gts": None, "score": 1.0, "step": 7}]
 
 
-def test_v1_background_dump_failure_is_logged_and_does_not_raise(caplog, tmp_path):
+def test_v1_background_dump_failure_is_logged_and_does_not_raise(monkeypatch, caplog, tmp_path):
     trainer = _trainer(global_steps=3)
+
+    def fail(*args, **kwargs):
+        raise OSError("simulated background I/O failure")
+
+    monkeypatch.setattr(trainer, "_write_generations", fail)
 
     with caplog.at_level(logging.WARNING):
         trainer._dump_generations(
             inputs=["prompt"],
-            outputs=torch.zeros(1, 3, 8, 8),
+            outputs=torch.zeros(1, 3, 8, 8, dtype=torch.uint8),
             gts=[None],
             scores=[0.0],
             reward_extra_infos_dict={},
@@ -146,7 +151,7 @@ def test_invalid_modality_is_not_hidden_by_logging(trainer_cls):
         global_steps=1,
         config=OmegaConf.create({"trainer": {"logger": ["wandb"], "log_val_generations": 1}}),
     )
-    with pytest.raises(ValueError, match="Unsupported media kind"):
+    with pytest.raises(ValueError, match="Explicit media_kind required"):
         trainer_cls._maybe_log_val_generations(
             trainer, ["prompt"], torch.zeros(1, 3, 8, 8, dtype=torch.uint8), [1.0], media_kinds=["depth"]
         )
@@ -155,7 +160,7 @@ def test_invalid_modality_is_not_hidden_by_logging(trainer_cls):
 def test_v1_invalid_modality_fails_before_background_submission(tmp_path):
     trainer = _trainer()
     try:
-        with pytest.raises(ValueError, match="Unsupported media kind"):
+        with pytest.raises(ValueError, match="Explicit media_kind required"):
             trainer._dump_generations(
                 inputs=["prompt"],
                 outputs=torch.zeros(1, 3, 8, 8, dtype=torch.uint8),

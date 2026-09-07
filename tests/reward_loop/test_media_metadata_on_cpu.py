@@ -122,6 +122,51 @@ async def test_latent_primary_and_decoded_artifacts_reach_real_reward_managers(m
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("manager_cls", [VisualRewardManager, multi.MultiVisualRewardManager])
+@pytest.mark.parametrize("mismatch", [False, True])
+async def test_decoded_audio_primary_is_self_describing_not_inferred_from_pixel_config(
+    monkeypatch, manager_cls, mismatch
+):
+    from verl_omni.pipelines.rollout_artifacts import (
+        ArtifactContractError,
+        ArtifactSpec,
+        MediaArtifact,
+        artifact_fields,
+    )
+    from verl_omni.utils.reward_score.clap import _get_audio
+
+    audio = torch.ones(2, 16)
+    fields = artifact_fields(
+        {"audio": MediaArtifact(ArtifactSpec("audio", "decoded", "CT", sample_rate=32000), audio)}, "audio"
+    )
+    data = DataProto.from_dict(
+        tensors={
+            "responses": (audio + 1 if mismatch else audio).unsqueeze(0),
+            **{key: value.unsqueeze(0) for key, value in fields.items() if isinstance(value, torch.Tensor)},
+        },
+        non_tensors={
+            "data_source": ["test"],
+            "reward_model": [{"ground_truth": "sound"}],
+            **{key: [value] for key, value in fields.items() if not isinstance(value, torch.Tensor)},
+        },
+    )
+
+    async def scorer(solution_image, extra_info, **kwargs):
+        assert solution_image.dtype == torch.float32
+        waveform, rate = _get_audio(extra_info)
+        assert waveform.shape == (16,) and rate == 32000
+        return {"score": 1.0}
+
+    manager = _manager(monkeypatch, manager_cls, scorer)
+    if mismatch:
+        with pytest.raises(ArtifactContractError, match="responses projection"):
+            await manager.run_single(data)
+    else:
+        result = await manager.run_single(data)
+        assert result["reward_score"] == 1.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("manager_cls", [VisualRewardManager, multi.MultiVisualRewardManager])
 @pytest.mark.parametrize(
     "field, value", [("media_kind", "image"), ("audio_sample_rate", 24000), ("audio", torch.zeros(1, 16))]
 )
