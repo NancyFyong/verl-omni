@@ -34,11 +34,21 @@ from verl_omni.pipelines.wan22_dance_grpo.diffusers_training_adapter import (
     _configure_wan_scheduler,
 )
 from verl_omni.trainer.diffusion.distillation.contracts import ConditionBundle, DistillationPlan, PhaseRequest
-from verl_omni.trainer.diffusion.distillation.utils import ode_regression_loss, timestep_shift, velocity_to_x0
+from verl_omni.trainer.diffusion.distillation.utils import (
+    consistency_renoise_step,
+    dmd_gradient,
+    dmd_surrogate_loss,
+    fake_score_loss,
+    legacy_cfg,
+    ode_regression_loss,
+    timestep_shift,
+    velocity_to_x0,
+)
 from verl_omni.utils.dataset.distillation import canonical_manifest_sha256
 from verl_omni.workers.config import DiffusionModelConfig
 
 from .causal_attention import WanCausalCache, allocate_wan_cache, configure_causal_wan, wan_causal_forward
+from .inference import wan_reference_sigma
 
 if TYPE_CHECKING:
     from verl_omni.workers.diffusion_distillation_worker import (
@@ -46,7 +56,14 @@ if TYPE_CHECKING:
         DistillationRoleRuntime,
     )
 
-__all__ = ["Wan21CausalODE", "WanODEComputer", "WanConditionProvider", "build_wan_causal_timesteps"]
+__all__ = [
+    "Wan21CausalODE",
+    "Wan21CausVid",
+    "WanODEComputer",
+    "WanCausVidComputer",
+    "WanConditionProvider",
+    "build_wan_causal_timesteps",
+]
 
 
 def build_wan_causal_timesteps(
@@ -253,7 +270,7 @@ class WanODEComputer:
             raise ValueError("Wan ODE trajectory fields must be tensors.")
         with runtime.use_role("student", grad_enabled=True) as module:
             device = next(module.parameters()).device
-            dtype = next(module.parameters()).dtype
+            dtype = module.dtype
             trajectory = trajectory.to(device=device, dtype=torch.float32)
             timesteps = timesteps.to(device=device, dtype=torch.float32)
             target = target.to(device=device, dtype=torch.float32)
@@ -363,3 +380,248 @@ class Wan21CausalODE(Wan22DanceGRPO, DistributionMatchingModelAdapter, Autoregre
     ) -> WanODEComputer:
         """Build the Wan ODE-regression computation."""
         return WanODEComputer(model_config, plan)
+
+
+class WanCausVidComputer:
+    """Causal student / bidirectional scores with the released real-latent CausVid flow.
+
+    Algorithmic reference: tianweiy/CausVid, causvid/dmd.py (no source copied).
+    Uses its conditional-plus-difference CFG and nearest-grid sigma lookup. LoRA,
+    fp32 reductions and completed-cycle accounting are explicit runtime choices.
+    """
+
+    def __init__(self, model_config: DiffusionModelConfig, plan: DistillationPlan) -> None:
+        if plan.name != "causvid" or plan.rollout["strategy"] != "teacher_forced_causal":
+            raise ValueError("Wan CausVid requires its real-latent teacher-forced recipe.")
+        if plan.objective["teacher_cfg_norm"] != "none":
+            raise ValueError("CausVid teacher uses legacy CFG without norm rescaling; set teacher_cfg_norm=none.")
+        self.plan = plan
+        self.model_config = model_config
+        self.frames_per_block = plan.rollout["frames_per_block"]
+        self.num_train_timesteps = plan.rollout["num_train_timesteps"]
+        if plan.rollout["score_discrete_steps"] != self.num_train_timesteps:
+            raise ValueError("CausVid requires discrete score sampling on the full training-timestep range.")
+        self.timesteps = tuple(float(value) for value in plan.rollout["denoising_timesteps"])
+        if (
+            not self.timesteps
+            or self.timesteps[0] != self.num_train_timesteps
+            or self.timesteps[-1] != 0
+            or any(left <= right for left, right in zip(self.timesteps, self.timesteps[1:], strict=False))
+        ):
+            raise ValueError("CausVid timesteps must descend from the training horizon to zero.")
+        self.condition_provider = WanConditionProvider(
+            model_config.local_path or model_config.path,
+            str(plan.data_requirements["conditioning_provider"]),
+            int(model_config.pipeline.max_sequence_length),
+        )
+        self.generators: dict[str, torch.Generator] = {}
+        self.pending_states: dict[str, torch.Tensor] = {}
+
+    def rng(self, stream: str, device: torch.device, runtime) -> torch.Generator:
+        """Keep index/noise/score RNG independent and checkpointable on each DP rank."""
+        streams = ("student_index", "student_noise", "score_timestep", "score_noise")
+        if stream not in self.generators:
+            engine = runtime.engine_for_role("student")
+            rank = engine.get_data_parallel_rank()
+            seed = int(self.plan.rollout["rng_seed"]) + rank * len(streams) + streams.index(stream)
+            generator = torch.Generator(device=device).manual_seed(seed)
+            if stream in self.pending_states:
+                generator.set_state(self.pending_states[stream])
+            self.generators[stream] = generator
+        return self.generators[stream]
+
+    def conditions(self, batch, runtime, need_negative: bool):
+        """Use frozen cached text embeddings, or the existing local Wan encoder."""
+        module = runtime.engine_for_role("student").module
+        parameter = next(module.parameters())
+        dtype = module.dtype
+        condition = self.condition_provider.encode(batch, device=parameter.device, dtype=dtype)
+        negative = None
+        if need_negative:
+            cached = tu.get(batch, "negative_prompt_embeds")
+            if cached is None:
+                if self.condition_provider.provider == "precomputed":
+                    raise ValueError("Cached CausVid student phases require negative_prompt_embeds.")
+                pipeline = self.condition_provider.ensure_pipeline(parameter.device, dtype)
+                with torch.no_grad():
+                    cached, _ = pipeline.encode_prompt(
+                        prompt=[self.plan.data_requirements["negative_prompt"]] * batch.batch_size[0],
+                        do_classifier_free_guidance=False,
+                        device=parameter.device,
+                        dtype=dtype,
+                        max_sequence_length=self.condition_provider.max_sequence_length,
+                    )
+            if not isinstance(cached, torch.Tensor) or cached.ndim != 3 or cached.shape[0] != batch.batch_size[0]:
+                raise ValueError("CausVid negative_prompt_embeds must match [B,L,D].")
+            negative = (
+                cached[:, : self.condition_provider.max_sequence_length]
+                .to(device=parameter.device, dtype=dtype)
+                .detach()
+            )
+        return condition.tensors["prompt_embeds"], negative
+
+    def clean_latents(self, batch: TensorDict, device: torch.device) -> torch.Tensor:
+        """Validate every real/teacher-clean FCHW sample against its VAE/trajectory provenance."""
+        clean = tu.get(batch, "final_clean_latent")
+        manifests = tu.get(batch, "trajectory_manifest")
+        hashes = tu.get(batch, "trajectory_manifest_sha256")
+        expected = self.plan.data_requirements["trajectory_manifest_sha256"]
+        if not expected or not isinstance(manifests, list) or len(manifests) != batch.batch_size[0]:
+            raise ValueError("CausVid real latents require one provenance manifest per sample.")
+        if not isinstance(hashes, list) or len(hashes) != len(manifests):
+            raise ValueError("CausVid real-latent provenance hashes are missing.")
+        if not isinstance(clean, torch.Tensor) or clean.ndim != 5 or clean.shape[0] != batch.batch_size[0]:
+            raise ValueError("CausVid clean latents must be [B,F,C,H,W].")
+        for manifest, digest in zip(manifests, hashes, strict=True):
+            if digest != expected or canonical_manifest_sha256(manifest) != digest:
+                raise ValueError("CausVid real-latent provenance does not match the configured manifest.")
+            if (
+                manifest.get("latent_layout") != "SFCHW"
+                or manifest.get("num_frames") != clean.shape[1]
+                or manifest.get("height") != clean.shape[-2]
+                or manifest.get("width") != clean.shape[-1]
+            ):
+                raise ValueError("CausVid real-latent geometry does not match its provenance.")
+        if clean.shape[1] % self.frames_per_block or not torch.isfinite(clean).all():
+            raise ValueError("CausVid clean latents must be finite complete temporal blocks.")
+        return clean.detach().to(device=device, dtype=torch.float32).permute(0, 2, 1, 3, 4).contiguous()
+
+    def sigma(self, timesteps: torch.Tensor) -> torch.Tensor:
+        """Use the same sigma lookup for corruption and velocity-to-x0 conversion."""
+        return wan_reference_sigma(timesteps, self.num_train_timesteps, self.plan.rollout["scheduler_shift"])
+
+    def predict(self, runtime, role, latents, timesteps, prompt_embeds, *, grad_enabled: bool):
+        """Run causal student or bidirectional score forwards through the shared role runtime."""
+        with runtime.use_role(role, grad_enabled=grad_enabled) as module:
+            module.eval()
+            dtype = module.dtype
+            model_timesteps = timesteps
+            if role == "student":
+                patch_t, patch_h, patch_w = module.config.patch_size
+                if patch_t != 1:
+                    raise ValueError("Causal Wan requires temporal patch size one.")
+                model_timesteps = timesteps.repeat_interleave(
+                    (latents.shape[-2] // patch_h) * (latents.shape[-1] // patch_w), dim=1
+                )
+            inputs = {
+                "hidden_states": latents.to(dtype),
+                "timestep": model_timesteps,
+                "encoder_hidden_states": prompt_embeds.to(dtype),
+                "return_dict": False,
+            }
+            if role == "student":
+                with wan_causal_forward(module, num_frames=latents.shape[2], frames_per_block=self.frames_per_block):
+                    return module(**inputs)[0].float()
+            return module(**inputs)[0].float()
+
+    def student_sample(self, batch, runtime, prompt_embeds, *, grad_enabled: bool):
+        """Select independently noised clean states with one shared timestep per motion block."""
+        clean = self.clean_latents(batch, prompt_embeds.device)
+        batch_size, channels, frames, height, width = clean.shape
+        schedule = clean.new_tensor(self.timesteps)
+        candidates = []
+        for timestep in schedule:
+            noise = torch.randn(
+                clean.shape, device=clean.device, generator=self.rng("student_noise", clean.device, runtime)
+            )
+            if timestep.item() == 0:
+                candidates.append(clean)
+            else:
+                candidates.append(consistency_renoise_step(clean, noise, self.sigma(timestep)))
+        indices = torch.randint(
+            len(schedule),
+            (batch_size, frames // self.frames_per_block),
+            device=clean.device,
+            generator=self.rng("student_index", clean.device, runtime),
+        ).repeat_interleave(self.frames_per_block, dim=1)
+        gather = indices[:, None, None, :, None, None].expand(batch_size, 1, channels, frames, height, width)
+        noisy = torch.stack(candidates, dim=1).gather(1, gather).squeeze(1)
+        times = schedule[indices]
+        velocity = self.predict(runtime, "student", noisy, times, prompt_embeds, grad_enabled=grad_enabled)
+        sigma = self.sigma(times)[:, None, :, None, None]
+        return velocity_to_x0(noisy, velocity, sigma)
+
+    def score_input(self, generated, runtime):
+        """Sample one integer score timestep per video, shift then clamp, and independently re-noise."""
+        times = torch.randint(
+            self.num_train_timesteps,
+            (generated.shape[0],),
+            device=generated.device,
+            generator=self.rng("score_timestep", generated.device, runtime),
+        )
+        times = timestep_shift(times, self.num_train_timesteps, self.plan.rollout["score_timestep_shift"])
+        times = times.clamp(
+            self.plan.rollout["score_sigma_min"] * self.num_train_timesteps,
+            self.plan.rollout["score_sigma_max"] * self.num_train_timesteps,
+        )
+        sigma = self.sigma(times)[:, None, None, None, None]
+        noise = torch.randn(
+            generated.shape,
+            device=generated.device,
+            dtype=torch.float32,
+            generator=self.rng("score_noise", generated.device, runtime),
+        )
+        noisy = consistency_renoise_step(generated.detach(), noise, sigma)
+        return noisy, noise, times, sigma
+
+    def compute_phase(self, request: PhaseRequest, batch: TensorDict, runtime) -> DistillationPhaseComputation:
+        """Compute one student DMD or fake-score flow-matching loss; no trainer special cases."""
+        from verl_omni.workers.diffusion_distillation_worker import DistillationPhaseComputation
+
+        role = request.kind
+        if role not in {"student", "fake_score"} or request.trainable_roles != (role,):
+            raise ValueError("CausVid requires one student or fake_score optimizer per phase.")
+        started = time.perf_counter()
+        prompt, negative = self.conditions(batch, runtime, role == "student")
+        generated = self.student_sample(batch, runtime, prompt, grad_enabled=role == "student")
+        noisy, noise, times, sigma = self.score_input(generated, runtime)
+        metrics = {"causvid/score_timestep": float(times.mean())}
+        if role == "student":
+            with torch.no_grad():
+                fake = self.predict(runtime, "fake_score", noisy, times, prompt, grad_enabled=False)
+                real_cond = self.predict(runtime, "teacher_score", noisy, times, prompt, grad_enabled=False)
+                real_uncond = self.predict(runtime, "teacher_score", noisy, times, negative, grad_enabled=False)
+                real = legacy_cfg(real_cond, real_uncond, self.plan.objective["teacher_guidance_scale"])
+                gradient, normalizer, nonfinite = dmd_gradient(
+                    velocity_to_x0(noisy, fake, sigma),
+                    velocity_to_x0(noisy, real, sigma),
+                    generated,
+                    normalization_epsilon=self.plan.objective["normalization_epsilon"],
+                )
+            loss, active = dmd_surrogate_loss(generated, gradient)
+            loss = self.plan.objective["dmd_loss_weight"] * loss
+            metrics.update(
+                {
+                    "dmd/nonfinite": nonfinite,
+                    "dmd/normalizer": float(normalizer.mean()),
+                    "dmd/grad_norm": float(gradient.abs().mean()),
+                }
+            )
+        else:
+            velocity = self.predict(runtime, "fake_score", noisy, times, prompt, grad_enabled=True)
+            loss, active = fake_score_loss(velocity, noise, generated.detach())
+        metrics.update({f"{role}/loss": float(loss.detach()), "perf/causvid_compute_s": time.perf_counter() - started})
+        return DistillationPhaseComputation(losses={role: loss}, metrics=metrics, loss_normalizer=active)
+
+    def state_dict(self) -> dict:
+        """Save every rank-local sampling stream for exact checkpoint replay."""
+        states = dict(self.pending_states)
+        states.update({name: generator.get_state().cpu() for name, generator in self.generators.items()})
+        return {"version": 1, "rng_seed": self.plan.rollout["rng_seed"], "states": states}
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Restore RNG before the next phase without retaining autograd graphs."""
+        if state.get("version") != 1 or state.get("rng_seed") != self.plan.rollout["rng_seed"]:
+            raise ValueError("Incompatible CausVid RNG checkpoint.")
+        self.pending_states = dict(state["states"])
+        self.generators = {}
+
+
+@DiffusionModelBase.register("WanPipeline", algorithm="causvid")
+class Wan21CausVid(Wan21CausalODE):
+    """Explicit causal-student/bidirectional-score Wan architecture registration."""
+
+    @classmethod
+    def build_distribution_matching_computer(cls, model_config, plan) -> WanCausVidComputer:
+        """Build the CausVid computer while preserving ODE as its own registry pair."""
+        return WanCausVidComputer(model_config, plan)

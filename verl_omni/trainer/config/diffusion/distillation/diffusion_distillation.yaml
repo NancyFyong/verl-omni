@@ -60,6 +60,9 @@ distribution_matching:
   # Optional bidirectional score checkpoint for later asymmetric DMD stages
   bidirectional_model_path: null
 
+  # ODE-initialized student LoRA, never loaded into bidirectional score roles
+  student_adapter_path: null
+
   # Optional recipe profile; null selects the recipe default
   profile: null
 
@@ -233,6 +236,9 @@ distribution_matching:
 
   # Unshifted few-step causal Wan inference timesteps
   causal_denoising_timesteps: [1000, 750, 500, 250]
+
+  # Resolved CausVid training timesteps including clean state; do not warp again
+  causvid_timesteps: [1000.0, 757.0, 522.0, 0.0]
 
   # Rational time shift for exported causal Wan schedules
   causal_timestep_shift: 8.0

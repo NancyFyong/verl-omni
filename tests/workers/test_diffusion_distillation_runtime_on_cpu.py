@@ -13,6 +13,8 @@
 # limitations under the License.
 """CPU tests for the generic multi-role distillation data plane."""
 
+import hashlib
+import json
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
@@ -32,6 +34,7 @@ from verl_omni.workers.diffusion_distillation_worker import (
     DistillationPhaseComputation,
     DistillationRoleRuntime,
     resolve_profiler_configs,
+    validate_student_initialization,
 )
 from verl_omni.workers.engine.fsdp.distillation_impl import DistillationRoleGroupEngine
 
@@ -63,6 +66,29 @@ def test_distillation_worker_instantiates_nested_profiler_tool_config():
     assert profiler_config.tool == "torch"
     assert tool_config.name == "torch"
     assert tool_config.contents == []
+
+
+class TestStudentInitialization:
+    def test_causvid_requires_verified_ode_artifact(self, tmp_path):
+        capabilities = frozenset({"distribution_matching", "autoregressive"})
+        plan = build_plan("causvid", {"model_path": "/base"}, capabilities)
+        with pytest.raises(ValueError, match="student_adapter_path"):
+            validate_student_initialization(plan)
+        weights = b"trusted fixture"
+        (tmp_path / "adapter_model.safetensors").write_bytes(weights)
+        manifest = {
+            "recipe": "ode_regression",
+            "role": "student",
+            "weights_sha256": hashlib.sha256(weights).hexdigest(),
+        }
+        (tmp_path / "inference_manifest.json").write_text(json.dumps(manifest))
+        initialized = build_plan(
+            "causvid", {"model_path": "/base", "student_adapter_path": str(tmp_path)}, capabilities
+        )
+        validate_student_initialization(initialized)
+        (tmp_path / "adapter_model.safetensors").write_bytes(b"corrupted")
+        with pytest.raises(ValueError, match="hash"):
+            validate_student_initialization(initialized)
 
 
 class ToyRoleEngine:

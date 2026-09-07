@@ -13,8 +13,10 @@
 # limitations under the License.
 """Reusable PEFT/LoRA adapter lifecycle helpers for training engines."""
 
+import json
 import logging
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 
 import torch
 from peft import LoraConfig
@@ -37,8 +39,21 @@ class LoRAAdapterMixin:
             print(f"Loading pre-trained LoRA adapter to from: {lora_adapter_path}")
             local_adapter_path = copy_to_local(lora_adapter_path, use_shm=self.model_config.use_shm)
 
-            # diffusers auto-names an unnamed first adapter "default_0"; name it explicitly.
-            module.load_lora_adapter(local_adapter_path, adapter_name=primary_adapter)
+            # PEFT checkpoint exports use a different filename from native Diffusers LoRAs.
+            peft_weights = Path(local_adapter_path) / "adapter_model.safetensors"
+            peft_metadata = Path(local_adapter_path) / "adapter_config.json"
+            if peft_weights.is_file() and peft_metadata.is_file():
+                from safetensors.torch import load_file
+
+                weights = {
+                    name.removeprefix("base_model.model.").removeprefix("transformer."): value
+                    for name, value in load_file(peft_weights).items()
+                }
+                metadata = json.loads(peft_metadata.read_text())
+                module.load_lora_adapter(weights, adapter_name=primary_adapter, prefix=None, metadata=metadata)
+            else:
+                # diffusers auto-names an unnamed first adapter "default_0"; name it explicitly.
+                module.load_lora_adapter(local_adapter_path, adapter_name=primary_adapter)
             peft_config = getattr(module, "peft_config", {}).get(primary_adapter, None)
             for adapter_name in extra_adapters:
                 if peft_config is not None and adapter_name not in getattr(module, "peft_config", {}):

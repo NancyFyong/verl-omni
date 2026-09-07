@@ -94,9 +94,9 @@ def _load_json(path: Path) -> dict:
         return json.load(f)
 
 
-def _to_peft_lora_key(key: str) -> str:
+def _to_peft_lora_key(key: str, adapter_name: str = "default") -> str:
     """Normalize an FSDP LoRA tensor name to PEFT ``adapter_model.safetensors`` format."""
-    peft_key = key.replace("_fsdp_wrapped_module.", "").replace(".default.weight", ".weight")
+    peft_key = key.replace("_fsdp_wrapped_module.", "").replace(f".{adapter_name}.weight", ".weight")
     if peft_key.startswith("base_model.model."):
         return peft_key
     return f"base_model.model.{peft_key}"
@@ -156,16 +156,23 @@ def _discover_fsdp_rank_paths(input_dir: Path, world_size: int) -> list[Path]:
     return rank_paths
 
 
-def _merge_fsdp_lora_tensors(rank_paths: list[Path]) -> tuple[OrderedDict[str, torch.Tensor], list[str]]:
+def _merge_fsdp_lora_tensors(
+    rank_paths: list[Path], adapter_name: str | None = None
+) -> tuple[OrderedDict[str, torch.Tensor], list[str]]:
     print(f"Loading rank 0/{len(rank_paths) - 1}: {rank_paths[0].name}")
     rank0_state = torch.load(rank_paths[0], map_location="cpu", weights_only=False, mmap=True)
-    lora_keys = sorted(key for key in rank0_state.keys() if "lora_" in key)
+    lora_keys = sorted(
+        key
+        for key in rank0_state
+        if "lora_" in key and (adapter_name is None or key.endswith(f".{adapter_name}.weight"))
+    )
     if not lora_keys:
-        raise RuntimeError(f"No lora_ keys found in {rank_paths[0]}")
+        raise RuntimeError(f"No lora_ keys for adapter {adapter_name!r} found in {rank_paths[0]}")
 
     print(f"Found {len(lora_keys)} LoRA tensors")
     lora_shards = {key: [_local_tensor(rank0_state[key])] for key in lora_keys}
     placements = {key: getattr(rank0_state[key], "placements", None) for key in lora_keys}
+    full_shapes = {key: tuple(rank0_state[key].shape) for key in lora_keys}
     del rank0_state
 
     for rank, rank_path in enumerate(rank_paths[1:], start=1):
@@ -184,12 +191,20 @@ def _merge_fsdp_lora_tensors(rank_paths: list[Path]) -> tuple[OrderedDict[str, t
         elif len(placement) == 1 and placement[0].is_shard():
             merged = torch.cat(lora_shards[key], dim=placement[0].dim).contiguous()
         else:
+            if adapter_name is not None and any(not item.is_replicate() for item in placement):
+                raise ValueError("Named-adapter export supports one-dimensional sharding or replicated DTensors.")
             merged = lora_shards[key][0].contiguous()
+        if placement is not None and tuple(merged.shape) != full_shapes[key]:
+            raise ValueError(f"Merged LoRA shape does not match checkpoint metadata for {key}.")
+        if not torch.isfinite(merged).all():
+            raise ValueError(f"Non-finite LoRA weights in {key}.")
 
         module_key = key.rsplit(".lora_", maxsplit=1)[0]
         target_parts = [part for part in module_key.split(".") if part != "base_layer"]
-        target_module = target_parts[-1]
-        peft_key = _to_peft_lora_key(key)
+        target_module = ".".join(target_parts[-2:]) if target_parts[-1].isdigit() else target_parts[-1]
+        peft_key = _to_peft_lora_key(key, adapter_name or "default")
+        if peft_key in lora_params:
+            raise ValueError(f"Duplicate exported LoRA key {peft_key}.")
         lora_params[peft_key] = merged
         target_modules.add(target_module)
 
@@ -219,6 +234,8 @@ def export_fsdp_lora_adapter(
     input_dir: str | Path,
     output_dir: str | Path | None = None,
     base_model_name_or_path: str | None = None,
+    *,
+    adapter_name: str | None = None,
 ) -> dict:
     """Export PEFT LoRA adapter weights from a verl FSDP checkpoint directory.
 
@@ -236,6 +253,9 @@ def export_fsdp_lora_adapter(
             ``<input_dir>/lora_adapter``.
         base_model_name_or_path: Optional value to write into the PEFT
             ``adapter_config.json`` as ``base_model_name_or_path``.
+        adapter_name: Export only this named adapter, stripping its role name from
+            PEFT keys. Required for shared-base multi-role distillation checkpoints.
+            Input checkpoints must be trusted: FSDP DTensor loading uses pickle.
 
     Returns:
         A summary dictionary with:
@@ -255,7 +275,7 @@ def export_fsdp_lora_adapter(
     print(f"Input directory: {input_dir}")
     print(f"Output: {output_dir}")
 
-    lora_params, target_modules = _merge_fsdp_lora_tensors(rank_paths)
+    lora_params, target_modules = _merge_fsdp_lora_tensors(rank_paths, adapter_name=adapter_name)
     peft_config = _build_peft_lora_config(lora_meta, target_modules, base_model_name_or_path)
 
     output_dir.mkdir(parents=True, exist_ok=True)

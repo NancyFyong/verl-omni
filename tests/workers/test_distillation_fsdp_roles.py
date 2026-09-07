@@ -310,35 +310,35 @@ def test_distillation_role_switch_preserves_graph_ema_and_state(strategy):
             dist.destroy_process_group()
 
 
-def tiny_wan_ode_model():
+def tiny_wan_ode_model(causal=True):
     from diffusers import WanTransformer3DModel
 
     from verl_omni.pipelines.wan21_distillation.causal_attention import configure_causal_wan
 
-    return configure_causal_wan(
-        WanTransformer3DModel(
-            patch_size=(1, 2, 2),
-            num_attention_heads=2,
-            attention_head_dim=8,
-            in_channels=4,
-            out_channels=4,
-            text_dim=16,
-            freq_dim=16,
-            ffn_dim=32,
-            num_layers=2,
-            cross_attn_norm=True,
-            qk_norm="rms_norm_across_heads",
-            rope_max_seq_len=32,
-        ).cuda()
-    )
+    model = WanTransformer3DModel(
+        patch_size=(1, 2, 2),
+        num_attention_heads=2,
+        attention_head_dim=8,
+        in_channels=4,
+        out_channels=4,
+        text_dim=16,
+        freq_dim=16,
+        ffn_dim=32,
+        num_layers=2,
+        cross_attn_norm=True,
+        qk_norm="rms_norm_across_heads",
+        rope_max_seq_len=32,
+    ).cuda()
+    return configure_causal_wan(model) if causal else model
 
 
-def wrap_wan_ode_model(strategy):
-    model = tiny_wan_ode_model()
+def wrap_wan_ode_model(strategy, role="student"):
+    model = tiny_wan_ode_model(causal=role == "student")
     adapter_config = LoraConfig(r=2, lora_alpha=2, target_modules=["to_q", "to_k", "to_v", "to_out.0"])
-    model.add_adapter(adapter_config, adapter_name="student")
-    model.add_adapter(adapter_config, adapter_name="student_ema")
-    model.set_adapter("student")
+    model.add_adapter(adapter_config, adapter_name=role)
+    if role == "student":
+        model.add_adapter(adapter_config, adapter_name="student_ema")
+    model.set_adapter(role)
     if strategy == "fsdp":
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
@@ -351,33 +351,36 @@ def wrap_wan_ode_model(strategy):
     return model
 
 
-def ode_engine_shell(module):
+def ode_engine_shell(module, role="student"):
     from verl_omni.pipelines.wan21_distillation.diffusers_training_adapter import Wan21CausalODE
 
     engine = object.__new__(DistillationRoleGroupEngine)
     engine.module = module
     engine.model_adapter = Wan21CausalODE
+    group = "causal_base" if role == "student" else "bidirectional_base"
     engine.role_group = RoleGroupSpec(
-        name="causal_base", model_ref="/tiny", storage="shared_base_adapters", placement="colocated"
+        name=group, model_ref="/tiny", storage="shared_base_adapters", placement="colocated"
     )
+    frozen_role = "student_ema" if role == "student" else "teacher_score"
+    frozen_adapter = "student_ema" if role == "student" else None
     engine.role_bindings = {
-        "student": RoleBinding("student", "causal_base", "student", True, "student_optim"),
-        "student_ema": RoleBinding("student_ema", "causal_base", "student_ema", False, None),
+        role: RoleBinding(role, group, role, True, f"{role}_optim"),
+        frozen_role: RoleBinding(frozen_role, group, frozen_adapter, False, None),
     }
     engine.optimizers = {}
     engine.lr_schedulers = {}
     engine.optimizer_configs = {}
-    engine._active_role = "student"
-    engine._primary_role = "student"
-    with engine.use_role("student"):
-        parameters = engine.model_adapter.distillation_role_parameters(module, "student")
-    engine._role_parameters = {"student": parameters}
-    engine.optimizers = {"student": torch.optim.AdamW(parameters, lr=0.1)}
-    engine.lr_schedulers = {"student": torch.optim.lr_scheduler.LambdaLR(engine.optimizers["student"], lambda _: 1.0)}
-    engine.optimizer_configs = {"student": SimpleNamespace(clip_grad=1.0)}
-    engine.optimizer = engine.optimizers["student"]
-    engine.lr_scheduler = engine.lr_schedulers["student"]
-    engine.optimizer_config = engine.optimizer_configs["student"]
+    engine._active_role = role
+    engine._primary_role = role
+    with engine.use_role(role):
+        parameters = engine.model_adapter.distillation_role_parameters(module, role)
+    engine._role_parameters = {role: parameters}
+    engine.optimizers = {role: torch.optim.AdamW(parameters, lr=0.1)}
+    engine.lr_schedulers = {role: torch.optim.lr_scheduler.LambdaLR(engine.optimizers[role], lambda _: 1.0)}
+    engine.optimizer_configs = {role: SimpleNamespace(clip_grad=1.0)}
+    engine.optimizer = engine.optimizers[role]
+    engine.lr_scheduler = engine.lr_schedulers[role]
+    engine.optimizer_config = engine.optimizer_configs[role]
     engine.rank = dist.get_rank()
     engine._is_offload_param = False
     engine._is_offload_optimizer = False
@@ -739,3 +742,84 @@ def test_wan_ode_regression_role_ema_export_and_checkpoint(strategy, qwen_proces
         dist.barrier()
         if dist.get_rank() == 0:
             shutil.rmtree(checkpoint_path)
+
+
+@pytest.mark.parametrize("strategy", ["fsdp", "fsdp2"])
+def test_causvid_asymmetric_roles_multicycle_and_checkpoint(strategy, qwen_process_group):
+    from verl_omni.pipelines.wan21_distillation.diffusers_training_adapter import WanCausVidComputer
+    from verl_omni.trainer.diffusion.distillation.contracts import TrainerCounters
+    from verl_omni.utils.dataset.distillation import canonical_manifest_sha256
+
+    torch.manual_seed(23)
+    engines = {
+        "causal_base": ode_engine_shell(wrap_wan_ode_model(strategy)),
+        "bidirectional_base": ode_engine_shell(wrap_wan_ode_model(strategy, role="fake_score"), role="fake_score"),
+    }
+    for engine in engines.values():
+        engine.model_config = SimpleNamespace(fsdp_layer_prefixes=["blocks."])
+        engine.ulysses_device_mesh = None
+        engine.ulysses_sequence_parallel_size = 1
+    manifest = {"latent_layout": "SFCHW", "height": 4, "width": 4, "num_frames": 6}
+    digest = canonical_manifest_sha256(manifest)
+    plan = build_plan(
+        "causvid",
+        {
+            "model_path": "/tiny",
+            "frames_per_block": 2,
+            "trajectory_manifest_sha256": digest,
+            "conditioning_provider": "precomputed",
+            "teacher_cfg_norm": "none",
+            "teacher_guidance_scale": 3.5,
+            "score_timestep_shift": 8.0,
+            "normalization_epsilon": 0.0,
+            "fake_update_ratio": 2,
+        },
+        frozenset({"distribution_matching", "autoregressive"}),
+    )
+    runtime = DistillationRoleRuntime(plan, engines, ema_decay=0.5, ema_start_step=0)
+    config = SimpleNamespace(path="/tiny", local_path="/tiny", pipeline=SimpleNamespace(max_sequence_length=8))
+    computer = WanCausVidComputer(config, plan)
+    batch = TensorDict(
+        {
+            "final_clean_latent": torch.randn(1, 6, 4, 4, 4, device="cuda"),
+            "prompt_embeds": torch.randn(1, 3, 16, device="cuda"),
+            "negative_prompt_embeds": torch.randn(1, 3, 16, device="cuda"),
+        },
+        batch_size=[1],
+    )
+    tu.assign_non_tensor_stack(batch, "trajectory_manifest", [manifest])
+    tu.assign_non_tensor_stack(batch, "trajectory_manifest_sha256", [digest])
+    counts = {"student": 0, "fake_score": 0}
+    for cycle in range(3):
+        for request in plan.update_schedule.next_cycle(TrainerCounters(global_step=cycle)).requests:
+            runtime.zero_grad(request.trainable_roles)
+            computation = computer.compute_phase(request, batch, runtime)
+            runtime.backward_micro_batch(request, computation, weight=1.0)
+            steps, _ = runtime.step_phase(request)
+            assert steps == {request.kind: 1}
+            counts[request.kind] += 1
+            if request.kind == "student":
+                runtime.update_ema()
+    assert counts == {"student": 3, "fake_score": 6}
+    paths = [tempfile.mkdtemp(prefix="causvid-") if dist.get_rank() == 0 else None]
+    dist.broadcast_object_list(paths, src=0)
+    try:
+        before = {
+            role: role_snapshot(runtime.engine_for_role(role), role)
+            for role in ("student", "fake_score", "student_ema")
+        }
+        rng = computer.state_dict()
+        for name, engine in engines.items():
+            engine.save_role_group_checkpoint(os.path.join(paths[0], name), 3)
+            with torch.no_grad():
+                for parameter in engine.parameters_for_role(engine._primary_role):
+                    parameter.add_(1)
+        for name, engine in engines.items():
+            engine.load_role_group_checkpoint(os.path.join(paths[0], name))
+        computer.load_state_dict(rng)
+        for role, tensors in before.items():
+            assert_tensors_equal(role_snapshot(runtime.engine_for_role(role), role), tensors)
+    finally:
+        dist.barrier()
+        if dist.get_rank() == 0:
+            shutil.rmtree(paths[0])

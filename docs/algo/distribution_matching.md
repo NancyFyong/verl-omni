@@ -146,14 +146,46 @@ count as `loss_normalizer`; the runtime accumulates numerator gradients and divi
 by the DP-averaged count before gradient clipping and the optimizer step. Reported
 losses use the same denominator, independently of micro-batch partitioning.
 
-The default exported causal schedule starts from unshifted timesteps
-`[1000, 750, 500, 250]` and applies the rational shift `8.0` exactly once.
-FSDP1/FSDP2 training, EMA, checkpoint/resume, and semantic student/EMA LoRA
-export use the shared multi-role runtime. Ulysses sequence parallelism and
-vLLM-Omni causal serving are not supported in this stage.
+The local video export records resolved sampling timesteps from the supplied ODE
+trajectory manifest; a CausVid export instead uses its saved rollout settings.
+Already shifted timestep metadata must not be shifted again. A terminal zero is a
+clean state, not a denoising prediction. FSDP1/FSDP2 training, EMA, checkpoint/resume,
+and semantic student/EMA LoRA export use the shared multi-role runtime. Ulysses
+sequence parallelism and vLLM-Omni causal serving are not supported in this stage.
 
 See `examples/distillation_trainer/wan21/README.md` for the trajectory contract
 and launch command.
+
+## Wan CausVid distribution matching
+
+`recipe=causvid` and the `(WanPipeline, causvid)` adapter implement the released
+real-latent CausVid training path after ODE initialization. The causal student/EMA
+and bidirectional teacher/fake-score occupy separate physical role groups. Only
+the student group loads the ODE-initialized adapter; startup verifies its artifact
+hash. The teacher is frozen and adapter-disabled, not an ODE student with adapters
+disabled on a causally modified model.
+
+The student consumes independently re-noised clean latents, selecting one state
+per motion block. Both score models use one score timestep across each entire
+video. The teacher CFG is `cond + scale*(cond-uncond)` (legacy scale 3.5 by default
+in the example), without Qwen-style norm rescaling. Corruption and x0 conversion
+use nearest-grid Wan sigmas after score-timestep shift and clamping. The reference
+normalizer divides by the unmasked mean absolute real-score residual, with epsilon
+zero; a positive epsilon is a stabilized variant. Fake-score learning uses velocity
+MSE against `noise - generated_x0.detach()`.
+
+A cycle groups one student update and K fake-score updates. The first fake update
+reuses the student batch; later ones consume fresh data. This reproduces the
+reference generator-every-K-critic-iterations ordering without adding a second
+training loop. LoRA storage, EMA, fp32 reductions and complete resumable checkpoints
+are framework choices rather than claims of bit-identical full-weight reproduction.
+
+`examples/distillation_trainer/wan21/wan21_video.py` provides adapter export, local
+blockwise consistency sampling, VAE-to-MP4 decoding and a prompt/video gallery.
+Caches are reset per video and only clean blocks commit K/V; intermediate denoising
+states never become persistent context. See the Wan example for executable commands
+and provenance requirements. The core algorithm and execution tests are separate
+from empirical video-quality acceptance, which requires held-out before/after runs.
 
 ## Role storage and checkpoints
 

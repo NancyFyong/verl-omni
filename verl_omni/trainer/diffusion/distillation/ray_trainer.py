@@ -382,6 +382,7 @@ class DistillationRayTrainer(BaseRayDiffusionTrainer):
                         "plan_version": self.plan.version,
                         "global_step": self.global_steps,
                         "export_role": self.plan.export.role,
+                        "rollout": dict(self.plan.rollout),
                         "fingerprint": self.checkpoint_fingerprint(),
                     },
                     file,

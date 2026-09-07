@@ -115,7 +115,8 @@ def dmd_gradient(
 ) -> tuple[Tensor, Tensor, int]:
     """Compute the detached normalized fake-minus-real score gradient.
 
-    Follows Self-Forcing ``_compute_kl_grad`` and LightX2V ``dmd_loss`` exactly:
+    Shared Self-Forcing/CausVid/LightX2V score surrogate. Set epsilon to zero
+    for the released CausVid unregularized normalizer, or positive for clamping:
 
     ``g = x0_fake - x0_real``
     ``normalizer = mean(abs(x_g - x0_real), non-batch dimensions)``
@@ -126,8 +127,8 @@ def dmd_gradient(
     dimensions of one sample, ``keepdim`` per sample, and is **not** restricted by
     ``gradient_mask``.
     """
-    if normalization_epsilon <= 0:
-        raise ValueError(f"normalization_epsilon must be greater than zero, got {normalization_epsilon}.")
+    if normalization_epsilon < 0:
+        raise ValueError(f"normalization_epsilon must be nonnegative, got {normalization_epsilon}.")
     if x_g.shape != x0_fake.shape or x_g.shape != x0_real.shape:
         raise ValueError(
             f"x_g, x0_fake, and x0_real must have identical shapes, got "

@@ -79,6 +79,7 @@ def build_rows(size: int, model_path: str, latent_frames: int, latent_height: in
                 "data_source": "wan_ode_smoke",
                 "prompt": [{"role": "user", "content": f"Synthetic video {index}"}],
                 "prompt_embeds": torch.zeros(4, text_dim).tolist(),
+                "negative_prompt_embeds": torch.ones(4, text_dim).tolist(),
                 "ode_latents": torch.stack((noise, middle, clean)).tolist(),
                 "ode_timesteps": manifest["timesteps"],
                 "final_clean_latent": clean.tolist(),

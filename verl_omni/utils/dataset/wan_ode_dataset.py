@@ -55,11 +55,12 @@ class WanODETrajectoryDataset(RLHFDataset):
         trajectory = load_float_tensor(row["ode_latents"], "ode_latents")
         timesteps = load_float_tensor(row["ode_timesteps"], "ode_timesteps")
         clean = load_float_tensor(row["final_clean_latent"], "final_clean_latent")
-        prompt_embeds = row.get("prompt_embeds")
-        if prompt_embeds is not None:
-            prompt_embeds = load_float_tensor(prompt_embeds, "prompt_embeds")
-            if prompt_embeds.ndim != 2 or prompt_embeds.shape[0] == 0:
-                raise ValueError("prompt_embeds must have shape [sequence, hidden_size].")
+        for key in ("prompt_embeds", "negative_prompt_embeds"):
+            if row.get(key) is not None:
+                embeds = load_float_tensor(row[key], key)
+                if embeds.ndim != 2 or embeds.shape[0] == 0:
+                    raise ValueError(f"{key} must have shape [sequence, hidden_size].")
+                row[key] = embeds
         manifest = row.get("trajectory_manifest")
         if trajectory.ndim != 5:
             raise ValueError("ode_latents must have shape [steps, frames, channels, height, width].")
@@ -87,8 +88,6 @@ class WanODETrajectoryDataset(RLHFDataset):
         row["ode_latents"] = trajectory
         row["ode_timesteps"] = timesteps
         row["final_clean_latent"] = clean
-        if prompt_embeds is not None:
-            row["prompt_embeds"] = prompt_embeds
         row["trajectory_manifest"] = dict(manifest)
         row["trajectory_manifest_sha256"] = canonical_manifest_sha256(manifest)
         return row

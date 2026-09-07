@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -23,6 +24,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable
 
 import torch
@@ -119,6 +121,26 @@ class MultiRoleDistributionMatchingComputer(Protocol):
     ) -> Iterator[tuple[str, DistillationPhaseComputation]]:
         """Yield each role loss in request order for immediate backward."""
         ...
+
+
+def validate_student_initialization(plan: DistillationPlan) -> None:
+    """Fail before allocating models if a required ODE adapter is absent or corrupted."""
+    if not plan.initialization.get("require_student_adapter", False):
+        return
+    path = plan.initialization.get("student_adapter_path")
+    if not path:
+        raise ValueError("This recipe requires an ODE-initialized student_adapter_path.")
+    directory = Path(path)
+    with (directory / "inference_manifest.json").open() as file:
+        manifest = json.load(file)
+    if manifest.get("recipe") != plan.initialization["stage"] or manifest.get("role") not in {"student", "student_ema"}:
+        raise ValueError("Student initialization must be an exported ODE student or student_ema artifact.")
+    digest = hashlib.sha256()
+    with (directory / "adapter_model.safetensors").open("rb") as file:
+        while chunk := file.read(1024 * 1024):
+            digest.update(chunk)
+    if digest.hexdigest() != manifest.get("weights_sha256"):
+        raise ValueError("Student initialization adapter hash does not match its manifest.")
 
 
 class DistillationRoleRuntime:
@@ -416,6 +438,7 @@ class DiffusionDistillationWorker(Worker, DistProfilerExtension):
                 f"{adapter_cls.__name__} must mix in DistributionMatchingModelAdapter for distillation training."
             )
 
+        validate_student_initialization(self.plan)
         engines = {}
         resolved_model_paths = {}
         for group in self.plan.role_layout.groups:
@@ -424,6 +447,12 @@ class DiffusionDistillationWorker(Worker, DistProfilerExtension):
             bindings = tuple(binding for binding in self.plan.role_layout.bindings if binding.group == group.name)
             trainable_bindings = tuple(binding for binding in bindings if binding.trainable)
             group_model_config = deepcopy(model_config)
+            student_adapter_path = self.plan.initialization.get("student_adapter_path")
+            if student_adapter_path is not None:
+                is_student_group = any(binding.role in {"student", "student_ema"} for binding in bindings)
+                object.__setattr__(
+                    group_model_config, "lora_adapter_path", student_adapter_path if is_student_group else None
+                )
             object.__setattr__(group_model_config, "model_type", "diffusion_distillation_model")
             object.__setattr__(group_model_config, "path", group.model_ref)
             if group.model_ref not in resolved_model_paths:

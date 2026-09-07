@@ -141,8 +141,16 @@ class TestDMDGradient:
 
     def test_invalid_normalization_epsilon_raises(self):
         tensor = torch.zeros(1, 2)
-        with pytest.raises(ValueError, match="greater than zero"):
-            dmd_gradient(tensor, tensor, tensor, normalization_epsilon=0)
+        with pytest.raises(ValueError, match="nonnegative"):
+            dmd_gradient(tensor, tensor, tensor, normalization_epsilon=-1)
+
+    def test_causvid_zero_epsilon_preserves_unclamped_reference(self):
+        clean = torch.ones(1, 2)
+        real = clean + 1e-7
+        fake = real + 1e-6
+        grad, normalizer, _ = dmd_gradient(fake, real, clean, normalization_epsilon=0)
+        torch.testing.assert_close(normalizer, (clean - real).abs().mean(dim=1, keepdim=True))
+        torch.testing.assert_close(grad, (fake - real) / normalizer)
 
     def test_mismatched_shapes_raise(self):
         with pytest.raises(ValueError, match="identical shapes"):

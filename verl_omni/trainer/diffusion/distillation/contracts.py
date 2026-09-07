@@ -371,20 +371,24 @@ class UpdateSchedule:
         """Expand either the next warmup cycle or the normal static phases."""
         is_warmup = counters.completed_cycles < self.warmup_cycles
         phases = self.warmup_phases if is_warmup else self.phases
-        requests = tuple(
-            PhaseRequest(
-                kind=phase.kind,
-                global_step=counters.global_step,
-                repeat_index=repeat_index,
-                batch_policy=phase.batch_policy,
-                trainable_roles=phase.trainable_roles,
-                update_ema=phase.update_ema,
-            )
-            for phase in phases
-            for repeat_index in range(phase.repeats)
-        )
+        requests = []
+        indices: dict[str, int] = {}
+        for phase in phases:
+            for _ in range(phase.repeats):
+                repeat_index = indices.get(phase.kind, 0)
+                requests.append(
+                    PhaseRequest(
+                        kind=phase.kind,
+                        global_step=counters.global_step,
+                        repeat_index=repeat_index,
+                        batch_policy=phase.batch_policy,
+                        trainable_roles=phase.trainable_roles,
+                        update_ema=phase.update_ema,
+                    )
+                )
+                indices[phase.kind] = repeat_index + 1
         return UpdateCycle(
-            requests=requests,
+            requests=tuple(requests),
             requires_student_update=not is_warmup,
             is_warmup=is_warmup,
         )

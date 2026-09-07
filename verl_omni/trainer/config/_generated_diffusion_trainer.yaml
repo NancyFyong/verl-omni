@@ -502,6 +502,7 @@ distillation:
     recipe: dmd2
     causal_model_path: null
     bidirectional_model_path: null
+    student_adapter_path: null
     profile: null
     fake_update_ratio: null
     fake_warmup_cycles: 0
@@ -566,6 +567,11 @@ distillation:
     - 750
     - 500
     - 250
+    causvid_timesteps:
+    - 1000.0
+    - 757.0
+    - 522.0
+    - 0.0
     causal_timestep_shift: 8.0
 algorithm:
   _target_: verl_omni.trainer.config.DiffusionAlgoConfig

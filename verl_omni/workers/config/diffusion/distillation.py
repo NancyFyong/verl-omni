@@ -96,8 +96,10 @@ class DiffusionDistributionMatchingConfig(BaseConfig):
     recipe: str = "dmd2"
     # Optional causal student checkpoint; defaults to actor_rollout_ref.model.path.
     causal_model_path: Optional[str] = None
-    # Optional bidirectional score checkpoint for later asymmetric DMD stages.
+    # Optional bidirectional score checkpoint for asymmetric DMD stages.
     bidirectional_model_path: Optional[str] = None
+    # ODE-initialized student LoRA artifact; never loaded into bidirectional score roles.
+    student_adapter_path: Optional[str] = None
     # Optional recipe profile; null selects the recipe default.
     profile: Optional[str] = None
     # Optional fake-score phase count; null selects the recipe default.
@@ -161,8 +163,10 @@ class DiffusionDistributionMatchingConfig(BaseConfig):
     ode_loss_weight: float = 1.0
     # Raw Wan training-timestep scale used to convert timesteps to sigmas.
     ode_num_train_timesteps: int = 1000
-    # Unshifted few-step causal Wan inference timesteps.
+    # Unshifted few-step causal Wan inference timesteps (ODE recipe).
     causal_denoising_timesteps: list[int] = field(default_factory=lambda: [1000, 750, 500, 250])
+    # Resolved CausVid training timesteps, including the clean-state entry.
+    causvid_timesteps: list[float] = field(default_factory=lambda: [1000.0, 757.0, 522.0, 0.0])
     # Rational time shift for exported causal Wan schedules.
     causal_timestep_shift: float = 8.0
 
@@ -241,8 +245,12 @@ class DiffusionDistributionMatchingConfig(BaseConfig):
             raise ValueError(f"score_timestep_shift must be at least 1, got {self.score_timestep_shift}")
         if self.score_discrete_steps < 0:
             raise ValueError(f"score_discrete_steps must be non-negative, got {self.score_discrete_steps}")
-        if self.normalization_epsilon <= 0:
-            raise ValueError(f"normalization_epsilon must be positive, got {self.normalization_epsilon}")
+        if (
+            not math.isfinite(self.normalization_epsilon)
+            or self.normalization_epsilon < 0
+            or (self.normalization_epsilon == 0 and self.recipe != "causvid")
+        ):
+            raise ValueError("normalization_epsilon must be positive (CausVid also permits zero for reference parity)")
         if self.dmd_loss_weight < 0:
             raise ValueError(f"dmd_loss_weight must be non-negative, got {self.dmd_loss_weight}")
         valid_regression_types = {"decoded_lpips", "latent_mse"}
@@ -296,6 +304,16 @@ class DiffusionDistributionMatchingConfig(BaseConfig):
             raise ValueError("causal_denoising_timesteps must be strictly descending positive integers in range")
         if not math.isfinite(self.causal_timestep_shift) or self.causal_timestep_shift < 1:
             raise ValueError("causal_timestep_shift must be finite and at least 1")
+        if (
+            len(self.causvid_timesteps) < 2
+            or self.causvid_timesteps[0] != self.ode_num_train_timesteps
+            or self.causvid_timesteps[-1] != 0
+            or any(isinstance(value, bool) or not math.isfinite(value) for value in self.causvid_timesteps)
+            or any(
+                left <= right for left, right in zip(self.causvid_timesteps, self.causvid_timesteps[1:], strict=False)
+            )
+        ):
+            raise ValueError("causvid_timesteps must descend from the training horizon to zero")
 
 
 @dataclass

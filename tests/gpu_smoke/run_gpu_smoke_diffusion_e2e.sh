@@ -77,4 +77,12 @@ run_test 13 "Wan 2.1 causal ODE regression e2e" \
     env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" NUM_GPUS="${NUM_GPUS}" \
     bash tests/special_e2e/run_ode_regression_wan21.sh "${diffusion_trainer_args[@]}"
 
+if [[ -n "${STUDENT_ADAPTER_PATH:-}" ]]; then
+    run_test 14 "Wan CausVid initialized-student e2e" \
+        env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" NUM_GPUS="${NUM_GPUS}" \
+        bash tests/special_e2e/run_causvid_wan21.sh "${diffusion_trainer_args[@]}"
+else
+    echo "Skip Wan CausVid e2e: set STUDENT_ADAPTER_PATH to an exported ODE student adapter."
+fi
+
 gpu_smoke_summary

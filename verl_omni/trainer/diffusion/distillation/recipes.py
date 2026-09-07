@@ -638,18 +638,44 @@ class CausVidRecipe(DistillationRecipeBase):
         model_ref = get_config_value(config, "model_path", "") or ""
         causal_ref = get_config_value(config, "causal_model_path", model_ref) or model_ref
         bidirectional_ref = get_config_value(config, "bidirectional_model_path", model_ref) or model_ref
+        common = common_plan_kwargs(config)
+        schedule = common["update_schedule"]
+        fake_repeats = schedule.phases[1].repeats
+        phases = [
+            schedule.phases[0],
+            UpdatePhaseSpec(kind="fake_score", trainable_roles=("fake_score",), batch_policy="reuse_student"),
+        ]
+        if fake_repeats > 1:
+            phases.append(UpdatePhaseSpec(kind="fake_score", trainable_roles=("fake_score",), repeats=fake_repeats - 1))
+        common["update_schedule"] = UpdateSchedule(
+            phases=tuple(phases), warmup_phases=schedule.warmup_phases, warmup_cycles=schedule.warmup_cycles
+        )
         return DistillationPlan(
             name="causvid",
             role_layout=apply_role_storage(
                 causal_bidirectional_layout(causal_ref, bidirectional_ref),
                 get_config_or_default(config, "role_storage", "shared_base_adapters"),
             ),
-            data_requirements={"mode": data_mode},
-            objective={"name": "dmd", "profile": "distribution_only"},
-            rollout={"strategy": rollout},
-            initialization={"stage": "ode_regression", "requires_provenance": True},
+            data_requirements={
+                **dmd_data_requirements(config, data_mode),
+                "trajectory_manifest_sha256": get_config_value(config, "trajectory_manifest_sha256"),
+            },
+            objective=dmd_objective(config, name="dmd", profile="distribution_only", cfg_convention="legacy"),
+            rollout={
+                **dmd_rollout(config, rollout),
+                "frames_per_block": get_config_or_default(config, "frames_per_block", 3),
+                "denoising_timesteps": tuple(get_config_or_default(config, "causvid_timesteps", [1000, 757, 522, 0])),
+                "num_train_timesteps": get_config_or_default(config, "ode_num_train_timesteps", 1000),
+                "scheduler_shift": float(get_config_or_default(config, "causal_timestep_shift", 8.0)),
+            },
+            initialization={
+                "stage": "ode_regression",
+                "requires_provenance": True,
+                "student_adapter_path": get_config_value(config, "student_adapter_path"),
+                "require_student_adapter": True,
+            },
             required_capabilities=frozenset({"distribution_matching", "autoregressive"}),
-            **common_plan_kwargs(config),
+            **common,
         )
 
 
@@ -753,6 +779,8 @@ def build_plan_from_config(config, capabilities) -> DistillationPlan:
         "ode_num_train_timesteps",
         "causal_denoising_timesteps",
         "causal_timestep_shift",
+        "causvid_timesteps",
+        "student_adapter_path",
     )
     for optional_key in optional_keys:
         value = get_config_value(distribution_matching, optional_key)

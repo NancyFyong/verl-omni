@@ -15,6 +15,8 @@
 from .causal_attention import WanCausalCache, allocate_wan_cache, configure_causal_wan, wan_causal_forward
 from .diffusers_training_adapter import (
     Wan21CausalODE,
+    Wan21CausVid,
+    WanCausVidComputer,
     WanConditionProvider,
     WanODEComputer,
     build_wan_causal_timesteps,
@@ -22,6 +24,8 @@ from .diffusers_training_adapter import (
 
 __all__ = [
     "Wan21CausalODE",
+    "Wan21CausVid",
+    "WanCausVidComputer",
     "WanCausalCache",
     "WanConditionProvider",
     "WanODEComputer",
