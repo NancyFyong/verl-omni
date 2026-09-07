@@ -20,6 +20,12 @@ from verl import DataProto
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
 from verl.utils.reward_score import default_compute_score as _upstream_default_compute_score
 
+from verl_omni.pipelines.rollout_artifacts import (
+    ARTIFACT_PREFIX,
+    ARTIFACT_SPECS,
+    PRIMARY_ARTIFACT,
+    artifacts_from_fields,
+)
 from verl_omni.utils.reward_score import default_compute_score_image
 
 
@@ -42,7 +48,9 @@ def _reward_extra_info(data_item) -> dict:
     extra_info = data_item.non_tensor_batch.get("extra_info", {})
     tool_extra_fields = data_item.non_tensor_batch.get("tool_extra_fields") or {}
     extra_info.update(tool_extra_fields)
-    for key in ("audio", "audio_sample_rate", "media_kind"):
+    media_keys = {"audio", "audio_sample_rate", "media_kind", ARTIFACT_SPECS, PRIMARY_ARTIFACT}
+    media_keys.update(key for key in data_item.batch.keys() if key.startswith(ARTIFACT_PREFIX))
+    for key in media_keys:
         value = data_item.batch.get(key)
         if value is None:
             value = data_item.non_tensor_batch.get(key)
@@ -57,6 +65,9 @@ def _reward_extra_info(data_item) -> dict:
             if not matches:
                 raise ValueError(f"Conflicting rollout media field {key!r} in batch and tool_extra_fields")
         extra_info[key] = value
+    artifacts = artifacts_from_fields(extra_info, context="reward entry")
+    if artifacts:
+        extra_info["media_artifacts"] = artifacts
     return extra_info
 
 

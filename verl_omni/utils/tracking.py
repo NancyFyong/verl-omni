@@ -26,6 +26,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from verl_omni.pipelines.rollout_artifacts import MediaArtifact
 from verl_omni.utils.reward_score.reward_utils import normalize_video_tensor
 
 logger = logging.getLogger(__name__)
@@ -76,7 +77,16 @@ def _write_wav(audio: Any, sample_rate: Any, path: Path) -> None:
 
 def _video_tensor_to_rgb24(video: torch.Tensor) -> tuple[np.ndarray, int, int]:
     """Return a contiguous RGB24 array from a supported RGB video layout."""
-    video = normalize_video_tensor(video)
+    if isinstance(video, MediaArtifact):
+        if (video.spec.modality, video.spec.representation) != ("video", "decoded"):
+            raise ValueError(f"Video export requires a decoded video artifact, got {video.spec}")
+        video = video.normalized(context="video export", name="preview").data
+        if video.shape[1] == 1:
+            video = video.expand(-1, 3, -1, -1)
+        elif video.shape[1] == 4:
+            video = video[:, :3]  # RGB24 has no alpha channel.
+    else:
+        video = normalize_video_tensor(video)
     frames = video.detach().permute(0, 2, 3, 1).to(device="cpu").contiguous().numpy()
     return frames, int(frames.shape[2]), int(frames.shape[1])
 
@@ -117,7 +127,10 @@ def _export_video(
 
         ffmpeg_exe = get_ffmpeg_exe()
 
-    fps = int(fps)
+    if isinstance(output, MediaArtifact) and output.spec.fps is not None:
+        fps = output.spec.fps
+    else:
+        fps = int(fps)
     if fps <= 0:
         raise ValueError(f"fps must be positive, got {fps}.")
 
@@ -204,6 +217,13 @@ def wrap_val_samples_for_wandb(samples, fps=24, output_dir=None, media_kinds=Non
         inp, out, score = sample[:3]
         audio = sample[3] if len(sample) > 3 else None
         audio_sample_rate = sample[4] if len(sample) > 4 else None
+        if isinstance(out, MediaArtifact):
+            out.validate(context="W&B", name="preview")
+            if out.spec.representation != "decoded" or out.spec.modality not in ("image", "video"):
+                raise ValueError(f"W&B requires a decoded visual artifact, got {out.spec}")
+            media_kind = out.spec.modality
+            if media_kind == "image":
+                out = out.normalized(context="W&B", name="preview").data
         output_ndim = getattr(out, "ndim", -1)
         is_video = resolve_is_video(output_ndim, media_kind) if media_kind is not None else output_ndim in (4, 5)
         if is_video and output_ndim == 5:

@@ -82,6 +82,46 @@ async def test_generated_media_reaches_scorer(monkeypatch, manager_cls, transpor
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("manager_cls", [VisualRewardManager, multi.MultiVisualRewardManager])
+async def test_latent_primary_and_decoded_artifacts_reach_real_reward_managers(monkeypatch, manager_cls):
+    from verl_omni.pipelines.rollout_artifacts import ArtifactSpec, MediaArtifact, artifact_fields
+    from verl_omni.utils.reward_score.clap import _get_audio
+
+    latent = torch.zeros(16, 2, 2, 2, dtype=torch.float16)
+    artifacts = {
+        "video_latent": MediaArtifact(ArtifactSpec("video", "latent", "CTHW"), latent),
+        "video_preview": MediaArtifact(
+            ArtifactSpec("video", "decoded", "TCHW", fps=24), torch.zeros(3, 3, 2, 2, dtype=torch.uint8)
+        ),
+        "audio": MediaArtifact(ArtifactSpec("audio", "decoded", "CT", sample_rate=32000), torch.ones(2, 16)),
+    }
+    fields = artifact_fields(artifacts, "video_latent", "video_preview")
+    data = DataProto.from_dict(
+        tensors={
+            "responses": latent.unsqueeze(0),
+            **{key: value.unsqueeze(0) for key, value in fields.items() if isinstance(value, torch.Tensor)},
+        },
+        non_tensors={
+            "data_source": ["test"],
+            "reward_model": [{"ground_truth": "prompt"}],
+            **{key: [value] for key, value in fields.items() if not isinstance(value, torch.Tensor)},
+        },
+    )
+
+    async def scorer(solution_image, extra_info, **kwargs):
+        assert solution_image.dtype == torch.float16
+        assert extra_info["media_artifacts"]["video_preview"].data.dtype == torch.uint8
+        audio, rate = _get_audio(extra_info)
+        assert rate == 32000 and audio.shape == (16,)
+        return {"score": 1.0}
+
+    manager = _manager(monkeypatch, manager_cls, scorer)
+    manager.config.actor_rollout_ref.rollout.pipeline.output_type = "latent"
+    result = await manager.run_single(data)
+    assert result["reward_score"] == 1.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("manager_cls", [VisualRewardManager, multi.MultiVisualRewardManager])
 @pytest.mark.parametrize(
     "field, value", [("media_kind", "image"), ("audio_sample_rate", 24000), ("audio", torch.zeros(1, 16))]
 )

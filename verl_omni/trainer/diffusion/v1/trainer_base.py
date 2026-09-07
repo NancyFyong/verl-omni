@@ -57,6 +57,7 @@ from verl.utils.skip import SkipManager
 from verl.utils.tracking import Tracking, ValidationGenerationsLogger
 from verl.workers.rollout.llm_server import LLMServerManager
 
+from verl_omni.pipelines.rollout_artifacts import previews_from_batch, validate_previews
 from verl_omni.trainer.diffusion.diffusion_algos import get_diffusion_loss_fn
 from verl_omni.trainer.diffusion.diffusion_metric_utils import (
     compute_data_metrics_diffusion,
@@ -1263,6 +1264,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         sample_audios: list = []
         sample_audio_sample_rates: list = []
         sample_media_kinds: list = []
+        sample_previews: list = []
         sample_gts: list = []
         sample_scores: list[float] = []
         sample_turns: list = []
@@ -1324,6 +1326,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             )
             sample_inputs.extend(input_texts)
             sample_outputs.append(output_images)
+            sample_previews.extend(previews_from_batch(data) or [None] * len(output_images))
             batch_size = len(output_images)
             sample_audios.extend(batch_items(data.batch.get("audio"), batch_size, "audio"))
             sample_audio_sample_rates.extend(
@@ -1367,6 +1370,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             audios=sample_audios,
             audio_sample_rates=sample_audio_sample_rates,
             media_kinds=sample_media_kinds,
+            previews=sample_previews,
         )
 
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
@@ -1383,6 +1387,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 audios=sample_audios,
                 audio_sample_rates=sample_audio_sample_rates,
                 media_kind=next((kind for kind in sample_media_kinds if kind is not None), None),
+                previews=sample_previews,
             )
 
         data_sources_arr = np.concatenate(data_sources, axis=0) if data_sources else np.array([])
@@ -1396,6 +1401,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         audios=None,
         audio_sample_rates=None,
         media_kinds=None,
+        previews=None,
     ):
         """Use the shared image/video W&B path with declared media metadata."""
         return BaseRayDiffusionTrainer._maybe_log_val_generations(
@@ -1406,6 +1412,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             audios=audios,
             audio_sample_rates=audio_sample_rates,
             media_kinds=media_kinds,
+            previews=previews,
         )
 
     def _dump_generations(
@@ -1421,8 +1428,10 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         audios=None,
         audio_sample_rates=None,
         media_kind=None,
+        previews=None,
     ):
         """Submit a best-effort image/video dump to the background executor."""
+        previews = validate_previews(previews, len(inputs))
         resolve_is_video(outputs.ndim, media_kind)
         global_step = self.global_steps
         future = self._dump_executor.submit(
@@ -1439,6 +1448,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             audios,
             audio_sample_rates,
             media_kind,
+            previews,
         )
         self._dump_futures.append((future, global_step))
         self._drain_dump_futures()
@@ -1457,6 +1467,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         audios,
         audio_sample_rates,
         media_kind,
+        previews=None,
     ):
         """Reuse the V0 media exporter with a step snapshot for thread safety."""
         dump_context = SimpleNamespace(global_steps=global_step)
@@ -1473,6 +1484,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             audios=audios,
             audio_sample_rates=audio_sample_rates,
             media_kind=media_kind,
+            previews=previews,
         )
 
     def _log_rollout_data(self, batch_meta: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
@@ -1502,7 +1514,10 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             )
             media_kinds = batch_items(data.non_tensor_batch.get("media_kind"), len(data), "media_kind")
 
+            previews = previews_from_batch(data)
             sort_idx = sort_diffusion_tq_keys(list(batch_meta.keys))
+            if previews is not None:
+                previews = [previews[i] for i in sort_idx]
             inputs = [inputs[i] for i in sort_idx]
             outputs = outputs[torch.tensor(sort_idx)]
             gts = [gts[i] for i in sort_idx]
@@ -1523,6 +1538,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 audios=audios,
                 audio_sample_rates=audio_sample_rates,
                 media_kind=next((kind for kind in media_kinds if kind is not None), None),
+                previews=previews,
             )
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns) -> dict:

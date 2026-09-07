@@ -137,6 +137,13 @@ def _preprocess_audio(audio, source_rate: int, device: str) -> torch.Tensor:
 
 
 def _to_tchw(video) -> torch.Tensor:
+    from verl_omni.pipelines.rollout_artifacts import MediaArtifact
+
+    if isinstance(video, MediaArtifact):
+        if (video.spec.modality, video.spec.representation) != ("video", "decoded"):
+            raise ValueError(f"ImageBind requires decoded video, got {video.spec}")
+        video = video.normalized(context="ImageBind", name="video")
+        return video.data.detach().float().cpu() / 255.0
     video = torch.as_tensor(video)
     if video.dtype != torch.uint8:
         raise ValueError(f"Expected uint8 video input, got {video.dtype}.")
@@ -247,6 +254,21 @@ def compute_score(
     need_audio = mode in {"audio_video", "text_audio", "all"}
     need_video = mode in {"audio_video", "text_video", "all"}
 
+    artifacts = extra_info.get("media_artifacts")
+    if artifacts is not None:
+        from verl_omni.pipelines.rollout_artifacts import select_artifact
+
+        if need_video:
+            solution_image = select_artifact(
+                artifacts, name="video_preview", modality="video", representation="decoded"
+            )
+        if need_audio:
+            audio_artifact = select_artifact(artifacts, name="audio", modality="audio", representation="decoded")
+            extra_info = {
+                **extra_info,
+                "audio": audio_artifact.data,
+                "audio_sample_rate": audio_artifact.spec.sample_rate,
+            }
     inputs = {}
     if need_text:
         inputs[ModalityType.TEXT] = _preprocess_text(ground_truth or "", device)

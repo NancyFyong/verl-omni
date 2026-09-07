@@ -31,8 +31,9 @@ from vllm_omni.diffusion.models.minimax_h3.packed_tokens import (
 from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
 
-from verl_omni.pipelines.diffusion_rollout_output import with_rollout_data
+from verl_omni.pipelines.diffusion_rollout_output import with_media_artifacts, with_rollout_data
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
+from verl_omni.pipelines.rollout_artifacts import ArtifactSpec, MediaArtifact
 from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 
 from .common import (
@@ -218,7 +219,7 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
                 }
             )
 
-        return with_rollout_data(
+        result = with_rollout_data(
             output,
             prompt_embeddings={
                 "prompt_embeds": prompt_embeds,
@@ -226,6 +227,39 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
             },
             rl=rl,
             to_cpu=True,
+        )
+        context = f"pipeline=MiniMaxH3Pipeline/diffusion_nft, request_id={getattr(request, 'request_id', 'unknown')}"
+        video, audio = output.output
+        if video.ndim != 5 or video.shape[0] != 1 or audio.ndim != 3 or audio.shape[0] != 1:
+            raise ValueError(f"{context}: expected one NTHWC video and NCT waveform, got {video.shape}, {audio.shape}")
+        video_latent = capture["video_latent"]
+        if video_latent.ndim != 5 or video_latent.shape[0] != 1:
+            raise ValueError(f"{context}: expected one NCTHW video latent, got {video_latent.shape}")
+        # Pinned H3 forward quantizes NTHWC; packed_tokens.py defines NCTHW/CLT latents.
+        specs = {
+            "video_preview": ArtifactSpec("video", "decoded", "THWC", fps=request.sampling_params.frame_rate or 24),
+            "audio": ArtifactSpec(
+                "audio", "decoded", "CT", sample_rate=self.diffusion_io_spec.auxiliary[0].sample_rate
+            ),
+            "video_latent": ArtifactSpec("video", "latent", "CTHW"),
+            "audio_latent": ArtifactSpec("audio", "latent", "CLT"),
+        }
+        data = {
+            "video_preview": video[0],
+            "audio": audio[0],
+            "video_latent": video_latent[0],
+            "audio_latent": capture["audio_latent"],
+        }
+        output_type = extra_args.get("output_type", request.sampling_params.output_type)
+        return with_media_artifacts(
+            result,
+            specs=specs,
+            artifacts=[(name, MediaArtifact(specs[name], tensor)) for name, tensor in data.items()],
+            primary="video_latent" if output_type == "latent" else "video_preview",
+            audio="audio",
+            preview="video_preview",
+            context=context,
+            requested=extra_args.get("requested_outputs"),
         )
 
     @staticmethod

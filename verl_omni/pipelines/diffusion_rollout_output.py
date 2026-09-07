@@ -22,10 +22,12 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable, Mapping
-from dataclasses import replace
+from dataclasses import asdict, replace
 from typing import Any
 
 from vllm_omni.diffusion.data import DiffusionOutput
+
+from verl_omni.pipelines.rollout_artifacts import ArtifactSpec, MediaArtifact, select_artifact, validate_artifacts
 
 _MEDIA_KEYS = ("image", "video", "output", "audio")
 
@@ -81,6 +83,53 @@ def with_rollout_data(
     )
 
 
+def with_media_artifacts(
+    base: DiffusionOutput,
+    *,
+    artifacts: list[tuple[str, MediaArtifact]],
+    specs: Mapping[str, ArtifactSpec],
+    primary: str,
+    context: str,
+    audio: str | None = None,
+    preview: str | None = None,
+    requested: list[str] | None = None,
+) -> DiffusionOutput:
+    """Replace legacy media with a named, already-normalized per-sample payload.
+
+    One modality-keyed payload holds all named tensors so the pinned upstream
+    formatter cannot discard non-primary streams. Trajectories and algorithm
+    metadata remain separate. This does not require changing upstream types.
+    """
+    normalized = validate_artifacts(artifacts, specs, primary=primary, context=context, requested=requested)
+    metadata = dict(base.output.get("metadata") or {}) if _is_envelope(base.output) else {}
+    if "media_artifacts" in metadata:
+        raise ValueError(f"{context}: duplicate media_artifacts metadata")
+    if audio is not None:
+        select_artifact(normalized, name=audio, modality="audio", representation="decoded")
+    if preview is not None:
+        artifact = normalized.get(preview)
+        if (
+            artifact is None
+            or artifact.spec.representation != "decoded"
+            or artifact.spec.modality not in ("image", "video")
+        ):
+            raise ValueError(f"{context}: preview artifact={preview!r} must be decoded visual media")
+    metadata["media_artifacts"] = {
+        "primary": primary,
+        "audio": audio,
+        "preview": preview,
+        "specs": {name: asdict(artifact.spec) for name, artifact in normalized.items()},
+    }
+    modality = normalized[primary].spec.modality
+    return replace(
+        base,
+        output={
+            "payload": {modality: {name: artifact.data for name, artifact in normalized.items()}},
+            "metadata": metadata,
+        },
+    )
+
+
 def wrap_rollout_postprocessor(postprocess: Callable[..., Any]) -> Callable[..., Any]:
     """Adapt a media-only upstream postprocessor to preserve rollout payload and metadata."""
 
@@ -91,6 +140,10 @@ def wrap_rollout_postprocessor(postprocess: Callable[..., Any]) -> Callable[...,
 
         payload = data["payload"]
         metadata = dict(data.get("metadata") or {})
+        if "media_artifacts" in metadata:
+            return data  # Named tensors are already decoded/normalized by the adapter.
+        if len(payload) != 1:
+            raise ValueError("A media-only postprocessor cannot consume multiple payload keys; use named artifacts.")
         media_key = next((key for key in _MEDIA_KEYS if key in payload), None)
         if media_key is None:
             raise ValueError("Diffusion output envelope has no media payload.")
@@ -131,6 +184,8 @@ def _unwrap_output(output: Any, default_key: str) -> tuple[Any, str, dict[str, A
     if not _is_envelope(output):
         return output, default_key, {}
     payload = output["payload"]
+    if len(payload) != 1:
+        raise ValueError("Cannot unwrap multiple diffusion payload keys without dropping media; use named artifacts.")
     for key in _MEDIA_KEYS:
         if key in payload:
             return payload[key], key, dict(output.get("metadata") or {})
