@@ -87,7 +87,7 @@ from verl_omni.trainer.diffusion.v1.tq_utils import (
     put_dataproto_fields_to_tq,
     sort_diffusion_tq_keys,
 )
-from verl_omni.utils.tracking import batch_items
+from verl_omni.utils.tracking import batch_items, resolve_is_video
 from verl_omni.workers.engine_workers import ActorRolloutRefWorker, resolve_teacher_infer_micro_batch_size
 from verl_omni.workers.utils.padding import embeds_padding_2_no_padding
 
@@ -1423,6 +1423,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         media_kind=None,
     ):
         """Submit a best-effort image/video dump to the background executor."""
+        resolve_is_video(outputs.ndim, media_kind)
         global_step = self.global_steps
         future = self._dump_executor.submit(
             self._write_generations,

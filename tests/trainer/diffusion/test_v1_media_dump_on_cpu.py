@@ -19,6 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from omegaconf import OmegaConf
 
@@ -99,6 +100,74 @@ def test_v1_background_dump_failure_is_logged_and_does_not_raise(caplog, tmp_pat
         trainer._shutdown_dump_executor()
 
     assert "Ignoring background media dump failure at step 3" in caplog.text
+
+
+@pytest.mark.parametrize("trainer_cls", [ray_diffusion_trainer.BaseRayDiffusionTrainer, _ConcreteTrainer])
+@pytest.mark.parametrize("failure", ["media", "table"])
+def test_validation_logger_failures_are_best_effort(monkeypatch, tmp_path, caplog, trainer_cls, failure):
+    import wandb
+
+    import verl_omni.utils.tracking as tracking
+
+    caplog.set_level(logging.WARNING, logger=ray_diffusion_trainer.sys_logger.name)
+    trainer = SimpleNamespace(global_steps=7)
+    trainer.config = OmegaConf.create({"trainer": {"logger": ["wandb"], "log_val_generations": 1}})
+    video_dir = tmp_path / "temporary-video"
+    video_dir.mkdir()
+    table_calls = []
+
+    def fail(*args, **kwargs):
+        raise OSError("simulated logger failure")
+
+    monkeypatch.setattr(
+        ray_diffusion_trainer,
+        "wrap_val_samples_for_wandb",
+        lambda *args, **kwargs: ([("prompt", "video", 1.0)], str(video_dir), {"val/videos/1": "video"}),
+    )
+    monkeypatch.setattr(wandb, "run", object())
+    monkeypatch.setattr(wandb, "log", fail if failure == "media" else lambda *args, **kwargs: None)
+    monkeypatch.setattr(ray_diffusion_trainer, "log_wandb_media", tracking.log_wandb_media)
+    trainer.validation_generations_logger = SimpleNamespace(
+        log=fail if failure == "table" else lambda *args: table_calls.append(args)
+    )
+
+    trainer_cls._maybe_log_val_generations(
+        trainer, ["prompt"], torch.zeros(1, 4, 3, 8, 8, dtype=torch.uint8), [1.0], media_kinds=["video"]
+    )
+    assert "step 7" in caplog.text and "simulated logger failure" in caplog.text
+    assert not video_dir.exists()
+    if failure == "media":
+        assert len(table_calls) == 1
+
+
+@pytest.mark.parametrize("trainer_cls", [ray_diffusion_trainer.BaseRayDiffusionTrainer, _ConcreteTrainer])
+def test_invalid_modality_is_not_hidden_by_logging(trainer_cls):
+    trainer = SimpleNamespace(
+        global_steps=1,
+        config=OmegaConf.create({"trainer": {"logger": ["wandb"], "log_val_generations": 1}}),
+    )
+    with pytest.raises(ValueError, match="Unsupported media kind"):
+        trainer_cls._maybe_log_val_generations(
+            trainer, ["prompt"], torch.zeros(1, 3, 8, 8, dtype=torch.uint8), [1.0], media_kinds=["depth"]
+        )
+
+
+def test_v1_invalid_modality_fails_before_background_submission(tmp_path):
+    trainer = _trainer()
+    try:
+        with pytest.raises(ValueError, match="Unsupported media kind"):
+            trainer._dump_generations(
+                inputs=["prompt"],
+                outputs=torch.zeros(1, 3, 8, 8, dtype=torch.uint8),
+                gts=[None],
+                scores=[1.0],
+                reward_extra_infos_dict={},
+                dump_path=str(tmp_path),
+                media_kind="depth",
+            )
+        assert trainer._dump_futures == []
+    finally:
+        trainer._shutdown_dump_executor()
 
 
 def test_v1_rollout_dump_sorts_and_forwards_media_metadata(monkeypatch):

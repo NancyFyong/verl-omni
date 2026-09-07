@@ -389,17 +389,14 @@ class BaseRayDiffusionTrainer(ABC):
         ``outputs`` is a batch of images ``[N, C, H, W]`` (-> ``{i}.jpg``) or videos
         ``[N, T, C, H, W]`` (-> ``{i}.mp4`` at ``fps``). ``max_samples`` caps how many
         are written (``None`` = all). Optional generated audio is muxed into video files.
-        Failed video exports are preserved as ``{i}.pt`` fallback payloads and recorded
-        in the JSONL instead of terminating training.
+        Failed video exports are preserved as ``{i}.pt`` fallback payloads when possible.
+        Media failures are recorded in JSONL; filesystem failures warn and skip the dump.
         """
         if not isinstance(outputs, torch.Tensor) or outputs.dtype != torch.uint8:
             dtype = getattr(outputs, "dtype", type(outputs))
             raise ValueError(f"Expected generation outputs to be a uint8 tensor, got {dtype}.")
 
-        os.makedirs(dump_path, exist_ok=True)
-
         visual_folder = os.path.join(dump_path, f"{self.global_steps}")
-        os.makedirs(visual_folder, exist_ok=True)
 
         n_full = outputs.shape[0]
         n = n_full if max_samples is None else min(max_samples, n_full)
@@ -413,9 +410,16 @@ class BaseRayDiffusionTrainer(ABC):
         # Prefer the adapter-declared media kind over the tensor rank.
         is_video = resolve_is_video(outputs.ndim, media_kind)
 
+        try:
+            os.makedirs(visual_folder, exist_ok=True)
+        except OSError as error:
+            sys_logger.warning("Skipping media dump at step %s: %s", self.global_steps, error)
+            return
+
         output_paths = []
         output_fallback_paths = [None] * n
         video_export_errors = [None] * n
+        image_export_errors = [None] * n
         if is_video:
             audios = batch_items(audios, n_full, "audio")
             audio_sample_rates = batch_items(audio_sample_rates, n_full, "audio_sample_rate")
@@ -463,8 +467,16 @@ class BaseRayDiffusionTrainer(ABC):
             images_pil = outputs[:n].cpu().permute(0, 2, 3, 1).numpy()
             for i, image in enumerate(images_pil):
                 image_path = os.path.join(visual_folder, f"{i}.jpg")
-                Image.fromarray(image).save(image_path)
-                output_paths.append(image_path)
+                try:
+                    Image.fromarray(image).save(image_path)
+                except (OSError, ValueError) as error:
+                    image_export_errors[i] = f"{type(error).__name__}: {error}"
+                    sys_logger.warning(
+                        "Failed to export rollout image at step %s sample %s: %s", self.global_steps, i, error
+                    )
+                    output_paths.append(None)
+                else:
+                    output_paths.append(image_path)
 
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
 
@@ -483,13 +495,20 @@ class BaseRayDiffusionTrainer(ABC):
             base_data["output_fallback"] = output_fallback_paths
             base_data["video_export_error"] = video_export_errors
 
-        lines = []
-        for i in range(n):
-            entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False, default=_json_encode_default))
+        if any(image_export_errors):
+            base_data["image_export_error"] = image_export_errors
 
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
+        try:
+            lines = []
+            for i in range(n):
+                entry = {k: v[i] for k, v in base_data.items()}
+                lines.append(json.dumps(entry, ensure_ascii=False, default=_json_encode_default))
+
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except (OSError, TypeError, ValueError) as error:
+            sys_logger.warning("Skipping media index at step %s (%s): %s", self.global_steps, filename, error)
+            return
 
         print(f"Dumped generations to {filename}")
 
@@ -621,8 +640,14 @@ class BaseRayDiffusionTrainer(ABC):
 
         # Log to each configured logger
         try:
-            log_wandb_media(wandb_media, self.global_steps)
-            self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+            try:
+                log_wandb_media(wandb_media, self.global_steps)
+            except Exception as error:
+                sys_logger.warning("Skipping validation media log at step %s: %s", self.global_steps, error)
+            try:
+                self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+            except Exception as error:
+                sys_logger.warning("Skipping validation table log at step %s: %s", self.global_steps, error)
         finally:
             if video_tmp_dir is not None:
                 shutil.rmtree(video_tmp_dir, ignore_errors=True)

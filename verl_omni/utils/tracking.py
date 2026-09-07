@@ -90,6 +90,8 @@ def resolve_is_video(ndim: int, media_kind: str | None) -> bool:
     an image batch.
     """
     if media_kind is not None:
+        if media_kind not in ("image", "video", "audio"):
+            raise ValueError(f"Unsupported media kind: {media_kind!r}")
         return media_kind == "video"
     return ndim == 5
 
@@ -203,7 +205,7 @@ def wrap_val_samples_for_wandb(samples, fps=24, output_dir=None, media_kinds=Non
         audio = sample[3] if len(sample) > 3 else None
         audio_sample_rate = sample[4] if len(sample) > 4 else None
         output_ndim = getattr(out, "ndim", -1)
-        is_video = media_kind == "video" if media_kind is not None else output_ndim in (4, 5)
+        is_video = resolve_is_video(output_ndim, media_kind) if media_kind is not None else output_ndim in (4, 5)
         if is_video and output_ndim == 5:
             # Batched video [B, T, C, H, W], [B, C, T, H, W], or [B, T, H, W, C].
             out = out[0]
