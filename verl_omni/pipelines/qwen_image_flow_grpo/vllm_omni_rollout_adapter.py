@@ -49,8 +49,7 @@ from verl_omni.pipelines.request_batch import (
 from verl_omni.pipelines.request_batch import (
     split_diffusion_output_by_request as _split_diffusion_output_by_request,
 )
-from verl_omni.pipelines.rollout_artifacts import ArtifactSpec
-from verl_omni.pipelines.rollout_media import DiffusionIOSpec
+from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 from verl_omni.pipelines.rollout_request import prompt_ids_from_payload
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 
@@ -86,8 +85,8 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
 
     diffusion_io_spec = DiffusionIOSpec(
         artifacts={
-            "image_preview": ArtifactSpec("image", "decoded", "CHW"),
-            "image_latent": ArtifactSpec("image", "latent", "LC"),
+            "image_preview": MediaSpec("image", "decoded", "CHW"),
+            "image_latent": MediaSpec("image", "latent", "LC"),
         }
     )
 

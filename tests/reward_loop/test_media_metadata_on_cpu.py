@@ -83,16 +83,17 @@ async def test_generated_media_reaches_scorer(monkeypatch, manager_cls, transpor
 @pytest.mark.asyncio
 @pytest.mark.parametrize("manager_cls", [VisualRewardManager, multi.MultiVisualRewardManager])
 async def test_latent_primary_and_decoded_artifacts_reach_real_reward_managers(monkeypatch, manager_cls):
-    from verl_omni.pipelines.rollout_artifacts import ArtifactSpec, MediaArtifact, artifact_fields
+    from verl_omni.pipelines.rollout_artifacts import MediaArtifact, artifact_fields
+    from verl_omni.pipelines.rollout_media import MediaSpec
     from verl_omni.utils.reward_score.clap import _get_audio
 
     latent = torch.zeros(16, 2, 2, 2, dtype=torch.float16)
     artifacts = {
-        "video_latent": MediaArtifact(ArtifactSpec("video", "latent", "CTHW"), latent),
+        "video_latent": MediaArtifact(MediaSpec("video", "latent", "CTHW"), latent),
         "video_preview": MediaArtifact(
-            ArtifactSpec("video", "decoded", "TCHW", fps=24), torch.zeros(3, 3, 2, 2, dtype=torch.uint8)
+            MediaSpec("video", "decoded", "TCHW", fps=24), torch.zeros(3, 3, 2, 2, dtype=torch.uint8)
         ),
-        "audio": MediaArtifact(ArtifactSpec("audio", "decoded", "CT", sample_rate=32000), torch.ones(2, 16)),
+        "audio": MediaArtifact(MediaSpec("audio", "decoded", "CT", sample_rate=32000), torch.ones(2, 16)),
     }
     fields = artifact_fields(artifacts, "video_latent", "video_preview")
     data = DataProto.from_dict(
@@ -126,17 +127,13 @@ async def test_latent_primary_and_decoded_artifacts_reach_real_reward_managers(m
 async def test_decoded_audio_primary_is_self_describing_not_inferred_from_pixel_config(
     monkeypatch, manager_cls, mismatch
 ):
-    from verl_omni.pipelines.rollout_artifacts import (
-        ArtifactContractError,
-        ArtifactSpec,
-        MediaArtifact,
-        artifact_fields,
-    )
+    from verl_omni.pipelines.rollout_artifacts import ArtifactContractError, MediaArtifact, artifact_fields
+    from verl_omni.pipelines.rollout_media import MediaSpec
     from verl_omni.utils.reward_score.clap import _get_audio
 
     audio = torch.ones(2, 16)
     fields = artifact_fields(
-        {"audio": MediaArtifact(ArtifactSpec("audio", "decoded", "CT", sample_rate=32000), audio)}, "audio"
+        {"audio": MediaArtifact(MediaSpec("audio", "decoded", "CT", sample_rate=32000), audio)}, "audio"
     )
     data = DataProto.from_dict(
         tensors={

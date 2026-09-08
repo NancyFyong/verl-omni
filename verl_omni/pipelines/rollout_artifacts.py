@@ -23,11 +23,11 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
-from typing import Any, Literal
+from typing import Any
 
 import torch
 
-from verl_omni.pipelines.rollout_media import Modality
+from verl_omni.pipelines.rollout_media import MediaSpec
 
 ARTIFACT_PREFIX = "media_artifact__"
 ARTIFACT_SPECS = "media_artifact_specs"
@@ -41,21 +41,10 @@ class ArtifactContractError(ValueError):
 
 
 @dataclass(frozen=True)
-class ArtifactSpec:
-    """One runtime artifact declaration; dtype belongs to the tensor, not config."""
-
-    modality: Modality
-    representation: Literal["decoded", "latent"]
-    layout: str
-    sample_rate: int | None = None
-    fps: float | None = None
-
-
-@dataclass(frozen=True)
 class MediaArtifact:
     """A named stream's declaration and one sample's tensor (no batch axis)."""
 
-    spec: ArtifactSpec
+    spec: MediaSpec
     data: torch.Tensor
     context: str = ""
 
@@ -135,7 +124,7 @@ def requested_artifact_names(requested: Any, *, context: str) -> list[str]:
 
 def validate_artifacts(
     items: Iterable[tuple[str, MediaArtifact]],
-    specs: Mapping[str, ArtifactSpec],
+    specs: Mapping[str, MediaSpec],
     *,
     primary: str,
     context: str,
@@ -200,7 +189,7 @@ def artifacts_from_fields(fields: Mapping[str, Any], *, context: str) -> dict[st
     if not isinstance(raw_specs, Mapping):
         raise TypeError(f"{context}: artifact declarations must be a mapping")
     try:
-        specs = {name: ArtifactSpec(**spec) for name, spec in raw_specs.items()}
+        specs = {name: MediaSpec(**spec) for name, spec in raw_specs.items()}
     except (TypeError, ValueError) as error:
         raise ValueError(f"{context}: invalid artifact declarations: {error}") from error
     unknown = tensors.keys() - specs.keys()
@@ -223,7 +212,7 @@ def validate_visual_batch(outputs: torch.Tensor, media_kind: str, *, fps: float,
         raise ArtifactContractError(
             f"{context}: expected canonical batched {media_kind}, got shape={tuple(outputs.shape)}"
         )
-    spec = ArtifactSpec(media_kind, "decoded", layout, fps=fps if media_kind == "video" else None)
+    spec = MediaSpec(media_kind, "decoded", layout, fps=fps if media_kind == "video" else None)
     for index, output in enumerate(outputs):
         MediaArtifact(spec, output).validate(context=context, name=f"preview_{index}")
 
@@ -233,9 +222,7 @@ def validate_audio(audio: Any, sample_rate: Any, *, context: str) -> None:
     if audio is not None:
         if isinstance(sample_rate, torch.Tensor):
             sample_rate = sample_rate.item()
-        artifact = MediaArtifact(
-            ArtifactSpec("audio", "decoded", "CT", sample_rate=sample_rate), torch.as_tensor(audio)
-        )
+        artifact = MediaArtifact(MediaSpec("audio", "decoded", "CT", sample_rate=sample_rate), torch.as_tensor(audio))
         artifact.validate(context=context, name="audio")
 
 

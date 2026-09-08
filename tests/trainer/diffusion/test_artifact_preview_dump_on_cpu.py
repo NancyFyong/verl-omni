@@ -22,7 +22,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from verl_omni.pipelines.rollout_artifacts import ArtifactSpec, MediaArtifact
+from verl_omni.pipelines.rollout_artifacts import MediaArtifact
+from verl_omni.pipelines.rollout_media import MediaSpec
 from verl_omni.trainer.diffusion import ray_diffusion_trainer as v0
 from verl_omni.trainer.diffusion.v1.trainer_base import PolicyGradientDiffusionTrainerV1 as V1
 from verl_omni.utils import tracking
@@ -30,9 +31,7 @@ from verl_omni.utils import tracking
 
 @pytest.mark.parametrize("version", [0, 1])
 def test_latent_primary_dumps_declared_preview_without_axis_guessing(monkeypatch, tmp_path, version):
-    preview = MediaArtifact(
-        ArtifactSpec("video", "decoded", "TCHW", fps=12), torch.zeros(3, 4, 2, 5, dtype=torch.uint8)
-    )
+    preview = MediaArtifact(MediaSpec("video", "decoded", "TCHW", fps=12), torch.zeros(3, 4, 2, 5, dtype=torch.uint8))
     latents = torch.randn(2, 16, 2, 2, 2, dtype=torch.bfloat16)
     before = latents.clone()
     captured = []
@@ -75,7 +74,7 @@ def test_latent_primary_dumps_declared_preview_without_axis_guessing(monkeypatch
 
 def test_invalid_preview_fails_before_background_submission(tmp_path):
     context = SimpleNamespace(_dump_executor=Mock())
-    latent = MediaArtifact(ArtifactSpec("video", "latent", "CTHW"), torch.zeros(16, 2, 2, 2))
+    latent = MediaArtifact(MediaSpec("video", "latent", "CTHW"), torch.zeros(16, 2, 2, 2))
     with pytest.raises(ValueError, match="decoded visual"):
         V1._dump_generations(
             context, ["one"], torch.zeros(1, 16, 2, 2, 2), [None], [0], {}, str(tmp_path), previews=[latent]
@@ -85,9 +84,7 @@ def test_invalid_preview_fails_before_background_submission(tmp_path):
 
 @pytest.mark.parametrize("export_fails", [False, True])
 def test_wandb_uses_named_preview_and_retains_best_effort_io(monkeypatch, tmp_path, export_fails):
-    preview = MediaArtifact(
-        ArtifactSpec("video", "decoded", "TCHW", fps=12), torch.zeros(3, 3, 2, 5, dtype=torch.uint8)
-    )
+    preview = MediaArtifact(MediaSpec("video", "decoded", "TCHW", fps=12), torch.zeros(3, 3, 2, 5, dtype=torch.uint8))
     monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(Video=lambda path, **kwargs: path))
 
     def export(output, path, **kwargs):
@@ -107,7 +104,7 @@ def test_wandb_uses_named_preview_and_retains_best_effort_io(monkeypatch, tmp_pa
 
 def test_artifact_export_preserves_fractional_fps(monkeypatch, tmp_path):
     preview = MediaArtifact(
-        ArtifactSpec("video", "decoded", "TCHW", fps=29.97), torch.zeros(3, 3, 2, 4, dtype=torch.uint8)
+        MediaSpec("video", "decoded", "TCHW", fps=29.97), torch.zeros(3, 3, 2, 4, dtype=torch.uint8)
     )
     commands = []
     monkeypatch.setattr(tracking.subprocess, "run", lambda command, **kwargs: commands.append(command))
@@ -119,7 +116,7 @@ def test_artifact_export_preserves_fractional_fps(monkeypatch, tmp_path):
 def test_tracking_explicit_layout_bypasses_legacy_normalizer(monkeypatch):
     monkeypatch.setattr(tracking, "normalize_video_tensor", lambda data: pytest.fail("inferred artifact layout"))
     canonical = torch.arange(3 * 3 * 2 * 5, dtype=torch.uint8).reshape(3, 3, 2, 5)
-    preview = MediaArtifact(ArtifactSpec("video", "decoded", "TCHW", fps=24), canonical)
+    preview = MediaArtifact(MediaSpec("video", "decoded", "TCHW", fps=24), canonical)
     frames, width, height = tracking._video_tensor_to_rgb24(preview)
     assert frames.shape == (3, 2, 5, 3) and (width, height) == (5, 2)
     torch.testing.assert_close(torch.from_numpy(frames).permute(0, 3, 1, 2), canonical)
@@ -172,7 +169,7 @@ def test_v1_dump_queue_is_bounded_and_does_not_retain_full_batch_storage(tmp_pat
     context._drain_dump_futures = lambda: V1._drain_dump_futures(context)
     context._report_dump_failure = V1._report_dump_failure
     pixels = torch.zeros(4, 3, 8, 8, dtype=torch.uint8)
-    previews = [MediaArtifact(ArtifactSpec("image", "decoded", "CHW"), row) for row in pixels]
+    previews = [MediaArtifact(MediaSpec("image", "decoded", "CHW"), row) for row in pixels]
     args = dict(
         inputs=[str(i) for i in range(4)],
         outputs=torch.zeros(4, 16, 2, 2),

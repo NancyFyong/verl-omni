@@ -18,6 +18,8 @@ the produced modality from the adapter-declared ``DiffusionIOSpec`` instead of
 inferring it from tensor rank, so a missing declaration is a bug.
 """
 
+from dataclasses import asdict
+
 import pytest
 
 pytest.importorskip("verl_omni.pipelines.model_base")
@@ -73,6 +75,22 @@ _JOINT_AUDIO_SAMPLE_RATE = [
     ),
     ("verl_omni.pipelines.ltx2_flow_grpo.vllm_omni_rollout_adapter", "LTX2Pipeline", "flow_grpo", 24000),
 ]
+
+
+def test_media_spec_keeps_public_import_and_serialized_fields():
+    from verl_omni.pipelines.rollout_media import MediaSpec
+
+    fields = {
+        "modality": "video",
+        "representation": "decoded",
+        "layout": "TCHW",
+        "sample_rate": None,
+        "fps": 29.97,
+    }
+    spec = MediaSpec(**fields)
+    assert asdict(spec) == fields
+    assert MediaSpec(**asdict(spec)) == spec
+    assert DiffusionIOSpec(artifacts={"video_preview": spec}).artifacts["video_preview"] is spec
 
 
 @pytest.mark.parametrize("artifacts", [{}, (), {"image_preview": object()}])

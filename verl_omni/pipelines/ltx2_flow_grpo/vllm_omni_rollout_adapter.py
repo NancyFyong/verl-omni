@@ -53,8 +53,7 @@ from verl_omni.pipelines.diffusion_rollout_output import (
     wrap_rollout_postprocessor,
 )
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
-from verl_omni.pipelines.rollout_artifacts import ArtifactSpec
-from verl_omni.pipelines.rollout_media import DiffusionIOSpec
+from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 from verl_omni.pipelines.rollout_request import prompt_ids_from_payload
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 
@@ -82,10 +81,10 @@ class LTX23PipelineWithLogProb(LTX2Pipeline):
 
     diffusion_io_spec = DiffusionIOSpec(
         artifacts={
-            "video_preview": ArtifactSpec("video", "decoded", "TCHW"),
-            "audio": ArtifactSpec("audio", "decoded", "CT"),
-            "video_latent": ArtifactSpec("video", "latent", "CTHW"),
-            "audio_latent": ArtifactSpec("audio", "latent", "CTF"),
+            "video_preview": MediaSpec("video", "decoded", "TCHW"),
+            "audio": MediaSpec("audio", "decoded", "CT"),
+            "video_latent": MediaSpec("video", "latent", "CTHW"),
+            "audio_latent": MediaSpec("audio", "latent", "CTF"),
         }
     )
 
@@ -499,15 +498,15 @@ class LTX23PipelineWithLogProb(LTX2Pipeline):
         self._current_timestep = None
         context = f"pipeline={type(self).__name__}, request_id={request.request_id}"
         specs = {
-            "video_latent": ArtifactSpec("video", "latent", "CTHW"),
-            "audio_latent": ArtifactSpec("audio", "latent", "CTF"),
+            "video_latent": MediaSpec("video", "latent", "CTHW"),
+            "audio_latent": MediaSpec("audio", "latent", "CTF"),
         }
         data = {"video_latent": video_latent, "audio_latent": audio_latent}
         if self._artifact_decode:
             specs.update(
                 {
-                    "video_preview": ArtifactSpec("video", "decoded", "TCHW", fps=request.sampling_params.frame_rate),
-                    "audio": ArtifactSpec("audio", "decoded", "CT", sample_rate=audio_sample_rate),
+                    "video_preview": MediaSpec("video", "decoded", "TCHW", fps=request.sampling_params.frame_rate),
+                    "audio": MediaSpec("audio", "decoded", "CT", sample_rate=audio_sample_rate),
                 }
             )
             data.update({"video_preview": quantize_pixels(video, "zero_one", context=context), "audio": audio})

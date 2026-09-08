@@ -33,8 +33,7 @@ from verl_omni.pipelines.diffusion_rollout_output import (
 )
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.qwen_image_flow_grpo.common import apply_true_cfg, build_img_shapes
-from verl_omni.pipelines.rollout_artifacts import ArtifactSpec
-from verl_omni.pipelines.rollout_media import DiffusionIOSpec
+from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 from verl_omni.pipelines.rollout_request import prompt_ids_from_payload
 
 __all__ = ["QwenImageDPOPipeline"]
@@ -52,8 +51,8 @@ class QwenImageDPOPipeline(QwenImagePipeline):
     #: the modality from the adapter instead of inferring it from tensor rank.
     diffusion_io_spec = DiffusionIOSpec(
         artifacts={
-            "image_preview": ArtifactSpec("image", "decoded", "CHW"),
-            "image_latent": ArtifactSpec("image", "latent", "LC"),
+            "image_preview": MediaSpec("image", "decoded", "CHW"),
+            "image_latent": MediaSpec("image", "latent", "LC"),
         }
     )
 

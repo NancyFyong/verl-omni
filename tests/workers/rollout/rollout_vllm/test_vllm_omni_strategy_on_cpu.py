@@ -23,8 +23,7 @@ import yaml
 
 from verl_omni.pipelines.model_base import OmniRolloutPipelineBase
 from verl_omni.pipelines.qwen3_omni.omni_rollout_adapter import Qwen3OmniRolloutAdapter
-from verl_omni.pipelines.rollout_artifacts import ArtifactSpec
-from verl_omni.pipelines.rollout_media import DiffusionIOSpec
+from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 from verl_omni.pipelines.rollout_request import OmniRolloutRequest
 from verl_omni.workers.rollout.vllm_rollout import vllm_omni_ar_strategy as ar_strategy_module
 from verl_omni.workers.rollout.vllm_rollout import vllm_omni_async_server as server_module
@@ -803,8 +802,8 @@ async def test_diffusion_strategy_rejects_nonzero_priority():
 def _joint_spec(sample_rate=48000):
     return DiffusionIOSpec(
         artifacts={
-            "video_preview": ArtifactSpec("video", "decoded", "TCHW", fps=24),
-            "audio": ArtifactSpec("audio", "decoded", "CT", sample_rate=sample_rate),
+            "video_preview": MediaSpec("video", "decoded", "TCHW", fps=24),
+            "audio": MediaSpec("audio", "decoded", "CT", sample_rate=sample_rate),
         }
     )
 
@@ -909,7 +908,7 @@ def test_diffusion_strategy_rejects_undeclared_named_audio(monkeypatch):
         "_diffusion_io_spec",
         lambda: DiffusionIOSpec(
             artifacts={
-                "video_preview": ArtifactSpec("video", "decoded", "TCHW"),
+                "video_preview": MediaSpec("video", "decoded", "TCHW"),
             }
         ),
     )

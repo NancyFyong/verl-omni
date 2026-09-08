@@ -14,7 +14,7 @@
 """The pinned H3 decoder and packed-token layouts, shared by NFT and FlowGRPO."""
 
 from verl_omni.pipelines.diffusion_rollout_output import with_batched_media_artifacts
-from verl_omni.pipelines.rollout_artifacts import ArtifactSpec
+from verl_omni.pipelines.rollout_media import MediaSpec
 
 
 def with_h3_artifacts(base, *, video, audio, video_latent, audio_latent, sampling, context):
@@ -22,15 +22,15 @@ def with_h3_artifacts(base, *, video, audio, video_latent, audio_latent, samplin
     extra = sampling.extra_args or {}
     output_type = extra.get("output_type", sampling.output_type)
     specs = {
-        "video_preview": ArtifactSpec(
+        "video_preview": MediaSpec(
             "video",
             "decoded",
             "THWC",
             fps=24 if sampling.frame_rate is None else sampling.frame_rate,
         ),
-        "audio": ArtifactSpec("audio", "decoded", "CT", sample_rate=32000),
-        "video_latent": ArtifactSpec("video", "latent", "CTHW"),
-        "audio_latent": ArtifactSpec("audio", "latent", "CLT"),
+        "audio": MediaSpec("audio", "decoded", "CT", sample_rate=32000),
+        "video_latent": MediaSpec("video", "latent", "CTHW"),
+        "audio_latent": MediaSpec("audio", "latent", "CLT"),
     }
     return with_batched_media_artifacts(
         base,

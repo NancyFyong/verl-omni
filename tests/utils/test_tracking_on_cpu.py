@@ -41,12 +41,13 @@ def _warm_clip(t=8, h=32, w=32):
 
 
 def test_adapter_declared_video_is_exported_without_axis_guessing():
-    from verl_omni.pipelines.rollout_artifacts import ArtifactSpec, MediaArtifact
+    from verl_omni.pipelines.rollout_artifacts import MediaArtifact
+    from verl_omni.pipelines.rollout_media import MediaSpec
 
     video = _warm_clip(t=5, h=8, w=12).permute(1, 0, 2, 3)
     with pytest.raises(ValueError, match="T, 3, H, W"):
         _video_tensor_to_rgb24(video)
-    preview = MediaArtifact(ArtifactSpec("video", "decoded", "CTHW", fps=24), video).normalized(
+    preview = MediaArtifact(MediaSpec("video", "decoded", "CTHW", fps=24), video).normalized(
         context="adapter", name="video_preview"
     )
     frames, width, height = _video_tensor_to_rgb24(preview)

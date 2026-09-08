@@ -20,7 +20,8 @@ import torch
 
 from verl_omni.agent_loop.diffusion_agent_loop import DiffusionAgentLoopWorker
 from verl_omni.agent_loop.diffusion_agent_loop_tq import DiffusionAgentLoopWorkerTQ
-from verl_omni.pipelines.rollout_artifacts import ArtifactSpec, MediaArtifact, artifact_fields, previews_from_batch
+from verl_omni.pipelines.rollout_artifacts import MediaArtifact, artifact_fields, previews_from_batch
+from verl_omni.pipelines.rollout_media import MediaSpec
 from verl_omni.reward_loop.reward_manager.visual import _reward_extra_info
 from verl_omni.trainer.diffusion.v1 import tq_utils
 from verl_omni.utils.reward_score.clap import _get_audio
@@ -30,12 +31,12 @@ from verl_omni.utils.reward_score.imagebind import _to_tchw
 def _internal():
     artifacts = {
         "video_preview": MediaArtifact(
-            ArtifactSpec("video", "decoded", "TCHW", fps=12), torch.zeros(3, 3, 2, 2, dtype=torch.uint8)
+            MediaSpec("video", "decoded", "TCHW", fps=12), torch.zeros(3, 3, 2, 2, dtype=torch.uint8)
         ),
         "video_latent": MediaArtifact(
-            ArtifactSpec("video", "latent", "CTHW"), torch.ones(16, 2, 2, 2, dtype=torch.float16)
+            MediaSpec("video", "latent", "CTHW"), torch.ones(16, 2, 2, 2, dtype=torch.float16)
         ),
-        "audio": MediaArtifact(ArtifactSpec("audio", "decoded", "CT", sample_rate=24000), torch.ones(2, 16)),
+        "audio": MediaArtifact(MediaSpec("audio", "decoded", "CT", sample_rate=24000), torch.ones(2, 16)),
     }
     fields = artifact_fields(artifacts, "video_latent", "video_preview")
     padded = {key: value.unsqueeze(0) if isinstance(value, torch.Tensor) else value for key, value in fields.items()}
@@ -87,4 +88,4 @@ def test_named_scorers_reject_missing_stream_instead_of_legacy_fallback():
     with pytest.raises(ValueError, match="absent"):
         _get_audio({"media_artifacts": {}, "audio": torch.ones(16), "audio_sample_rate": 32000})
     with pytest.raises(ValueError, match="decoded video"):
-        _to_tchw(MediaArtifact(ArtifactSpec("video", "latent", "CTHW"), torch.zeros(16, 3, 2, 2)))
+        _to_tchw(MediaArtifact(MediaSpec("video", "latent", "CTHW"), torch.zeros(16, 3, 2, 2)))

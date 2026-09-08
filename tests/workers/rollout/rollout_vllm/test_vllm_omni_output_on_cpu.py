@@ -19,7 +19,8 @@ import pytest
 import torch
 
 from verl_omni.pipelines.diffusion_rollout_output import quantize_pixels
-from verl_omni.pipelines.rollout_artifacts import ArtifactSpec, MediaArtifact
+from verl_omni.pipelines.rollout_artifacts import MediaArtifact
+from verl_omni.pipelines.rollout_media import MediaSpec
 from verl_omni.pipelines.rollout_request import OmniRolloutRequest
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_async_server import vLLMOmniHttpServer
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy
@@ -54,7 +55,7 @@ def _request_output(artifacts, primary="image_preview", audio=None):
 def _pixels_output(pixels):
     encoded = quantize_pixels(pixels, "zero_one", context="adapter")
     return _request_output(
-        {"image_preview": MediaArtifact(ArtifactSpec("image", "decoded", "CHW"), encoded.reshape(1, 1, -1))}
+        {"image_preview": MediaArtifact(MediaSpec("image", "decoded", "CHW"), encoded.reshape(1, 1, -1))}
     )
 
 
@@ -103,8 +104,8 @@ def test_pixel_quantization_preserves_float_audio(diffusion_strategy):
     output = diffusion_strategy.process_output(
         _request_output(
             {
-                "image_preview": MediaArtifact(ArtifactSpec("image", "decoded", "CHW"), pixels.reshape(3, 1, 1)),
-                "audio": MediaArtifact(ArtifactSpec("audio", "decoded", "CT", sample_rate=48000), audio),
+                "image_preview": MediaArtifact(MediaSpec("image", "decoded", "CHW"), pixels.reshape(3, 1, 1)),
+                "audio": MediaArtifact(MediaSpec("audio", "decoded", "CT", sample_rate=48000), audio),
             },
             audio="audio",
         ),
@@ -121,7 +122,7 @@ def test_latent_output_preserves_native_dtype_and_axes(diffusion_strategy, dtype
     output = diffusion_strategy.process_output(
         _request_output(
             {
-                "image_latent": MediaArtifact(ArtifactSpec("image", "latent", "LC"), latents),
+                "image_latent": MediaArtifact(MediaSpec("image", "latent", "LC"), latents),
             },
             primary="image_latent",
         ),

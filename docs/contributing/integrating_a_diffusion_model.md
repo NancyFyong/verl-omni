@@ -1,6 +1,6 @@
 # How to Integrate a New Diffusion Model for FlowGRPO Training
 
-Last updated: 09/07/2026.
+Last updated: 09/08/2026.
 
 This guide walks you through everything required to integrate a new diffusion
 model into VeRL-Omni so it can be trained end-to-end with the **FlowGRPO**
@@ -457,18 +457,19 @@ outputs, batching, transport and fail-fast validation.
 
 Set `diffusion_io_spec` to the named outputs your adapter can produce. The
 strategy resolves it by `(architecture, algorithm)` and checks returned names,
-modality, representation and layout against it. The positional `primary` /
-`auxiliary` declaration and `MediaSpec` API have been replaced:
+modality, representation and layout against it. `DiffusionIOSpec` and `MediaSpec`
+retain their names and import location. The positional `primary` / `auxiliary`
+declaration is replaced by named artifacts, with `representation` and `layout`
+added to `MediaSpec`:
 
 ```python
-from verl_omni.pipelines.rollout_media import DiffusionIOSpec
-from verl_omni.pipelines.rollout_artifacts import ArtifactSpec
+from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 
 @VllmOmniPipelineBase.register("MyModelPipeline", algorithm="flow_grpo")
 class MyModelPipelineWithLogProb(MyModelPipeline):
     diffusion_io_spec = DiffusionIOSpec(artifacts={
-        "image_preview": ArtifactSpec("image", "decoded", "CHW"),
-        "image_latent": ArtifactSpec("image", "latent", "LC"),
+        "image_preview": MediaSpec("image", "decoded", "CHW"),
+        "image_latent": MediaSpec("image", "latent", "LC"),
     })
 ```
 

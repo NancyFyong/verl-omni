@@ -21,13 +21,13 @@ import torch
 
 from verl_omni.pipelines.diffusion_rollout_output import with_media_artifacts, wrap_rollout_postprocessor
 from verl_omni.pipelines.rollout_artifacts import (
-    ArtifactSpec,
     MediaArtifact,
     artifact_fields,
     artifacts_from_fields,
     select_artifact,
     validate_artifacts,
 )
+from verl_omni.pipelines.rollout_media import MediaSpec
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy
 
 
@@ -36,7 +36,7 @@ from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import 
 def test_decoded_video_axes_do_not_depend_on_channel_count(layout, frames, channels):
     canonical = torch.arange(frames * channels * 2 * 4, dtype=torch.uint8).reshape(frames, channels, 2, 4)
     raw = canonical.permute(*("TCHW".index(axis) for axis in layout))
-    result = MediaArtifact(ArtifactSpec("video", "decoded", layout, fps=24), raw).normalized(
+    result = MediaArtifact(MediaSpec("video", "decoded", layout, fps=24), raw).normalized(
         context="test", name="preview"
     )
     assert result.spec.layout == "TCHW"
@@ -47,7 +47,7 @@ def test_decoded_video_axes_do_not_depend_on_channel_count(layout, frames, chann
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_native_latents_keep_dtype_axes_and_storage(layout, shape, dtype):
     data = torch.randn(shape).to(dtype)
-    artifact = MediaArtifact(ArtifactSpec("video", "latent", layout), data)
+    artifact = MediaArtifact(MediaSpec("video", "latent", layout), data)
     assert artifact.normalized(context="native", name="latent") is artifact
     assert artifact.data.data_ptr() == data.data_ptr()
 
@@ -55,15 +55,15 @@ def test_native_latents_keep_dtype_axes_and_storage(layout, shape, dtype):
 @pytest.mark.parametrize(
     "spec,data,error",
     [
-        (ArtifactSpec("video", "decoded", "TCHW"), torch.zeros(3, 3, 2, 2), "uint8"),
-        (ArtifactSpec("video", "latent", "CTHW"), torch.zeros(3, 3, 2, 2, dtype=torch.uint8), "floating latent"),
-        (ArtifactSpec("audio", "decoded", "CT"), torch.zeros(2, 8), "sample_rate"),
-        (ArtifactSpec("audio", "decoded", "CT", sample_rate=0), torch.zeros(2, 8), "sample_rate"),
-        (ArtifactSpec("audio", "decoded", "CT", sample_rate=True), torch.zeros(2, 8), "sample_rate"),
-        (ArtifactSpec("video", "decoded", "CHW"), torch.zeros(3, 2, 2, dtype=torch.uint8), "layout"),
-        (ArtifactSpec("video", "latent", "CTHW"), torch.zeros(3, 2, 2), "shape"),
-        (ArtifactSpec("image", "decoded", "CHW", fps=24), torch.zeros(3, 2, 2, dtype=torch.uint8), "fps"),
-        (ArtifactSpec("depth", "decoded", "CHW"), torch.zeros(3, 2, 2, dtype=torch.uint8), "modality"),
+        (MediaSpec("video", "decoded", "TCHW"), torch.zeros(3, 3, 2, 2), "uint8"),
+        (MediaSpec("video", "latent", "CTHW"), torch.zeros(3, 3, 2, 2, dtype=torch.uint8), "floating latent"),
+        (MediaSpec("audio", "decoded", "CT"), torch.zeros(2, 8), "sample_rate"),
+        (MediaSpec("audio", "decoded", "CT", sample_rate=0), torch.zeros(2, 8), "sample_rate"),
+        (MediaSpec("audio", "decoded", "CT", sample_rate=True), torch.zeros(2, 8), "sample_rate"),
+        (MediaSpec("video", "decoded", "CHW"), torch.zeros(3, 2, 2, dtype=torch.uint8), "layout"),
+        (MediaSpec("video", "latent", "CTHW"), torch.zeros(3, 2, 2), "shape"),
+        (MediaSpec("image", "decoded", "CHW", fps=24), torch.zeros(3, 2, 2, dtype=torch.uint8), "fps"),
+        (MediaSpec("depth", "decoded", "CHW"), torch.zeros(3, 2, 2, dtype=torch.uint8), "modality"),
     ],
 )
 def test_invalid_artifact_fails_with_context(spec, data, error):
@@ -76,12 +76,12 @@ def test_invalid_artifact_fails_with_context(spec, data, error):
 def _artifacts():
     return {
         "video_preview": MediaArtifact(
-            ArtifactSpec("video", "decoded", "THWC", fps=12), torch.zeros(3, 4, 5, 3, dtype=torch.uint8)
+            MediaSpec("video", "decoded", "THWC", fps=12), torch.zeros(3, 4, 5, 3, dtype=torch.uint8)
         ),
         "video_latent": MediaArtifact(
-            ArtifactSpec("video", "latent", "CTHW"), torch.zeros(16, 2, 2, 2, dtype=torch.bfloat16)
+            MediaSpec("video", "latent", "CTHW"), torch.zeros(16, 2, 2, 2, dtype=torch.bfloat16)
         ),
-        "audio": MediaArtifact(ArtifactSpec("audio", "decoded", "CT", sample_rate=32000), torch.zeros(2, 160)),
+        "audio": MediaArtifact(MediaSpec("audio", "decoded", "CT", sample_rate=32000), torch.zeros(2, 160)),
     }
 
 
@@ -172,7 +172,7 @@ def test_named_empty_payload_is_not_misreported_as_abort():
                     "primary": "video_preview",
                     "preview": "video_preview",
                     "audio": None,
-                    "specs": {"video_preview": asdict(ArtifactSpec("video", "decoded", "TCHW", fps=24))},
+                    "specs": {"video_preview": asdict(MediaSpec("video", "decoded", "TCHW", fps=24))},
                 }
             }
         },

@@ -22,7 +22,8 @@ import pytest
 import torch
 from safetensors.torch import load as load_tensors
 
-from verl_omni.pipelines.rollout_artifacts import ArtifactSpec, MediaArtifact
+from verl_omni.pipelines.rollout_artifacts import MediaArtifact
+from verl_omni.pipelines.rollout_media import MediaSpec
 
 
 def _load_client_module():
@@ -42,7 +43,7 @@ def _reward_inputs():
         "ground_truth": "",
         "extra_info": {
             "media_artifacts": {
-                "image_latent": MediaArtifact(ArtifactSpec("image", "latent", "CHW"), torch.zeros(16, 2, 2))
+                "image_latent": MediaArtifact(MediaSpec("image", "latent", "CHW"), torch.zeros(16, 2, 2))
             },
             "prompt_embeds": torch.arange(32, dtype=torch.float32).reshape(4, 8),
             "pooled_prompt_embeds": torch.arange(8, dtype=torch.float32),
@@ -74,7 +75,7 @@ def test_serialize_request_prefers_named_latent_over_legacy_fields():
     explicit_latent = torch.ones(16, 2, 2)
     inputs["extra_info"]["latents_clean"] = torch.full_like(explicit_latent, 99)
     inputs["extra_info"]["media_artifacts"]["image_latent"] = MediaArtifact(
-        ArtifactSpec("image", "latent", "CHW"), explicit_latent
+        MediaSpec("image", "latent", "CHW"), explicit_latent
     )
 
     tensors = load_tensors(

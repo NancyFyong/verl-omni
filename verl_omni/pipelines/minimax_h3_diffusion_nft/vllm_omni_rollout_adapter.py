@@ -33,8 +33,7 @@ from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_s
 
 from verl_omni.pipelines.diffusion_rollout_output import with_rollout_data
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
-from verl_omni.pipelines.rollout_artifacts import ArtifactSpec
-from verl_omni.pipelines.rollout_media import DiffusionIOSpec
+from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 
 from .artifacts import with_h3_artifacts
 from .common import (
@@ -59,10 +58,10 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
     #: does not hard-code the audio tuple position or its 32 kHz sample rate.
     diffusion_io_spec = DiffusionIOSpec(
         artifacts={
-            "video_preview": ArtifactSpec("video", "decoded", "TCHW"),
-            "audio": ArtifactSpec("audio", "decoded", "CT", sample_rate=32000),
-            "video_latent": ArtifactSpec("video", "latent", "CTHW"),
-            "audio_latent": ArtifactSpec("audio", "latent", "CLT"),
+            "video_preview": MediaSpec("video", "decoded", "TCHW"),
+            "audio": MediaSpec("audio", "decoded", "CT", sample_rate=32000),
+            "video_latent": MediaSpec("video", "latent", "CTHW"),
+            "audio_latent": MediaSpec("audio", "latent", "CLT"),
         }
     )
 

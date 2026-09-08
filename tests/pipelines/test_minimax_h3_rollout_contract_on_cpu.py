@@ -20,7 +20,8 @@ import torch
 
 from verl_omni.pipelines.diffusion_rollout_output import rollout_output
 from verl_omni.pipelines.minimax_h3_diffusion_nft.artifacts import with_h3_artifacts
-from verl_omni.pipelines.rollout_artifacts import ArtifactSpec, MediaArtifact
+from verl_omni.pipelines.rollout_artifacts import MediaArtifact
+from verl_omni.pipelines.rollout_media import MediaSpec
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy
 
 
@@ -93,7 +94,7 @@ def test_rewards_reject_undeclared_channels_first_input():
     video = torch.zeros(3, 5, 8, 12, dtype=torch.uint8)
     with pytest.raises(ValueError, match="T, 3, H, W"):
         video_tensor_to_pil_frames(video)
-    artifact = MediaArtifact(ArtifactSpec("video", "decoded", "CTHW", fps=24), video)
+    artifact = MediaArtifact(MediaSpec("video", "decoded", "CTHW", fps=24), video)
     assert len(video_tensor_to_pil_frames(artifact.normalized(context="adapter", name="video_preview").data)) == 5
 
 
@@ -117,9 +118,9 @@ def test_dump_consumes_adapter_normalized_preview(layout, shape, monkeypatch, tm
     from verl_omni.trainer.diffusion import ray_diffusion_trainer as trainer
 
     previews = [
-        MediaArtifact(
-            ArtifactSpec("video", "decoded", layout, fps=24), torch.zeros(shape, dtype=torch.uint8)
-        ).normalized(context="adapter", name="video_preview")
+        MediaArtifact(MediaSpec("video", "decoded", layout, fps=24), torch.zeros(shape, dtype=torch.uint8)).normalized(
+            context="adapter", name="video_preview"
+        )
         for _ in range(2)
     ]
     seen = []

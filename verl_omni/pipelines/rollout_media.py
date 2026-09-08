@@ -17,12 +17,20 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
-
-if TYPE_CHECKING:
-    from verl_omni.pipelines.rollout_artifacts import ArtifactSpec
+from typing import Literal
 
 Modality = Literal["image", "video", "audio"]
+
+
+@dataclass(frozen=True)
+class MediaSpec:
+    """One media declaration; dtype belongs to the tensor, not config."""
+
+    modality: Modality
+    representation: Literal["decoded", "latent"]
+    layout: str
+    sample_rate: int | None = None
+    fps: float | None = None
 
 
 @dataclass(frozen=True)
@@ -34,14 +42,10 @@ class DiffusionIOSpec:
     fixed rate or leave it to a model's runtime decoder configuration.
     """
 
-    artifacts: Mapping[str, ArtifactSpec]
+    artifacts: Mapping[str, MediaSpec]
 
     def __post_init__(self) -> None:
-        from verl_omni.pipelines.rollout_artifacts import ArtifactSpec
-
         if not isinstance(self.artifacts, Mapping) or not self.artifacts:
             raise ValueError("DiffusionIOSpec requires named artifacts")
-        if any(
-            not isinstance(name, str) or not isinstance(spec, ArtifactSpec) for name, spec in self.artifacts.items()
-        ):
-            raise TypeError("DiffusionIOSpec requires artifact-name to ArtifactSpec declarations")
+        if any(not isinstance(name, str) or not isinstance(spec, MediaSpec) for name, spec in self.artifacts.items()):
+            raise TypeError("DiffusionIOSpec requires artifact-name to MediaSpec declarations")
