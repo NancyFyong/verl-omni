@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""MiniCPM-o 4.5 simplex thinker training and rollout adapters."""
 
-from . import model
-from .actor import OmniActorConfig, OmniLossConfig
-from .distillation import OmniDistillationTeacherModelConfig
-from .model import *  # noqa: F401
+from .agent_loop import MiniCPMAgentLoopManager, MiniCPMSimplexAgentLoop
+from .omni_rollout_adapter import MiniCPMRolloutAdapter
+from .thinker_training_adapter import MiniCPMThinkerAdapter
 
-__all__ = list(model.__all__) + ["OmniLossConfig", "OmniActorConfig", "OmniDistillationTeacherModelConfig"]
+__all__ = ["MiniCPMAgentLoopManager", "MiniCPMSimplexAgentLoop", "MiniCPMRolloutAdapter", "MiniCPMThinkerAdapter"]
