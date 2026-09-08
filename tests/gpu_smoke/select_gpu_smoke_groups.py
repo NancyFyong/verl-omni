@@ -78,7 +78,7 @@ GROUP_PATTERNS = {
         "tests/special_e2e/*dpo*",
         "tests/special_e2e/*flowgrpo*",
         "tests/special_e2e/build_minimax_h3_tiny_random.py",
-        "tests/special_e2e/create_dummy_h3_t2av_data.py",
+        "tests/special_e2e/create_dummy_h3_*.py",
         "tests/special_e2e/minimax_h3_dummy_reward.py",
         "tests/special_e2e/*qwen_image*",
         "tests/special_e2e/*bagel*",
