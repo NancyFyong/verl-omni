@@ -28,7 +28,8 @@ from typing import Any, Literal
 import torch
 from vllm_omni.diffusion.data import DiffusionOutput
 
-from verl_omni.pipelines.rollout_artifacts import ArtifactSpec, MediaArtifact, select_artifact, validate_artifacts
+from verl_omni.pipelines.rollout_artifacts import MediaArtifact, select_artifact, validate_artifacts
+from verl_omni.pipelines.rollout_media import MediaSpec
 
 _MEDIA_KEYS = frozenset(("image", "video", "output", "audio"))
 
@@ -88,7 +89,7 @@ def with_media_artifacts(
     base: DiffusionOutput,
     *,
     artifacts: list[tuple[str, MediaArtifact]],
-    specs: Mapping[str, ArtifactSpec],
+    specs: Mapping[str, MediaSpec],
     primary: str,
     context: str,
     audio: str | None = None,
@@ -136,7 +137,7 @@ def with_batched_media_artifacts(
     base: DiffusionOutput,
     *,
     data: Mapping[str, torch.Tensor],
-    specs: Mapping[str, ArtifactSpec],
+    specs: Mapping[str, MediaSpec],
     primary: str,
     context: str,
     preview: str | None = None,
@@ -215,10 +216,10 @@ def with_visual_artifacts(
     """
     latent_name, preview_name = f"{modality}_latent", f"{modality}_preview"
     data = {latent_name: latents}
-    specs = {latent_name: ArtifactSpec(modality, "latent", latent_layout)}
+    specs = {latent_name: MediaSpec(modality, "latent", latent_layout)}
     if decoded is not None:
         data[preview_name] = quantize_pixels(decoded, pixel_range, context=context)
-        specs[preview_name] = ArtifactSpec(modality, "decoded", decoded_layout, fps=fps)
+        specs[preview_name] = MediaSpec(modality, "decoded", decoded_layout, fps=fps)
     return with_batched_media_artifacts(
         base,
         data=data,

@@ -17,10 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
-
-if TYPE_CHECKING:
-    from verl_omni.pipelines.rollout_artifacts import ArtifactSpec
+from typing import Literal
 
 Modality = Literal["image", "video", "audio"]
 
@@ -61,6 +58,17 @@ def validate_visual_media_batch_rank(ndim: int, media_kind: str | None) -> None:
 
 
 @dataclass(frozen=True)
+class MediaSpec:
+    """One media declaration; dtype belongs to the tensor, not config."""
+
+    modality: Modality
+    representation: Literal["decoded", "latent"]
+    layout: str
+    sample_rate: int | None = None
+    fps: float | None = None
+
+
+@dataclass(frozen=True)
 class DiffusionIOSpec:
     """Available named artifacts, with canonical decoded and native latent axes.
 
@@ -69,14 +77,10 @@ class DiffusionIOSpec:
     adapter-owned artifact names, representations, and layouts.
     """
 
-    artifacts: Mapping[str, ArtifactSpec]
+    artifacts: Mapping[str, MediaSpec]
 
     def __post_init__(self) -> None:
-        from verl_omni.pipelines.rollout_artifacts import ArtifactSpec
-
         if not isinstance(self.artifacts, Mapping) or not self.artifacts:
             raise ValueError("DiffusionIOSpec requires named artifacts")
-        if any(
-            not isinstance(name, str) or not isinstance(spec, ArtifactSpec) for name, spec in self.artifacts.items()
-        ):
-            raise TypeError("DiffusionIOSpec requires artifact-name to ArtifactSpec declarations")
+        if any(not isinstance(name, str) or not isinstance(spec, MediaSpec) for name, spec in self.artifacts.items()):
+            raise TypeError("DiffusionIOSpec requires artifact-name to MediaSpec declarations")

@@ -21,7 +21,8 @@ from types import ModuleType
 import pytest
 import torch
 
-from verl_omni.pipelines.rollout_artifacts import ArtifactSpec, MediaArtifact
+from verl_omni.pipelines.rollout_artifacts import MediaArtifact
+from verl_omni.pipelines.rollout_media import MediaSpec
 
 
 def _load_scorer_module():
@@ -57,7 +58,7 @@ def test_to_tchw_requires_adapter_normalized_video():
     video = torch.full((3, 8, 10, 3), 255, dtype=torch.uint8)
     with pytest.raises(ValueError, match="T, 3, H, W"):
         imagebind._to_tchw(video)
-    artifact = MediaArtifact(ArtifactSpec("video", "decoded", "THWC", fps=24), video)
+    artifact = MediaArtifact(MediaSpec("video", "decoded", "THWC", fps=24), video)
     converted = imagebind._to_tchw(artifact.normalized(context="adapter", name="video_preview"))
 
     assert converted.shape == (3, 3, 8, 10)
@@ -114,9 +115,9 @@ def test_compute_score_supports_flowfactory_modes(
         extra_info={
             "media_artifacts": {
                 "video_preview": MediaArtifact(
-                    ArtifactSpec("video", "decoded", "TCHW", fps=24), torch.zeros(2, 3, 8, 8, dtype=torch.uint8)
+                    MediaSpec("video", "decoded", "TCHW", fps=24), torch.zeros(2, 3, 8, 8, dtype=torch.uint8)
                 ),
-                "audio": MediaArtifact(ArtifactSpec("audio", "decoded", "CT", sample_rate=16000), torch.ones(1, 16)),
+                "audio": MediaArtifact(MediaSpec("audio", "decoded", "CT", sample_rate=16000), torch.ones(1, 16)),
             }
         },
         device="cpu",

@@ -52,8 +52,7 @@ from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     validate_ref2va_reference_image_short_edge,
 )
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
-from verl_omni.pipelines.rollout_artifacts import ArtifactSpec
-from verl_omni.pipelines.rollout_media import DiffusionIOSpec
+from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 
 from .common import (
@@ -94,10 +93,10 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
 
     diffusion_io_spec = DiffusionIOSpec(
         artifacts={
-            "video_preview": ArtifactSpec("video", "decoded", "TCHW"),
-            "audio": ArtifactSpec("audio", "decoded", "CT", sample_rate=32000),
-            "video_latent": ArtifactSpec("video", "latent", "CTHW"),
-            "audio_latent": ArtifactSpec("audio", "latent", "CLT"),
+            "video_preview": MediaSpec("video", "decoded", "TCHW"),
+            "audio": MediaSpec("audio", "decoded", "CT", sample_rate=32000),
+            "video_latent": MediaSpec("video", "latent", "CTHW"),
+            "audio_latent": MediaSpec("audio", "latent", "CLT"),
         }
     )
 

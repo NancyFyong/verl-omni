@@ -44,8 +44,7 @@ from verl_omni.pipelines.diffusion_rollout_output import (
     wrap_rollout_postprocessor,
 )
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
-from verl_omni.pipelines.rollout_artifacts import ArtifactSpec
-from verl_omni.pipelines.rollout_media import DiffusionIOSpec
+from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 from verl_omni.pipelines.rollout_request import prompt_ids_from_payload
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 
@@ -117,8 +116,8 @@ class Wan22DanceGRPOPipelineWithLogProb(Wan22Pipeline):
     #: the modality from the adapter instead of inferring it from tensor rank.
     diffusion_io_spec = DiffusionIOSpec(
         artifacts={
-            "video_preview": ArtifactSpec("video", "decoded", "TCHW"),
-            "video_latent": ArtifactSpec("video", "latent", "CTHW"),
+            "video_preview": MediaSpec("video", "decoded", "TCHW"),
+            "video_latent": MediaSpec("video", "latent", "CTHW"),
         }
     )
 

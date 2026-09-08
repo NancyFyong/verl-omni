@@ -26,8 +26,8 @@ from typing import Any
 import numpy as np
 import torch
 
-from verl_omni.pipelines.rollout_artifacts import MediaArtifact
-from verl_omni.pipelines.rollout_media import resolve_is_video
+from verl_omni.pipelines.rollout_artifacts import MediaArtifact, validate_audio
+from verl_omni.pipelines.rollout_media import MediaSpec, resolve_is_video
 from verl_omni.utils.reward_score.reward_utils import normalize_video_tensor
 
 logger = logging.getLogger(__name__)
@@ -215,8 +215,14 @@ def wrap_val_samples_for_wandb(samples, fps=24, output_dir=None, media_kinds=Non
         if is_video and output_ndim == 5:
             # Batched video [B, T, C, H, W], [B, C, T, H, W], or [B, T, H, W, C].
             out = out[0]
+        if not isinstance(out, MediaArtifact):
+            MediaArtifact(
+                MediaSpec(media_kind, "decoded", "TCHW" if is_video else "CHW", fps=fps if is_video else None),
+                out,
+            ).validate(context="W&B", name="preview")
         if is_video:
             try:
+                validate_audio(audio, audio_sample_rate, context="W&B")
                 if video_dir is None:
                     video_tmp_dir = tempfile.mkdtemp(prefix="val_video_")
                     video_dir = video_tmp_dir

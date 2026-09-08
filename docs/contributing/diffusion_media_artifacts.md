@@ -1,6 +1,6 @@
 # Named diffusion media artifacts
 
-Last updated: 09/07/2026.
+Last updated: 09/08/2026.
 
 All registered in-tree diffusion adapters emit named media. The strategy,
 agent loops, rewards and V0/V1 exporters consume declarations rather than
@@ -9,11 +9,15 @@ The public `generate(**kwargs)` RPC is unchanged.
 
 ## Contract
 
-`pipelines/rollout_artifacts.py` defines:
+`pipelines/rollout_media.py` retains `MediaSpec` and `DiffusionIOSpec`:
 
-- `ArtifactSpec(modality, representation, layout, sample_rate=None, fps=None)`.
+- `MediaSpec(modality, representation, layout, sample_rate=None, fps=None)`.
   Modality is `image`, `video` or `audio`; representation is `latent` or
   `decoded`. **The tensor owns its dtype**, not the configuration.
+- `DiffusionIOSpec(artifacts=...)` maps available artifact names to `MediaSpec`.
+
+`pipelines/rollout_artifacts.py` defines:
+
 - `MediaArtifact(spec, data, context="")`: one sample, with no implicit request
   batch dimension. Context records the pipeline/request for downstream errors.
 - `validate_artifacts`: checks returned versus expected names, duplicates,
@@ -36,13 +40,12 @@ packed layout are distinct facts.
 Each adapter declares available names next to its implementation:
 
 ```python
-from verl_omni.pipelines.rollout_artifacts import ArtifactSpec
-from verl_omni.pipelines.rollout_media import DiffusionIOSpec
+from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 
 class MyPipeline(...):
     diffusion_io_spec = DiffusionIOSpec(artifacts={
-        "image_preview": ArtifactSpec("image", "decoded", "CHW"),
-        "image_latent": ArtifactSpec("image", "latent", "LC"),
+        "image_preview": MediaSpec("image", "decoded", "CHW"),
+        "image_latent": MediaSpec("image", "latent", "LC"),
     })
 ```
 

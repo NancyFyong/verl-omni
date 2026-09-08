@@ -29,7 +29,8 @@ from pathlib import Path
 import torch
 
 from verl_omni.pipelines.diffusion_rollout_output import quantize_pixels
-from verl_omni.pipelines.rollout_artifacts import ArtifactSpec, MediaArtifact
+from verl_omni.pipelines.rollout_artifacts import MediaArtifact
+from verl_omni.pipelines.rollout_media import MediaSpec
 
 
 def _load_diffusers(root, subfolder, device):
@@ -113,23 +114,23 @@ def probe(case, checkpoint, device):
     assert decoded.shape[0] == 1 and torch.isfinite(decoded).all(), case
     if audio:
         assert decoded.shape[1] == 2, (case, tuple(decoded.shape))
-        artifact = MediaArtifact(ArtifactSpec("audio", "decoded", "CT", sample_rate=sample_rate), decoded[0])
+        artifact = MediaArtifact(MediaSpec("audio", "decoded", "CT", sample_rate=sample_rate), decoded[0])
     elif case == "h3-video":
         from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _prepare_minimax_h3_video_output
 
         assert decoded.shape[1] == 3, tuple(decoded.shape)
         pixels = _prepare_minimax_h3_video_output(decoded)
-        artifact = MediaArtifact(ArtifactSpec("video", "decoded", "THWC", fps=24), pixels[0])
+        artifact = MediaArtifact(MediaSpec("video", "decoded", "THWC", fps=24), pixels[0])
     elif case == "qwen-image":
         assert decoded.shape[1] == 3 and decoded.shape[2] == 1, tuple(decoded.shape)
         artifact = MediaArtifact(
-            ArtifactSpec("image", "decoded", "CHW"), quantize_pixels(decoded[0, :, 0], "minus_one_one", context=case)
+            MediaSpec("image", "decoded", "CHW"), quantize_pixels(decoded[0, :, 0], "minus_one_one", context=case)
         )
     else:
         assert decoded.shape[1] == 3, (case, tuple(decoded.shape))
         kind = "video" if decoded_layout == "NCTHW" else "image"
         artifact = MediaArtifact(
-            ArtifactSpec(kind, "decoded", "CTHW" if kind == "video" else "CHW", fps=24 if kind == "video" else None),
+            MediaSpec(kind, "decoded", "CTHW" if kind == "video" else "CHW", fps=24 if kind == "video" else None),
             quantize_pixels(decoded[0], "minus_one_one", context=case),
         )
     artifact = artifact.normalized(context=f"pipeline={case}, request_id=vae-probe", name="decoded")

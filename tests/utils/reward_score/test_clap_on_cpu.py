@@ -23,7 +23,8 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-from verl_omni.pipelines.rollout_artifacts import ArtifactContractError, ArtifactSpec, MediaArtifact
+from verl_omni.pipelines.rollout_artifacts import ArtifactContractError, MediaArtifact
+from verl_omni.pipelines.rollout_media import MediaSpec
 
 
 def _load_scorer_module():
@@ -42,7 +43,7 @@ def test_get_audio_uses_canonical_channels_and_declared_rate():
     audio, sample_rate = clap._get_audio(
         {
             "media_artifacts": {
-                "audio": MediaArtifact(ArtifactSpec("audio", "decoded", "CT", sample_rate=48000), torch.ones(2, 16)),
+                "audio": MediaArtifact(MediaSpec("audio", "decoded", "CT", sample_rate=48000), torch.ones(2, 16)),
             }
         }
     )
@@ -128,7 +129,7 @@ def _score(prompt, waveform, sample_rate=48_000, **kwargs):
         extra_info={
             "media_artifacts": {
                 "audio": MediaArtifact(
-                    ArtifactSpec("audio", "decoded", "CT", sample_rate=sample_rate), torch.tensor(waveform).unsqueeze(0)
+                    MediaSpec("audio", "decoded", "CT", sample_rate=sample_rate), torch.tensor(waveform).unsqueeze(0)
                 ),
             }
         },

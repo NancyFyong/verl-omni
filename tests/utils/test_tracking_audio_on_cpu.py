@@ -110,12 +110,13 @@ def test_video_tensor_to_rgb24_requires_canonical_or_declared_layout(monkeypatch
         "thwc": canonical.permute(0, 2, 3, 1),
     }[layout]
 
-    from verl_omni.pipelines.rollout_artifacts import ArtifactSpec, MediaArtifact
+    from verl_omni.pipelines.rollout_artifacts import MediaArtifact
+    from verl_omni.pipelines.rollout_media import MediaSpec
 
     if layout != "tchw":
         with pytest.raises(ValueError, match="T, 3, H, W"):
             tracking._video_tensor_to_rgb24(video)
-    declared = MediaArtifact(ArtifactSpec("video", "decoded", layout.upper(), fps=24), video)
+    declared = MediaArtifact(MediaSpec("video", "decoded", layout.upper(), fps=24), video)
     canonical_artifact = declared.normalized(context="adapter", name="video_preview")
     frames, width, height = tracking._video_tensor_to_rgb24(canonical_artifact)
 
