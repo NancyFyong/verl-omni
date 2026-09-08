@@ -52,9 +52,11 @@ from tests.special_e2e.build_minimax_h3_tiny_random import (  # noqa: E402
     DEFAULT_OUTPUT_DIR as _DEFAULT_TINY_MODEL_DIR,
 )
 from tests.special_e2e.build_minimax_h3_tiny_random import ensure_tiny_minimax_h3_checkpoint  # noqa: E402
-from tests.special_e2e.create_dummy_h3_fl2va_data import build_dummy_h3_fl2va_data  # noqa: E402
-from tests.special_e2e.create_dummy_h3_ref2va_data import build_dummy_h3_ref2va_data  # noqa: E402
-from tests.special_e2e.create_dummy_h3_t2av_data import build_dummy_h3_data  # noqa: E402
+from tests.special_e2e.create_dummy_h3_data import (  # noqa: E402
+    build_dummy_h3_fl2va_data,
+    build_dummy_h3_ref2va_data,
+    build_dummy_h3_t2va_data,
+)
 
 _DEFAULT_DATA_DIR = os.path.expanduser("~/data/dummy_h3_flowgrpo")
 
@@ -273,7 +275,7 @@ def run_smoke(
     train_batch_size = max(1, num_gpus * micro_bsz_per_gpu) * n_resp_per_prompt
     print(f"[2/3] ensuring dummy {task} parquet at {data_dir}", flush=True)
     if task == "t2va":
-        train_parquet, val_parquet = build_dummy_h3_data(
+        train_parquet, val_parquet = build_dummy_h3_t2va_data(
             data_dir,
             train_size=train_batch_size,
             val_size=2,
