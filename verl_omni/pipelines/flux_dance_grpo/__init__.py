@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .audio import AudioRewardManager
-from .multi import MultiVisualRewardManager
-from .visual import VisualRewardManager
+from .diffusers_training_adapter import FluxDanceGRPO
+from .vllm_omni_rollout_adapter import FluxDanceGRPOPipelineWithLogProb
 
-__all__ = ["AudioRewardManager", "VisualRewardManager", "MultiVisualRewardManager"]
+__all__ = ["FluxDanceGRPO", "FluxDanceGRPOPipelineWithLogProb"]

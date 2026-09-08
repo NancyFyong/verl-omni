@@ -538,6 +538,7 @@ distillation:
       model_path: null
       world_size: 0
   teacher_key: data_source
+  scheduler: inline
   distribution_matching:
     _target_: verl_omni.workers.config.diffusion.DiffusionDistributionMatchingConfig
     recipe: dmd2
