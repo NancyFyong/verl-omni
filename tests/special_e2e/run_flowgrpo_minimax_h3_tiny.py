@@ -22,6 +22,9 @@ policy-gradient actor update. FL2VA uses an embedded PNG first-frame condition
 and ``frame_indices=[0]`` to exercise its fixed-row replay mask. Ref2VA uses a
 single embedded PNG reference image and ``pipeline.task=ref2va`` to exercise the
 reference-block layout, condition-anchor replay, and target-only scoring path.
+The launched trainer and Ray workers also receive a test-local ``sitecustomize``
+patch so vLLM-Omni validates the Qwen3-VL output width from the TinyRandom
+checkpoint config instead of its production-only 5120-wide constant.
 
 Usage:
     python tests/special_e2e/run_flowgrpo_minimax_h3_tiny.py \
@@ -38,6 +41,7 @@ Env overrides:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -59,6 +63,8 @@ from tests.special_e2e.create_dummy_h3_data import (  # noqa: E402
 )
 
 _DEFAULT_DATA_DIR = os.path.expanduser("~/data/dummy_h3_flowgrpo")
+_TINY_PATCH_DIR = _REPO_ROOT / "tests" / "special_e2e" / "minimax_h3_tiny_patch"
+_TINY_TEXT_CONFIG_ENV = "VERL_OMNI_MINIMAX_H3_TINY_TEXT_CONFIG"
 
 
 def _require_minimax_h3_diffusers() -> None:
@@ -81,6 +87,38 @@ def _fixup_ld_library_path() -> None:
     current = os.environ.get("LD_LIBRARY_PATH", "")
     parts = [part for part in current.split(":") if part and part != "/usr/local/cuda/lib64"]
     os.environ["LD_LIBRARY_PATH"] = ":".join([cudnn_dir, *parts])
+
+
+def _tiny_patch_environment(tiny_model_dir: str, task: str) -> dict[str, str]:
+    """Scope the config-driven vLLM-Omni patch to trainer/Ray subprocesses."""
+    partition = "Ref2VA" if task == "ref2va" else "FL2VA"
+    partition_dir = Path(tiny_model_dir) / partition
+    text_config_path = partition_dir / "text_encoder" / "config.json"
+    text_config = json.loads(text_config_path.read_text())["text_config"]
+    text_hidden_size = int(text_config["hidden_size"])
+
+    rollout_config = json.loads((partition_dir / "transformer" / "config.json").read_text())
+    actor_config = json.loads((Path(tiny_model_dir) / "transformer" / "config.json").read_text())
+    configured_widths = {
+        "text encoder": text_hidden_size,
+        "rollout transformer": int(rollout_config["text_dim"]),
+        "actor transformer": int(actor_config["text_dim"]),
+    }
+    if len(set(configured_widths.values())) != 1:
+        raise ValueError(f"TinyRandom MiniMax H3 text widths do not match: {configured_widths}")
+
+    patch_file = _TINY_PATCH_DIR / "sitecustomize.py"
+    if not patch_file.is_file():
+        raise FileNotFoundError(f"TinyRandom vLLM-Omni patch not found: {patch_file}")
+    env = os.environ.copy()
+    env[_TINY_TEXT_CONFIG_ENV] = str(text_config_path)
+    current_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = os.pathsep.join(part for part in (str(_TINY_PATCH_DIR), current_pythonpath) if part)
+    print(
+        f"using config-driven vLLM-Omni TinyRandom text width {text_hidden_size} from {text_config_path}",
+        flush=True,
+    )
+    return env
 
 
 def _hydra_overrides(
@@ -325,13 +363,14 @@ def run_smoke(
         num_inference_steps=num_inference_steps,
     )
     cmd = [sys.executable, "-m", "verl_omni.trainer.main_diffusion", *overrides]
+    child_env = _tiny_patch_environment(tiny_model_dir, task)
     print(
         f"[3/3] launching FlowGRPO {task.upper()} main_diffusion (num_gpus={num_gpus}, tp={rollout_tp}, "
         f"te_tp={text_encoder_tp}, steps={total_training_steps})",
         flush=True,
     )
     print("  cmd:", " ".join(cmd), flush=True)
-    return subprocess.call(cmd, cwd=str(_REPO_ROOT))
+    return subprocess.call(cmd, cwd=str(_REPO_ROOT), env=child_env)
 
 
 def _parse_args() -> argparse.Namespace:

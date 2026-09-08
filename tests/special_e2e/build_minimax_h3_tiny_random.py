@@ -24,18 +24,20 @@ from that Diffusers checkpoint in three relevant ways:
 
 * it consumes 24 video-latent channels and 32 audio-latent channels, while the
   HF tiny DiT has 8 channels for both streams;
-* it requires a native Qwen3-VL encoder with 64 attention heads, 8 KV heads,
-  and a 5120-wide hidden state;
+* its native encoder currently validates text width against the production
+  Qwen3-VL width instead of the checkpoint config;
 * it loads native remote-code video/audio VAE components, while the HF tiny
   checkpoint stores standard Diffusers VAEs.
 
 The builder expands the affected DiT projections with deterministic random
-weights, creates a compact one-layer Qwen3-VL with a 5120-wide output and a
-512-token vocabulary, and writes tiny local remote-code VAE stubs that
-implement vLLM-Omni's native VAE contract. The stubs preserve H3 latent
-geometry for T2VA, FL2VA image encoding, Ref2VA reference encoding, and
-video/audio decoding; they are intentionally not suitable for image or audio
-quality evaluation.
+weights, creates a compact one-layer Qwen3-VL using the pinned TinyRandom
+snapshot's text dimensions and a 512-token vocabulary, and writes tiny local
+remote-code VAE stubs that implement vLLM-Omni's native VAE contract. The
+special E2E runner applies a process-local compatibility patch that makes
+vLLM-Omni read the expected text width from this generated model config. The
+stubs preserve H3 latent geometry for T2VA, FL2VA image encoding, Ref2VA
+reference encoding, and video/audio decoding; they are intentionally not
+suitable for image or audio quality evaluation.
 
 Layout produced under ``<output-dir>``::
 
@@ -93,12 +95,7 @@ _SEED = 42
 _VIDEO_LATENT_CHANNELS = 24
 _AUDIO_LATENT_CHANNELS = 32
 _PATCH_VOLUME = 4  # MiniMax-H3 uses a (1, 2, 2) video patch.
-_CHECKPOINT_FORMAT_VERSION = 4
-_VLLM_TEXT_HIDDEN_SIZE = 5120
-_VLLM_TEXT_NUM_ATTENTION_HEADS = 64
-_VLLM_TEXT_NUM_KEY_VALUE_HEADS = 8
-_VLLM_TEXT_HEAD_DIM = 8
-_VLLM_TEXT_INTERMEDIATE_SIZE = 64
+_CHECKPOINT_FORMAT_VERSION = 5
 _VLLM_TEXT_VOCAB_SIZE = 512
 _VLLM_TEXT_NUM_LAYERS = 1
 
@@ -127,17 +124,19 @@ _SHARED_TRANSFORMER_FIELDS = (
     "final_norm_eps",
 )
 
-# H3's Diffusers state dict names and the target shapes after changing the
-# video/audio latent channels. All other HF tiny tensors keep their exact shape.
-_RESIZED_TRANSFORMER_TENSORS = {
-    "audio_proj_in.weight": (64, _AUDIO_LATENT_CHANNELS),
-    "audio_proj_out.bias": (_AUDIO_LATENT_CHANNELS,),
-    "audio_proj_out.weight": (_AUDIO_LATENT_CHANNELS, 64),
-    "context_embedder.weight": (64, _VLLM_TEXT_HIDDEN_SIZE),
-    "proj_in.weight": (64, _VIDEO_LATENT_CHANNELS * _PATCH_VOLUME),
-    "proj_out.bias": (_VIDEO_LATENT_CHANNELS * _PATCH_VOLUME,),
-    "proj_out.weight": (_VIDEO_LATENT_CHANNELS * _PATCH_VOLUME, 64),
-}
+
+def _resized_transformer_tensors(text_hidden_size: int) -> dict[str, tuple[int, ...]]:
+    """Return H3 projection shapes after changing latent and text widths."""
+    return {
+        "audio_proj_in.weight": (64, _AUDIO_LATENT_CHANNELS),
+        "audio_proj_out.bias": (_AUDIO_LATENT_CHANNELS,),
+        "audio_proj_out.weight": (_AUDIO_LATENT_CHANNELS, 64),
+        "context_embedder.weight": (64, text_hidden_size),
+        "proj_in.weight": (64, _VIDEO_LATENT_CHANNELS * _PATCH_VOLUME),
+        "proj_out.bias": (_VIDEO_LATENT_CHANNELS * _PATCH_VOLUME,),
+        "proj_out.weight": (_VIDEO_LATENT_CHANNELS * _PATCH_VOLUME, 64),
+    }
+
 
 _VIDEO_VAE_SOURCE = '''# SPDX-License-Identifier: Apache-2.0
 """Tiny deterministic MiniMax-H3 video-VAE compatibility component."""
@@ -383,35 +382,37 @@ def _write_vllm_tokenizer(component_dir: Path, chat_template: Path) -> dict[str,
     return {token: int(token_id) for token, token_id in special_token_ids.items()}
 
 
-def _write_vllm_text_encoder(component_dir: Path, special_token_ids: dict[str, int]) -> None:
-    """Write the smallest Qwen3-VL accepted by vLLM-Omni's H3 encoder."""
+def _write_vllm_text_encoder(
+    component_dir: Path,
+    special_token_ids: dict[str, int],
+    source_config: Qwen3VLConfig,
+) -> None:
+    """Write a one-layer Qwen3-VL using the pinned TinyRandom dimensions."""
+    source_text = source_config.text_config
     text_config = Qwen3VLTextConfig(
         vocab_size=_VLLM_TEXT_VOCAB_SIZE,
-        hidden_size=_VLLM_TEXT_HIDDEN_SIZE,
-        intermediate_size=_VLLM_TEXT_INTERMEDIATE_SIZE,
+        hidden_size=int(source_text.hidden_size),
+        intermediate_size=int(source_text.intermediate_size),
         num_hidden_layers=_VLLM_TEXT_NUM_LAYERS,
-        num_attention_heads=_VLLM_TEXT_NUM_ATTENTION_HEADS,
-        num_key_value_heads=_VLLM_TEXT_NUM_KEY_VALUE_HEADS,
-        head_dim=_VLLM_TEXT_HEAD_DIM,
+        num_attention_heads=int(source_text.num_attention_heads),
+        num_key_value_heads=int(source_text.num_key_value_heads),
+        head_dim=int(source_text.head_dim),
         max_position_embeddings=4096,
-        rope_parameters={
-            "rope_type": "default",
-            "rope_theta": 5_000_000.0,
-            "mrope_section": [2, 1, 1],
-            "mrope_interleaved": True,
-        },
+        rope_parameters=dict(source_text.rope_parameters),
+        rms_norm_eps=float(source_text.rms_norm_eps),
         pad_token_id=special_token_ids["<|endoftext|>"],
     )
+    source_vision = source_config.vision_config
     vision_config = Qwen3VLVisionConfig(
         depth=1,
-        hidden_size=64,
-        intermediate_size=64,
-        num_heads=4,
-        in_channels=3,
-        patch_size=16,
-        spatial_merge_size=2,
-        temporal_patch_size=2,
-        out_hidden_size=_VLLM_TEXT_HIDDEN_SIZE,
+        hidden_size=int(source_vision.hidden_size),
+        intermediate_size=int(source_vision.intermediate_size),
+        num_heads=int(source_vision.num_heads),
+        in_channels=int(source_vision.in_channels),
+        patch_size=int(source_vision.patch_size),
+        spatial_merge_size=int(source_vision.spatial_merge_size),
+        temporal_patch_size=int(source_vision.temporal_patch_size),
+        out_hidden_size=int(source_text.hidden_size),
         num_position_embeddings=64,
         deepstack_visual_indexes=[],
     )
@@ -458,11 +459,11 @@ def _download_hf_tiny(cache_dir: str | None) -> Path:
     )
 
 
-def _expanded_transformer_config(source: Path) -> dict:
+def _expanded_transformer_config(source: Path, *, text_hidden_size: int) -> dict:
     config = json.loads(source.read_text())
     config["in_channels"] = _VIDEO_LATENT_CHANNELS
     config["audio_in_channels"] = _AUDIO_LATENT_CHANNELS
-    config["text_dim"] = _VLLM_TEXT_HIDDEN_SIZE
+    config["text_dim"] = text_hidden_size
     return config
 
 
@@ -498,13 +499,14 @@ def _write_expanded_transformer(source_dir: Path, target_dir: Path, *, config: d
     target_dir.mkdir(parents=True, exist_ok=True)
     generator = torch.Generator(device="cpu").manual_seed(seed)
     source_weights = source_dir / "diffusion_pytorch_model.safetensors"
+    resized_tensors = _resized_transformer_tensors(int(config["text_dim"]))
     tensors: dict[str, torch.Tensor] = {}
     with safe_open(source_weights, framework="pt", device="cpu") as handle:
         for name in handle.keys():
             tensor = handle.get_tensor(name)
             tensors[name] = _resize_tensor(
                 tensor,
-                _RESIZED_TRANSFORMER_TENSORS.get(name, tuple(tensor.shape)),
+                resized_tensors.get(name, tuple(tensor.shape)),
                 generator,
             )
     save_file(tensors, target_dir / "diffusion_pytorch_model.safetensors")
@@ -566,6 +568,7 @@ def _write_partition(
     partition: str,
     tasks: list[str],
     hf_root: Path,
+    source_qwen_config: Qwen3VLConfig,
 ) -> Path:
     """Write one self-contained MiniMax-H3 partition (FL2VA or Ref2VA).
 
@@ -582,7 +585,11 @@ def _write_partition(
     )
     # vLLM-Omni needs the fused-arch schema while the actor needs the same
     # expanded weights under Diffusers' schema.
-    diffusers_config = _expanded_transformer_config(hf_root / "transformer" / "config.json")
+    text_hidden_size = int(source_qwen_config.text_config.hidden_size)
+    diffusers_config = _expanded_transformer_config(
+        hf_root / "transformer" / "config.json",
+        text_hidden_size=text_hidden_size,
+    )
     _write_expanded_transformer(
         hf_root / "transformer",
         component_dir / "transformer",
@@ -593,7 +600,7 @@ def _write_partition(
         component_dir / "tokenizer",
         hf_root / "tokenizer" / "chat_template.jinja",
     )
-    _write_vllm_text_encoder(component_dir / "text_encoder", special_token_ids)
+    _write_vllm_text_encoder(component_dir / "text_encoder", special_token_ids, source_qwen_config)
     _copy_tree(hf_root / "processor", component_dir / "processor")
     _copy_tokenizer_to_processor(component_dir / "tokenizer", component_dir / "processor")
     # Qwen3VLProcessor requires this key even though the HF tiny processor
@@ -656,6 +663,10 @@ def ensure_tiny_minimax_h3_checkpoint(
         return str(output)
 
     hf_root = _download_hf_tiny(hf_cache_dir)
+    source_qwen_config = Qwen3VLConfig.from_pretrained(
+        hf_root / "text_encoder",
+        local_files_only=True,
+    )
     if output.exists():
         shutil.rmtree(output)
     output.mkdir(parents=True)
@@ -666,6 +677,7 @@ def ensure_tiny_minimax_h3_checkpoint(
         partition="fl2va",
         tasks=["t2va", "fl2va"],
         hf_root=hf_root,
+        source_qwen_config=source_qwen_config,
     )
     _write_partition(
         output,
@@ -673,10 +685,14 @@ def ensure_tiny_minimax_h3_checkpoint(
         partition="ref2va",
         tasks=["ref2va"],
         hf_root=hf_root,
+        source_qwen_config=source_qwen_config,
     )
     # Both vLLM-Omni and the actor need the exact same expanded weight geometry,
     # but they consume different config schemas.
-    actor_config = _expanded_transformer_config(hf_root / "transformer_ref" / "config.json")
+    actor_config = _expanded_transformer_config(
+        hf_root / "transformer_ref" / "config.json",
+        text_hidden_size=int(source_qwen_config.text_config.hidden_size),
+    )
     _write_expanded_transformer(
         hf_root / "transformer_ref",
         output / "transformer",
@@ -687,9 +703,9 @@ def ensure_tiny_minimax_h3_checkpoint(
         json.dumps(
             {
                 "format_version": _CHECKPOINT_FORMAT_VERSION,
-                "text_hidden_size": _VLLM_TEXT_HIDDEN_SIZE,
-                "text_num_attention_heads": _VLLM_TEXT_NUM_ATTENTION_HEADS,
-                "text_num_key_value_heads": _VLLM_TEXT_NUM_KEY_VALUE_HEADS,
+                "text_hidden_size": int(source_qwen_config.text_config.hidden_size),
+                "text_num_attention_heads": int(source_qwen_config.text_config.num_attention_heads),
+                "text_num_key_value_heads": int(source_qwen_config.text_config.num_key_value_heads),
                 "text_num_hidden_layers": _VLLM_TEXT_NUM_LAYERS,
                 "text_vocab_size": _VLLM_TEXT_VOCAB_SIZE,
             },
