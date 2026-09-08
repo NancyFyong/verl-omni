@@ -90,10 +90,15 @@ class TestAdapterContext:
 
 
 class TestAdapterAwareExport:
-    def test_non_default_adapter_exports_its_own_peft_config(self, monkeypatch):
+    @pytest.fixture(autouse=True)
+    def mock_gpu_memory_logging(self, monkeypatch):
+        monkeypatch.setattr("verl_omni.workers.engine.fsdp.diffusers_impl.log_gpu_memory_usage", Mock())
+
+    @pytest.mark.parametrize("adapter_name", [None, "default", "student", "student_ema"])
+    def test_selected_adapter_exports_its_own_peft_config(self, monkeypatch, adapter_name):
         harness = MixinHarness()
         harness._uses_fsdp2_cpu_offload_policy = True
-        harness.model_config = SimpleNamespace(fsdp_layer_prefixes=["transformer_blocks."])
+        harness.model_config = SimpleNamespace(lora={"merge": False}, fsdp_layer_prefixes=["transformer_blocks."])
         collect_lora_params = Mock(return_value={"adapter.weight": torch.tensor([2.0])})
 
         monkeypatch.setattr(
@@ -107,18 +112,18 @@ class TestAdapterAwareExport:
         params, peft_config = DiffusersFSDPEngine.get_per_tensor_param(
             harness,
             base_sync_done=True,
-            adapter_name="student_ema",
+            adapter_name=adapter_name,
         )
         assert dict(params) == {"transformer.adapter.weight": torch.tensor([2.0])}
-        assert peft_config == {"name": "student_ema"}
+        assert peft_config == {"name": adapter_name or "default"}
         collect_lora_params.assert_called_once()
-        assert collect_lora_params.call_args.kwargs["adapter_name"] == "student_ema"
+        assert collect_lora_params.call_args.kwargs["adapter_name"] == (adapter_name or "default")
         assert harness.module.active_adapter == "student"
 
     def test_unknown_adapter_fails_before_export(self):
         harness = MixinHarness()
         harness._uses_fsdp2_cpu_offload_policy = True
-        harness.model_config = SimpleNamespace(fsdp_layer_prefixes=[])
+        harness.model_config = SimpleNamespace(lora={"merge": False}, fsdp_layer_prefixes=[])
         with pytest.raises(ValueError, match="unknown LoRA adapter"):
             DiffusersFSDPEngine.get_per_tensor_param(
                 harness,

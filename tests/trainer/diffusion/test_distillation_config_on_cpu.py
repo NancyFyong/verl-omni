@@ -91,6 +91,14 @@ class TestDiffusionDistillationConfig:
                 teacher_models={"teacher_model": DiffusionDistillationTeacherModelConfig()},
             )
 
+    def test_unknown_scheduler_rejected(self):
+        with pytest.raises(ValueError, match="scheduler"):
+            DiffusionDistillationConfig(
+                enabled=True,
+                scheduler="bogus",
+                teacher_models={"teacher_model": DiffusionDistillationTeacherModelConfig(model_path="/ckpt/teacher")},
+            )
+
     def test_single_teacher_is_keyed_default(self):
         config = DiffusionDistillationConfig(
             enabled=True,
@@ -182,6 +190,23 @@ class TestDistillationConfigComposition:
         config = omega_conf_to_dataclass(cfg.distillation)
         assert isinstance(config, DiffusionDistillationConfig)
         assert config.enabled is False
+        assert isinstance(config.distribution_matching, DiffusionDistributionMatchingConfig)
+        assert config.distribution_matching.recipe == "dmd2"
+
+    @pytest.mark.parametrize("scheduler", ["inline", "one_step_off"])
+    def test_opd_schedule_and_distribution_matching_settings_coexist(self, scheduler):
+        from verl.utils.config import omega_conf_to_dataclass
+
+        cfg = self._compose(
+            [
+                "distillation.enabled=true",
+                "distillation.teacher_models.teacher_model.model_path=/ckpt/teacher",
+                f"distillation.scheduler={scheduler}",
+            ]
+        )
+        config = omega_conf_to_dataclass(cfg.distillation)
+        assert config.scheduler == scheduler
+        assert config.teacher_models["default"].model_path == "/ckpt/teacher"
         assert isinstance(config.distribution_matching, DiffusionDistributionMatchingConfig)
         assert config.distribution_matching.recipe == "dmd2"
 
