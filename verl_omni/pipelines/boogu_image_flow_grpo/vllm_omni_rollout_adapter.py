@@ -431,7 +431,7 @@ class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipel
         custom_prompt = prompts[0] if prompts else {}
         condition_images: list = []
         if isinstance(custom_prompt, dict):
-            condition_images = list(condition_images_from_payload(custom_prompt) or [])
+            condition_images = list(condition_images_from_payload(custom_prompt))
         if len(condition_images) > 1:
             raise ValueError(
                 f"Boogu-Image editing supports a single reference image; received {len(condition_images)}."
