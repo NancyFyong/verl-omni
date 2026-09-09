@@ -90,6 +90,32 @@ class MiniMaxH3Flops(DiffusionModelFlops):
         video_seqlens, audio_seqlens = self._get_stream_seqlens(data)
         return [video + audio for video, audio in zip(video_seqlens, audio_seqlens, strict=True)]
 
+    def _get_timestep_groups(self, data: Any) -> list[int]:
+        """Distinct timestep embeddings each forward runs, per sample.
+
+        H3 denoises a video and an audio target stream at (generally) distinct
+        timesteps, and every present reference/condition modality adds one
+        frozen timestep (``build_row_timesteps`` returns ``torch.unique`` of the
+        row timesteps). AdaLN/timestep projections run once per distinct value.
+        """
+        latent_meta = data.get("latent_meta")
+        if isinstance(latent_meta, torch.Tensor) and latent_meta.ndim == 2 and latent_meta.shape[1] >= 2:
+            batch_size = int(latent_meta.shape[0])
+            condition_video = self._count_values(data.get("condition_video_row_count"), batch_size)
+            condition_audio = self._count_values(data.get("condition_audio_row_count"), batch_size)
+            if condition_video is not None and condition_audio is not None:
+                video = [int(item) for item in latent_meta[:, 0].detach().tolist()]
+                audio = [int(item) for item in latent_meta[:, 1].detach().tolist()]
+                return [
+                    int(v > 0) + int(a > 0) + int(cv > 0) + int(ca > 0)
+                    for v, a, cv, ca in zip(video, audio, condition_video, condition_audio, strict=True)
+                ]
+
+        # FlowGRPO packed layout does not expose the condition split; count the
+        # video and audio target streams that are present.
+        video_seqlens, audio_seqlens = self._get_stream_seqlens(data)
+        return [int(video > 0) + int(audio > 0) for video, audio in zip(video_seqlens, audio_seqlens, strict=True)]
+
     def collect_meta(self, data: Any) -> dict[str, list[int]]:
         video_seqlens, audio_seqlens = self._get_stream_seqlens(data)
         return {
@@ -97,6 +123,7 @@ class MiniMaxH3Flops(DiffusionModelFlops):
             "prompt_seqlens": list(self.get_prompt_seqlens(data)),
             "video_seqlens": video_seqlens,
             "audio_seqlens": audio_seqlens,
+            "timestep_group_seqlens": self._get_timestep_groups(data),
         }
 
     def estimate_flops(
@@ -109,6 +136,7 @@ class MiniMaxH3Flops(DiffusionModelFlops):
         num_forward_passes: int,
         video_seqlens: Sequence[int] | None = None,
         audio_seqlens: Sequence[int] | None = None,
+        timestep_group_seqlens: Sequence[int] | None = None,
     ) -> float:
         hidden_size = self._config_int("hidden_size")
         num_heads = self._config_int("num_attention_heads")
@@ -131,7 +159,6 @@ class MiniMaxH3Flops(DiffusionModelFlops):
 
         latent_total = sum_seqlens(latent_seqlens)
         prompt_total = sum_seqlens(prompt_seqlens)
-        batch_size = max(len(latent_seqlens), len(prompt_seqlens))
         if video_seqlens is None or audio_seqlens is None:
             video_seqlens = latent_seqlens
             audio_seqlens = [0] * len(latent_seqlens)
@@ -139,6 +166,12 @@ class MiniMaxH3Flops(DiffusionModelFlops):
             raise ValueError("MiniMax-H3 video/audio sequence lengths must match latent_seqlens.")
         video_total = sum_seqlens(video_seqlens)
         audio_total = sum_seqlens(audio_seqlens)
+        if timestep_group_seqlens is None:
+            timestep_groups = max(len(latent_seqlens), len(prompt_seqlens))
+        elif len(timestep_group_seqlens) != len(latent_seqlens):
+            raise ValueError("MiniMax-H3 timestep group counts must match latent_seqlens.")
+        else:
+            timestep_groups = sum_seqlens(timestep_group_seqlens)
 
         # QKV/out project hidden_size <-> inner_dim; SwiGLU uses two input
         # projections and one output projection.
@@ -157,10 +190,10 @@ class MiniMaxH3Flops(DiffusionModelFlops):
         output_params = hidden_size * (video_patch_dim + audio_in_channels) * (latent_total + prompt_total)
         input_output_dense = self.compute_dense_flops(input_params + output_params, 1)
 
-        # Account one timestep/AdaLN projection set per sample.
+        # AdaLN/timestep projections run once per distinct timestep embedding.
         timestep_params = freq_dim * time_embed_hidden_dim + time_embed_hidden_dim * time_embed_dim
         adaln_params = num_layers * time_embed_dim * 18 * hidden_size + time_embed_dim * 2 * hidden_size
-        time_dense = self.compute_dense_flops(timestep_params + adaln_params, batch_size)
+        time_dense = self.compute_dense_flops(timestep_params + adaln_params, timestep_groups)
 
         main_attention = self.compute_attention_flops(latent_seqlens, prompt_seqlens)
         refiner_attention = 12 * num_refiner_layers * inner_dim * sum(int(length) ** 2 for length in prompt_seqlens)

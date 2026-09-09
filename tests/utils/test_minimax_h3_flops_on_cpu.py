@@ -20,7 +20,8 @@ import pytest
 import torch
 
 from verl_omni.utils.mfu import DiffusionFlopsCounter, MiniMaxH3Flops, collect_diffusion_flops_meta
-from verl_omni.utils.mfu.diffusion_flops_counter import _REGISTRY
+from verl_omni.utils.mfu import diffusion_flops_counter as dfc
+from verl_omni.utils.mfu.diffusion_flops_counter import _REGISTRY, allgather_diffusion_flops_meta
 
 H3_CONFIG: dict = {
     "_class_name": "MiniMaxH3Transformer3DModel",
@@ -113,9 +114,24 @@ class TestMiniMaxH3FlopsMetadata:
             "prompt_seqlens": [3, 2],
             "video_seqlens": [104, 128],
             "audio_seqlens": [22, 33],
+            "timestep_group_seqlens": [4, 4],
             "num_timesteps": 3,
             "num_forward_passes": 1,
         }
+
+    def test_nft_metadata_timestep_groups_drop_absent_reference_streams(self):
+        data = {
+            "latent_meta": torch.tensor([[100, 20, 1, 1, 1, 1], [120, 30, 1, 1, 1, 1]]),
+            "condition_video_row_count": torch.tensor([[4], [0]]),
+            "condition_audio_row_count": torch.tensor([[0], [0]]),
+            "prompt_embeds_mask": torch.ones(2, 4, dtype=torch.long),
+            "train_timesteps": torch.ones(2, 3),
+        }
+
+        meta = collect_diffusion_flops_meta(_counter(), data)
+
+        # Sample 0 adds one frozen reference-video timestep; sample 1 is pure T2VA.
+        assert meta["timestep_group_seqlens"] == [3, 2]
 
     def test_flowgrpo_metadata_uses_packed_layout_counts(self):
         data = {
@@ -131,6 +147,7 @@ class TestMiniMaxH3FlopsMetadata:
         assert meta["audio_seqlens"] == [40, 48]
         assert meta["latent_seqlens"] == [184, 208]
         assert meta["prompt_seqlens"] == [2, 3]
+        assert meta["timestep_group_seqlens"] == [2, 2]
         assert meta["num_timesteps"] == 2
 
 
@@ -185,6 +202,60 @@ class TestMiniMaxH3FlopsFormula:
         small, _ = _counter().estimate_flops(latent_seqlens=[512], video_seqlens=[480], audio_seqlens=[32], **common)
         large, _ = _counter().estimate_flops(latent_seqlens=[8192], video_seqlens=[7680], audio_seqlens=[512], **common)
         assert large / small > 16.0
+
+    def test_timestep_groups_scale_only_the_adaln_term(self):
+        kwargs = self._kwargs()
+        base, _ = _counter().estimate_flops(**kwargs)  # fallback groups == batch size (2)
+        more, _ = _counter().estimate_flops(**kwargs, timestep_group_seqlens=[3, 3])  # sum 6
+
+        config = H3_CONFIG
+        time_hidden = int(config["time_embed_hidden_dim"])
+        time_dim = int(config["time_embed_dim"])
+        timestep_weights = int(config["freq_dim"]) * time_hidden + time_hidden * time_dim
+        adaln_weights = int(config["num_layers"]) * time_dim * 18 * int(config["hidden_size"]) + time_dim * 2 * int(
+            config["hidden_size"]
+        )
+        per_group = 6 * (timestep_weights + adaln_weights)
+        expected_delta = per_group * (6 - 2) * kwargs["num_timesteps"] / kwargs["delta_time"] / 1e12
+        assert math.isclose(more - base, expected_delta, rel_tol=1e-9), (more - base, expected_delta)
+
+    def test_timestep_group_length_must_match_batch(self):
+        with pytest.raises(ValueError, match="timestep group counts must match"):
+            _counter().estimate_flops(**self._kwargs(), timestep_group_seqlens=[2])
+
+
+class TestMiniMaxH3FlopsDPGather:
+    def test_dp_gather_flattens_h3_stream_metadata(self, monkeypatch):
+        meta = {
+            "latent_seqlens": [10],
+            "prompt_seqlens": [3],
+            "video_seqlens": [8],
+            "audio_seqlens": [2],
+            "timestep_group_seqlens": [4],
+            "num_timesteps": 5,
+            "num_forward_passes": 2,
+        }
+
+        def fake_all_gather_object(gathered, value, group):
+            # Rank 0 contributes the local value; rank 1 a distinct payload.
+            gathered[0] = list(value)
+            gathered[1] = [item + 100 for item in value]
+
+        monkeypatch.setattr(dfc.torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(dfc.torch.distributed, "get_world_size", lambda group=None: 2)
+        monkeypatch.setattr(dfc.torch.distributed, "all_gather_object", fake_all_gather_object)
+
+        gathered = allgather_diffusion_flops_meta(meta, dp_group=object())
+
+        # Every per-sample list field is flattened across both ranks in order.
+        assert gathered["latent_seqlens"] == [10, 110]
+        assert gathered["prompt_seqlens"] == [3, 103]
+        assert gathered["video_seqlens"] == [8, 108]
+        assert gathered["audio_seqlens"] == [2, 102]
+        assert gathered["timestep_group_seqlens"] == [4, 104]
+        # Scalar fields are constant across the DP group and stay unchanged.
+        assert gathered["num_timesteps"] == 5
+        assert gathered["num_forward_passes"] == 2
 
 
 class TestMiniMaxH3FlopsParamCount:
