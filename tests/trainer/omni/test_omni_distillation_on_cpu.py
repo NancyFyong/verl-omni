@@ -61,6 +61,13 @@ def test_teacher_topk_extension_keeps_upstream_backends(engine):
         config._validate_topk_logprobs(True, 16)
 
 
+@pytest.mark.parametrize("topk", [None, 0, -1])
+def test_teacher_topk_rejects_missing_or_nonpositive_budget(topk):
+    config = OmniDistillationTeacherModelConfig(inference=RolloutConfig(name="vllm_omni"))
+    with pytest.raises(ValueError, match="positive"):
+        config._validate_topk_logprobs(True, topk)
+
+
 @pytest.mark.parametrize("same_policy", [False, True])
 def test_reverse_kl_updates_only_valid_student_actions(same_policy):
     from tensordict import TensorDict
@@ -103,15 +110,13 @@ def test_reverse_kl_updates_only_valid_student_actions(same_policy):
     assert teacher.grad is None
 
 
-def test_teacher_padding_changes_only_synthetic_sequence_fields(monkeypatch):
+def test_teacher_padding_reuses_shared_template_and_preserves_source():
     from verl.trainer.ppo import padding_utils
 
-    original = padding_utils.construct_minimal_padding_template
-    monkeypatch.setattr(padding_utils, "construct_minimal_padding_template", original)
-    module.install_teacher_padding()
+    from verl_omni.workers.utils.padding import patched_padding_template
+
     wrapper = padding_utils.construct_minimal_padding_template
-    module.install_teacher_padding()
-    assert padding_utils.construct_minimal_padding_template is wrapper
+    assert wrapper is patched_padding_template
     source = {
         "input_ids": torch.arange(5),
         "teacher_ids": torch.ones(5, 2, dtype=torch.long),

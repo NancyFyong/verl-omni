@@ -11,9 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Token and padding contracts for the existing omni OPD trainer."""
+"""Tokenizer compatibility checks for the existing omni OPD trainer."""
 
-import torch
 from transformers import AutoTokenizer
 from verl.utils.config import omega_conf_to_dataclass
 
@@ -35,24 +34,3 @@ def validate_teacher_tokenizers(tokenizer, config):
             raise ValueError(
                 f"Omni OPD teacher {teacher.key!r} must share the student's tokenizer and special-token IDs."
             )
-
-
-def install_teacher_padding():
-    """Pad teacher sequence fields in verl's synthetic zero-loss samples (PR #375)."""
-    from verl.trainer.ppo import padding_utils
-
-    original = padding_utils.construct_minimal_padding_template
-    if getattr(original, "_omni_teacher_padding", False):
-        return
-
-    def construct_minimal_padding_template(source_td, source_tag, eos_token_id):
-        sample, tag = original(source_td, source_tag, eos_token_id)
-        length = sample["input_ids"].shape[0]
-        for key, fill in (("teacher_ids", eos_token_id), ("teacher_logprobs", 0.0)):
-            value = sample.get(key)
-            if isinstance(value, torch.Tensor):
-                sample[key] = value.new_full((length, *value.shape[1:]), fill)
-        return sample, tag
-
-    construct_minimal_padding_template._omni_teacher_padding = True
-    padding_utils.construct_minimal_padding_template = construct_minimal_padding_template

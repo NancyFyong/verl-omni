@@ -11,7 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Omni teacher configuration, adapted from the shared OPD integration in PR #375."""
+"""Omni distillation configs.
+
+Subclass verl's ``DistillationTeacherModelConfig`` to teach the on-policy
+distillation path about the ``vllm_omni`` rollout engine:
+"""
 
 from dataclasses import dataclass
 from typing import Optional
@@ -23,17 +27,24 @@ __all__ = ["OmniDistillationTeacherModelConfig"]
 
 @dataclass
 class OmniDistillationTeacherModelConfig(DistillationTeacherModelConfig):
-    """Extend the upstream teacher's log-probability budget to vLLM-Omni."""
+    """Teacher config that also accepts ``inference.name == "vllm_omni"``."""
 
     def _validate_topk_logprobs(self, use_topk: bool, topk: Optional[int]) -> None:
-        if self.inference.name != "vllm_omni" or not use_topk:
+        if self.inference.name != "vllm_omni":
             return super()._validate_topk_logprobs(use_topk, topk)
+        if not use_topk:
+            return
         if topk is None or topk <= 0:
             raise ValueError("topk must be positive when requesting teacher top-k log probabilities.")
-        engine_kwargs = dict(self.inference.engine_kwargs.get("vllm_omni", {}))
-        max_logprobs = engine_kwargs.get("max_logprobs")
+        engine_kwargs = self.inference.engine_kwargs
+        omni_engine_kwargs = dict(engine_kwargs.get("vllm_omni", {}))
+        max_logprobs = omni_engine_kwargs.get("max_logprobs")
         if max_logprobs is None:
-            engine_kwargs["max_logprobs"] = topk
-        elif max_logprobs < topk:
-            raise ValueError(f"vllm_omni max_logprobs ({max_logprobs}) must be >= distillation topk ({topk}).")
-        self.inference.engine_kwargs["vllm_omni"] = engine_kwargs
+            omni_engine_kwargs["max_logprobs"] = topk
+            max_logprobs = topk
+        if max_logprobs < topk:
+            raise ValueError(
+                f"vllm_omni max_logprobs ({max_logprobs}) must be >= distillation_loss topk "
+                f"({topk}) to enable distillation loss computation."
+            )
+        engine_kwargs["vllm_omni"] = omni_engine_kwargs

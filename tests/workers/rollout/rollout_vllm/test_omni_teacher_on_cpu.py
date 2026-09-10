@@ -33,8 +33,47 @@ def _output():
     )
 
 
+@pytest.mark.parametrize("response_ids", [[], [198, 198, 271]])
+def test_typed_request_preserves_minicpm_tokens_media_and_processor_options(monkeypatch, response_ids):
+    from verl_omni.pipelines.minicpm import omni_rollout_adapter as adapter
+    from verl_omni.pipelines.rollout_request import OmniRolloutRequest
+
+    monkeypatch.setattr(adapter, "_install_token_native_multimodal_replay", lambda: None)
+    strategy = ARStrategy(
+        SimpleNamespace(
+            config=SimpleNamespace(max_model_len=64, prompt_length=32, response_length=8),
+            model_config=SimpleNamespace(processor=None),
+        )
+    )
+    strategy._rollout_adapter = adapter.MiniCPMRolloutAdapter
+    replay = {"source_ids": [1, 8, 3], "expanded_ids": [1, 4, 4, 3]}
+    kwargs = {adapter.MINICPM_PROMPT_KEY: replay, "max_slice_nums": 1, "use_image_id": False}
+    image = object()
+    request = OmniRolloutRequest.from_generate_kwargs(
+        prompt_ids=replay["expanded_ids"] + response_ids,
+        image_data=[image],
+        mm_processor_kwargs=kwargs,
+    )
+
+    prompt, params = strategy.preprocess_input(request, {"max_tokens": 1, "prompt_logprobs": 0}, None)
+
+    assert prompt["prompt_token_ids"] == replay["expanded_ids"] + response_ids
+    assert prompt["multi_modal_data"] == {"image": [image]}
+    assert prompt["mm_processor_kwargs"] == {
+        adapter._MINICPM_PROCESSED_PROMPT_KEY: replay,
+        "max_slice_nums": 1,
+        "use_image_id": False,
+    }
+    assert adapter.MINICPM_PROMPT_KEY in kwargs
+    assert params.prompt_logprobs == 0
+
+
 @pytest.mark.parametrize("stage_index", [0, 1])
-def test_teacher_scores_follow_selected_stage_and_next_token_alignment(stage_index):
+def test_teacher_scores_follow_selected_stage_and_next_token_alignment(stage_index, monkeypatch):
+    import verl_omni.workers.rollout.vllm_rollout.vllm_omni_ar_strategy as module
+
+    extract = MagicMock(wraps=module.extract_prompt_logprobs)
+    monkeypatch.setattr(module, "extract_prompt_logprobs", extract)
     strategy = ARStrategy(SimpleNamespace(global_steps=7))
     strategy._policy_stage_index = stage_index
     teacher_params = SamplingParams(max_tokens=1, prompt_logprobs=0)
@@ -44,6 +83,7 @@ def test_teacher_scores_follow_selected_stage_and_next_token_alignment(stage_ind
     assert result.extra_fields["prompt_logprobs"] == [[-0.2], [-0.3], [0.0]]
     assert result.extra_fields["rollout_prompt_ids"] == [1, 2, 3]
     assert result.log_probs is None
+    extract.assert_called_once()
 
 
 def test_teacher_fails_if_engine_omits_prompt_scores():
