@@ -53,8 +53,34 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
 
         # 1. patch for Lora
         VLLMOmniHijack.hijack()
+        if os.environ.get("VERL_OMNI_MINICPM_DUPLEX_OPD") == "1":
+            from verl_omni.pipelines.minicpm.duplex_patch import install_minicpm_duplex_patch
+
+            install_minicpm_duplex_patch()
 
         return super().__new__(cls)
+
+    def take_minicpm_duplex_trace(self, session_id, incarnation=0, epoch=0, discard=False):
+        """Drain a closed native session's training trace from each Thinker rank."""
+        model = self.model_runner.get_model()
+        if not getattr(model, "_verl_duplex_opd_patched", False):
+            raise RuntimeError("MiniCPM duplex OPD worker patch was not installed.")
+        traces = getattr(model, "_verl_duplex_traces", {})
+        trace = traces.pop((session_id, incarnation, epoch), None)
+        if discard:
+            return None
+        if trace is None:
+            raise RuntimeError("Missing native MiniCPM duplex training trace.")
+        trace.closed = True
+        return trace.windows()
+
+    def take_minicpm_duplex_score(self, request_id):
+        """Return proof that the teacher scored the native replay distribution."""
+        model = self.model_runner.get_model()
+        score = getattr(model, "_verl_duplex_scores", {}).pop(request_id, None)
+        if score is None:
+            raise RuntimeError("Teacher request did not execute the native duplex replay sampler.")
+        return score
 
     def set_pending_lora_peft_config(self, peft_config: dict | None = None):
         """Stash the actor's LoRA ``peft_config`` for the next
@@ -110,6 +136,10 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
         """
 
         from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
+
+        standard_model = self._get_standard_weight_model_and_config()
+        if standard_model is not None and getattr(standard_model[0], "_verl_duplex_traces", {}):
+            raise RuntimeError("Close and drain all duplex sessions before updating policy weights.")
 
         if peft_config is None and self._pending_lora_peft_config is not None:
             peft_config = self._pending_lora_peft_config

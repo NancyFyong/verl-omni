@@ -810,6 +810,11 @@ class OmniRolloutPipelineBase:
         return {}
 
     @classmethod
+    def get_deploy_config_base(cls, pipeline_mode: str = "thinker_only") -> str | None:
+        """Optionally inherit a native deployment's connectors and frozen-stage defaults."""
+        return None
+
+    @classmethod
     def get_stage_engine_extras(cls, stage_id: int, pipeline_mode: str = "thinker_only") -> dict:
         """Return per-stage ``engine_extras`` to inject into the deploy config.
 
@@ -831,6 +836,15 @@ class OmniRolloutPipelineBase:
         mm_processor_kwargs: Optional[dict] = None,
     ) -> dict | None:
         """Build an architecture-specific rollout prompt when required."""
+        return None
+
+    @classmethod
+    async def generate_session(cls, server, prompt: dict, params, request_id: str):
+        """Optionally collect a bounded native session and return a TokenOutput.
+
+        None delegates ordinary requests to the shared AR generation path.
+        The adapter must close/drain native sessions before returning.
+        """
         return None
 
     @classmethod

@@ -91,3 +91,13 @@ algorithm:
 
   # Whether to normalize advantages using global standard deviation.
   global_std: true
+
+
+# Keep upstream distillation defaults; extend teacher engine validation for omni.
+distillation:
+
+  teacher_models:
+
+    teacher_model:
+
+      _target_: verl_omni.workers.config.omni.distillation.OmniDistillationTeacherModelConfig

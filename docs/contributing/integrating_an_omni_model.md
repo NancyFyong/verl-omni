@@ -1,6 +1,6 @@
 # How to Add a New Omni Model
 
-Last updated: 08/31/2026.
+Last updated: 09/09/2026.
 
 This guide walks through adding a new omni (multimodal autoregressive) model to
 the verl-omni training framework. It uses the Qwen3-Omni Thinker adapter as a
@@ -102,8 +102,9 @@ and implement:
 
 Optional overrides fall into four groups:
 
-- Pipeline setup: `ensure_pipeline_registered`, `get_engine_hf_overrides`, and
-  `get_stage_engine_extras`.
+- Pipeline setup: `ensure_pipeline_registered`, `get_engine_hf_overrides`,
+  `get_stage_engine_extras`, and optional `get_deploy_config_base` for inheriting
+  a native deployment's connectors and frozen-stage settings.
 - Policy and resource behavior: `policy_stage_id` identifies the stage whose
   sampling parameters and logprobs define the trained policy;
   `weight_sync_stage_ids` identifies the stages that receive actor weights.
@@ -111,6 +112,11 @@ Optional overrides fall into four groups:
   custom prompt, the adapter must include any non-`None`
   `mm_processor_kwargs`; the shared strategy adds them automatically only to
   its default prompt.
+- Bounded native sessions: `generate_session` may return a `TokenOutput` rather
+  than use ordinary request/response generation. It must close and drain sessions
+  before returning, preserve native action/replay data, and fence weight/cache
+  changes while `_active_native_sessions` is nonempty. Returning `None` preserves
+  the ordinary AR path. This is not equivalent to chunking a completed response.
 - Multi-stage output assembly: override `combine_engine_outputs` to opt into
   retaining outputs from every stage marked `final_output` in the pipeline
   topology. Adapters that keep the default hook preserve the engine's existing

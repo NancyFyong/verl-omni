@@ -11,10 +11,4 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-from . import model
-from .actor import OmniActorConfig, OmniLossConfig
-from .distillation import OmniDistillationTeacherModelConfig
-from .model import *  # noqa: F401
-
-__all__ = list(model.__all__) + ["OmniLossConfig", "OmniActorConfig", "OmniDistillationTeacherModelConfig"]
+"""Causal native-session data contracts for duplex post-training."""

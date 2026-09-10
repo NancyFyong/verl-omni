@@ -21,6 +21,7 @@ from typing import Any, Optional
 import ray
 import torch
 import vllm_omni.entrypoints.cli.serve
+from omegaconf import DictConfig, OmegaConf
 from verl.workers.config import RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, TokenOutput
 from verl.workers.rollout.utils import run_uvicorn
@@ -203,6 +204,8 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         kwargs: dict[str, Any] | None = None,
     ):
         """Dispatch a shared RPC to the stages selected by the active strategy."""
+        if method in {"set_pending_lora_peft_config", "update_weights_from_ipc"}:
+            self._require_drained_native_sessions()
         await self.engine.collective_rpc(
             method=method,
             timeout=timeout,
@@ -237,8 +240,14 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         await self.engine.resume_generation()
         self._invalidate_lora_request_cache()
 
+    def _require_drained_native_sessions(self):
+        """Never mutate a policy or its caches underneath a native session."""
+        if getattr(self, "_active_native_sessions", None):
+            raise RuntimeError("Close and drain all native sessions before weight/cache changes.")
+
     async def set_global_steps(self, global_steps: int):
         if global_steps != self.global_steps:
+            self._require_drained_native_sessions()
             self._invalidate_lora_request_cache()
         await super().set_global_steps(global_steps)
 
@@ -251,6 +260,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             await renderer.clear_mm_cache_async()
 
     async def sleep(self):
+        self._require_drained_native_sessions()
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
         if self.rollout_mode == RolloutMode.STANDALONE:
@@ -263,6 +273,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
 
     async def release_kv_cache(self):
         """Free cache around a weight sync without discarding Omni weights."""
+        self._require_drained_native_sessions()
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
         if self.rollout_mode == RolloutMode.COLOCATED:
@@ -500,8 +511,21 @@ class vLLMOmniReplica(vLLMReplica):
         model_config: DiffusionModelConfig | OmniModelConfig,
         gpus_per_node: int = 8,
         is_reward_model: bool = False,
+        is_teacher_model: bool = False,
+        name_suffix: str = "",
     ):
-        super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model)
+        if is_teacher_model and isinstance(model_config, dict | DictConfig):
+            engine_kwargs = config.engine_kwargs.get("vllm_omni", {})
+            if engine_kwargs.get("output_mode") == "ar":
+                # Checkpoint workers construct the model config before the HTTP server does.
+                model_config = OmegaConf.merge(
+                    {"trust_remote_code": engine_kwargs.get("trust_remote_code", False)},
+                    model_config,
+                    {"_target_": "verl_omni.workers.config.OmniModelConfig"},
+                )
+        super().__init__(
+            replica_rank, config, model_config, gpus_per_node, is_reward_model, is_teacher_model, name_suffix
+        )
         self.server_class = ray.remote(vLLMOmniHttpServer)
 
     def _get_server_name_prefix(self) -> str:

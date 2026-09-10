@@ -534,7 +534,7 @@ async def test_ar_strategy_retains_requested_stage_outputs_and_targets_weight_sy
             self.rpc_kwargs = kwargs
             return "rpc-result"
 
-    class Adapter:
+    class Adapter(OmniRolloutPipelineBase):
         @staticmethod
         def combine_engine_outputs(outputs, prompt):
             assert outputs == [policy]
