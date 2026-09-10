@@ -13,9 +13,58 @@
 # limitations under the License.
 """Bounded MiniCPM-o thinker topology and token-native multimodal prompts."""
 
+from functools import wraps
+
 from verl_omni.pipelines.model_base import OmniRolloutPipelineBase
 
 MINICPM_PROMPT_KEY = "minicpm_prompt"
+_MINICPM_PROCESSED_PROMPT_KEY = "_verl_minicpm_processed_prompt"
+
+
+def _install_token_native_multimodal_replay() -> None:
+    from vllm.multimodal.processing.inputs import ProcessorInputs
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
+        MiniCPMO45OmniLLMMultiModalProcessor,
+    )
+
+    processor_cls = MiniCPMO45OmniLLMMultiModalProcessor
+    if hasattr(processor_cls, "_verl_original_cached_apply_hf_processor"):
+        return
+    original = processor_cls._cached_apply_hf_processor
+
+    @wraps(original)
+    def apply_with_preserved_tokens(self, inputs, timing_ctx):
+        replay = inputs.hf_processor_mm_kwargs.get(_MINICPM_PROCESSED_PROMPT_KEY)
+        if replay is None:
+            return original(self, inputs, timing_ctx)
+        if not isinstance(inputs.prompt, list):
+            raise TypeError("MiniCPM-o replay requires token IDs as the serving prompt.")
+        processor_kwargs = dict(inputs.hf_processor_mm_kwargs)
+        processor_kwargs.pop(_MINICPM_PROCESSED_PROMPT_KEY)
+        source_inputs = ProcessorInputs(
+            prompt=replay["source_ids"],
+            mm_data_items=inputs.mm_data_items,
+            mm_uuid_items=inputs.mm_uuid_items,
+            hf_processor_mm_kwargs=processor_kwargs,
+            tokenization_kwargs=inputs.tokenization_kwargs,
+        )
+        source_ids, mm_info, is_update_applied = original(self, source_inputs, timing_ctx)
+        source_ids, _ = self._maybe_apply_prompt_updates(
+            inputs.mm_data_items,
+            source_ids,
+            mm_info.kwargs,
+            mm_info.prompt_updates,
+            is_update_applied,
+        )
+        expanded_ids = replay["expanded_ids"]
+        if source_ids != expanded_ids:
+            raise ValueError("MiniCPM-o serving expansion differs from the actor's processed prompt.")
+        if inputs.prompt[: len(expanded_ids)] != expanded_ids:
+            raise ValueError("MiniCPM-o serving prompt no longer starts with the processed actor prompt.")
+        return list(inputs.prompt), mm_info, True
+
+    processor_cls._verl_original_cached_apply_hf_processor = original
+    processor_cls._cached_apply_hf_processor = apply_with_preserved_tokens
 
 
 @OmniRolloutPipelineBase.register("minicpmo_4_5")
@@ -70,6 +119,10 @@ class MiniCPMRolloutAdapter(OmniRolloutPipelineBase):
             prefix = replay["expanded_ids"]
             if list(prompt_ids[: len(prefix)]) != prefix:
                 raise ValueError("MiniCPM-o rollout/teacher prefix differs from the actor's processed prompt.")
-            # Only replace media-expanded prompt slots; never decode or re-tokenize the student response.
-            effective_ids = [*replay["source_ids"], *prompt_ids[len(prefix) :]]
+            if multi_modal_data:
+                _install_token_native_multimodal_replay()
+                processor_kwargs[_MINICPM_PROCESSED_PROMPT_KEY] = replay
+                effective_ids = list(prompt_ids)
+            else:
+                effective_ids = [*replay["source_ids"], *prompt_ids[len(prefix) :]]
         return {"prompt_token_ids": effective_ids, "mm_processor_kwargs": processor_kwargs}

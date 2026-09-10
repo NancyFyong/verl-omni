@@ -23,7 +23,10 @@ from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopWorkerTQ
 
 from verl_omni.pipelines.minicpm import MiniCPMRolloutAdapter, MiniCPMThinkerAdapter
 from verl_omni.pipelines.minicpm.agent_loop import MiniCPMAgentLoopWorker
-from verl_omni.pipelines.minicpm.omni_rollout_adapter import MINICPM_PROMPT_KEY
+from verl_omni.pipelines.minicpm.omni_rollout_adapter import (
+    _MINICPM_PROCESSED_PROMPT_KEY,
+    MINICPM_PROMPT_KEY,
+)
 from verl_omni.pipelines.minicpm.processor import (
     _load_audio,
     clone_minicpmo_actor_inputs,
@@ -66,7 +69,10 @@ def test_teacher_prompt_preserves_response_ids_and_processor_options():
     replay = {"source_ids": [1, 8, 3], "expanded_ids": [1, 4, 4, 4, 3]}
     kwargs = {MINICPM_PROMPT_KEY: replay, "max_slice_nums": 1}
     result = MiniCPMRolloutAdapter.prepare_engine_prompt([1, 4, 4, 4, 3, 19, 20], config, {"image": [object()]}, kwargs)
-    assert result == {"prompt_token_ids": [1, 8, 3, 19, 20], "mm_processor_kwargs": {"max_slice_nums": 1}}
+    assert result == {
+        "prompt_token_ids": [1, 4, 4, 4, 3, 19, 20],
+        "mm_processor_kwargs": {"max_slice_nums": 1, _MINICPM_PROCESSED_PROMPT_KEY: replay},
+    }
     assert MINICPM_PROMPT_KEY in kwargs
     with pytest.raises(ValueError, match="prefix differs"):
         MiniCPMRolloutAdapter.prepare_engine_prompt([1, 7, 3], config, {}, kwargs)

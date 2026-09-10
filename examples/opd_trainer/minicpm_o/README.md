@@ -1,6 +1,6 @@
 # MiniCPM-o 4.5 simplex thinker OPD
 
-Last updated: 09/08/2026.
+Last updated: 09/09/2026.
 
 This recipe implements the first, thinker-stage part of [RFC #565](https://github.com/verl-project/verl-omni/issues/565), under [#345](https://github.com/verl-project/verl-omni/issues/345). The student generates a complete text response; a frozen teacher scores the same tokens and the existing verl reverse-KL policy-gradient loss updates the student.
 
@@ -23,7 +23,19 @@ hf download openbmb/MiniCPM-o-4_5 \
   --local-dir "$HOME/models/MiniCPM-o-4_5"
 ```
 
-Provide a compatible frozen teacher checkpoint with the same tokenizer and special-token mapping. Vocabulary compatibility is checked before worker allocation. An identical teacher/student checkpoint is useful for a consistency smoke test, **not evidence of useful distillation or quality improvement**. A learning experiment needs a justified teacher advantage.
+Use the original checkpoint as the frozen teacher. To reproduce the noise-perturbed-student setup from [Qwen3-Omni OPD PR #375](https://github.com/verl-project/verl-omni/pull/375) with 20% noise, create a separate student checkpoint:
+
+```bash
+python examples/opd_trainer/minicpm_o/prepare_noised_student.py \
+  --source-model "$HOME/models/MiniCPM-o-4_5" \
+  --output-model "$HOME/models/MiniCPM-o-4_5-Thinker-Noise20" \
+  --noise-ratio 0.20 \
+  --seed 42
+```
+
+The script copies the complete checkpoint but perturbs only nonzero floating-point `llm.*` tensors. For every perturbed tensor it samples a Gaussian direction and rescales it so that `||ΔW||₂ / ||W||₂ = 0.20`, within the checkpoint dtype's rounding precision. The frozen vision/audio encoders, processor, tokenizer, and other model components remain identical to the teacher. The output contains `noise_manifest.json` recording the scope, ratio, and seed. The destination must not already exist.
+
+Teacher and student must retain the same tokenizer and special-token mapping; vocabulary compatibility is checked before worker allocation. Using an identical unperturbed checkpoint on both sides is useful for a consistency smoke test, **not evidence of useful distillation or quality improvement**.
 
 Do not downgrade the repository's Transformers version to match the model card's older reference environment. Use Python 3.12 with FlashInfer 0.6.16.post3: its communication module evaluates `array.array[int]`, which fails during worker initialization on Python 3.11.
 
@@ -66,8 +78,8 @@ The output embeds one image per row and includes the ground-truth answer, parsed
 ## Training
 
 ```bash
-STUDENT_MODEL="$HOME/models/MiniCPM-o-4_5" \
-TEACHER_MODEL="$HOME/models/minicpm-o45-teacher" \
+STUDENT_MODEL="$HOME/models/MiniCPM-o-4_5-Thinker-Noise20" \
+TEACHER_MODEL="$HOME/models/MiniCPM-o-4_5" \
 DATA_DIR="$HOME/data/minicpm_simplex" \
 bash examples/opd_trainer/minicpm_o/run_simplex_opd_lora.sh
 ```
@@ -77,8 +89,8 @@ Defaults use four student GPUs and four teacher GPUs, TP=2 for each rollout/teac
 For MMK12, use the dedicated wrapper:
 
 ```bash
-STUDENT_MODEL="$HOME/models/MiniCPM-o-4_5" \
-TEACHER_MODEL="$HOME/models/minicpm-o45-teacher" \
+STUDENT_MODEL="$HOME/models/MiniCPM-o-4_5-Thinker-Noise20" \
+TEACHER_MODEL="$HOME/models/MiniCPM-o-4_5" \
 DATA_DIR="$HOME/data/mmk12" \
 bash examples/opd_trainer/minicpm_o/run_simplex_opd_lora_mmk12.sh
 ```
