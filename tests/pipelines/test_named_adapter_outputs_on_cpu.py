@@ -16,6 +16,7 @@
 import importlib
 import json
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -55,6 +56,7 @@ def _format(native, architecture="QwenImagePipeline", request_id="request"):
         ("qwen_image_flow_grpo", "get_rollout_post_process_func", "QwenImagePipeline", "image", "LC"),
         ("qwen_image_edit_flow_grpo", "get_rollout_post_process_func", "QwenImageEditPlusPipeline", "image", "LC"),
         ("sd3_flow_grpo", "get_latent_post_process_func", "StableDiffusion3Pipeline", "image", "CHW"),
+        ("flux_dance_grpo", "get_rollout_post_process_func", "FluxPipeline", "image", "LC"),
         ("boogu_image_flow_grpo", "get_rollout_post_process_func", "BooguImagePipeline", "image", "CHW"),
         ("wan22_dance_grpo", "get_rollout_post_process_func", "WanPipeline", "video", "CTHW"),
         ("ltx2_flow_grpo", "get_rollout_post_process_func", "LTX2Pipeline", "video", "CTHW"),
@@ -98,6 +100,73 @@ def test_native_postprocessor_and_formatter_preserve_named_streams(
     assert output.extra_fields["sentinel"] == 13
     torch.testing.assert_close(output.artifacts[f"{kind}_latent"].data, latents[0])
     assert output.artifacts[f"{kind}_preview"].spec.layout == ("TCHW" if kind == "video" else "CHW")
+
+
+@pytest.mark.parametrize("output_type,request_preview", [("image", False), ("latent", False), ("latent", True)])
+def test_flux_forward_emits_named_packed_latents_and_optional_batch_preview(output_type, request_preview):
+    from verl_omni.pipelines.flux_dance_grpo.vllm_omni_rollout_adapter import FluxDanceGRPOPipelineWithLogProb
+    from verl_omni.pipelines.rollout_request import OmniRolloutRequest
+
+    pipeline = object.__new__(FluxDanceGRPOPipelineWithLogProb)
+    pipeline.device = torch.device("cpu")
+    pipeline.vae_scale_factor = 8
+    pipeline.transformer = SimpleNamespace(in_channels=64)
+    pipeline.encode_prompt_from_token_ids = MagicMock(
+        return_value=(torch.zeros(2, 4, 8), torch.zeros(2, 8), torch.zeros(4, 3))
+    )
+    pipeline._set_timesteps = MagicMock(return_value=torch.tensor([1000.0, 500.0, 100.0]))
+    native = torch.arange(2 * 16 * 4 * 6, dtype=torch.float32).reshape(2, 16, 4, 6)
+    packed = pipeline._pack_latents(native, 2, 16, 4, 6)
+    trajectory = packed.unsqueeze(1).expand(-1, 3, -1, -1).clone()
+    pipeline.diffuse = MagicMock(return_value=(trajectory, trajectory + 1, torch.zeros(2, 3), torch.ones(2, 3), packed))
+    pixels = torch.linspace(-1, 1, 2 * 3 * 32 * 48).reshape(2, 3, 32, 48)
+    pipeline.vae = SimpleNamespace(
+        config=SimpleNamespace(scaling_factor=2.0, shift_factor=0.5),
+        dtype=torch.float32,
+        decode=MagicMock(return_value=(pixels,)),
+    )
+    requests = [
+        OmniDiffusionRequest(
+            request_id=f"flux-{index}",
+            prompt=OmniRolloutRequest.from_generate_kwargs(
+                prompt_ids=[index], extra_prompt_ids={"clip": [index], "t5": [index, 2]}
+            ).to_diffusion_prompt(),
+            sampling_params=OmniDiffusionSamplingParams(
+                height=32,
+                width=48,
+                num_inference_steps=3,
+                output_type=output_type,
+                seed=index,
+                extra_args={
+                    "timestep_sample_strategy": "continuous",
+                    "drop_last_transition": False,
+                    "requested_outputs": ["image_preview"] if request_preview and index == 1 else [],
+                },
+            ),
+        )
+        for index in range(2)
+    ]
+    outputs = pipeline.forward(DiffusionRequestBatch(requests=requests))
+    decode = output_type == "image" or request_preview
+    assert pipeline.vae.decode.call_count == int(decode)
+    if decode:
+        torch.testing.assert_close(pipeline.vae.decode.call_args.args[0], native / 2 + 0.5)
+    for index, output in enumerate(outputs):
+        converted = DiffusionStrategy(SimpleNamespace(global_steps=1)).process_output(
+            _format(output, "FluxPipeline", requests[index].request_id), None, {"output_type": output_type}
+        )
+        artifact = converted.artifacts["image_latent"]
+        assert artifact.spec.layout == "LC"
+        assert artifact.data.dtype == packed.dtype
+        torch.testing.assert_close(artifact.data, packed[index])
+        torch.testing.assert_close(output.trajectory_latents, trajectory[index : index + 1])
+        torch.testing.assert_close(converted.extra_fields["all_next_latents"], trajectory[index] + 1)
+        assert ("image_preview" in converted.artifacts) == decode
+        if decode:
+            preview = converted.artifacts["image_preview"]
+            assert preview.spec.layout == "CHW"
+            expected = quantize_pixels(pixels[index], "minus_one_one", context="test")
+            torch.testing.assert_close(preview.data, expected)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])

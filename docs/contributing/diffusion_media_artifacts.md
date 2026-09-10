@@ -1,6 +1,6 @@
 # Named diffusion media artifacts
 
-Last updated: 09/08/2026.
+Last updated: 09/10/2026.
 
 All registered in-tree diffusion adapters emit named media. The strategy,
 agent loops, rewards and V0/V1 exporters consume declarations rather than
@@ -72,7 +72,7 @@ an adapter declaration is available. Packed request batches take the union of
 all requests' requirements, not just those of the first request.
 
 Requested names express **required availability**, not an exclusive output set.
-Qwen/SD3/Boogu/Wan can avoid preview decoding when it is not requested and the
+Qwen/SD3/FLUX/Boogu/Wan can avoid preview decoding when it is not requested and the
 primary is latent. LTX decodes its joint pair when either decoded stream is
 required. Pinned H3 and Bagel forwards still decode; no selective-decoding
 optimization is claimed for those models.
@@ -180,6 +180,7 @@ The adapters and pinned VAE/postprocessor code establish these distinct layouts:
 | --- | --- | --- | --- |
 | Qwen image / edit / DPO / NFT / dual / mix | packed `LC` | `NCTHW`, image T=1 | `NCHW` after selecting the image frame |
 | SD3, Boogu | `CHW` | `NCHW` | `NCHW` |
+| FLUX DanceGRPO | packed `LC` | `NCHW` after unpacking | `NCHW` |
 | Bagel | packed `LC` | `NCHW` after unpatchifying | RGB PIL image |
 | Wan | `CTHW` | `NCTHW` | `NCTHW` |
 | LTX | video `CTHW`, audio `CTF` | `NCTHW` / `NCTF` | `NTCHW` from `VideoProcessor(..., output_type="pt")` |
@@ -188,6 +189,11 @@ The adapters and pinned VAE/postprocessor code establish these distinct layouts:
 H3 and LTX decoded audio is `NCT` at their decoder boundary. H3 uses 32000 Hz;
 LTX reads the vocoder's actual `output_sampling_rate` (BWE checkpoints can be
 48000 Hz, not the old 24000 Hz default).
+
+FLUX DanceGRPO was aligned when rebasing onto the newer main branch. Its pinned
+packing/unpacking, named outputs, per-request splitting and optional preview
+union are CPU-tested with mocked encoders/denoising/VAE. Real FLUX VAE and GPU
+rollout validation remain pending; the earlier GPU matrix does not cover it.
 
 Reproducible GPU checks live under `tests/special_e2e/`:
 
