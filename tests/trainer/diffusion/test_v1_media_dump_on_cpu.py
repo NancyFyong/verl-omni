@@ -15,6 +15,7 @@
 
 import json
 import logging
+from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,6 +23,7 @@ import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
+from verl import DataProto
 
 import verl_omni.trainer.diffusion.ray_diffusion_trainer as ray_diffusion_trainer
 import verl_omni.trainer.diffusion.v1.trainer_base as trainer_base_module
@@ -84,13 +86,17 @@ def test_v1_video_dump_reuses_shared_export_and_honors_max_samples(monkeypatch, 
     assert rows == [{"input": "first", "output": str(tmp_path / "7/0.mp4"), "gts": None, "score": 1.0, "step": 7}]
 
 
-def test_v1_background_dump_failure_is_logged_and_does_not_raise(caplog, tmp_path):
+def test_v1_background_dump_failure_is_logged_and_does_not_raise(monkeypatch, caplog, tmp_path):
     trainer = _trainer(global_steps=3)
 
+    def fail(*args, **kwargs):
+        raise OSError("simulated background I/O failure")
+
+    monkeypatch.setattr(trainer_base_module, "dump_generations", fail)
     with caplog.at_level(logging.WARNING):
         trainer._dump_generations(
             inputs=["prompt"],
-            outputs=torch.zeros(1, 3, 8, 8),
+            outputs=torch.zeros(1, 3, 8, 8, dtype=torch.uint8),
             gts=[None],
             scores=[0.0],
             reward_extra_infos_dict={},
@@ -100,6 +106,55 @@ def test_v1_background_dump_failure_is_logged_and_does_not_raise(caplog, tmp_pat
         trainer._shutdown_dump_executor()
 
     assert "Ignoring background media dump failure at step 3" in caplog.text
+
+
+def test_v1_background_export_uses_submission_step_snapshot(tmp_path):
+    queued = []
+    trainer = object.__new__(_ConcreteTrainer)
+    trainer.global_steps = 7
+    trainer._dump_futures = []
+    trainer._dump_executor = SimpleNamespace(submit=lambda *args: queued.append(args) or Future())
+    trainer._dump_generations(
+        ["prompt"], torch.zeros(1, 3, 8, 8, dtype=torch.uint8), [None], [1.0], {}, str(tmp_path), media_kind="image"
+    )
+    trainer.global_steps = 8
+    fn, *args = queued[0]
+    assert fn is ray_diffusion_trainer.dump_generations
+    fn(*args)
+    assert (tmp_path / "7" / "0.jpg").exists()
+    assert not (tmp_path / "8").exists()
+    assert json.loads((tmp_path / "7.jsonl").read_text())["step"] == 7
+
+
+@pytest.mark.parametrize("transport", ["top", "tool"])
+@pytest.mark.parametrize("kinds", [["image", "video"], [None, "video"], [None, None]])
+def test_v0_rollout_validates_all_declared_kinds(transport, kinds):
+    captured = {}
+    non_tensors = {"reward_model": [{}, {}]}
+    if transport == "top":
+        non_tensors["media_kind"] = kinds
+    else:
+        non_tensors["tool_extra_fields"] = [{"media_kind": kind} for kind in kinds]
+    data = DataProto.from_dict(
+        tensors={
+            "prompts": torch.ones(2, 1, dtype=torch.long),
+            "responses": torch.zeros(2, 4, 3, 8, 8, dtype=torch.uint8),
+            "sample_level_scores": torch.zeros(2, 1),
+        },
+        non_tensors=non_tensors,
+    )
+    trainer = SimpleNamespace(
+        config=OmegaConf.create({"trainer": {}}),
+        tokenizer=SimpleNamespace(batch_decode=lambda *args, **kwargs: ["first", "second"]),
+        _dump_generations=lambda **kwargs: captured.update(kwargs),
+    )
+    if kinds == ["image", "video"]:
+        with pytest.raises(ValueError, match="Conflicting media kinds"):
+            ray_diffusion_trainer.BaseRayDiffusionTrainer._log_rollout_data(trainer, data, {}, {}, "/tmp/unused")
+        assert captured == {}
+    else:
+        ray_diffusion_trainer.BaseRayDiffusionTrainer._log_rollout_data(trainer, data, {}, {}, "/tmp/unused")
+        assert captured["media_kind"] == kinds[-1]
 
 
 @pytest.mark.parametrize("trainer_cls", [ray_diffusion_trainer.BaseRayDiffusionTrainer, _ConcreteTrainer])
@@ -170,7 +225,19 @@ def test_v1_invalid_modality_fails_before_background_submission(tmp_path):
         trainer._shutdown_dump_executor()
 
 
-def test_v1_rollout_dump_sorts_and_forwards_media_metadata(monkeypatch):
+@pytest.mark.parametrize("outputs", [torch.zeros(1, 3, 8, 8), [torch.zeros(3, 8, 8)]])
+def test_v1_invalid_dtype_fails_before_background_submission(tmp_path, outputs):
+    trainer = _trainer()
+    try:
+        with pytest.raises(ValueError, match="uint8"):
+            trainer._dump_generations(["prompt"], outputs, [None], [0.0], {}, str(tmp_path), media_kind="image")
+        assert trainer._dump_futures == []
+    finally:
+        trainer._shutdown_dump_executor()
+
+
+@pytest.mark.parametrize("media_kinds", [["video", "video"], ["video", "image"], ["video", "depth"]])
+def test_v1_rollout_dump_sorts_and_forwards_media_metadata(monkeypatch, media_kinds):
     trainer = object.__new__(_ConcreteTrainer)
     trainer.config = OmegaConf.create({"trainer": {"rollout_data_max_samples": 1, "video_fps": 12}})
     trainer.tokenizer = SimpleNamespace(
@@ -194,13 +261,18 @@ def test_v1_rollout_dump_sorts_and_forwards_media_metadata(monkeypatch):
             "audio": audio,
         },
         non_tensor_batch={
-            "media_kind": np.array(["video", "video"], dtype=object),
+            "media_kind": np.array(media_kinds, dtype=object),
             "audio_sample_rate": np.array([48_000, 48_000], dtype=object),
         },
     )
     monkeypatch.setattr(trainer_base_module, "diffusion_tq_batch_to_dataproto", lambda *args, **kwargs: data)
 
     batch_meta = SimpleNamespace(keys=["second_0_0", "first_0_0"], partition_id="train")
+    if media_kinds != ["video", "video"]:
+        with pytest.raises(ValueError, match="media kind"):
+            trainer._log_rollout_data(batch_meta, {}, "/tmp/unused")
+        assert captured == {}
+        return
     trainer._log_rollout_data(batch_meta, {}, "/tmp/unused")
 
     assert captured["inputs"] == ["first", "second"]

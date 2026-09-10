@@ -20,7 +20,6 @@ from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pprint import pprint
-from types import SimpleNamespace
 
 import numpy as np
 import ray
@@ -57,6 +56,7 @@ from verl.utils.skip import SkipManager
 from verl.utils.tracking import Tracking, ValidationGenerationsLogger
 from verl.workers.rollout.llm_server import LLMServerManager
 
+from verl_omni.pipelines.rollout_media import resolve_batch_media_kind, resolve_is_video
 from verl_omni.trainer.diffusion.diffusion_algos import get_diffusion_loss_fn
 from verl_omni.trainer.diffusion.diffusion_metric_utils import (
     compute_data_metrics_diffusion,
@@ -73,7 +73,9 @@ from verl_omni.trainer.diffusion.diffusion_trainer_utils import (
 from verl_omni.trainer.diffusion.ray_diffusion_trainer import (
     BaseRayDiffusionTrainer,
     _to_diffusion_worker_tensordict,
+    _validate_generation_outputs,
     compute_advantage,
+    dump_generations,
 )
 from verl_omni.trainer.diffusion.rollout_correction import (
     apply_bypass_mode_to_diffusion_batch,
@@ -87,7 +89,7 @@ from verl_omni.trainer.diffusion.v1.tq_utils import (
     put_dataproto_fields_to_tq,
     sort_diffusion_tq_keys,
 )
-from verl_omni.utils.tracking import batch_items, resolve_is_video
+from verl_omni.utils.tracking import batch_items
 from verl_omni.workers.engine_workers import ActorRolloutRefWorker, resolve_teacher_infer_micro_batch_size
 from verl_omni.workers.utils.padding import embeds_padding_2_no_padding
 
@@ -1382,7 +1384,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 fps=int(self.config.trainer.get("video_fps", 24)),
                 audios=sample_audios,
                 audio_sample_rates=sample_audio_sample_rates,
-                media_kind=next((kind for kind in sample_media_kinds if kind is not None), None),
+                media_kind=resolve_batch_media_kind(sample_media_kinds),
             )
 
         data_sources_arr = np.concatenate(data_sources, axis=0) if data_sources else np.array([])
@@ -1422,18 +1424,19 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         audio_sample_rates=None,
         media_kind=None,
     ):
-        """Submit a best-effort image/video dump to the background executor."""
+        """Validate media synchronously, then submit best-effort I/O with a step snapshot."""
+        _validate_generation_outputs(outputs)
         resolve_is_video(outputs.ndim, media_kind)
         global_step = self.global_steps
         future = self._dump_executor.submit(
-            self._write_generations,
+            dump_generations,
+            global_step,
             inputs,
             outputs,
             gts,
             scores,
             reward_extra_infos_dict,
             dump_path,
-            global_step,
             max_samples,
             fps,
             audios,
@@ -1442,38 +1445,6 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         )
         self._dump_futures.append((future, global_step))
         self._drain_dump_futures()
-
-    @staticmethod
-    def _write_generations(
-        inputs,
-        outputs,
-        gts,
-        scores,
-        reward_extra_infos_dict,
-        dump_path,
-        global_step,
-        max_samples,
-        fps,
-        audios,
-        audio_sample_rates,
-        media_kind,
-    ):
-        """Reuse the V0 media exporter with a step snapshot for thread safety."""
-        dump_context = SimpleNamespace(global_steps=global_step)
-        BaseRayDiffusionTrainer._dump_generations(
-            dump_context,
-            inputs,
-            outputs,
-            gts,
-            scores,
-            reward_extra_infos_dict,
-            dump_path,
-            max_samples=max_samples,
-            fps=fps,
-            audios=audios,
-            audio_sample_rates=audio_sample_rates,
-            media_kind=media_kind,
-        )
 
     def _log_rollout_data(self, batch_meta: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
         """Fetch rollout rows from TQ and dump sorted by uid."""
@@ -1522,7 +1493,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 fps=int(self.config.trainer.get("video_fps", 24)),
                 audios=audios,
                 audio_sample_rates=audio_sample_rates,
-                media_kind=next((kind for kind in media_kinds if kind is not None), None),
+                media_kind=resolve_batch_media_kind(media_kinds),
             )
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns) -> dict:

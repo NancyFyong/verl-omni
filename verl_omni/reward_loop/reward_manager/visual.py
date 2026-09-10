@@ -14,13 +14,14 @@
 
 import inspect
 
-import numpy as np
 import torch
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
 from verl.utils.reward_score import default_compute_score as _upstream_default_compute_score
 
 from verl_omni.utils.reward_score import default_compute_score_image
+
+from .media import _reward_extra_info
 
 
 def _validate_visual_response(response_visual, config, *, is_validate: bool) -> None:
@@ -35,29 +36,6 @@ def _validate_visual_response(response_visual, config, *, is_validate: bool) -> 
     elif not isinstance(response_visual, torch.Tensor) or response_visual.dtype != torch.uint8:
         dtype = getattr(response_visual, "dtype", type(response_visual))
         raise ValueError(f"Expected uint8 pixel responses for output_type={output_type!r}, got {dtype}.")
-
-
-def _reward_extra_info(data_item) -> dict:
-    """Project generated media from ordinary/TQ batches into scorer metadata."""
-    extra_info = data_item.non_tensor_batch.get("extra_info", {})
-    tool_extra_fields = data_item.non_tensor_batch.get("tool_extra_fields") or {}
-    extra_info.update(tool_extra_fields)
-    for key in ("audio", "audio_sample_rate", "media_kind"):
-        value = data_item.batch.get(key)
-        if value is None:
-            value = data_item.non_tensor_batch.get(key)
-        if value is None:
-            continue
-        tool_value = tool_extra_fields.get(key)
-        if tool_value is not None and tool_value is not value:
-            if isinstance(value, torch.Tensor) and isinstance(tool_value, torch.Tensor):
-                matches = value.device == tool_value.device and torch.equal(value, tool_value)
-            else:
-                matches = np.array_equal(value, tool_value)
-            if not matches:
-                raise ValueError(f"Conflicting rollout media field {key!r} in batch and tool_extra_fields")
-        extra_info[key] = value
-    return extra_info
 
 
 class VisualRewardManager(RewardManagerBase):

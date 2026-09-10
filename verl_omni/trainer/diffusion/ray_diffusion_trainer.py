@@ -54,6 +54,7 @@ from verl.utils.py_functional import rename_dict
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.llm_server import LLMServerManager
 
+from verl_omni.pipelines.rollout_media import resolve_batch_media_kind, resolve_is_video
 from verl_omni.trainer.config import DiffusionAlgoConfig
 from verl_omni.trainer.diffusion.diffusion_algos import (
     DiffusionAdvantageEstimator,
@@ -85,7 +86,6 @@ from verl_omni.utils.tracking import (
     _export_video,
     batch_items,
     log_wandb_media,
-    resolve_is_video,
     wrap_val_samples_for_wandb,
 )
 from verl_omni.workers.utils.padding import embeds_padding_2_no_padding
@@ -187,6 +187,146 @@ def compute_advantage(
     data.batch["advantages"] = advantages
     data.batch["returns"] = returns
     return data
+
+
+def _validate_generation_outputs(outputs) -> None:
+    """Reject non-pixel outputs before best-effort logging or async submission."""
+    if not isinstance(outputs, torch.Tensor) or outputs.dtype != torch.uint8:
+        dtype = getattr(outputs, "dtype", type(outputs))
+        raise ValueError(f"Expected generation outputs to be a uint8 tensor, got {dtype}.")
+
+
+def dump_generations(
+    global_steps,
+    inputs,
+    outputs,
+    gts,
+    scores,
+    reward_extra_infos_dict,
+    dump_path,
+    max_samples=None,
+    fps=24,
+    audios=None,
+    audio_sample_rates=None,
+    media_kind=None,
+):
+    """Dump samples to disk as media files plus a JSONL index.
+
+    ``outputs`` is a batch of images ``[N, C, H, W]`` (-> ``{i}.jpg``) or videos
+    ``[N, T, C, H, W]`` (-> ``{i}.mp4`` at ``fps``). ``max_samples`` caps how many
+    are written (``None`` = all). Optional generated audio is muxed into video files.
+    Failed video exports are preserved as ``{i}.pt`` fallback payloads when possible.
+    Media failures are recorded in JSONL; filesystem failures warn and skip the dump.
+    """
+    _validate_generation_outputs(outputs)
+    visual_folder = os.path.join(dump_path, f"{global_steps}")
+
+    n_full = outputs.shape[0]
+    n = n_full if max_samples is None else min(max_samples, n_full)
+    if outputs.ndim == 6:
+        # Per-sample batch dim from single-seq rollouts: [N, 1, T, C, H, W].
+        outputs = outputs.squeeze(1)
+    if outputs.ndim == 5 and outputs.shape[1] == 3 and outputs.shape[2] != 3:
+        # Channels-first [N, C, T, H, W] -> [N, T, C, H, W]. Layout normalization
+        # is still heuristic; declaring/normalizing it is deferred to the layout PR.
+        outputs = outputs.permute(0, 2, 1, 3, 4)
+    # Prefer the adapter-declared media kind over the tensor rank.
+    is_video = resolve_is_video(outputs.ndim, media_kind)
+
+    try:
+        os.makedirs(visual_folder, exist_ok=True)
+    except OSError as error:
+        sys_logger.warning("Skipping media dump at step %s: %s", global_steps, error)
+        return
+
+    output_paths = []
+    output_fallback_paths = [None] * n
+    video_export_errors = [None] * n
+    image_export_errors = [None] * n
+    if is_video:
+        audios = batch_items(audios, n_full, "audio")
+        audio_sample_rates = batch_items(audio_sample_rates, n_full, "audio_sample_rate")
+        for i in range(n):
+            video_path = os.path.join(visual_folder, f"{i}.mp4")
+            try:
+                _export_video(
+                    outputs[i],
+                    video_path,
+                    fps=fps,
+                    audio=audios[i],
+                    audio_sample_rate=audio_sample_rates[i],
+                )
+            except (OSError, subprocess.SubprocessError, ValueError) as error:
+                error_message = f"{type(error).__name__}: {error}"
+                fallback_path = os.path.join(visual_folder, f"{i}.pt")
+                fallback_audio = audios[i]
+                if isinstance(fallback_audio, torch.Tensor):
+                    fallback_audio = fallback_audio.detach().cpu()
+                fallback = {
+                    "video": outputs[i].detach().cpu(),
+                    "audio": fallback_audio,
+                    "audio_sample_rate": audio_sample_rates[i],
+                }
+                try:
+                    torch.save(fallback, fallback_path)
+                except Exception as fallback_error:
+                    fallback_path = None
+                    error_message = (
+                        f"{error_message}; fallback save failed: {type(fallback_error).__name__}: {fallback_error}"
+                    )
+                else:
+                    output_fallback_paths[i] = fallback_path
+                video_export_errors[i] = error_message
+                sys_logger.warning(
+                    "Failed to export rollout video at step %s sample %s: %s",
+                    global_steps,
+                    i,
+                    error_message,
+                )
+                output_paths.append(None)
+            else:
+                output_paths.append(video_path)
+    else:
+        images_pil = outputs[:n].cpu().permute(0, 2, 3, 1).numpy()
+        for i, image in enumerate(images_pil):
+            image_path = os.path.join(visual_folder, f"{i}.jpg")
+            try:
+                Image.fromarray(image).save(image_path)
+            except (OSError, ValueError) as error:
+                image_export_errors[i] = f"{type(error).__name__}: {error}"
+                sys_logger.warning("Failed to export rollout image at step %s sample %s: %s", global_steps, i, error)
+                output_paths.append(None)
+            else:
+                output_paths.append(image_path)
+
+    filename = os.path.join(dump_path, f"{global_steps}.jsonl")
+    base_data = {
+        "input": list(inputs)[:n],
+        "output": output_paths,
+        "gts": list(gts)[:n],
+        "score": list(scores)[:n],
+        "step": [global_steps] * n,
+    }
+    for k, v in reward_extra_infos_dict.items():
+        if len(v) == n_full:
+            base_data[k] = list(v)[:n]
+    if any(video_export_errors):
+        base_data["output_fallback"] = output_fallback_paths
+        base_data["video_export_error"] = video_export_errors
+    if any(image_export_errors):
+        base_data["image_export_error"] = image_export_errors
+
+    try:
+        lines = []
+        for i in range(n):
+            entry = {k: v[i] for k, v in base_data.items()}
+            lines.append(json.dumps(entry, ensure_ascii=False, default=_json_encode_default))
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except (OSError, TypeError, ValueError) as error:
+        sys_logger.warning("Skipping media index at step %s (%s): %s", global_steps, filename, error)
+        return
+    print(f"Dumped generations to {filename}")
 
 
 class BaseRayDiffusionTrainer(ABC):
@@ -384,133 +524,21 @@ class BaseRayDiffusionTrainer(ABC):
         audio_sample_rates=None,
         media_kind=None,
     ):
-        """Dump samples to disk as media files plus a JSONL index.
-
-        ``outputs`` is a batch of images ``[N, C, H, W]`` (-> ``{i}.jpg``) or videos
-        ``[N, T, C, H, W]`` (-> ``{i}.mp4`` at ``fps``). ``max_samples`` caps how many
-        are written (``None`` = all). Optional generated audio is muxed into video files.
-        Failed video exports are preserved as ``{i}.pt`` fallback payloads when possible.
-        Media failures are recorded in JSONL; filesystem failures warn and skip the dump.
-        """
-        if not isinstance(outputs, torch.Tensor) or outputs.dtype != torch.uint8:
-            dtype = getattr(outputs, "dtype", type(outputs))
-            raise ValueError(f"Expected generation outputs to be a uint8 tensor, got {dtype}.")
-
-        visual_folder = os.path.join(dump_path, f"{self.global_steps}")
-
-        n_full = outputs.shape[0]
-        n = n_full if max_samples is None else min(max_samples, n_full)
-        if outputs.ndim == 6:
-            # Per-sample batch dim from single-seq rollouts: [N, 1, T, C, H, W].
-            outputs = outputs.squeeze(1)
-        if outputs.ndim == 5 and outputs.shape[1] == 3 and outputs.shape[2] != 3:
-            # Channels-first [N, C, T, H, W] -> [N, T, C, H, W]. Layout normalization
-            # is still heuristic; declaring/normalizing it is deferred to the layout PR.
-            outputs = outputs.permute(0, 2, 1, 3, 4)
-        # Prefer the adapter-declared media kind over the tensor rank.
-        is_video = resolve_is_video(outputs.ndim, media_kind)
-
-        try:
-            os.makedirs(visual_folder, exist_ok=True)
-        except OSError as error:
-            sys_logger.warning("Skipping media dump at step %s: %s", self.global_steps, error)
-            return
-
-        output_paths = []
-        output_fallback_paths = [None] * n
-        video_export_errors = [None] * n
-        image_export_errors = [None] * n
-        if is_video:
-            audios = batch_items(audios, n_full, "audio")
-            audio_sample_rates = batch_items(audio_sample_rates, n_full, "audio_sample_rate")
-            for i in range(n):
-                video_path = os.path.join(visual_folder, f"{i}.mp4")
-                try:
-                    _export_video(
-                        outputs[i],
-                        video_path,
-                        fps=fps,
-                        audio=audios[i],
-                        audio_sample_rate=audio_sample_rates[i],
-                    )
-                except (OSError, subprocess.SubprocessError, ValueError) as error:
-                    error_message = f"{type(error).__name__}: {error}"
-                    fallback_path = os.path.join(visual_folder, f"{i}.pt")
-                    fallback_audio = audios[i]
-                    if isinstance(fallback_audio, torch.Tensor):
-                        fallback_audio = fallback_audio.detach().cpu()
-                    fallback = {
-                        "video": outputs[i].detach().cpu(),
-                        "audio": fallback_audio,
-                        "audio_sample_rate": audio_sample_rates[i],
-                    }
-                    try:
-                        torch.save(fallback, fallback_path)
-                    except Exception as fallback_error:
-                        fallback_path = None
-                        error_message = (
-                            f"{error_message}; fallback save failed: {type(fallback_error).__name__}: {fallback_error}"
-                        )
-                    else:
-                        output_fallback_paths[i] = fallback_path
-                    video_export_errors[i] = error_message
-                    sys_logger.warning(
-                        "Failed to export rollout video at step %s sample %s: %s",
-                        self.global_steps,
-                        i,
-                        error_message,
-                    )
-                    output_paths.append(None)
-                else:
-                    output_paths.append(video_path)
-        else:
-            images_pil = outputs[:n].cpu().permute(0, 2, 3, 1).numpy()
-            for i, image in enumerate(images_pil):
-                image_path = os.path.join(visual_folder, f"{i}.jpg")
-                try:
-                    Image.fromarray(image).save(image_path)
-                except (OSError, ValueError) as error:
-                    image_export_errors[i] = f"{type(error).__name__}: {error}"
-                    sys_logger.warning(
-                        "Failed to export rollout image at step %s sample %s: %s", self.global_steps, i, error
-                    )
-                    output_paths.append(None)
-                else:
-                    output_paths.append(image_path)
-
-        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
-
-        base_data = {
-            "input": list(inputs)[:n],
-            "output": output_paths,
-            "gts": list(gts)[:n],
-            "score": list(scores)[:n],
-            "step": [self.global_steps] * n,
-        }
-
-        for k, v in reward_extra_infos_dict.items():
-            if len(v) == n_full:
-                base_data[k] = list(v)[:n]
-        if any(video_export_errors):
-            base_data["output_fallback"] = output_fallback_paths
-            base_data["video_export_error"] = video_export_errors
-
-        if any(image_export_errors):
-            base_data["image_export_error"] = image_export_errors
-
-        try:
-            lines = []
-            for i in range(n):
-                entry = {k: v[i] for k, v in base_data.items()}
-                lines.append(json.dumps(entry, ensure_ascii=False, default=_json_encode_default))
-
-            with open(filename, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines) + "\n")
-        except (OSError, TypeError, ValueError) as error:
-            sys_logger.warning("Skipping media index at step %s (%s): %s", self.global_steps, filename, error)
-            return
-
-        print(f"Dumped generations to {filename}")
+        """Dump media with the shared exporter at the current training step."""
+        return dump_generations(
+            self.global_steps,
+            inputs,
+            outputs,
+            gts,
+            scores,
+            reward_extra_infos_dict,
+            dump_path,
+            max_samples=max_samples,
+            fps=fps,
+            audios=audios,
+            audio_sample_rates=audio_sample_rates,
+            media_kind=media_kind,
+        )
 
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
@@ -551,27 +579,12 @@ class BaseRayDiffusionTrainer(ABC):
                     "audio_sample_rate", batch.batch.get("audio_sample_rate")
                 )
 
-            # The primary media kind is declared per adapter and is uniform across a
-            # rollout batch (one pipeline); take the first declared value. Direct
-            # diffusion loops project it as a top-level non-tensor field, while
-            # composite loops may retain the tool-extra envelope.
+            # One pipeline owns the batch; validate rather than silently choosing
+            # one sample's kind. Composite loops may retain the tool-extra envelope.
             media_kind_values = batch.non_tensor_batch.get("media_kind")
-            if media_kind_values is not None:
-                media_kind = next(
-                    (value for value in batch_items(media_kind_values, len(batch), "media_kind") if value is not None),
-                    None,
-                )
-            elif tool_extra is not None:
-                media_kind = next(
-                    (
-                        item.get("media_kind")
-                        for item in tool_extra
-                        if isinstance(item, dict) and item.get("media_kind")
-                    ),
-                    None,
-                )
-            else:
-                media_kind = None
+            if media_kind_values is None and tool_extra is not None:
+                media_kind_values = [item.get("media_kind") if isinstance(item, dict) else None for item in tool_extra]
+            media_kind = resolve_batch_media_kind(batch_items(media_kind_values, len(batch), "media_kind"))
 
             self._dump_generations(
                 inputs=inputs,
@@ -602,6 +615,7 @@ class BaseRayDiffusionTrainer(ABC):
 
         if generations_to_log == 0:
             return
+        _validate_generation_outputs(outputs)
 
         import shutil
 
@@ -610,6 +624,7 @@ class BaseRayDiffusionTrainer(ABC):
         audios = batch_items(audios, len(inputs), "audio")
         audio_sample_rates = batch_items(audio_sample_rates, len(inputs), "audio_sample_rate")
         media_kinds = batch_items(media_kinds, len(inputs), "media_kind")
+        resolve_batch_media_kind(media_kinds)
         samples = list(zip(inputs, list(outputs), scores, audios, audio_sample_rates, media_kinds, strict=True))
         samples.sort(key=lambda x: x[0])  # Sort by input text
 
@@ -809,7 +824,7 @@ class BaseRayDiffusionTrainer(ABC):
                 fps=int(self.config.trainer.get("video_fps", 24)),
                 audios=sample_audios,
                 audio_sample_rates=sample_audio_sample_rates,
-                media_kind=next((kind for kind in sample_media_kinds if kind is not None), None),
+                media_kind=resolve_batch_media_kind(sample_media_kinds),
             )
 
         for key_info, lst in reward_extra_infos_dict.items():

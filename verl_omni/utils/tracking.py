@@ -26,6 +26,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from verl_omni.pipelines.rollout_media import resolve_is_video
 from verl_omni.utils.reward_score.reward_utils import normalize_video_tensor
 
 logger = logging.getLogger(__name__)
@@ -79,21 +80,6 @@ def _video_tensor_to_rgb24(video: torch.Tensor) -> tuple[np.ndarray, int, int]:
     video = normalize_video_tensor(video)
     frames = video.detach().permute(0, 2, 3, 1).to(device="cpu").contiguous().numpy()
     return frames, int(frames.shape[2]), int(frames.shape[1])
-
-
-def resolve_is_video(ndim: int, media_kind: str | None) -> bool:
-    """Decide whether a rollout output is a video.
-
-    Prefers the adapter-declared media kind (from ``DiffusionIOSpec``); the tensor
-    rank is only a fallback for outputs that do not carry a declared kind. This
-    avoids misclassifying, e.g., a short 3-frame video whose rank happens to match
-    an image batch.
-    """
-    if media_kind is not None:
-        if media_kind not in ("image", "video", "audio"):
-            raise ValueError(f"Unsupported media kind: {media_kind!r}")
-        return media_kind == "video"
-    return ndim == 5
 
 
 def _export_video(

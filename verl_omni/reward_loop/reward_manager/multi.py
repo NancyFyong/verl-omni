@@ -19,7 +19,8 @@ import logging
 from verl import DataProto
 from verl.utils.import_utils import load_extern_object
 
-from .visual import VisualRewardManager, _reward_extra_info, _validate_visual_response
+from .media import _reward_extra_info
+from .visual import VisualRewardManager, _validate_visual_response
 
 logger = logging.getLogger(__name__)
 
