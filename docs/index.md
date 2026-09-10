@@ -63,6 +63,7 @@ algo/diffusionnft.md
 algo/grpo_guard.md
 algo/mixgrpo.md
 algo/diffusion_opd.md
+algo/omni_opd.md
 algo/performance.md
 ```
 
@@ -83,6 +84,7 @@ examples/mixgrpo_trainer.md
 examples/diffusionopd_trainer.md
 examples/flowgrpo_trainer_sd35_drm.md
 examples/bagel/flowgrpo_trainer_bagel.md
+examples/qwen3_tts/grpo_trainer_qwen3_tts.md
 examples/qwen_image_edit/flowgrpo_trainer_qwen_image_edit.md
 examples/ltx2/flowgrpo_trainer_ltx2.md
 examples/minimax_h3/diffusionnft_trainer_minimax_h3.md
@@ -134,6 +136,13 @@ contributing/integrating_a_new_policy_gradient_algorithm_for_diffusion_model.md
 contributing/integrating_a_new_direct_preference_algorithm_for_diffusion_model.md
 contributing/gpu_smoke_tests.md
 contributing/common_pitfalls.md
+```
+
+```{toctree}
+:maxdepth: 1
+:caption: Community
+
+community/governance.md
 ```
 
 ## Contribution

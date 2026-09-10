@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from . import model
-from .actor import OmniActorConfig, OmniLossConfig
-from .distillation import OmniDistillationTeacherModelConfig
-from .model import *  # noqa: F401
+from .omni_rollout_adapter import Qwen3TTSRolloutAdapter
+from .talker_training_adapter import Qwen3TTSTalkerAdapter
 
-__all__ = list(model.__all__) + [
-    "OmniLossConfig",
-    "OmniActorConfig",
-    "OmniDistillationTeacherModelConfig",
-]
+__all__ = ["Qwen3TTSTalkerAdapter", "Qwen3TTSRolloutAdapter"]
