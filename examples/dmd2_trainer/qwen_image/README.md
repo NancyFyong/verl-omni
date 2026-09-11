@@ -1,5 +1,10 @@
 # Qwen-Image DMD2 distribution-only
 
+Last updated: 09/11/2026.
+
+See the [algorithm and runtime contract](../../../docs/algo/diffusion_distillation.md)
+for the objectives, role ownership, configuration and checkpoint semantics.
+
 This MVP trains a conditional-only few-step **Qwen-Image T2I student** from prompts.
 It is **DMD2 distribution-only**, not original DMD: there are no paired teacher
 trajectories, LPIPS regression, discriminator, GAN, rewards or PPO advantages.
