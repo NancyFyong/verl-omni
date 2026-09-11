@@ -27,12 +27,22 @@ paper-level reproduction, convergence or generation-quality improvement.
 | Optimization | Separate student and fake-score optimizers | Actor update with the configured OPD loss |
 | Rewards / PPO tensors | Not needed | Existing policy-gradient/OPD lifecycle |
 
-`algorithm.sample_source=offline` means **no rollout server or reward workers are
-started**. It does not mean that student images are precomputed: generation
-happens during training inside FSDP, where the student graph can be retained.
 Do not enable `distillation.enabled`, actor `use_distill_loss`, or additional KL
 objectives to run DMD2. See [diffusion OPD](diffusion_opd.md) for that separate
 configuration and teacher-scheduling contract.
+
+### What `offline` means here
+
+`algorithm.sample_source=offline` selects the framework's **engine-local execution
+path**, not offline RL or training on a fixed dataset of pre-generated images.
+No independent rollout server or reward workers are started.
+
+The current student generates fresh samples from prompts and random noise during
+each training attempt. Sampling runs inside the FSDP training engine so the
+selected student forward can retain its autograd graph. Thus sample generation
+is online during training, despite the configuration name `offline`; it does not
+require precomputed student images or teacher trajectories. Keep
+`sample_source=offline` for this implementation.
 
 The supported launcher uses `verl_omni.trainer.main_diffusion`.
 `main_diffusion_v1.py` integration is not implemented for this DMD2 path.

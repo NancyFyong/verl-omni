@@ -46,6 +46,13 @@ actor_rollout_ref:
     model_type: diffusion_dmd_model
 ```
 
+Here `sample_source: offline` means **engine-local sampling**, not offline RL or
+training on pre-generated images. The current student generates fresh samples
+from prompts and noise during training inside FSDP, retaining the graph needed
+for its objective. No independent vLLM rollout server or reward workers are
+started. Keep this configuration value `offline`; it does not make the student
+samples precomputed.
+
 `dmd` is a separate top-level configuration group. Do **not** enable the existing
 OPD `distillation.enabled` or actor `use_distill_loss` flags. Existing
 policy-gradient, direct-preference and OPD routing is unchanged.
