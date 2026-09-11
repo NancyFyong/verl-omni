@@ -2,14 +2,14 @@
 # LTX-2.3 text-and-image-to-audio-video LoRA FlowGRPO recipe.
 set -x
 
-export WANDB_MODE=${WANDB_MODE:-offline}
+export WANDB_MODE=${WANDB_MODE:-online}
 
 WORKSPACE=${WORKSPACE:-$HOME}
 MODEL_PATH=${MODEL_PATH:-dg845/LTX-2.3-Diffusers}
 DATA_DIR=${DATA_DIR:-$WORKSPACE/data/ltx2_ti2va/verl_omni}
 NUM_GPUS=${NUM_GPUS:-8}
-ROLLOUT_TP=${ROLLOUT_TP:-2}
-TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-100}
+ROLLOUT_TP=${ROLLOUT_TP:-1}
+TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-1000}
 
 train_path=$DATA_DIR/train.parquet
 test_path=$DATA_DIR/test.parquet
@@ -40,7 +40,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     data.val_files=$test_path \
     data.train_batch_size=32 \
     data.val_max_samples=1024 \
-    data.max_prompt_length=1024 \
+    data.max_prompt_length=4096 \
     data.truncation=error \
     data.seed=42 \
     data.custom_cls.path=pkg://verl_omni.pipelines.ltx2_flow_grpo.dataset \
@@ -49,21 +49,21 @@ python3 -m verl_omni.trainer.main_diffusion \
     algorithm.global_std=True \
     actor_rollout_ref.model.path=$MODEL_PATH \
     actor_rollout_ref.model.algorithm=flow_grpo \
-    actor_rollout_ref.model.attn_backend=native \
+    actor_rollout_ref.model.attn_backend=_flash_3_varlen_hub \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.model.lora_rank=64 \
     actor_rollout_ref.model.lora_alpha=128 \
     actor_rollout_ref.model.target_modules="$ltx_lora_targets" \
     actor_rollout_ref.model.fsdp_layer_prefixes="['transformer_blocks.']" \
     '+actor_rollout_ref.actor.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap=[LTX2VideoTransformerBlock]' \
-    actor_rollout_ref.actor.strategy=fsdp \
+    actor_rollout_ref.actor.strategy=fsdp2 \
     actor_rollout_ref.actor.optim.lr=3e-4 \
     actor_rollout_ref.actor.optim.weight_decay=1e-4 \
     actor_rollout_ref.actor.optim.betas="[0.9,0.999]" \
     actor_rollout_ref.actor.optim.override_optimizer_config="{eps: 1e-8}" \
     actor_rollout_ref.actor.optim.clip_grad=1.0 \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.actor.diffusion_loss.clip_ratio=1e-4 \
     actor_rollout_ref.actor.diffusion_loss.adv_clip_max=5.0 \
     actor_rollout_ref.actor.use_kl_loss=False \
@@ -72,9 +72,9 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm_omni \
-    actor_rollout_ref.rollout.rollout_attn_backend=TORCH_SDPA \
+    actor_rollout_ref.rollout.rollout_attn_backend=FLASH_ATTN_3_HUB \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP \
-    actor_rollout_ref.rollout.n=8 \
+    actor_rollout_ref.rollout.n=16 \
     actor_rollout_ref.rollout.seed=42 \
     actor_rollout_ref.rollout.agent.num_workers=$((NUM_GPUS / ROLLOUT_TP)) \
     actor_rollout_ref.rollout.agent.default_agent_loop=ltx2_diffusion_single_turn_agent \
@@ -83,10 +83,10 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.rollout.pipeline.height=256 \
     actor_rollout_ref.rollout.pipeline.width=384 \
-    actor_rollout_ref.rollout.pipeline.num_frames=81 \
+    actor_rollout_ref.rollout.pipeline.num_frames=121 \
     actor_rollout_ref.rollout.pipeline.frame_rate=24.0 \
     actor_rollout_ref.rollout.pipeline.task=ti2va \
-    actor_rollout_ref.rollout.pipeline.num_inference_steps=24 \
+    actor_rollout_ref.rollout.pipeline.num_inference_steps=10 \
     actor_rollout_ref.rollout.pipeline.guidance_scale=4.0 \
     actor_rollout_ref.rollout.pipeline.max_sequence_length=1024 \
     +actor_rollout_ref.rollout.pipeline.output_type=pt \
@@ -99,7 +99,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.rollout.calculate_log_probs=True \
     actor_rollout_ref.rollout.val_kwargs.pipeline.height=256 \
     actor_rollout_ref.rollout.val_kwargs.pipeline.width=384 \
-    actor_rollout_ref.rollout.val_kwargs.pipeline.num_frames=81 \
+    actor_rollout_ref.rollout.val_kwargs.pipeline.num_frames=121 \
     actor_rollout_ref.rollout.val_kwargs.pipeline.frame_rate=24.0 \
     actor_rollout_ref.rollout.val_kwargs.pipeline.num_inference_steps=50 \
     actor_rollout_ref.rollout.val_kwargs.pipeline.guidance_scale=4.0 \
@@ -134,7 +134,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     trainer.val_before_train=True \
     trainer.n_gpus_per_node=$NUM_GPUS \
     trainer.nnodes=1 \
-    trainer.save_freq=50 \
+    trainer.save_freq=20 \
     trainer.test_freq=20 \
     trainer.total_epochs=15 \
     trainer.total_training_steps=$TOTAL_TRAINING_STEPS "$@"

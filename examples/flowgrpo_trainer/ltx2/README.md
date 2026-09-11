@@ -102,6 +102,16 @@ reward worker. CLAP and ImageBind run on `cuda:0` and `cuda:1`, respectively.
 The TI2VA recipe supports exactly one first-frame image and does not train the
 fixed condition frame as part of the stochastic policy transition.
 
+The TI2VA launcher ships the validated long-run configuration: rollout tensor
+parallel size 1, 512 samples per step (batch 32 x n=16), 121-frame 10-step
+256x384 training rollouts with FSDP2 and micro batch 16, SDE window 3 sampled
+non-contiguously from `[0, 10)`, 121-frame 50-step validation, FA3 attention
+on both the actor (`_flash_3_varlen_hub`) and rollout (`FLASH_ATTN_3_HUB`)
+sides, and checkpoints every 20 steps. On 8x H800 with a 27,687-sample FLUX
+first-frame dataset this configuration trained stably for 140 steps with the
+CLAP+ImageBind training reward climbing from 0.16 to 0.63; FA3 was verified
+error-free on Hopper (compute capability 9.0) for the whole run.
+
 ### Ascend NPU
 
 ```bash
