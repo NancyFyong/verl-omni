@@ -678,13 +678,8 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         """
         self.optimizer.zero_grad()
 
-    def optimizer_step(self):
-        """
-        Clip gradients, skip update if non-finite, and step optimizer.
-
-        Returns:
-            grad_norm (float): Norm of gradients before clipping.
-        """
+    def clip_grad_norm(self):
+        """Clip gradients using the active FSDP strategy and return the global norm."""
         assert self.optimizer_config.clip_grad is not None
 
         if isinstance(self.module, FSDP):
@@ -699,7 +694,11 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         if isinstance(grad_norm, DTensor):
             grad_norm = grad_norm.full_tensor()
 
-        # if grad_norm is not finite, skip the update
+        return grad_norm
+
+    def optimizer_step(self):
+        """Clip gradients and step the optimizer only when the norm is finite."""
+        grad_norm = self.clip_grad_norm()
         if not torch.isfinite(grad_norm):
             print(f"WARN: grad_norm is not finite: {grad_norm}")
             self.optimizer.zero_grad()

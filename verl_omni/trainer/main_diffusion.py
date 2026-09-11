@@ -130,13 +130,13 @@ def _get_trainer_cls(config):
         return PolicyGradientRayTrainer
     if trainer_type == "direct_preference":
         return DirectPreferenceRayTrainer
-    if trainer_type == "distillation":
-        from verl_omni.trainer.diffusion.distillation.ray_trainer import DistillationRayTrainer
+    if trainer_type == "distribution_matching":
+        from verl_omni.trainer.diffusion.ray_diffusion_trainer import DistributionMatchingRayTrainer
 
-        return DistillationRayTrainer
+        return DistributionMatchingRayTrainer
     raise ValueError(
         f"Unsupported diffusion trainer_type {trainer_type!r}. "
-        f"Expected one of: 'policy_gradient', 'direct_preference', 'distillation'."
+        "Expected one of: 'policy_gradient', 'direct_preference', 'distribution_matching'."
     )
 
 
@@ -160,16 +160,14 @@ class TaskRunner:
         from verl.single_controller.ray import RayWorkerGroup
         from verl.trainer.ppo.ray_trainer import Role
 
-        if config.algorithm.trainer_type == "distillation":
-            from verl_omni.workers.diffusion_distillation_worker import DiffusionDistillationWorker
+        if config.algorithm.trainer_type == "distribution_matching":
+            from verl_omni.trainer.diffusion.ray_diffusion_trainer import DistributionMatchingRayTrainer
+            from verl_omni.workers.dmd_worker import DMDTrainingWorker
 
-            if config.algorithm.sample_source != "offline":
-                raise ValueError("The distillation trainer requires algorithm.sample_source=offline.")
-            if not hasattr(Role, "Actor"):
-                raise ValueError("Distillation training requires verl Role.Actor support.")
-            self.role_worker_mapping[Role.Actor] = ray.remote(DiffusionDistillationWorker)
+            DistributionMatchingRayTrainer.validate_config(config)
+            self.role_worker_mapping[Role.Actor] = ray.remote(DMDTrainingWorker)
             self.mapping[Role.Actor] = "global_pool"
-            return DiffusionDistillationWorker, RayWorkerGroup
+            return DMDTrainingWorker, RayWorkerGroup
 
         from verl_omni.workers.engine_workers import ActorRolloutRefWorker
 

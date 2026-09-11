@@ -254,28 +254,6 @@ class DiffusionModelBase(ABC):
         return module(**model_inputs)[0]
 
 
-class DistributionMatchingModelAdapter:
-    """Optional capability mixin for DMD-family architecture adapters.
-
-    The generic distillation runtime owns role placement, optimization, EMA, and
-    checkpointing. Architecture packages implement the differentiable phase
-    program and declare capabilities without adding recipe branches to the
-    trainer or worker.
-    """
-
-    @classmethod
-    def distillation_capabilities(cls) -> frozenset[str]:
-        """Return capabilities accepted by distillation recipe validation."""
-        return frozenset({"distribution_matching"})
-
-    @classmethod
-    def build_distribution_matching_computer(cls, model_config, plan):
-        """Build the architecture-owned phase computation used by the worker."""
-        raise NotImplementedError(
-            f"{cls.__name__} declares distribution-matching support but builds no distribution-matching computer."
-        )
-
-
 class DiffusionI2IModelBase(DiffusionModelBase):
     """Base class for image-conditioned diffusion model training helpers.
 
@@ -501,6 +479,7 @@ class OmniModelBase(ABC):
     """
 
     _registry: dict[tuple[str, str], type["OmniModelBase"]] = {}
+    auto_model_class: Any = None
 
     @classmethod
     def register(cls, architecture: str, stage: str = "thinker"):
@@ -532,6 +511,11 @@ class OmniModelBase(ABC):
             model_config.model_stage,
             getattr(model_config, "external_lib", None),
         )
+
+    @classmethod
+    def peek_class(cls, architecture: str, stage: str) -> Optional[type["OmniModelBase"]]:
+        """Return the registered adapter for ``(architecture, stage)`` or ``None``."""
+        return cls._registry.get((architecture, stage))
 
     @classmethod
     def get_class_by_name(
@@ -567,6 +551,11 @@ class OmniModelBase(ABC):
                 f"stage={stage!r}). Registered: {registered}. "
                 f"Set ``external_lib`` to load your training adapter."
             ) from None
+
+    @classmethod
+    def register_auto_classes(cls) -> None:
+        """Register optional model-package classes with Transformers auto APIs."""
+        return
 
     @classmethod
     @abstractmethod
@@ -637,7 +626,6 @@ class OmniModelBase(ABC):
         Default implementation strips the submodules returned by
         ``get_strip_modules``.  Override to also:
 
-        - Register the model class with ``AutoModelForCausalLM``.
         - Redirect ``forward()`` and embedding accessors to the
           trainable sub-component.
         - Force ``tie_word_embeddings=False`` for FSDP compatibility.
@@ -692,6 +680,7 @@ class OmniRolloutPipelineBase:
     """
 
     _registry: dict[str, type["OmniRolloutPipelineBase"]] = {}
+    supports_async_chunk = True
 
     @classmethod
     def register(cls, model_type: str):
@@ -769,6 +758,16 @@ class OmniRolloutPipelineBase:
         return {}
 
     @classmethod
+    def weight_sync_stage_ids(cls, pipeline_mode="thinker_only") -> list[int] | None:
+        """Return stages that receive actor weights, or all stages by default."""
+        return None
+
+    @classmethod
+    def policy_stage_id(cls, pipeline_mode="thinker_only") -> int:
+        """Return the stage whose sampling parameters and logprobs define the policy."""
+        return 0
+
+    @classmethod
     def get_pipeline_id(cls, pipeline_mode: str = "thinker_only") -> str:
         """Return the vLLM-Omni pipeline model_type for *pipeline_mode*.
 
@@ -822,3 +821,30 @@ class OmniRolloutPipelineBase:
             dict: Extra key-value pairs merged into the stage's engine args.
         """
         return {}
+
+    @classmethod
+    def prepare_engine_prompt(
+        cls,
+        prompt_ids: list[int],
+        model_config,
+        multi_modal_data: dict,
+        mm_processor_kwargs: Optional[dict] = None,
+    ) -> dict | None:
+        """Build an architecture-specific rollout prompt when required."""
+        return None
+
+    @classmethod
+    def combine_engine_outputs(cls, outputs: list, prompt: dict) -> tuple[Any, dict[str, Any]]:
+        """Select the policy output and collect architecture-specific fields.
+
+        Overriding this hook opts an adapter into retaining and assembling
+        multiple final stage outputs. The default preserves single-output AR
+        behavior.
+        """
+        if not outputs:
+            raise RuntimeError("The omni rollout engine returned no outputs.")
+        if len(outputs) != 1:
+            raise NotImplementedError(
+                "An omni rollout adapter with multiple final outputs must implement combine_engine_outputs()."
+            )
+        return outputs[0], {}

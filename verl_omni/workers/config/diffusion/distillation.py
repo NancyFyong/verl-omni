@@ -16,18 +16,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from verl.base_config import BaseConfig
-from verl.workers.config import FSDPOptimizerConfig
 
-
-def default_fake_score_optimizer() -> FSDPOptimizerConfig:
-    return FSDPOptimizerConfig(lr=2e-5, weight_decay=0.01, clip_grad=1.0, lr_scheduler_type="constant")
-
-
-__all__ = [
-    "DiffusionDistillationTeacherModelConfig",
-    "DiffusionDistributionMatchingConfig",
-    "DiffusionDistillationConfig",
-]
+__all__ = ["DiffusionDistillationTeacherModelConfig", "DiffusionDistillationConfig"]
 
 
 @dataclass
@@ -57,95 +47,8 @@ class DiffusionDistillationTeacherModelConfig(BaseConfig):
 
 
 @dataclass
-class DiffusionDistributionMatchingConfig(BaseConfig):
-    """Architecture-neutral DMD-family recipe selection.
-
-    This config is active only when ``algorithm.trainer_type=distillation``.
-    The existing parent ``enabled`` flag remains exclusively owned by on-policy
-    distillation and must stay false for DMD-family training.
-    """
-
-    # Registered recipe name.
-    recipe: str = "dmd2"
-    # Optional recipe profile; null selects the recipe default.
-    profile: Optional[str] = None
-    # Optional fake-score phase count; null selects the recipe default.
-    fake_update_ratio: Optional[int] = None
-    # Number of fake/discriminator-only cycles before student updates begin.
-    fake_warmup_cycles: int = 0
-    # Optional registered rollout override; null selects the recipe default.
-    rollout_strategy: Optional[str] = None
-    # Optional data-mode override; null selects the recipe default.
-    data_mode: Optional[str] = None
-    # Semantic role exported to inference replicas.
-    export_role: str = "student_ema"
-    # Physical storage used by the initial colocated runtime.
-    role_storage: str = "shared_base_adapters"
-    # Per-device student phase micro-batch size.
-    student_micro_batch_size_per_gpu: int = 1
-    # Per-device fake-score phase micro-batch size.
-    fake_score_micro_batch_size_per_gpu: int = 1
-    # Independent fake-score optimizer and scheduler configuration.
-    fake_score_optim: FSDPOptimizerConfig = field(default_factory=default_fake_score_optimizer)
-    # EMA decay applied after successful student optimizer steps.
-    ema_decay: float = 0.999
-    # First completed student step that updates EMA.
-    ema_start_step: int = 0
-
-    def __post_init__(self):
-        valid_recipes = {"dmd", "dmd2", "causvid", "self_forcing"}
-        if self.recipe not in valid_recipes:
-            raise ValueError(f"Invalid recipe: {self.recipe}. Must be one of {sorted(valid_recipes)}")
-        valid_profiles = {"distribution_only", "paper"}
-        if self.profile is not None and self.profile not in valid_profiles:
-            raise ValueError(f"Invalid profile: {self.profile}. Must be one of {sorted(valid_profiles)}")
-        if self.fake_update_ratio is not None and self.fake_update_ratio <= 0:
-            raise ValueError(f"fake_update_ratio must be greater than 0, got {self.fake_update_ratio}")
-        if self.fake_warmup_cycles < 0:
-            raise ValueError(f"fake_warmup_cycles must be non-negative, got {self.fake_warmup_cycles}")
-        valid_rollout_strategies = {
-            "backward_simulated",
-            "consistency_renoise",
-            "ode_euler",
-            "one_step",
-            "self_forced",
-            "teacher_forced_causal",
-        }
-        if self.rollout_strategy is not None and self.rollout_strategy not in valid_rollout_strategies:
-            raise ValueError(
-                f"Invalid rollout_strategy: {self.rollout_strategy}. Must be one of {sorted(valid_rollout_strategies)}"
-            )
-        valid_data_modes = {"prompts", "prompt_and_real_latent", "regression_pairs"}
-        if self.data_mode is not None and self.data_mode not in valid_data_modes:
-            raise ValueError(f"Invalid data_mode: {self.data_mode}. Must be one of {sorted(valid_data_modes)}")
-        valid_export_roles = {"student", "student_ema"}
-        if self.export_role not in valid_export_roles:
-            raise ValueError(f"Invalid export_role: {self.export_role}. Must be one of {sorted(valid_export_roles)}")
-        valid_role_storage = {"shared_base_adapters", "colocated_independent"}
-        if self.role_storage not in valid_role_storage:
-            raise ValueError(f"Invalid role_storage: {self.role_storage}. Must be one of {sorted(valid_role_storage)}")
-        if self.student_micro_batch_size_per_gpu <= 0:
-            raise ValueError(
-                f"student_micro_batch_size_per_gpu must be greater than 0, got {self.student_micro_batch_size_per_gpu}"
-            )
-        if self.fake_score_micro_batch_size_per_gpu <= 0:
-            raise ValueError(
-                "fake_score_micro_batch_size_per_gpu must be greater than 0, "
-                f"got {self.fake_score_micro_batch_size_per_gpu}"
-            )
-        if not 0.0 <= self.ema_decay <= 1.0:
-            raise ValueError(f"ema_decay must be in [0, 1], got {self.ema_decay}")
-        if self.ema_start_step < 0:
-            raise ValueError(f"ema_start_step must be non-negative, got {self.ema_start_step}")
-
-
-@dataclass
 class DiffusionDistillationConfig(BaseConfig):
-    """Diffusion distillation settings shared by OPD and DMD-family routing.
-
-    ``enabled`` and the teacher-pool fields remain exclusive to OPD. DMD-family
-    training is selected by ``algorithm.trainer_type=distillation`` and reads the
-    nested ``distribution_matching`` config while keeping ``enabled=false``.
+    """Diffusion on-policy distillation.
 
     enabled (bool):
         Whether on-policy distillation is enabled.
@@ -183,7 +86,7 @@ class DiffusionDistillationConfig(BaseConfig):
     ```
     """
 
-    _mutable_fields = BaseConfig._mutable_fields | {"teacher_models", "distribution_matching"}
+    _mutable_fields = BaseConfig._mutable_fields | {"teacher_models"}
 
     enabled: bool = False
     n_gpus_per_node: int = 0
@@ -191,10 +94,6 @@ class DiffusionDistillationConfig(BaseConfig):
     teacher_models: dict[str, DiffusionDistillationTeacherModelConfig] = field(default_factory=dict)
     teacher_key: str = "data_source"
     scheduler: str = "inline"
-    # DMD-family recipe settings; selected by algorithm.trainer_type rather than enabled.
-    distribution_matching: DiffusionDistributionMatchingConfig = field(
-        default_factory=DiffusionDistributionMatchingConfig
-    )
 
     def __post_init__(self):
         if not self.enabled:
