@@ -13,14 +13,16 @@
 # limitations under the License.
 
 import asyncio
+import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 from PIL import Image
 from tensordict import TensorDict
-from verl.utils.dataset.rl_dataset import RLHFDataset
+from verl.utils.dataset.rl_dataset import get_dataset_class
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.ltx2.ltx2_conditioning import LTXPromptContext
 from vllm_omni.diffusion.models.ltx2.ltx2_denoise import LTXPhaseResult, _official_ltx_sigmas
@@ -35,11 +37,11 @@ from verl_omni.pipelines.ltx2_flow_grpo.common import (
     calculate_shift,
     set_ltx23_timesteps,
 )
-from verl_omni.pipelines.ltx2_flow_grpo.dataset import LTX2TI2VADataset
 from verl_omni.pipelines.ltx2_flow_grpo.diffusers_training_adapter import LTX23FlowGRPO
 from verl_omni.pipelines.ltx2_flow_grpo.vllm_omni_rollout_adapter import LTX23PipelineWithLogProb
 from verl_omni.pipelines.model_base import DiffusionI2IModelBase, DiffusionModelBase, VllmOmniPipelineBase
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
+from verl_omni.utils.dataset.rl_dataset import RLHFDataset, create_rl_dataset
 
 
 def test_ltx2_reference_lora_targets_are_complete() -> None:
@@ -64,29 +66,60 @@ def test_ltx2_processor_files_use_text_tokenizer_path(tmp_path) -> None:
     assert result == str(tokenizer_dir)
 
 
-def test_ltx2_ti2va_dataset_builds_image_message_without_hf_processor(monkeypatch) -> None:
-    def fake_init(self, _data_files, _tokenizer, _config, processor=None, max_samples=-1):
-        del _data_files, _tokenizer, _config, max_samples
-        self.processor = processor
-        self.image_key = "images"
-        self.video_key = "videos"
-        self.audio_key = "audios"
-
-    monkeypatch.setattr(RLHFDataset, "__init__", fake_init)
-    dataset = LTX2TI2VADataset("unused", MagicMock(), MagicMock(), processor=None)
-    image = Image.new("RGB", (16, 16))
-
-    messages = dataset._build_messages(
-        {
-            "prompt": [{"role": "user", "content": "<image>Animate this frame."}],
-            "images": [image],
-        },
-        key="prompt",
+def test_ltx2_ti2va_default_dataset_forwards_image_without_hf_processor(tmp_path) -> None:
+    image = Image.new("RGB", (56, 56), "red")
+    image_path = tmp_path / "frame.png"
+    image.save(image_path)
+    data_path = tmp_path / "data.json"
+    data_path.write_text(
+        json.dumps(
+            [
+                {
+                    "prompt": [{"role": "user", "content": "<image>Animate this frame."}],
+                    "negative_prompt": [{"role": "user", "content": ""}],
+                    "images": [str(image_path)],
+                }
+            ]
+        )
+    )
+    data_config = OmegaConf.create({"filter_overlong_prompts": False})
+    tokenizer = MagicMock(return_value={"input_ids": [1, 2, 3]})
+    dataset = create_rl_dataset(str(data_path), data_config, tokenizer, processor=None)
+    assert type(dataset) is RLHFDataset
+    assert dataset.processor is None
+    row = dataset[0]
+    assert row["raw_negative_prompt"] == [{"role": "user", "content": ""}]
+    server = SimpleNamespace(
+        generate=AsyncMock(
+            return_value=SimpleNamespace(
+                diffusion_output=torch.zeros(1), log_probs=None, num_preempted=None, extra_fields={}
+            )
+        )
     )
 
-    assert messages[0]["content"][0]["type"] == "image"
-    assert messages[0]["content"][0]["image"].size == image.size
-    assert messages[0]["content"][1] == {"type": "text", "text": "Animate this frame."}
+    async def run():
+        rollout = SimpleNamespace(prompt_length=128, enable_prompt_embed_cache=False)
+        agent = LTX2DiffusionSingleTurnAgentLoop(
+            SimpleNamespace(config=SimpleNamespace(actor_rollout_ref=SimpleNamespace(rollout=rollout))),
+            server_manager=server,
+            tokenizer=tokenizer,
+            processor=None,
+            dataset_cls=get_dataset_class(data_config),
+            data_config=SimpleNamespace(config=data_config),
+        )
+        await agent.run({}, **row)
+        assert agent.processor is None
+
+    asyncio.run(run())
+
+    call = server.generate.await_args.kwargs
+    assert len(call["image_data"]) == 1
+    assert call["image_data"][0].tobytes() == image.tobytes()
+    assert call["video_data"] is None
+    assert call["audio_data"] is None
+    assert call["prompt_ids"] == [1, 2, 3]
+    assert call["negative_prompt_ids"] == [1, 2, 3]
+    assert [call.args[0] for call in tokenizer.call_args_list] == ["Animate this frame.", ""]
 
 
 def test_ltx2_x0_cfg_and_resolution_dependent_shift() -> None:
@@ -119,7 +152,7 @@ def test_ltx2_agent_loop_extracts_images_without_hf_processor() -> None:
 
     media = asyncio.run(agent.process_multi_modal_info([{"role": "user", "content": []}]))
 
-    assert agent.processor is not None
+    assert agent.processor is None
     assert media == {"images": [image]}
 
 

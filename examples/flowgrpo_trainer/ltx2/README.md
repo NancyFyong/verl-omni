@@ -65,11 +65,11 @@ python3 examples/flowgrpo_trainer/ltx2/prepare_ti2va_data.py \
   --output_dir "$WORKSPACE/data/ltx2_ti2va/verl_omni"
 ```
 
-The converter embeds exactly one image in each parquet row. The launcher selects
-`LTX2TI2VADataset` so the image is transported separately and does not enter the
-Gemma-3 text-token stream. The rollout keeps its first latent frame fixed, stores
-only generated video rows plus audio in each trajectory state, and transports the
-fixed frame once for Actor replay.
+The converter embeds exactly one image in each parquet row. The shared
+`RLHFDataset` and LTX agent loop transport the image separately without a HF
+processor, keeping it out of the Gemma-3 text-token stream. The rollout keeps its
+first latent frame fixed, stores only generated video rows plus audio in each
+trajectory state, and transports the fixed frame once for Actor replay.
 
 ## Install reward dependencies
 

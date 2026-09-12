@@ -23,8 +23,6 @@ from verl.utils.tokenizer import normalize_token_ids
 from verl_omni.agent_loop.single_turn_agent_loop import DiffusionSingleTurnAgentLoop
 from verl_omni.agent_loop.utils import messages_to_text as _messages_to_text
 
-from .dataset import ensure_ltx_media_processor
-
 
 @register("ltx2_diffusion_single_turn_agent")
 class LTX2DiffusionSingleTurnAgentLoop(DiffusionSingleTurnAgentLoop):
@@ -50,7 +48,7 @@ class LTX2DiffusionSingleTurnAgentLoop(DiffusionSingleTurnAgentLoop):
         self.rollout_config = self.config.actor_rollout_ref.rollout
         self.server_manager = server_manager
         self.tokenizer = tokenizer
-        self.processor = ensure_ltx_media_processor(processor)
+        self.processor = processor
         self.dataset_cls = dataset_cls
         self.data_config = data_config.config
         self.apply_chat_template_kwargs = self.data_config.get("apply_chat_template_kwargs", {})
@@ -58,6 +56,15 @@ class LTX2DiffusionSingleTurnAgentLoop(DiffusionSingleTurnAgentLoop):
         self.extra_tokenizer_map = extra_tokenizer_map or {}
         self.system_prompt = []
         self.loop = get_event_loop()
+
+    async def process_multi_modal_info(self, messages: list[dict]) -> dict[str, Any]:
+        """Extract VAE conditions independently of the text encoder's processor."""
+        if self.processor is not None:
+            return await super().process_multi_modal_info(messages)
+        media = await self.dataset_cls.process_multi_modal_info(messages, image_patch_size=14, config=self.data_config)
+        return {
+            key: value for key, value in zip(("images", "videos", "audios"), media, strict=True) if value is not None
+        }
 
     def _assert_mm_supported(self, has_multi_modal: bool) -> None:
         """Allow separately transported LTX first-frame images."""

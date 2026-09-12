@@ -43,8 +43,6 @@ python3 -m verl_omni.trainer.main_diffusion \
     data.max_prompt_length=4096 \
     data.truncation=error \
     data.seed=42 \
-    data.custom_cls.path=pkg://verl_omni.pipelines.ltx2_flow_grpo.dataset \
-    data.custom_cls.name=LTX2TI2VADataset \
     algorithm.adv_estimator=flow_grpo \
     algorithm.global_std=True \
     actor_rollout_ref.model.path=$MODEL_PATH \
