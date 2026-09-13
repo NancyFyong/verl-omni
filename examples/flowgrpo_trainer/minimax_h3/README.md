@@ -343,7 +343,8 @@ The T2VA, FL2VA, and Ref2VA adapters can reuse the checkpoint-compatible packed 
 transformer from DiffusionNFT. Append these overrides to a launcher:
 
 ```bash
-actor_rollout_ref.model.use_packed_batch=true \
+actor_rollout_ref.model._target_=verl_omni.workers.config.diffusion.minimax_h3.MiniMaxH3ModelConfig \
++actor_rollout_ref.model.use_packed_batch=true \
 actor_rollout_ref.model.attn_backend=_flash_3_varlen_hub \
 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
 actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
@@ -358,9 +359,12 @@ video/audio schedules, fixed reference rows, target-only log-probabilities, and
 FlowGRPO loss are unchanged. The same path also serves old-policy log-probability
 recomputation.
 
-`use_packed_batch` defaults to `false`, retaining the existing dense path.
-`torch_varlen` is another packed backend (paired with rollout `TORCH_SDPA`);
-`native` provides a padded SDPA numerical reference. FA3 requires a compatible
+`use_packed_batch` is an H3-only option in `MiniMaxH3ModelConfig`, shared with NFT,
+not a field in the generic diffusion config/YAML. It defaults to `false`, retaining
+the dense path; both the H3 `_target_` and the `+` override are required.
+`native` provides a padded SDPA numerical reference (paired with rollout `TORCH_SDPA`).
+PyTorch `torch_varlen` is available only in the standalone H3 numerical test.
+FA3 requires a compatible
 training kernel, provisioned ahead of time on offline hosts (see the
 [shared H3 packed-forward notes](../../diffusionnft_trainer/minimax_h3/README.md#experimental-packed-actor-forward)).
 Sequence parallelism and VeOmni are unsupported. This does not enable dynamic

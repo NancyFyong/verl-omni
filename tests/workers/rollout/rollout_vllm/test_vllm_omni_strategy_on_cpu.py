@@ -62,6 +62,44 @@ def test_server_selects_one_generation_strategy(monkeypatch, output_mode, expect
     assert model_config == (expected_kind, "model-config")
 
 
+@pytest.mark.parametrize("target", [None, "DiffusionModelConfig", "MiniMaxH3ModelConfig"])
+@pytest.mark.parametrize("structured", [False, True])
+def test_diffusion_server_preserves_model_config_target(tmp_path, target, structured):
+    from omegaconf import OmegaConf
+
+    from verl_omni.workers.config import DiffusionModelConfig, MiniMaxH3ModelConfig
+
+    config = dict(
+        path=str(tmp_path),
+        architecture="MiniMaxH3Pipeline",
+        algorithm="flow_grpo",
+        load_tokenizer=False,
+        attn_backend="native",
+    )
+    if target is not None:
+        config["_target_"] = f"verl_omni.workers.config.{target}"
+    if target == "MiniMaxH3ModelConfig":
+        config["use_packed_batch"] = True
+    original = dict(config)
+    if structured:
+        config = OmegaConf.create(config)
+    server = object.__new__(server_module.vLLMOmniHttpServer)
+    server._generate_strategy = DiffusionStrategy(server)
+
+    result = server._init_model_config(config)
+
+    expected = MiniMaxH3ModelConfig if target == "MiniMaxH3ModelConfig" else DiffusionModelConfig
+    assert type(result) is expected
+    assert getattr(result, "use_packed_batch", False) == (target == "MiniMaxH3ModelConfig")
+    assert dict(config) == original
+    assert server._init_model_config(result) is result
+
+
+def test_diffusion_server_rejects_non_model_config_target():
+    with pytest.raises(TypeError, match="must inherit DiffusionModelConfig"):
+        DiffusionStrategy(None).init_model_config({"_target_": "builtins.dict"})
+
+
 @pytest.mark.asyncio
 async def test_server_generate_delegates_without_changing_rpc_arguments():
     server = object.__new__(server_module.vLLMOmniHttpServer)

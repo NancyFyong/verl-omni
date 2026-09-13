@@ -383,8 +383,9 @@ can map.
 Return a diffusers-compatible transformer class to specialize its forward while
 retaining the Diffusers FSDP engine's normal loading, attention, fp32-island,
 checkpointing and LoRA setup. Return `None` to use `diffusers.AutoModel`.
-MiniMax-H3 NFT uses this hook for opt-in `model.use_packed_batch` execution;
-unsupported adapters reject that flag. Keep checkpoint parameter names unchanged.
+MiniMax-H3 NFT and FlowGRPO select their packed transformer through this hook
+using the H3-only `MiniMaxH3ModelConfig`; the base config has no packed option.
+Keep checkpoint parameter names unchanged.
 This hook is not a custom loader and is not currently used by the VeOmni engine.
 
 ---

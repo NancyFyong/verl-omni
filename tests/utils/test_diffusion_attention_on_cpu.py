@@ -73,24 +73,6 @@ def test_fa3_actor_allows_flash_attn():
     )
 
 
-@pytest.mark.parametrize("rollout_backend", ["TORCH_SDPA", "FLASH_ATTN_3_HUB"])
-def test_torch_varlen_actor_attention_pair(rollout_backend):
-    config = OmegaConf.create(
-        {
-            "actor_rollout_ref": {
-                "model": {"attn_backend": "torch_varlen", "use_packed_batch": True},
-                "actor": {"strategy": "fsdp2"},
-                "rollout": {"rollout_attn_backend": rollout_backend},
-            }
-        }
-    )
-    if rollout_backend == "TORCH_SDPA":
-        validate_attention_consistency(config)
-    else:
-        with pytest.raises(ValueError, match="requires rollout_attn_backend='TORCH_SDPA'"):
-            validate_attention_consistency(config)
-
-
 def test_native_actor_rejects_flash_attn_3_hub():
     try:
         validate_attention_consistency(

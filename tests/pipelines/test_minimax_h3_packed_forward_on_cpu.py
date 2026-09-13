@@ -266,11 +266,14 @@ def test_checkpoint_roundtrip_preserves_class_config_and_weight_names(tmp_path):
 
 @pytest.mark.parametrize("enabled", [False, True])
 def test_fsdp_loader_keeps_attention_checkpointing_and_fp32_islands(tmp_path, monkeypatch, enabled):
+    from verl_omni.workers.config import MiniMaxH3ModelConfig
     from verl_omni.workers.engine.fsdp import diffusers_impl
 
     serial, _ = _models()
     serial.save_pretrained(tmp_path)
-    config = SimpleNamespace(
+    config = MiniMaxH3ModelConfig(
+        path=str(tmp_path),
+        load_tokenizer=False,
         use_packed_batch=enabled,
         architecture="MiniMaxH3Pipeline",
         algorithm="diffusion_nft",
@@ -305,10 +308,11 @@ def test_packed_model_preserves_recipe_fsdp_wrap_targets():
 
 
 @pytest.mark.parametrize("algorithm", ["diffusion_nft", "flow_grpo"])
-def test_packed_config_composes_without_plus_prefix(tmp_path, algorithm):
+def test_packed_config_is_opt_in_through_h3_target(tmp_path, algorithm):
     from hydra import compose, initialize_config_dir
-    from hydra.errors import InstantiationException
     from verl.utils.config import omega_conf_to_dataclass
+
+    from verl_omni.workers.config import MiniMaxH3ModelConfig
 
     (tmp_path / "model_index.json").write_text('{"_class_name": "MiniMaxH3Pipeline"}')
     config_dir = Path(__file__).resolve().parents[2] / "verl_omni/trainer/config/diffusion/model"
@@ -319,17 +323,66 @@ def test_packed_config_composes_without_plus_prefix(tmp_path, algorithm):
                 f"path={tmp_path}",
                 "+load_tokenizer=false",
                 f"algorithm={algorithm}",
-                "use_packed_batch=true",
-                "attn_backend=torch_varlen",
+                "_target_=verl_omni.workers.config.diffusion.minimax_h3.MiniMaxH3ModelConfig",
+                "+use_packed_batch=true",
+                "attn_backend=native",
             ],
         )
     model_config = omega_conf_to_dataclass(config)
+    assert isinstance(model_config, MiniMaxH3ModelConfig)
     assert model_config.use_packed_batch
     adapter = DiffusionModelBase.get_class_by_name("MiniMaxH3Pipeline", algorithm)
     assert adapter.get_transformer_class(model_config) is MiniMaxH3PackedTransformer3DModel
-    config.use_packed_batch = False
-    with pytest.raises(InstantiationException, match="torch_varlen requires use_packed_batch"):
-        omega_conf_to_dataclass(config)
+    from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy
+
+    rollout_model_config = DiffusionStrategy(None).init_model_config(config)
+    assert isinstance(rollout_model_config, MiniMaxH3ModelConfig)
+    assert rollout_model_config.use_packed_batch
+    assert config.use_packed_batch  # Deserialization must not mutate the supplied config.
+    del config.use_packed_batch
+    model_config = omega_conf_to_dataclass(config)
+    assert not model_config.use_packed_batch
+    assert adapter.get_transformer_class(model_config) is None
+
+
+def test_generic_diffusion_config_does_not_expose_packing():
+    from dataclasses import fields
+
+    from hydra import compose, initialize_config_dir
+
+    from verl_omni.workers.config import DiffusionModelConfig
+
+    assert "use_packed_batch" not in {field.name for field in fields(DiffusionModelConfig)}
+    with pytest.raises(TypeError, match="use_packed_batch"):
+        DiffusionModelConfig(use_packed_batch=True)
+    with pytest.raises(ValueError, match="Invalid attn_backend"):
+        DiffusionModelConfig(attn_backend="torch_varlen")
+    config_dir = Path(__file__).resolve().parents[2] / "verl_omni/trainer/config"
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        config = compose(config_name="diffusion_trainer")
+    assert "use_packed_batch" not in config.actor_rollout_ref.model
+
+
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        ({"architecture": "QwenImagePipeline"}, "requires architecture=MiniMaxH3Pipeline"),
+        ({"attn_backend": "_native_npu"}, "requires attn_backend=native or _flash_3_varlen_hub"),
+    ],
+)
+def test_h3_config_rejects_incompatible_packed_options(tmp_path, overrides, match):
+    from verl_omni.workers.config import MiniMaxH3ModelConfig
+
+    kwargs = dict(
+        path=str(tmp_path),
+        architecture="MiniMaxH3Pipeline",
+        load_tokenizer=False,
+        attn_backend="native",
+        use_packed_batch=True,
+    )
+    kwargs.update(overrides)
+    with pytest.raises(ValueError, match=match):
+        MiniMaxH3ModelConfig(**kwargs)
 
 
 def test_packed_boundaries_must_match_rows():
@@ -367,8 +420,7 @@ def test_opt_in_loader_and_unsupported_combinations_fail_closed():
     config = SimpleNamespace(use_packed_batch=True)
     assert MiniMaxH3DiffusionNFT.get_transformer_class(config) is MiniMaxH3PackedTransformer3DModel
     assert MiniMaxH3DiffusionNFT.get_transformer_class(SimpleNamespace(use_packed_batch=False)) is None
-    with pytest.raises(NotImplementedError, match="does not support packed"):
-        DiffusionModelBase.get_transformer_class(config)
+    assert DiffusionModelBase.get_transformer_class(SimpleNamespace()) is None
     serial, packed = _models()
     with pytest.raises(TypeError, match="packed transformer"):
         _forward(serial, _inputs(serial), True)

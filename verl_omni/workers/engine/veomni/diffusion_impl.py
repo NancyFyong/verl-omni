@@ -63,8 +63,6 @@ class VeOmniDiffusionEngine(BaseEngine):
         optimizer_config: VeOmniDiffusionOptimizerConfig,
         checkpoint_config: CheckpointConfig,
     ):
-        if getattr(model_config, "use_packed_batch", False):
-            raise NotImplementedError("Packed batch forward currently requires the Diffusers FSDP backend.")
         if model_config.lora_rank > 0 or model_config.lora_adapter_path is not None:
             raise NotImplementedError(
                 "VeOmni diffusion backend does not support LoRA training yet. "

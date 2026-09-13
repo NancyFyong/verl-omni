@@ -102,8 +102,6 @@ class DiffusionModelBase(ABC):
     @classmethod
     def get_transformer_class(cls, model_config: DiffusionModelConfig):
         """Optionally select a diffusers-compatible class without bypassing engine setup."""
-        if getattr(model_config, "use_packed_batch", False):
-            raise NotImplementedError(f"{cls.__name__} does not support packed batch forward.")
         return None
 
     @classmethod

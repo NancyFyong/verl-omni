@@ -372,7 +372,8 @@ The Diffusers FSDP/FSDP2 actor can execute a fixed micro-batch with one packed
 transformer forward instead of one forward per sample. Enable it by appending:
 
 ```bash
-actor_rollout_ref.model.use_packed_batch=true \
+actor_rollout_ref.model._target_=verl_omni.workers.config.diffusion.minimax_h3.MiniMaxH3ModelConfig \
++actor_rollout_ref.model.use_packed_batch=true \
 actor_rollout_ref.model.attn_backend=_flash_3_varlen_hub \
 actor_rollout_ref.rollout.rollout_attn_backend=FLASH_ATTN_3_HUB \
 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2
@@ -385,10 +386,14 @@ compatible kernel build must be available; it never silently falls back.
 For an offline run, provision the kernel first or use the `kernels` package's
 `LOCAL_KERNELS` setting to select a downloaded kernel repository.
 
-`torch_varlen` remains available for comparison via PyTorch's `varlen_attn`
-(tested with PyTorch 2.13); `native` selects padded batched SDPA rather than a
-padding-free performance path. Both pair with rollout `TORCH_SDPA`.
-The flag defaults to `false`, retaining serial forward.
+`native` selects padded batched SDPA for numerical comparison and pairs with
+rollout `TORCH_SDPA`. PyTorch `torch_varlen` remains a standalone H3 numerical-test
+option, not a trainer configuration backend.
+
+`use_packed_batch` belongs only to `MiniMaxH3ModelConfig`, shared by the H3 NFT and
+FlowGRPO adapters, and defaults to `false`. The standard diffusion config/YAML
+contains no packed-forward option; selecting the H3 `_target_` and adding the
+field with `+` are both required. Existing launchers retain serial forward.
 
 The packer preserves sample-local positions, noise timesteps, reference rows and
 per-sample loss weighting. Both the main DiT and text token-refiner have independent
