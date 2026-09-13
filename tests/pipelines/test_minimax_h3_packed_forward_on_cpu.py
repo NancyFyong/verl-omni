@@ -25,10 +25,10 @@ from peft import LoraConfig, get_peft_model
 from tensordict import TensorDict
 
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import pack_video_audio_rows, serialize_ref_blocks
-from verl_omni.pipelines.minimax_h3_diffusion_nft.diffusers_training_adapter import MiniMaxH3DiffusionNFT
-from verl_omni.pipelines.minimax_h3_diffusion_nft.packed_forward import (
-    MiniMaxH3PackedTransformer3DModel,
+from verl_omni.pipelines.minimax_h3_diffusion_nft.diffusers_training_adapter import (
+    MiniMaxH3DiffusionNFT,
     PackedSequenceLayout,
+    enable_packed_forward,
     pack_model_inputs,
 )
 from verl_omni.pipelines.model_base import DiffusionModelBase
@@ -50,10 +50,10 @@ _MODEL_KWARGS = dict(
 )
 
 
-def _models(lora=False, checkpointing=False):
+def _models(lora=False, checkpointing=False, install_packed=True):
     torch.manual_seed(13)
     serial = MiniMaxH3Transformer3DModel(**_MODEL_KWARGS)
-    packed = MiniMaxH3PackedTransformer3DModel(**_MODEL_KWARGS)
+    packed = MiniMaxH3Transformer3DModel(**_MODEL_KWARGS)
     serial.set_attention_backend("native")
     packed.load_state_dict(serial.state_dict(), strict=True)
     if lora:
@@ -71,6 +71,8 @@ def _models(lora=False, checkpointing=False):
     if checkpointing:
         serial.enable_gradient_checkpointing()
         packed.enable_gradient_checkpointing()
+    if install_packed:
+        enable_packed_forward(packed)
     return serial, packed
 
 
@@ -187,7 +189,7 @@ def test_one_forward_per_micro_batch_and_no_cross_sample_attention():
 
 
 def test_fa3_receives_separate_dit_and_text_boundaries(monkeypatch):
-    from verl_omni.pipelines.minimax_h3_diffusion_nft import packed_forward
+    from verl_omni.pipelines.minimax_h3_diffusion_nft import diffusers_training_adapter as packed_forward
 
     calls = []
 
@@ -219,7 +221,7 @@ def test_fa3_receives_separate_dit_and_text_boundaries(monkeypatch):
 
 
 def test_unavailable_fa3_fails_instead_of_falling_back(monkeypatch):
-    from verl_omni.pipelines.minimax_h3_diffusion_nft import packed_forward
+    from verl_omni.pipelines.minimax_h3_diffusion_nft import diffusers_training_adapter as packed_forward
 
     def unavailable():
         raise RuntimeError("FA3 kernel unavailable")
@@ -268,7 +270,8 @@ def test_checkpoint_recompute_keeps_each_forward_boundaries():
 def test_checkpoint_roundtrip_preserves_class_config_and_weight_names(tmp_path):
     serial, packed = _models()
     serial.save_pretrained(tmp_path)
-    loaded = MiniMaxH3PackedTransformer3DModel.from_pretrained(tmp_path)
+    loaded = MiniMaxH3Transformer3DModel.from_pretrained(tmp_path)
+    enable_packed_forward(loaded)
     assert loaded.config.hidden_size == 32
     assert loaded.state_dict().keys() == serial.state_dict().keys()
     inputs = _inputs(serial)
@@ -306,7 +309,9 @@ def test_fsdp_loader_keeps_attention_checkpointing_and_fp32_islands(tmp_path, mo
     )
     monkeypatch.setattr(diffusers_impl, "get_init_weight_context_manager", lambda **_: nullcontext)
     model = diffusers_impl.DiffusersFSDPEngine._build_module(engine)
-    assert isinstance(model, MiniMaxH3PackedTransformer3DModel)
+    assert type(model) is MiniMaxH3Transformer3DModel
+    assert not getattr(model, "supports_packed_batch", False)
+    enable_packed_forward(model)
     assert model.gradient_checkpointing and model.token_refiner.gradient_checkpointing
     assert model.proj_in.weight.dtype == torch.float32
     assert model.transformer_blocks[0].attn.to_q.weight.dtype == torch.bfloat16
@@ -343,7 +348,10 @@ def test_h3_packing_is_default_with_the_generic_model_config(tmp_path, algorithm
     model_config = omega_conf_to_dataclass(config)
     assert type(model_config) is DiffusionModelConfig
     adapter = DiffusionModelBase.get_class_by_name("MiniMaxH3Pipeline", algorithm)
-    assert adapter.get_transformer_class(model_config) is MiniMaxH3PackedTransformer3DModel
+    model = MiniMaxH3Transformer3DModel(**_MODEL_KWARGS)
+    enable_packed_forward(model)
+    assert getattr(model, "supports_packed_batch", False)
+    assert adapter is not None
     from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy
 
     rollout_model_config = DiffusionStrategy(None).init_model_config(config)
@@ -400,16 +408,19 @@ def test_packed_input_preparation_rejects_mixed_target_geometry():
         )
 
 
-def test_default_loader_and_unsupported_combinations_fail_closed():
-    assert MiniMaxH3DiffusionNFT.get_transformer_class(SimpleNamespace()) is MiniMaxH3PackedTransformer3DModel
-    assert DiffusionModelBase.get_transformer_class(SimpleNamespace()) is None
+def test_automodel_forward_override_and_unsupported_backend_fail_closed():
     serial, packed = _models()
-    with pytest.raises(TypeError, match="packed transformer"):
-        _forward(serial, _inputs(serial), True)
-    with pytest.raises(NotImplementedError, match="sequence parallelism"):
-        packed.enable_parallelism(None)
+    assert type(packed) is MiniMaxH3Transformer3DModel
+    assert packed is enable_packed_forward(packed)
     with pytest.raises(ValueError, match="attn_backend"):
         packed.set_attention_backend("unsupported_backend")
+
+    sequence_parallel = MiniMaxH3Transformer3DModel(**_MODEL_KWARGS)
+    sequence_parallel.transformer_blocks[0].attn.processor._parallel_config = object()
+    with pytest.raises(NotImplementedError, match="sequence parallelism"):
+        enable_packed_forward(sequence_parallel)
+    with pytest.raises(TypeError, match="MiniMaxH3Transformer3DModel"):
+        enable_packed_forward(torch.nn.Linear(2, 2))
 
 
 @pytest.mark.parametrize("lengths", [[], [0], [3, -1]])

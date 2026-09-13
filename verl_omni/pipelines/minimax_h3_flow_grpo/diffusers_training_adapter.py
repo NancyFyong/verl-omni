@@ -74,13 +74,6 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
     """Replay flattened joint video/audio transitions with the H3 DiT."""
 
     @classmethod
-    def get_transformer_class(cls, model_config: DiffusionModelConfig):
-        """Load the shared H3 transformer with isolated micro-batch attention."""
-        from verl_omni.pipelines.minimax_h3_diffusion_nft.packed_forward import MiniMaxH3PackedTransformer3DModel
-
-        return MiniMaxH3PackedTransformer3DModel
-
-    @classmethod
     def prepare_processor_files(cls, model_path: str) -> str:
         """Make the official Qwen3-VL processor discoverable by AutoProcessor."""
         return prepare_h3_processor_files(model_path)
@@ -139,9 +132,7 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
         micro_batch: TensorDict,
         step: int,
     ) -> tuple[dict, None]:
-        del negative_prompt_embeds, negative_prompt_embeds_mask
-        if not getattr(module, "supports_packed_batch", False):
-            raise ValueError("MiniMax H3 requires MiniMaxH3PackedTransformer3DModel.")
+        del module, negative_prompt_embeds, negative_prompt_embeds_mask
         replay = cls._select_replay_fields(micro_batch)
         # Inspect metadata on the host once, not through per-sample CUDA scalar reads.
         replay = {
@@ -319,8 +310,13 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
         del negative_model_inputs
         if scheduler_inputs is None:
             raise ValueError("MiniMax H3 replay requires rollout scheduler inputs.")
-        from verl_omni.pipelines.minimax_h3_diffusion_nft.packed_forward import pack_model_inputs
+        from verl_omni.pipelines.minimax_h3_diffusion_nft.diffusers_training_adapter import (
+            enable_packed_forward,
+            pack_model_inputs,
+        )
 
+        if isinstance(module, torch.nn.Module):
+            enable_packed_forward(module)
         samples = model_inputs["_h3_samples"]
         transformer_inputs = [
             {key: value for key, value in sample.items() if not key.startswith("_h3_")} for sample in samples

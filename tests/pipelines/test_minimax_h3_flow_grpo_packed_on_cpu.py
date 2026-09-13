@@ -17,12 +17,12 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from diffusers import MiniMaxH3Transformer3DModel
 from tensordict import TensorDict
 from torch.nn.utils.rnn import pad_sequence
 
-from tests.pipelines.test_minimax_h3_packed_forward_on_cpu import _inputs, _models
+from tests.pipelines.test_minimax_h3_packed_forward_on_cpu import _MODEL_KWARGS, _inputs, _models
 from verl_omni.pipelines.minimax_h3_diffusion_nft.diffusers_training_adapter import MiniMaxH3DiffusionNFT
-from verl_omni.pipelines.minimax_h3_diffusion_nft.packed_forward import MiniMaxH3PackedTransformer3DModel
 from verl_omni.pipelines.minimax_h3_flow_grpo.common import (
     configure_flow_scheduler,
     flatten_joint_latents,
@@ -218,11 +218,12 @@ def test_different_text_lengths_still_fail_closed_in_dense_mode():
         _prepare(dense, _flow_batch(dense), False)
 
 
-def test_flowgrpo_packed_loader_is_default():
-    assert MiniMaxH3FlowGRPO.get_transformer_class(SimpleNamespace()) is MiniMaxH3PackedTransformer3DModel
-    dense, _ = _models()
-    with pytest.raises(ValueError, match="requires MiniMaxH3Packed"):
-        _prepare(dense, _flow_batch(dense), True)
+def test_flowgrpo_installs_packed_forward_on_automodel():
+    dense = MiniMaxH3Transformer3DModel(**_MODEL_KWARGS)
+    data = _flow_batch(dense)
+    assert not getattr(dense, "supports_packed_batch", False)
+    _run(dense, data, True, _schedulers())
+    assert getattr(dense, "supports_packed_batch", False)
 
 
 @pytest.mark.parametrize("task", ["t2va", "fl2va", "ref2va"])

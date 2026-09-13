@@ -370,7 +370,7 @@ fidelity.
 
 The Diffusers FSDP/FSDP2 actor can execute a fixed micro-batch with one packed
 transformer forward instead of one forward per sample. This is the default H3
-Actor path, shared with FlowGRPO via `verl_omni/pipelines/minimax_h3_diffusion_nft/packed_forward.py`.
+Actor path, shared with FlowGRPO through the existing DiffusionNFT training adapter.
 There is no extra config class or enable switch. For FA3, use:
 
 ```bash

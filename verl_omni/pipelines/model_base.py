@@ -100,11 +100,6 @@ class DiffusionModelBase(ABC):
         return None
 
     @classmethod
-    def get_transformer_class(cls, model_config: DiffusionModelConfig):
-        """Optionally select a diffusers-compatible class without bypassing engine setup."""
-        return None
-
-    @classmethod
     def configure_train_mode(cls, module: torch.nn.Module) -> None:
         """Hook called after ``module.train()`` for architecture-specific overrides."""
         return

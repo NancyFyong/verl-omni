@@ -1,6 +1,6 @@
 # How to Integrate a New Diffusion Model for FlowGRPO Training
 
-Last updated: 09/12/2026.
+Last updated: 08/21/2026.
 
 This guide walks you through everything required to integrate a new diffusion
 model into VeRL-Omni so it can be trained end-to-end with the **FlowGRPO**
@@ -377,16 +377,6 @@ so a bad ``target_modules`` fails fast at startup instead of at the first
 weight sync.  The default is a no-op.  MiniMax H3 overrides it to reject
 ``all-linear`` and keep LoRA on the transformer/refiner blocks its sync path
 can map.
-
-### 3.6 (Optional) `get_transformer_class`
-
-Return a diffusers-compatible transformer class to specialize its forward while
-retaining the Diffusers FSDP engine's normal loading, attention, fp32-island,
-checkpointing and LoRA setup. Return `None` to use `diffusers.AutoModel`.
-MiniMax-H3 NFT and FlowGRPO select their shared packed transformer through this
-hook by default, without adding model configuration fields.
-Keep checkpoint parameter names unchanged.
-This hook is not a custom loader and is not currently used by the VeOmni engine.
 
 ---
 

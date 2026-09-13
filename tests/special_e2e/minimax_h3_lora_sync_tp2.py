@@ -145,8 +145,9 @@ def _setup_packed_models(device, mesh, sharded, backend):
     from verl.utils.fsdp_utils import apply_fsdp2
 
     from tests.pipelines.test_minimax_h3_packed_forward_on_cpu import _models
+    from verl_omni.pipelines.minimax_h3_diffusion_nft.diffusers_training_adapter import enable_packed_forward
 
-    serial, packed = _models(lora=True, checkpointing=True)
+    serial, packed = _models(lora=True, checkpointing=True, install_packed=False)
     for model in (serial, packed):
         for name, parameter in model.named_parameters():
             if not any(part in name for part in model._keep_in_fp32_modules):
@@ -176,6 +177,7 @@ def _setup_packed_models(device, mesh, sharded, backend):
                 isinstance(block, FSDPModule)
                 for block in [*base.token_refiner.refiner_blocks, *base.transformer_blocks]
             )
+    enable_packed_forward(packed)
     return serial, packed
 
 

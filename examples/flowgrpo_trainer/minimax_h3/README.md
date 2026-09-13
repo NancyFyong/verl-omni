@@ -296,11 +296,9 @@ parameter/optimizer offload because reference presentations can be much longer
 than T2VA prompts.
 
 `NUM_GPUS` must be divisible by `ROLLOUT_TP`. `TEXT_ENCODER_TP` cannot exceed
-`ROLLOUT_TP`; H3 supports text-encoder TP sizes 1, 2, 4, and 8. The recipe uses
-an Actor micro-batch of 1 by default. The default dense Actor forward requires
-shared text lengths, layouts, scheduler steps, and video/audio timesteps within
-each micro-batch. Opt into the experimental packed path below to batch samples
-with different prompt lengths or reference layouts.
+`ROLLOUT_TP`; H3 supports text-encoder TP sizes 1, 2, 4, and 8. The recipe uses an Actor micro-batch of 1 by default. The packed Actor forward
+also supports larger micro-batches with different prompt lengths or reference
+layouts, subject to the limits below.
 
 MiniMax H3 requires a named `ASPECT_RATIO`, one of `21:9`, `16:9`, `4:3`,
 `1:1`, `3:4`, or `9:16`. The explicit height and width select the generated
@@ -340,7 +338,7 @@ Extra Hydra overrides may be appended to either launcher command.
 ## Experimental packed Actor forward
 
 The T2VA, FL2VA, and Ref2VA adapters use the shared checkpoint-compatible H3
-transformer in `verl_omni/pipelines/minimax_h3_diffusion_nft/packed_forward.py` by default, together with
+forward installed by the existing DiffusionNFT training adapter, together with
 DiffusionNFT. No extra config class or enable switch is required. For FA3, use:
 
 ```bash
