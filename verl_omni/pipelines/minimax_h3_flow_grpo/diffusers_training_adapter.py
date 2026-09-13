@@ -76,7 +76,7 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
     @classmethod
     def get_transformer_class(cls, model_config: DiffusionModelConfig):
         """Load the shared H3 transformer with isolated micro-batch attention."""
-        from verl_omni.pipelines.minimax_h3_common import MiniMaxH3PackedTransformer3DModel
+        from verl_omni.pipelines.minimax_h3_diffusion_nft.packed_forward import MiniMaxH3PackedTransformer3DModel
 
         return MiniMaxH3PackedTransformer3DModel
 
@@ -319,7 +319,7 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
         del negative_model_inputs
         if scheduler_inputs is None:
             raise ValueError("MiniMax H3 replay requires rollout scheduler inputs.")
-        from verl_omni.pipelines.minimax_h3_common import pack_model_inputs
+        from verl_omni.pipelines.minimax_h3_diffusion_nft.packed_forward import pack_model_inputs
 
         samples = model_inputs["_h3_samples"]
         transformer_inputs = [

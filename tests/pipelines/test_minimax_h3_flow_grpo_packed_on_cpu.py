@@ -21,8 +21,8 @@ from tensordict import TensorDict
 from torch.nn.utils.rnn import pad_sequence
 
 from tests.pipelines.test_minimax_h3_packed_forward_on_cpu import _inputs, _models
-from verl_omni.pipelines.minimax_h3_common import MiniMaxH3PackedTransformer3DModel
 from verl_omni.pipelines.minimax_h3_diffusion_nft.diffusers_training_adapter import MiniMaxH3DiffusionNFT
+from verl_omni.pipelines.minimax_h3_diffusion_nft.packed_forward import MiniMaxH3PackedTransformer3DModel
 from verl_omni.pipelines.minimax_h3_flow_grpo.common import (
     configure_flow_scheduler,
     flatten_joint_latents,

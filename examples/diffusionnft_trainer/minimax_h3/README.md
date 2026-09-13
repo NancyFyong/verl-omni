@@ -370,7 +370,7 @@ fidelity.
 
 The Diffusers FSDP/FSDP2 actor can execute a fixed micro-batch with one packed
 transformer forward instead of one forward per sample. This is the default H3
-Actor path, shared with FlowGRPO in `verl_omni/pipelines/minimax_h3_common.py`.
+Actor path, shared with FlowGRPO via `verl_omni/pipelines/minimax_h3_diffusion_nft/packed_forward.py`.
 There is no extra config class or enable switch. For FA3, use:
 
 ```bash
@@ -409,12 +409,13 @@ Numerical regressions (no model downloads; the GPU test requires the FA3 kernel)
 
 ```bash
 python -m pytest -q tests/pipelines/test_minimax_h3_packed_forward_on_cpu.py
-python -m torch.distributed.run --standalone --nproc-per-node=2 \
-  tests/special_e2e/minimax_h3_packed_forward.py --attn-backend _flash_3_varlen_hub
+NUM_GPUS=2 bash tests/special_e2e/run_minimax_h3_lora_sync_tp2.sh \
+  --check-packed-forward --attn-backend _flash_3_varlen_hub
 ```
 
-The GPU regression compares serial-FA3 with packed-FA3: NFT loss, LoRA gradients,
-sample isolation, gradient checkpointing and FSDP2 on a tiny transformer.
+The optional checks extend the existing LoRA sync regression with NFT/FlowGRPO
+loss, LoRA gradients, sample isolation, gradient checkpointing and FSDP2 comparisons
+between the original and packed forwards on a tiny transformer.
 It is not a rollout/trainer e2e or a production
 speed benchmark. Measure actor time, total step time and peak memory before using
 larger micro-batches; batching does not reduce the model's mathematical FLOPs.

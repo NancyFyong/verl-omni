@@ -24,13 +24,13 @@ from diffusers import MiniMaxH3Transformer3DModel
 from peft import LoraConfig, get_peft_model
 from tensordict import TensorDict
 
-from verl_omni.pipelines.minimax_h3_common import (
+from verl_omni.pipelines.minimax_h3_diffusion_nft.common import pack_video_audio_rows, serialize_ref_blocks
+from verl_omni.pipelines.minimax_h3_diffusion_nft.diffusers_training_adapter import MiniMaxH3DiffusionNFT
+from verl_omni.pipelines.minimax_h3_diffusion_nft.packed_forward import (
     MiniMaxH3PackedTransformer3DModel,
     PackedSequenceLayout,
     pack_model_inputs,
 )
-from verl_omni.pipelines.minimax_h3_diffusion_nft.common import pack_video_audio_rows, serialize_ref_blocks
-from verl_omni.pipelines.minimax_h3_diffusion_nft.diffusers_training_adapter import MiniMaxH3DiffusionNFT
 from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.trainer.diffusion.diffusion_algos import DiffusionNFTLoss
 from verl_omni.workers.config.diffusion.actor import DiffusionLossConfig
@@ -187,7 +187,7 @@ def test_one_forward_per_micro_batch_and_no_cross_sample_attention():
 
 
 def test_fa3_receives_separate_dit_and_text_boundaries(monkeypatch):
-    from verl_omni.pipelines import minimax_h3_common as packed_forward
+    from verl_omni.pipelines.minimax_h3_diffusion_nft import packed_forward
 
     calls = []
 
@@ -219,7 +219,7 @@ def test_fa3_receives_separate_dit_and_text_boundaries(monkeypatch):
 
 
 def test_unavailable_fa3_fails_instead_of_falling_back(monkeypatch):
-    from verl_omni.pipelines import minimax_h3_common as packed_forward
+    from verl_omni.pipelines.minimax_h3_diffusion_nft import packed_forward
 
     def unavailable():
         raise RuntimeError("FA3 kernel unavailable")

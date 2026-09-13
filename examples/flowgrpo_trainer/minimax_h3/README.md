@@ -340,7 +340,7 @@ Extra Hydra overrides may be appended to either launcher command.
 ## Experimental packed Actor forward
 
 The T2VA, FL2VA, and Ref2VA adapters use the shared checkpoint-compatible H3
-transformer in `verl_omni/pipelines/minimax_h3_common.py` by default, together with
+transformer in `verl_omni/pipelines/minimax_h3_diffusion_nft/packed_forward.py` by default, together with
 DiffusionNFT. No extra config class or enable switch is required. For FA3, use:
 
 ```bash
@@ -376,8 +376,8 @@ as the reference. NFT speedups do not establish FlowGRPO speedups.
 
 ```bash
 python -m pytest -q tests/pipelines/test_minimax_h3_flow_grpo_packed_on_cpu.py
-torchrun --standalone --nproc-per-node=2 tests/special_e2e/minimax_h3_packed_forward.py \
-  --algorithm flow_grpo --attn-backend _flash_3_varlen_hub
+NUM_GPUS=2 bash tests/special_e2e/run_minimax_h3_lora_sync_tp2.sh \
+  --check-packed-forward --attn-backend _flash_3_varlen_hub
 ```
 
 ## Current limitations
