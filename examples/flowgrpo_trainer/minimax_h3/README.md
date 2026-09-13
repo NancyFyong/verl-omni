@@ -373,7 +373,7 @@ not an artificial serial loop. Different-layout correctness uses per-sample repl
 as the reference. NFT speedups do not establish FlowGRPO speedups.
 
 ```bash
-python -m pytest -q tests/pipelines/test_minimax_h3_flow_grpo_packed_on_cpu.py
+python -m pytest -q tests/pipelines/test_minimax_h3_packed_forward_on_cpu.py
 NUM_GPUS=2 bash tests/special_e2e/run_minimax_h3_lora_sync_tp2.sh \
   --check-packed-forward --attn-backend _flash_3_varlen_hub
 ```

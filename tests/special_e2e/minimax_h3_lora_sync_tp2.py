@@ -240,7 +240,7 @@ def _check_packed_nft(device, mesh, sharded, backend):
 def _check_packed_flow_grpo(device, mesh, sharded, backend, task):
     from types import SimpleNamespace
 
-    from tests.pipelines.test_minimax_h3_flow_grpo_packed_on_cpu import _flow_batch, _run, _schedulers, _serial
+    from tests.pipelines.test_minimax_h3_packed_forward_on_cpu import _flow_batch, _run, _schedulers, _serial
     from verl_omni.trainer.diffusion.diffusion_algos import FlowGRPOLoss
     from verl_omni.workers.config.diffusion.actor import DiffusionLossConfig
 
