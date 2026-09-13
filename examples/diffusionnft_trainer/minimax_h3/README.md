@@ -1,6 +1,6 @@
 # MiniMax H3 T2VA, FL2VA, and Ref2VA DiffusionNFT
 
-Last updated: 09/04/2026
+Last updated: 09/12/2026
 
 These recipes train rank-64 MiniMax H3 LoRA adapters with online DiffusionNFT
 for text-to-audio-video (T2VA), first-frame image-to-audio-video (FL2VA), and
@@ -365,6 +365,56 @@ The initial recipe reuses CLAP and ImageBind to validate joint audio-video
 training. These rewards do not measure similarity to the reference image, so
 a separate reference-aware reward is required before evaluating reference
 fidelity.
+
+## Experimental packed actor forward
+
+The Diffusers FSDP/FSDP2 actor can execute a fixed micro-batch with one packed
+transformer forward instead of one forward per sample. Enable it by appending:
+
+```bash
+actor_rollout_ref.model.use_packed_batch=true \
+actor_rollout_ref.model.attn_backend=_flash_3_varlen_hub \
+actor_rollout_ref.rollout.rollout_attn_backend=FLASH_ATTN_3_HUB \
+actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2
+```
+
+`_flash_3_varlen_hub` calls the autograd-enabled FA3 `flash_attn_varlen_func`
+directly with separate DiT/text-refiner sequence boundaries, using the same
+`kernels-community/flash-attn3` v1 kernel as the serial diffusers backend. A
+compatible kernel build must be available; it never silently falls back.
+For an offline run, provision the kernel first or use the `kernels` package's
+`LOCAL_KERNELS` setting to select a downloaded kernel repository.
+
+`torch_varlen` remains available for comparison via PyTorch's `varlen_attn`
+(tested with PyTorch 2.13); `native` selects padded batched SDPA rather than a
+padding-free performance path. Both pair with rollout `TORCH_SDPA`.
+The flag defaults to `false`, retaining serial forward.
+
+The packer preserves sample-local positions, noise timesteps, reference rows and
+per-sample loss weighting. Both the main DiT and text token-refiner have independent
+sample boundaries. It changes neither rollout nor batch scheduling; micro-batch
+sizes must still satisfy the trainer's existing divisibility requirements.
+
+This first stage targets T2VA NFT. FL2VA uses the same layout-driven implementation,
+but requires shared keyframe anchors within a micro-batch; target latent layouts
+must be shared in all tasks. Production FL2VA/Ref2VA convergence and throughput
+remain to be validated. Sequence parallelism and the VeOmni backend are not yet
+supported and are rejected explicitly. Checkpoint names and LoRA sync mappings are
+unchanged; gradient checkpointing remains available.
+
+Numerical regressions (no model downloads; the GPU test requires the FA3 kernel):
+
+```bash
+python -m pytest -q tests/pipelines/test_minimax_h3_packed_forward_on_cpu.py
+python -m torch.distributed.run --standalone --nproc-per-node=2 \
+  tests/special_e2e/minimax_h3_packed_forward.py --attn-backend _flash_3_varlen_hub
+```
+
+The GPU regression compares serial-FA3 with packed-FA3: NFT loss, LoRA gradients,
+sample isolation, gradient checkpointing and FSDP2 on a tiny transformer.
+It is not a rollout/trainer e2e or a production
+speed benchmark. Measure actor time, total step time and peak memory before using
+larger micro-batches; batching does not reduce the model's mathematical FLOPs.
 
 ## T2VA performance reference
 

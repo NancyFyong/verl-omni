@@ -278,7 +278,7 @@ def test_ref2va_actor_slices_padded_reference_rows_and_returns_targets_only():
     module = MagicMock(side_effect=_identity)
     module.config = None
 
-    output = MiniMaxH3DiffusionNFT.forward(module, MagicMock(), model_inputs)
+    output = MiniMaxH3DiffusionNFT.forward(module, MagicMock(use_packed_batch=False), model_inputs)
 
     call = module.call_args.kwargs
     assert call["hidden_states"].shape == (1, _NUM_COND_VIDEO + 4, VIDEO_ROW_WIDTH)
@@ -325,7 +325,7 @@ def test_ref2va_actor_rejects_condition_rows_that_disagree_with_the_layout():
     module.config = None
 
     with pytest.raises(ValueError, match="condition video rows"):
-        MiniMaxH3DiffusionNFT.forward(module, MagicMock(), model_inputs)
+        MiniMaxH3DiffusionNFT.forward(module, MagicMock(use_packed_batch=False), model_inputs)
 
 
 def test_ref2va_prompt_keeps_original_ids_with_all_reference_modalities(monkeypatch):

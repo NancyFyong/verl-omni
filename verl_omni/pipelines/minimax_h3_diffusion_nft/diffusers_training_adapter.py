@@ -49,6 +49,15 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
             validate_lora_target_modules(model_config.target_modules)
 
     @classmethod
+    def get_transformer_class(cls, model_config: DiffusionModelConfig):
+        """Load the checkpoint-compatible packed transformer only when requested."""
+        if not getattr(model_config, "use_packed_batch", False):
+            return None
+        from .packed_forward import MiniMaxH3PackedTransformer3DModel
+
+        return MiniMaxH3PackedTransformer3DModel
+
+    @classmethod
     def prepare_processor_files(cls, model_path: str) -> str:
         """Make the official Qwen3-VL processor discoverable by AutoProcessor."""
         return prepare_h3_processor_files(model_path)
@@ -84,6 +93,12 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
     ) -> tuple[dict, Optional[dict]]:
         """Unpack joint latents and prepare H3 transformer inputs."""
         del step, negative_prompt_embeds, negative_prompt_embeds_mask
+        if getattr(model_config, "use_packed_batch", False):
+            if not torch.all(micro_batch["latent_meta"] == micro_batch["latent_meta"][0]):
+                raise ValueError("Packed H3 currently requires a shared target latent layout within each micro-batch.")
+            keyframes = micro_batch.get("keyframe_frame_indices", None)
+            if keyframes is not None and not torch.all(keyframes == keyframes[0]):
+                raise ValueError("Packed H3 currently requires shared FL2VA keyframe anchors within each micro-batch.")
         meta = micro_batch["latent_meta"][0].reshape(-1).tolist()
         num_video_rows, num_audio_rows = int(meta[0]), int(meta[1])
         video_rows, audio_rows = unpack_video_audio_rows(latents, num_video_rows, num_audio_rows)
@@ -124,8 +139,36 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
         model_inputs: dict,
         negative_model_inputs: Optional[dict] = None,
     ) -> torch.Tensor:
-        """Run H3 per sample and return packed flow-match velocities."""
+        """Return per-sample flow-match velocities using serial or packed execution."""
         del negative_model_inputs
+        samples = list(cls._iter_sample_inputs(module, model_inputs))
+        if getattr(model_config, "use_packed_batch", False):
+            if not getattr(module, "supports_packed_batch", False):
+                raise TypeError("use_packed_batch requires the H3 packed transformer (Diffusers FSDP backend).")
+            from .packed_forward import pack_model_inputs
+
+            inputs = [sample[0] for sample in samples]
+            video, audio = split_dual_velocity(module(**pack_model_inputs(inputs)))
+            results = zip(
+                video.split([item["hidden_states"].shape[1] for item in inputs], dim=1),
+                audio.split([item["audio_hidden_states"].shape[1] for item in inputs], dim=1),
+                strict=True,
+            )
+        else:
+            results = (split_dual_velocity(module(**inputs)) for inputs, _, _ in samples)
+
+        packed_velocities = []
+        for (v_video, v_audio), (_, num_cond_video, num_cond_audio) in zip(results, samples, strict=True):
+            packed_velocities.append(
+                pack_video_audio_rows(
+                    h3_velocity_to_flow_match(v_video[:, num_cond_video:]),
+                    h3_velocity_to_flow_match(v_audio[:, num_cond_audio:]),
+                )
+            )
+        return torch.cat(packed_velocities, dim=0)
+
+    @classmethod
+    def _iter_sample_inputs(cls, module, model_inputs):
         video_rows = model_inputs["video_rows"]
         audio_rows = model_inputs["audio_rows"]
         condition_video_rows = model_inputs["condition_video_rows"]
@@ -150,7 +193,6 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
         else:
             text_lengths = [encoder_hidden_states.shape[1]] * batch
 
-        packed_velocities = []
         for index in range(batch):
             num_text_tokens = int(text_lengths[index])
             sample_text_tags = None if prompt_token_tags is None else prompt_token_tags[index, :num_text_tokens]
@@ -205,26 +247,23 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
                 condition_video_timestep=max(video_t, 0.999),
                 condition_audio_timestep=1.0 if ref_block_meta is not None else video_t,
             )
-            result = module(
-                hidden_states=full_video_rows,
-                audio_hidden_states=full_audio_rows,
-                encoder_hidden_states=encoder_hidden_states[index : index + 1, :num_text_tokens],
-                timestep=unique_timesteps.to(device),
-                timestep_indices=timestep_indices.to(device),
-                token_tags=token_tags.to(device),
-                position_ids=position_ids.to(device),
-                video_indices=video_indices.to(device),
-                audio_indices=audio_indices.to(device),
-                text_indices=text_indices.to(device),
-                return_dict=False,
+            yield (
+                dict(
+                    hidden_states=full_video_rows,
+                    audio_hidden_states=full_audio_rows,
+                    encoder_hidden_states=encoder_hidden_states[index : index + 1, :num_text_tokens],
+                    timestep=unique_timesteps.to(device),
+                    timestep_indices=timestep_indices.to(device),
+                    token_tags=token_tags.to(device),
+                    position_ids=position_ids.to(device),
+                    video_indices=video_indices.to(device),
+                    audio_indices=audio_indices.to(device),
+                    text_indices=text_indices.to(device),
+                    return_dict=False,
+                ),
+                num_cond_video,
+                num_cond_audio,
             )
-            v_video, v_audio = split_dual_velocity(result)
-            v_video = v_video[:, num_cond_video:]
-            v_audio = v_audio[:, num_cond_audio:]
-            packed_velocities.append(
-                pack_video_audio_rows(h3_velocity_to_flow_match(v_video), h3_velocity_to_flow_match(v_audio))
-            )
-        return torch.cat(packed_velocities, dim=0)
 
     @classmethod
     def forward_and_sample_previous_step(

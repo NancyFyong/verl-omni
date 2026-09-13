@@ -24,11 +24,12 @@ logger = logging.getLogger(__name__)
 ACTOR_FA2_BACKEND = "flash_varlen_hub"
 ACTOR_FA3_BACKEND = "_flash_3_varlen_hub"
 ACTOR_NATIVE_BACKEND = "native"
+ACTOR_TORCH_VARLEN_BACKEND = "torch_varlen"
 ROLLOUT_SDPA_BACKEND = "TORCH_SDPA"
 
 # Keep in sync with vllm-omni diffusion attention backends for FA train/rollout pairs.
 FA_ROLLOUT_BACKENDS = ("FLASH_ATTN", "FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB")
-ACTOR_BACKENDS = (ACTOR_FA2_BACKEND, ACTOR_FA3_BACKEND, ACTOR_NATIVE_BACKEND, "_native_npu")
+ACTOR_BACKENDS = (ACTOR_FA2_BACKEND, ACTOR_FA3_BACKEND, ACTOR_NATIVE_BACKEND, ACTOR_TORCH_VARLEN_BACKEND, "_native_npu")
 ROLLOUT_BACKENDS = FA_ROLLOUT_BACKENDS + (ROLLOUT_SDPA_BACKEND,)
 
 
@@ -71,8 +72,9 @@ def validate_attention_consistency(config: Any) -> None:
         - If ``attn_backend`` is ``flash_varlen_hub`` or ``_flash_3_varlen_hub``
           (FA2/FA3), rollout must be one of ``FA_ROLLOUT_BACKENDS`` (default
           ``FLASH_ATTN_3_HUB`` for kernels FA3 train/rollout consistency).
-        - If ``attn_backend`` is ``native`` or ``_native_npu``, rollout must be
-          ``TORCH_SDPA``.
+        - If ``attn_backend`` is ``native``, ``torch_varlen`` or ``_native_npu``,
+          rollout must be ``TORCH_SDPA``. Packed PyTorch varlen is numerically
+          compared against SDPA; this pairing does not imply bitwise equality.
 
     Raises:
         ValueError: If the rollout attention backend does not match the training
@@ -99,7 +101,7 @@ def validate_attention_consistency(config: Any) -> None:
         if rollout_backend in FA_ROLLOUT_BACKENDS:
             return
         expected = ", ".join(FA_ROLLOUT_BACKENDS)
-    elif attn_backend in (ACTOR_NATIVE_BACKEND, "_native_npu"):
+    elif attn_backend in (ACTOR_NATIVE_BACKEND, ACTOR_TORCH_VARLEN_BACKEND, "_native_npu"):
         expected = ROLLOUT_SDPA_BACKEND
     if rollout_backend != expected:
         raise ValueError(

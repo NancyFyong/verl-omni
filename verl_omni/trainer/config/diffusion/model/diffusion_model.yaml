@@ -34,6 +34,9 @@ external_lib: null
 # whether to enable gradient checkpointing.
 enable_gradient_checkpointing: True
 
+# Opt-in packed micro-batch forward for supported training adapters.
+use_packed_batch: False
+
 # Optional model config path. If null, backends use <path>/<transformer_subfolder>.
 config_path: null
 

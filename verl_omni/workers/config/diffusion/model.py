@@ -88,6 +88,9 @@ class DiffusionModelConfig(BaseConfig):
     enable_gradient_checkpointing: bool = True
     attn_backend: str = "_flash_3_varlen_hub"
 
+    # Opt-in packed micro-batch forward for adapters that support it.
+    use_packed_batch: bool = False
+
     lora_rank: int = 0
     lora_alpha: int = 64
     lora_init_weights: str = "gaussian"
@@ -126,9 +129,11 @@ class DiffusionModelConfig(BaseConfig):
     def __post_init__(self):
         import_external_libs(self.external_lib)
 
-        valid_backends = {"native", "_native_npu", "flash_varlen_hub", "_flash_3_varlen_hub"}
+        valid_backends = {"native", "_native_npu", "flash_varlen_hub", "_flash_3_varlen_hub", "torch_varlen"}
         if self.attn_backend not in valid_backends:
             raise ValueError(f"Invalid attn_backend: {self.attn_backend}. Must be one of {sorted(valid_backends)}")
+        if self.attn_backend == "torch_varlen" and not self.use_packed_batch:
+            raise ValueError("attn_backend=torch_varlen requires use_packed_batch=True.")
 
         if self.attn_backend in ["flash_varlen_hub", "_flash_3_varlen_hub"]:
             try:

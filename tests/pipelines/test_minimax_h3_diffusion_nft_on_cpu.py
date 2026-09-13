@@ -230,7 +230,10 @@ class TestMiniMaxH3Forward:
         # Echoing the per-sample rows back and re-packing must reproduce the flat ``xt`` layout exactly,
         # negated: H3's velocity is ``x0 - noise`` and the loss expects the opposite convention.
         out = MiniMaxH3DiffusionNFT.forward(
-            module=_module(_identity), model_config=MagicMock(), model_inputs=model_inputs, negative_model_inputs=None
+            module=_module(_identity),
+            model_config=MagicMock(use_packed_batch=False),
+            model_inputs=model_inputs,
+            negative_model_inputs=None,
         )
         assert out.shape == packed.shape
         torch.testing.assert_close(out, -packed)
@@ -241,7 +244,10 @@ class TestMiniMaxH3Forward:
 
         module = _module(lambda **kw: (kw["hidden_states"] * 2.0, kw["audio_hidden_states"] * 3.0))
         out = MiniMaxH3DiffusionNFT.forward(
-            module=module, model_config=MagicMock(), model_inputs=model_inputs, negative_model_inputs=None
+            module=module,
+            model_config=MagicMock(use_packed_batch=False),
+            model_inputs=model_inputs,
+            negative_model_inputs=None,
         )
         assert module.call_count == _BATCH
         torch.testing.assert_close(out, pack_video_audio_rows(video_rows * -2.0, audio_rows * -3.0))
@@ -252,7 +258,10 @@ class TestMiniMaxH3Forward:
 
         module = _module(_identity)
         MiniMaxH3DiffusionNFT.forward(
-            module=module, model_config=MagicMock(), model_inputs=model_inputs, negative_model_inputs=None
+            module=module,
+            model_config=MagicMock(use_packed_batch=False),
+            model_inputs=model_inputs,
+            negative_model_inputs=None,
         )
         kwargs = module.call_args_list[0].kwargs
         seq_len = _TEXT_LEN + _NUM_VIDEO_ROWS + _NUM_AUDIO_ROWS
@@ -276,7 +285,10 @@ class TestMiniMaxH3Forward:
 
         module = _module(_identity)
         MiniMaxH3DiffusionNFT.forward(
-            module=module, model_config=MagicMock(), model_inputs=model_inputs, negative_model_inputs=None
+            module=module,
+            model_config=MagicMock(use_packed_batch=False),
+            model_inputs=model_inputs,
+            negative_model_inputs=None,
         )
         assert module.call_args_list[0].kwargs["encoder_hidden_states"].shape == (1, 5, _TEXT_DIM)
         assert module.call_args_list[1].kwargs["encoder_hidden_states"].shape == (1, _TEXT_LEN, _TEXT_DIM)
@@ -302,7 +314,7 @@ class TestMiniMaxH3Forward:
             step=0,
         )
         module = _module(_identity)
-        output = MiniMaxH3DiffusionNFT.forward(module, MagicMock(), model_inputs)
+        output = MiniMaxH3DiffusionNFT.forward(module, MagicMock(use_packed_batch=False), model_inputs)
 
         kwargs = module.call_args.kwargs
         assert kwargs["hidden_states"].shape == (1, 12, VIDEO_ROW_WIDTH)
@@ -317,7 +329,7 @@ class TestMiniMaxH3Forward:
         with pytest.raises(TypeError, match="Unexpected MiniMax H3 transformer output"):
             MiniMaxH3DiffusionNFT.forward(
                 module=_module(lambda **kw: torch.randn(1, 8)),
-                model_config=MagicMock(),
+                model_config=MagicMock(use_packed_batch=False),
                 model_inputs=model_inputs,
                 negative_model_inputs=None,
             )

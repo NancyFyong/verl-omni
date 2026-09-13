@@ -339,7 +339,7 @@ def test_ref2va_actor_rejects_invalid_block_count_before_transformer(monkeypatch
     with pytest.raises(ValueError, match="block count 13"):
         MiniMaxH3FlowGRPO.prepare_model_inputs(
             module=module,
-            model_config=MagicMock(),
+            model_config=MagicMock(use_packed_batch=False),
             latents=trajectory["all_latents"],
             timesteps=trajectory["all_timesteps"],
             prompt_embeds=trajectory["prompt_embeds"],

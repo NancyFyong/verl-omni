@@ -213,7 +213,7 @@ def test_rollout_output_reaches_actor_and_replays_joint_transition(monkeypatch) 
     micro_batch = TensorDict(actor_fields, batch_size=[1])
     model_inputs, negative_inputs = MiniMaxH3FlowGRPO.prepare_model_inputs(
         module=MagicMock(),
-        model_config=MagicMock(),
+        model_config=MagicMock(use_packed_batch=False),
         latents=micro_batch["all_latents"],
         timesteps=micro_batch["all_timesteps"],
         prompt_embeds=micro_batch["prompt_embeds"],
@@ -606,7 +606,7 @@ def _prepare_actor_payload(payload: dict[str, torch.Tensor], module=None):
     module = module or MagicMock()
     result = MiniMaxH3FlowGRPO.prepare_model_inputs(
         module=module,
-        model_config=MagicMock(),
+        model_config=MagicMock(use_packed_batch=False),
         latents=payload["all_latents"],
         timesteps=payload["all_timesteps"],
         prompt_embeds=payload["prompt_embeds"],

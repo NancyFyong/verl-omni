@@ -72,6 +72,15 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
     """Replay flattened joint video/audio transitions with the H3 DiT."""
 
     @classmethod
+    def get_transformer_class(cls, model_config: DiffusionModelConfig):
+        """Select the shared checkpoint-compatible packed transformer on opt-in."""
+        if not getattr(model_config, "use_packed_batch", False):
+            return None
+        from verl_omni.pipelines.minimax_h3_diffusion_nft.packed_forward import MiniMaxH3PackedTransformer3DModel
+
+        return MiniMaxH3PackedTransformer3DModel
+
+    @classmethod
     def prepare_processor_files(cls, model_path: str) -> str:
         """Make the official Qwen3-VL processor discoverable by AutoProcessor."""
         return prepare_h3_processor_files(model_path)
@@ -130,10 +139,38 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
         micro_batch: TensorDict,
         step: int,
     ) -> tuple[dict, None]:
-        del module, model_config, negative_prompt_embeds, negative_prompt_embeds_mask
+        del negative_prompt_embeds, negative_prompt_embeds_mask
+        if getattr(model_config, "use_packed_batch", False):
+            if not getattr(module, "supports_packed_batch", False):
+                raise ValueError("use_packed_batch requires MiniMaxH3PackedTransformer3DModel.")
+            replay = cls._select_replay_fields(micro_batch)
+            samples = [
+                cls._prepare_batch_inputs(
+                    latents[index : index + 1],
+                    timesteps[index : index + 1],
+                    prompt_embeds[index : index + 1],
+                    None if prompt_embeds_mask is None else prompt_embeds_mask[index : index + 1],
+                    {key: value[index : index + 1] for key, value in replay.items()},
+                    step,
+                )[0]
+                for index in range(latents.shape[0])
+            ]
+            if not samples:
+                raise ValueError("Cannot pack an empty H3 FlowGRPO micro-batch.")
+            targets = {
+                (int(sample["_h3_video_update_mask"].sum()), int(sample["_h3_audio_update_mask"].sum()))
+                for sample in samples
+            }
+            if len(targets) != 1:
+                raise ValueError("Packed H3 FlowGRPO requires shared target video/audio row counts.")
+            return {"_h3_samples": samples}, None
+        return cls._prepare_batch_inputs(latents, timesteps, prompt_embeds, prompt_embeds_mask, micro_batch, step)
+
+    @staticmethod
+    def _select_replay_fields(micro_batch):
+        """Leave unrelated nested fields untouched when slicing per-sample replay data."""
         required = {"all_next_latents", "h3_step_indices", "h3_audio_timesteps"}
-        is_ref2va = "ref_block_meta" in micro_batch
-        if is_ref2va:
+        if "ref_block_meta" in micro_batch:
             required.update(
                 {
                     "latent_meta",
@@ -142,6 +179,7 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
                     "condition_audio_rows",
                     "condition_video_row_count",
                     "condition_audio_row_count",
+                    "ref_block_meta",
                     "ref_block_count",
                 }
             )
@@ -162,7 +200,13 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
         missing = sorted(required - set(micro_batch.keys()))
         if missing:
             raise KeyError(f"MiniMax H3 rollout is missing fields: {missing}.")
+        return {key: micro_batch[key] for key in required}
 
+    @classmethod
+    def _prepare_batch_inputs(cls, latents, timesteps, prompt_embeds, prompt_embeds_mask, micro_batch, step):
+        """Build the existing shared-layout contract, also used for each packed sample."""
+        micro_batch = cls._select_replay_fields(micro_batch)
+        is_ref2va = "ref_block_meta" in micro_batch
         if prompt_embeds_mask is not None:
             text_len = _shared_int(prompt_embeds_mask.sum(dim=-1), "text length")
             prompt_embeds = prompt_embeds[:, :text_len]
@@ -177,6 +221,8 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
             condition_audio_count = _shared_int(micro_batch["condition_audio_row_count"], "condition audio row count")
             condition_video = micro_batch["condition_video_rows"][:, :condition_video_count]
             condition_audio = micro_batch["condition_audio_rows"][:, :condition_audio_count]
+            if condition_video.shape[1] != condition_video_count or condition_audio.shape[1] != condition_audio_count:
+                raise ValueError("MiniMax H3 reference row counts exceed the supplied condition tensors.")
             ref_block_count = _shared_int(micro_batch["ref_block_count"], "reference block count")
             ref_block_meta = _shared_layout(
                 micro_batch["ref_block_meta"], micro_batch["ref_block_meta"].shape[1], "reference block metadata"
@@ -267,12 +313,48 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
         del negative_model_inputs
         if scheduler_inputs is None:
             raise ValueError("MiniMax H3 replay requires rollout scheduler inputs.")
+        if "_h3_samples" in model_inputs:
+            from verl_omni.pipelines.minimax_h3_diffusion_nft.packed_forward import pack_model_inputs
+
+            samples = model_inputs["_h3_samples"]
+            transformer_inputs = [
+                {key: value for key, value in sample.items() if not key.startswith("_h3_")} for sample in samples
+            ]
+            video, audio = module(**pack_model_inputs(transformer_inputs))
+            video_parts = video.split([sample["hidden_states"].shape[1] for sample in samples], dim=1)
+            audio_parts = audio.split([sample["audio_hidden_states"].shape[1] for sample in samples], dim=1)
+            outputs = [
+                cls._sample_previous_step(
+                    scheduler,
+                    model_config,
+                    sample,
+                    {"all_next_latents": scheduler_inputs["all_next_latents"][index : index + 1]},
+                    video_part,
+                    audio_part,
+                    step,
+                )
+                for index, (sample, video_part, audio_part) in enumerate(
+                    zip(samples, video_parts, audio_parts, strict=True)
+                )
+            ]
+            return tuple(torch.cat(parts, dim=0) for parts in zip(*outputs, strict=True))
+
+        transformer_inputs = {key: value for key, value in model_inputs.items() if not key.startswith("_h3_")}
+        video_velocity, audio_velocity = module(**transformer_inputs)
+        return cls._sample_previous_step(
+            scheduler, model_config, model_inputs, scheduler_inputs, video_velocity, audio_velocity, step
+        )
+
+    @classmethod
+    def _sample_previous_step(
+        cls, scheduler, model_config, model_inputs, scheduler_inputs, video_velocity, audio_velocity, step
+    ):
+        """Replay each modality with its original schedule and target-only scoring mask."""
         model_inputs = dict(model_inputs)
         original_step = int(model_inputs.pop("_h3_scheduler_step"))
         video_update_mask = model_inputs.pop("_h3_video_update_mask")
         audio_update_mask = model_inputs.pop("_h3_audio_update_mask")
         target_only_trajectory = bool(model_inputs.pop("_h3_target_only_trajectory"))
-        video_velocity, audio_velocity = module(**model_inputs)
         video = model_inputs["hidden_states"].float()
         audio = model_inputs["audio_hidden_states"].float()
         if target_only_trajectory:

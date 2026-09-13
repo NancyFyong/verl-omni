@@ -280,6 +280,8 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
             torch_dtype = torch.float32 if not self.engine_config.forward_only else torch.bfloat16
 
         torch_dtype = PrecisionType.to_dtype(torch_dtype)
+        model_cls = DiffusionModelBase.get_class(self.model_config)
+        transformer_cls = model_cls.get_transformer_class(self.model_config) or AutoModel
 
         module = self._build_module_from_registry(torch_dtype)
         if module is not None:
@@ -291,7 +293,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
 
-            module = AutoModel.from_pretrained(
+            module = transformer_cls.from_pretrained(
                 self.model_config.config_path or self.model_config.local_path,
                 torch_dtype=torch_dtype,
                 trust_remote_code=self.model_config.trust_remote_code,
@@ -308,7 +310,6 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
 
             # Keep architecture-declared fp32 islands unless the adapter marks
             # them as incompatible with its FSDP wrapping units.
-            model_cls = DiffusionModelBase.get_class(self.model_config)
             _cast_loaded_diffusers_module(
                 module,
                 torch_dtype,
