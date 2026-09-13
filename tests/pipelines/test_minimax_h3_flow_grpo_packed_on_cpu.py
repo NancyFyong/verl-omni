@@ -214,16 +214,37 @@ def test_packed_matches_existing_dense_batch_when_layouts_are_shared():
 
 def test_packed_ref2va_accepts_variable_reference_layouts_rejected_by_dense_batch():
     dense, packed = _models()
-    data = _flow_batch(dense, task="ref2va", lengths=(4, 4, 4), shared_steps=True)
-    assert data["condition_video_row_count"].flatten().tolist() == [4, 8, 12]
-    assert data["condition_audio_row_count"].flatten().tolist() == [0, 4, 0]
+    data = _flow_batch(dense, task="ref2va", lengths=(4, 4, 4, 4), shared_steps=True)
+    grouped_fields = (
+        "prompt_embeds",
+        "prompt_embeds_mask",
+        "ref_block_meta",
+        "ref_block_count",
+        "condition_video_rows",
+        "condition_audio_rows",
+        "condition_video_row_count",
+        "condition_audio_row_count",
+        "prompt_token_tags",
+    )
+    for key in grouped_fields:
+        first_prompt, second_prompt = data[key][0].clone(), data[key][1].clone()
+        data[key][0:2] = first_prompt
+        data[key][2:4] = second_prompt
+
+    # Model two rollout groups with n=2: layouts match within each prompt and differ across prompts.
+    assert data["condition_video_row_count"].flatten().tolist() == [4, 4, 8, 8]
+    assert data["condition_audio_row_count"].flatten().tolist() == [0, 0, 4, 4]
+    torch.testing.assert_close(data["prompt_embeds"][0], data["prompt_embeds"][1])
+    torch.testing.assert_close(data["prompt_embeds"][2], data["prompt_embeds"][3])
 
     with pytest.raises(ValueError, match="shared condition video row count"):
         _prepare(dense, data, False)
 
     prepared = _prepare(packed, data, True)
     sequence_lengths = [sample["position_ids"].shape[0] for sample in prepared["_h3_samples"]]
-    assert len(set(sequence_lengths)) > 1
+    assert sequence_lengths[0] == sequence_lengths[1]
+    assert sequence_lengths[2] == sequence_lengths[3]
+    assert sequence_lengths[0] != sequence_lengths[2]
 
     expected = _serial(dense, data, _schedulers())
     calls = []

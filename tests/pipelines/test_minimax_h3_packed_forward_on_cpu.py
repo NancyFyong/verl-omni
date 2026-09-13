@@ -103,7 +103,7 @@ def _inputs(model, lengths=(3, 5, 4), task="t2va"):
         model,
         SimpleNamespace(),
         latents,
-        torch.tensor([200.0, 700.0, 500.0])[:batch],
+        torch.tensor([200.0, 700.0, 500.0, 300.0])[:batch],
         torch.randn(batch, max(lengths), 16),
         torch.arange(max(lengths))[None] < torch.tensor(lengths)[:, None],
         None,
