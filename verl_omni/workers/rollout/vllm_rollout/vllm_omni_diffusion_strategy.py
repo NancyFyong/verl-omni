@@ -19,8 +19,6 @@ from typing import Any, Optional
 import numpy as np
 import torch
 import torchvision.transforms as T
-from hydra.utils import get_class
-from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.import_utils import import_external_libs
 from vllm_omni.inputs.data import OmniCustomPrompt, OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
@@ -94,15 +92,6 @@ class DiffusionStrategy(OmniStrategyBase):
 
     rollout_config_cls = DiffusionRolloutConfig
     model_config_cls = DiffusionModelConfig
-
-    def init_model_config(self, model_config: Any) -> Any:
-        """Preserve model-specific config subclasses selected by the Hydra target."""
-        config_cls = self.model_config_cls
-        if isinstance(model_config, Mapping) and model_config.get("_target_"):
-            config_cls = get_class(model_config["_target_"])
-            if not issubclass(config_cls, self.model_config_cls):
-                raise TypeError("Diffusion model config target must inherit DiffusionModelConfig.")
-        return omega_conf_to_dataclass(model_config, dataclass_type=config_cls)
 
     def post_init(self, cuda_visible_devices: str) -> None:
         self.server._to_tensor = T.PILToTensor()

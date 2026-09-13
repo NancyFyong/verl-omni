@@ -24,13 +24,13 @@ from diffusers import MiniMaxH3Transformer3DModel
 from peft import LoraConfig, get_peft_model
 from tensordict import TensorDict
 
-from verl_omni.pipelines.minimax_h3_diffusion_nft.common import pack_video_audio_rows, serialize_ref_blocks
-from verl_omni.pipelines.minimax_h3_diffusion_nft.diffusers_training_adapter import MiniMaxH3DiffusionNFT
-from verl_omni.pipelines.minimax_h3_diffusion_nft.packed_forward import (
+from verl_omni.pipelines.minimax_h3_common import (
     MiniMaxH3PackedTransformer3DModel,
     PackedSequenceLayout,
     pack_model_inputs,
 )
+from verl_omni.pipelines.minimax_h3_diffusion_nft.common import pack_video_audio_rows, serialize_ref_blocks
+from verl_omni.pipelines.minimax_h3_diffusion_nft.diffusers_training_adapter import MiniMaxH3DiffusionNFT
 from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.trainer.diffusion.diffusion_algos import DiffusionNFTLoss
 from verl_omni.workers.config.diffusion.actor import DiffusionLossConfig
@@ -113,7 +113,14 @@ def _inputs(model, lengths=(3, 5, 4), task="t2va"):
 
 
 def _forward(model, inputs, packed):
-    return MiniMaxH3DiffusionNFT.forward(model, SimpleNamespace(use_packed_batch=packed), inputs)
+    if packed:
+        return MiniMaxH3DiffusionNFT.forward(model, SimpleNamespace(), inputs)
+    # The former per-sample implementation is retained only as a numerical baseline.
+    outputs = []
+    for sample, video_count, audio_count in MiniMaxH3DiffusionNFT._iter_sample_inputs(model, inputs):
+        video, audio = model(**sample)
+        outputs.append(pack_video_audio_rows(-video[:, video_count:], -audio[:, audio_count:]))
+    return torch.cat(outputs)
 
 
 def _loss(prediction, old_prediction, ref_prediction):
@@ -180,7 +187,7 @@ def test_one_forward_per_micro_batch_and_no_cross_sample_attention():
 
 
 def test_fa3_receives_separate_dit_and_text_boundaries(monkeypatch):
-    from verl_omni.pipelines.minimax_h3_diffusion_nft import packed_forward
+    from verl_omni.pipelines import minimax_h3_common as packed_forward
 
     calls = []
 
@@ -212,7 +219,7 @@ def test_fa3_receives_separate_dit_and_text_boundaries(monkeypatch):
 
 
 def test_unavailable_fa3_fails_instead_of_falling_back(monkeypatch):
-    from verl_omni.pipelines.minimax_h3_diffusion_nft import packed_forward
+    from verl_omni.pipelines import minimax_h3_common as packed_forward
 
     def unavailable():
         raise RuntimeError("FA3 kernel unavailable")
@@ -222,6 +229,15 @@ def test_unavailable_fa3_fails_instead_of_falling_back(monkeypatch):
     with pytest.raises(RuntimeError, match="FA3 kernel unavailable"):
         packed.set_attention_backend("_flash_3_varlen_hub")
     assert packed.transformer_blocks[0].attn.processor._attention_backend == "native"
+
+
+def test_varlen_layout_does_not_materialize_native_padding():
+    layout = PackedSequenceLayout.from_lengths([2, 4], torch.device("cpu"))
+    assert layout.total_tokens == 6
+    assert "valid_mask" not in vars(layout) and "padded_indices" not in vars(layout)
+    query = torch.randn(1, 6, 2, 16)
+    assert layout.attention(query, query, query, "native").shape == query.shape
+    assert "valid_mask" in vars(layout) and "padded_indices" in vars(layout)
 
 
 def test_packing_preserves_row_timesteps_and_resets_positions():
@@ -264,17 +280,15 @@ def test_checkpoint_roundtrip_preserves_class_config_and_weight_names(tmp_path):
     torch.testing.assert_close(_forward(restored, inputs, False), _forward(serial, inputs, False))
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-def test_fsdp_loader_keeps_attention_checkpointing_and_fp32_islands(tmp_path, monkeypatch, enabled):
-    from verl_omni.workers.config import MiniMaxH3ModelConfig
+def test_fsdp_loader_keeps_attention_checkpointing_and_fp32_islands(tmp_path, monkeypatch):
+    from verl_omni.workers.config import DiffusionModelConfig
     from verl_omni.workers.engine.fsdp import diffusers_impl
 
     serial, _ = _models()
     serial.save_pretrained(tmp_path)
-    config = MiniMaxH3ModelConfig(
+    config = DiffusionModelConfig(
         path=str(tmp_path),
         load_tokenizer=False,
-        use_packed_batch=enabled,
         architecture="MiniMaxH3Pipeline",
         algorithm="diffusion_nft",
         external_lib=None,
@@ -292,7 +306,7 @@ def test_fsdp_loader_keeps_attention_checkpointing_and_fp32_islands(tmp_path, mo
     )
     monkeypatch.setattr(diffusers_impl, "get_init_weight_context_manager", lambda **_: nullcontext)
     model = diffusers_impl.DiffusersFSDPEngine._build_module(engine)
-    assert isinstance(model, MiniMaxH3PackedTransformer3DModel) == enabled
+    assert isinstance(model, MiniMaxH3PackedTransformer3DModel)
     assert model.gradient_checkpointing and model.token_refiner.gradient_checkpointing
     assert model.proj_in.weight.dtype == torch.float32
     assert model.transformer_blocks[0].attn.to_q.weight.dtype == torch.bfloat16
@@ -308,11 +322,11 @@ def test_packed_model_preserves_recipe_fsdp_wrap_targets():
 
 
 @pytest.mark.parametrize("algorithm", ["diffusion_nft", "flow_grpo"])
-def test_packed_config_is_opt_in_through_h3_target(tmp_path, algorithm):
+def test_h3_packing_is_default_with_the_generic_model_config(tmp_path, algorithm):
     from hydra import compose, initialize_config_dir
     from verl.utils.config import omega_conf_to_dataclass
 
-    from verl_omni.workers.config import MiniMaxH3ModelConfig
+    from verl_omni.workers.config import DiffusionModelConfig
 
     (tmp_path / "model_index.json").write_text('{"_class_name": "MiniMaxH3Pipeline"}')
     config_dir = Path(__file__).resolve().parents[2] / "verl_omni/trainer/config/diffusion/model"
@@ -323,26 +337,18 @@ def test_packed_config_is_opt_in_through_h3_target(tmp_path, algorithm):
                 f"path={tmp_path}",
                 "+load_tokenizer=false",
                 f"algorithm={algorithm}",
-                "_target_=verl_omni.workers.config.diffusion.minimax_h3.MiniMaxH3ModelConfig",
-                "+use_packed_batch=true",
                 "attn_backend=native",
             ],
         )
     model_config = omega_conf_to_dataclass(config)
-    assert isinstance(model_config, MiniMaxH3ModelConfig)
-    assert model_config.use_packed_batch
+    assert type(model_config) is DiffusionModelConfig
     adapter = DiffusionModelBase.get_class_by_name("MiniMaxH3Pipeline", algorithm)
     assert adapter.get_transformer_class(model_config) is MiniMaxH3PackedTransformer3DModel
     from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy
 
     rollout_model_config = DiffusionStrategy(None).init_model_config(config)
-    assert isinstance(rollout_model_config, MiniMaxH3ModelConfig)
-    assert rollout_model_config.use_packed_batch
-    assert config.use_packed_batch  # Deserialization must not mutate the supplied config.
-    del config.use_packed_batch
-    model_config = omega_conf_to_dataclass(config)
-    assert not model_config.use_packed_batch
-    assert adapter.get_transformer_class(model_config) is None
+    assert type(rollout_model_config) is DiffusionModelConfig
+    assert "use_packed_batch" not in config
 
 
 def test_generic_diffusion_config_does_not_expose_packing():
@@ -361,28 +367,6 @@ def test_generic_diffusion_config_does_not_expose_packing():
     with initialize_config_dir(config_dir=str(config_dir), version_base=None):
         config = compose(config_name="diffusion_trainer")
     assert "use_packed_batch" not in config.actor_rollout_ref.model
-
-
-@pytest.mark.parametrize(
-    "overrides,match",
-    [
-        ({"architecture": "QwenImagePipeline"}, "requires architecture=MiniMaxH3Pipeline"),
-        ({"attn_backend": "_native_npu"}, "requires attn_backend=native or _flash_3_varlen_hub"),
-    ],
-)
-def test_h3_config_rejects_incompatible_packed_options(tmp_path, overrides, match):
-    from verl_omni.workers.config import MiniMaxH3ModelConfig
-
-    kwargs = dict(
-        path=str(tmp_path),
-        architecture="MiniMaxH3Pipeline",
-        load_tokenizer=False,
-        attn_backend="native",
-        use_packed_batch=True,
-    )
-    kwargs.update(overrides)
-    with pytest.raises(ValueError, match=match):
-        MiniMaxH3ModelConfig(**kwargs)
 
 
 def test_packed_boundaries_must_match_rows():
@@ -404,7 +388,7 @@ def test_packed_input_preparation_rejects_mixed_target_geometry():
     with pytest.raises(ValueError, match="shared target latent layout"):
         MiniMaxH3DiffusionNFT.prepare_model_inputs(
             serial,
-            SimpleNamespace(use_packed_batch=True),
+            SimpleNamespace(),
             None,
             None,
             None,
@@ -416,10 +400,8 @@ def test_packed_input_preparation_rejects_mixed_target_geometry():
         )
 
 
-def test_opt_in_loader_and_unsupported_combinations_fail_closed():
-    config = SimpleNamespace(use_packed_batch=True)
-    assert MiniMaxH3DiffusionNFT.get_transformer_class(config) is MiniMaxH3PackedTransformer3DModel
-    assert MiniMaxH3DiffusionNFT.get_transformer_class(SimpleNamespace(use_packed_batch=False)) is None
+def test_default_loader_and_unsupported_combinations_fail_closed():
+    assert MiniMaxH3DiffusionNFT.get_transformer_class(SimpleNamespace()) is MiniMaxH3PackedTransformer3DModel
     assert DiffusionModelBase.get_transformer_class(SimpleNamespace()) is None
     serial, packed = _models()
     with pytest.raises(TypeError, match="packed transformer"):

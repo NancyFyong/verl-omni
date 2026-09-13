@@ -50,10 +50,8 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
 
     @classmethod
     def get_transformer_class(cls, model_config: DiffusionModelConfig):
-        """Load the checkpoint-compatible packed transformer only when requested."""
-        if not getattr(model_config, "use_packed_batch", False):
-            return None
-        from .packed_forward import MiniMaxH3PackedTransformer3DModel
+        """Load the shared H3 transformer with isolated micro-batch attention."""
+        from verl_omni.pipelines.minimax_h3_common import MiniMaxH3PackedTransformer3DModel
 
         return MiniMaxH3PackedTransformer3DModel
 
@@ -93,12 +91,11 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
     ) -> tuple[dict, Optional[dict]]:
         """Unpack joint latents and prepare H3 transformer inputs."""
         del step, negative_prompt_embeds, negative_prompt_embeds_mask
-        if getattr(model_config, "use_packed_batch", False):
-            if not torch.all(micro_batch["latent_meta"] == micro_batch["latent_meta"][0]):
-                raise ValueError("Packed H3 currently requires a shared target latent layout within each micro-batch.")
-            keyframes = micro_batch.get("keyframe_frame_indices", None)
-            if keyframes is not None and not torch.all(keyframes == keyframes[0]):
-                raise ValueError("Packed H3 currently requires shared FL2VA keyframe anchors within each micro-batch.")
+        if not torch.all(micro_batch["latent_meta"] == micro_batch["latent_meta"][0]):
+            raise ValueError("Packed H3 currently requires a shared target latent layout within each micro-batch.")
+        keyframes = micro_batch.get("keyframe_frame_indices", None)
+        if keyframes is not None and not torch.all(keyframes == keyframes[0]):
+            raise ValueError("Packed H3 currently requires shared FL2VA keyframe anchors within each micro-batch.")
         meta = micro_batch["latent_meta"][0].reshape(-1).tolist()
         num_video_rows, num_audio_rows = int(meta[0]), int(meta[1])
         video_rows, audio_rows = unpack_video_audio_rows(latents, num_video_rows, num_audio_rows)
@@ -139,23 +136,20 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
         model_inputs: dict,
         negative_model_inputs: Optional[dict] = None,
     ) -> torch.Tensor:
-        """Return per-sample flow-match velocities using serial or packed execution."""
-        del negative_model_inputs
-        samples = list(cls._iter_sample_inputs(module, model_inputs))
-        if getattr(model_config, "use_packed_batch", False):
-            if not getattr(module, "supports_packed_batch", False):
-                raise TypeError("use_packed_batch requires the H3 packed transformer (Diffusers FSDP backend).")
-            from .packed_forward import pack_model_inputs
+        """Return target-only flow-match velocities from one packed H3 forward."""
+        from verl_omni.pipelines.minimax_h3_common import pack_model_inputs
 
-            inputs = [sample[0] for sample in samples]
-            video, audio = split_dual_velocity(module(**pack_model_inputs(inputs)))
-            results = zip(
-                video.split([item["hidden_states"].shape[1] for item in inputs], dim=1),
-                audio.split([item["audio_hidden_states"].shape[1] for item in inputs], dim=1),
-                strict=True,
-            )
-        else:
-            results = (split_dual_velocity(module(**inputs)) for inputs, _, _ in samples)
+        del negative_model_inputs
+        if not getattr(module, "supports_packed_batch", False):
+            raise TypeError("MiniMax H3 requires the packed transformer (Diffusers FSDP backend).")
+        samples = list(cls._iter_sample_inputs(module, model_inputs))
+        inputs = [sample[0] for sample in samples]
+        video, audio = split_dual_velocity(module(**pack_model_inputs(inputs)))
+        results = zip(
+            video.split([item["hidden_states"].shape[1] for item in inputs], dim=1),
+            audio.split([item["audio_hidden_states"].shape[1] for item in inputs], dim=1),
+            strict=True,
+        )
 
         packed_velocities = []
         for (v_video, v_audio), (_, num_cond_video, num_cond_audio) in zip(results, samples, strict=True):

@@ -19,7 +19,7 @@ parameters keep their original names for PEFT, FSDP, and rollout weight sync.
 """
 
 from dataclasses import dataclass
-from functools import lru_cache, wraps
+from functools import cached_property, lru_cache, wraps
 from itertools import accumulate
 
 import torch
@@ -51,22 +51,30 @@ class PackedSequenceLayout:
 
     cu_seqlens: torch.Tensor
     max_seqlen: int
-    valid_mask: torch.Tensor
-    padded_indices: torch.Tensor
+    lengths: tuple[int, ...]
+    total_tokens: int
 
     @classmethod
     def from_lengths(cls, lengths: list[int], device: torch.device):
         """Build boundaries for nonempty sequences without allocating a quadratic mask."""
         if not lengths or any(length <= 0 for length in lengths):
             raise ValueError("Packed H3 sequences must have positive lengths.")
-        max_length = max(lengths)
-        mask = torch.arange(max_length, device=device)[None] < torch.tensor(lengths, device=device)[:, None]
         return cls(
             torch.tensor([0, *accumulate(lengths)], dtype=torch.int32, device=device),
-            max_length,
-            mask,
-            mask.flatten().nonzero().flatten(),
+            max(lengths),
+            tuple(lengths),
+            sum(lengths),
         )
+
+    @cached_property
+    def valid_mask(self):
+        """Materialize padding only for the native SDPA backend."""
+        device = self.cu_seqlens.device
+        return torch.arange(self.max_seqlen, device=device)[None] < torch.tensor(self.lengths, device=device)[:, None]
+
+    @cached_property
+    def padded_indices(self):
+        return self.valid_mask.flatten().nonzero().flatten()
 
     def attention(self, query, key, value, backend):
         """Attend independently to each document in packed ``(1, total, heads, dim)`` tensors."""
@@ -129,11 +137,17 @@ def pack_model_inputs(samples: list[dict]) -> dict:
         for key in ("hidden_states", "audio_hidden_states", "encoder_hidden_states")
     }
     for key in ("video_indices", "audio_indices", "text_indices"):
-        packed[key] = torch.cat([sample[key] + offset for sample, offset in zip(samples, offsets, strict=True)])
+        packed[key] = torch.cat([sample[key] + offset for sample, offset in zip(samples, offsets, strict=True)]).to(
+            device
+        )
     for key in ("position_ids", "token_tags"):
-        packed[key] = torch.cat([sample[key] for sample in samples])
-    row_timesteps = torch.cat([sample["timestep"][sample["timestep_indices"]] for sample in samples])
-    packed["timestep"], packed["timestep_indices"] = torch.unique(row_timesteps, sorted=True, return_inverse=True)
+        packed[key] = torch.cat([sample[key] for sample in samples]).to(device)
+    timesteps, table_indices = torch.unique(
+        torch.cat([sample["timestep"] for sample in samples]), sorted=True, return_inverse=True
+    )
+    tables = table_indices.split([sample["timestep"].numel() for sample in samples])
+    indices = torch.cat([table[sample["timestep_indices"]] for table, sample in zip(tables, samples, strict=True)])
+    packed["timestep"], packed["timestep_indices"] = timesteps.to(device), indices.to(device)
     packed["sequence_layout"] = PackedSequenceLayout.from_lengths(lengths, device)
     packed["text_sequence_layout"] = PackedSequenceLayout.from_lengths(text_lengths, device)
     packed["return_dict"] = False
@@ -248,9 +262,9 @@ class MiniMaxH3PackedTransformer3DModel(MiniMaxH3Transformer3DModel):
         ):
             raise ValueError("Packed H3 positions, token tags and timesteps must describe the same sequence.")
 
-        if sequence_layout.padded_indices.numel() != sequence_length:
+        if sequence_layout.total_tokens != sequence_length:
             raise ValueError("Packed H3 attention boundaries do not match the sequence length.")
-        if text_sequence_layout.padded_indices.numel() != encoder_hidden_states.shape[1]:
+        if text_sequence_layout.total_tokens != encoder_hidden_states.shape[1]:
             raise ValueError("Packed H3 text attention boundaries do not match the text length.")
         rotary_emb = self.rope(position_ids)
         video_embeds = self.proj_in(hidden_states.to(get_parameter_dtype(self.proj_in)))

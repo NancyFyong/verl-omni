@@ -288,6 +288,8 @@ def test_ref2va_actor_replays_full_layout_and_scores_only_targets(monkeypatch):
     assert not micro_batch["condition_video_rows"].is_nested
     assert not micro_batch["condition_audio_rows"].is_nested
     assert negative_inputs is None
+    packed_inputs = model_inputs
+    model_inputs = packed_inputs["_h3_samples"][0]
     assert model_inputs["hidden_states"].shape == (1, 24, H3_VIDEO_WIDTH)
     assert model_inputs["audio_hidden_states"].shape == (1, 16, H3_AUDIO_WIDTH)
     assert model_inputs["timestep"].tolist() == pytest.approx(
@@ -316,7 +318,7 @@ def test_ref2va_actor_replays_full_layout_and_scores_only_targets(monkeypatch):
         module=module,
         scheduler=(MagicMock(), MagicMock()),
         model_config=model_config,
-        model_inputs=model_inputs,
+        model_inputs=packed_inputs,
         negative_model_inputs=None,
         scheduler_inputs=micro_batch,
         step=0,
@@ -339,7 +341,7 @@ def test_ref2va_actor_rejects_invalid_block_count_before_transformer(monkeypatch
     with pytest.raises(ValueError, match="block count 13"):
         MiniMaxH3FlowGRPO.prepare_model_inputs(
             module=module,
-            model_config=MagicMock(use_packed_batch=False),
+            model_config=MagicMock(),
             latents=trajectory["all_latents"],
             timesteps=trajectory["all_timesteps"],
             prompt_embeds=trajectory["prompt_embeds"],

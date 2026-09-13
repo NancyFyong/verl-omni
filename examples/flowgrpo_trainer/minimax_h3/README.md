@@ -339,12 +339,11 @@ Extra Hydra overrides may be appended to either launcher command.
 
 ## Experimental packed Actor forward
 
-The T2VA, FL2VA, and Ref2VA adapters can reuse the checkpoint-compatible packed H3
-transformer from DiffusionNFT. Append these overrides to a launcher:
+The T2VA, FL2VA, and Ref2VA adapters use the shared checkpoint-compatible H3
+transformer in `verl_omni/pipelines/minimax_h3_common.py` by default, together with
+DiffusionNFT. No extra config class or enable switch is required. For FA3, use:
 
 ```bash
-actor_rollout_ref.model._target_=verl_omni.workers.config.diffusion.minimax_h3.MiniMaxH3ModelConfig \
-+actor_rollout_ref.model.use_packed_batch=true \
 actor_rollout_ref.model.attn_backend=_flash_3_varlen_hub \
 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
 actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
@@ -354,14 +353,14 @@ actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2
 Each micro-batch makes one transformer call. FA3 uses separate per-sample
 boundaries for the text refiner and main DiT, preserving each sample's positions,
 modality tags, and timesteps. Reference layouts and prompt lengths may differ;
-target video/audio row counts must match. Scheduler replay remains per sample:
-video/audio schedules, fixed reference rows, target-only log-probabilities, and
+target video/audio row counts must match. Target rows are gathered and scheduler
+replay is batched by original scheduler step, then restored to sample order.
+Video/audio schedules, fixed reference rows, target-only log-probabilities, and
 FlowGRPO loss are unchanged. The same path also serves old-policy log-probability
 recomputation.
 
-`use_packed_batch` is an H3-only option in `MiniMaxH3ModelConfig`, shared with NFT,
-not a field in the generic diffusion config/YAML. It defaults to `false`, retaining
-the dense path; both the H3 `_target_` and the `+` override are required.
+The standard model configuration is unchanged; the former dense forward is
+retained only as a numerical/performance-test baseline.
 `native` provides a padded SDPA numerical reference (paired with rollout `TORCH_SDPA`).
 PyTorch `torch_varlen` is available only in the standalone H3 numerical test.
 FA3 requires a compatible

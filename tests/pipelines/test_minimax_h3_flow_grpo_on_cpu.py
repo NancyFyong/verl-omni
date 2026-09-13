@@ -213,7 +213,7 @@ def test_rollout_output_reaches_actor_and_replays_joint_transition(monkeypatch) 
     micro_batch = TensorDict(actor_fields, batch_size=[1])
     model_inputs, negative_inputs = MiniMaxH3FlowGRPO.prepare_model_inputs(
         module=MagicMock(),
-        model_config=MagicMock(use_packed_batch=False),
+        model_config=MagicMock(),
         latents=micro_batch["all_latents"],
         timesteps=micro_batch["all_timesteps"],
         prompt_embeds=micro_batch["prompt_embeds"],
@@ -224,6 +224,8 @@ def test_rollout_output_reaches_actor_and_replays_joint_transition(monkeypatch) 
         step=0,
     )
     assert negative_inputs is None
+    packed_inputs = model_inputs
+    model_inputs = packed_inputs["_h3_samples"][0]
     assert model_inputs["hidden_states"].shape == (1, 2, H3_VIDEO_WIDTH)
     assert model_inputs["audio_hidden_states"].shape == (1, 3, H3_AUDIO_WIDTH)
 
@@ -248,7 +250,7 @@ def test_rollout_output_reaches_actor_and_replays_joint_transition(monkeypatch) 
         module=module,
         scheduler=(MagicMock(), MagicMock()),
         model_config=model_config,
-        model_inputs=model_inputs,
+        model_inputs=packed_inputs,
         negative_model_inputs=None,
         scheduler_inputs=micro_batch,
         step=0,
@@ -606,7 +608,7 @@ def _prepare_actor_payload(payload: dict[str, torch.Tensor], module=None):
     module = module or MagicMock()
     result = MiniMaxH3FlowGRPO.prepare_model_inputs(
         module=module,
-        model_config=MagicMock(use_packed_batch=False),
+        model_config=MagicMock(),
         latents=payload["all_latents"],
         timesteps=payload["all_timesteps"],
         prompt_embeds=payload["prompt_embeds"],
@@ -625,11 +627,13 @@ def test_actor_accepts_a_shared_replicated_h3_layout() -> None:
     module, (model_inputs, negative_inputs) = _prepare_actor_payload(payload)
 
     assert negative_inputs is None
-    assert model_inputs["hidden_states"].shape == (2, 2, H3_VIDEO_WIDTH)
-    assert model_inputs["audio_hidden_states"].shape == (2, 3, H3_AUDIO_WIDTH)
-    assert model_inputs["encoder_hidden_states"].shape == (2, 2, 8)
-    assert model_inputs["timestep"].tolist() == [0.25, 0.5]
-    assert model_inputs["_h3_scheduler_step"] == 0
+    assert len(model_inputs["_h3_samples"]) == 2
+    for sample in model_inputs["_h3_samples"]:
+        assert sample["hidden_states"].shape == (1, 2, H3_VIDEO_WIDTH)
+        assert sample["audio_hidden_states"].shape == (1, 3, H3_AUDIO_WIDTH)
+        assert sample["encoder_hidden_states"].shape == (1, 2, 8)
+        assert sample["timestep"].tolist() == [0.25, 0.5]
+        assert sample["_h3_scheduler_step"] == 0
     module.assert_not_called()
 
 
@@ -644,17 +648,7 @@ def test_actor_accepts_a_shared_replicated_h3_layout() -> None:
         (
             lambda payload: payload["h3_video_rows"].__setitem__(1, 3),
             ValueError,
-            "one shared video row count",
-        ),
-        (
-            lambda payload: payload["h3_position_ids"].__setitem__((1, 0, 0), 9),
-            ValueError,
-            "different position_ids layouts",
-        ),
-        (
-            lambda payload: payload["h3_audio_timesteps"].__setitem__((1, 0), 0.75),
-            ValueError,
-            "shared video/audio timesteps",
+            "joint width .* does not match video/audio metadata",
         ),
         (
             lambda payload: payload.__setitem__("all_latents", payload["all_latents"][..., :-1]),
@@ -665,8 +659,6 @@ def test_actor_accepts_a_shared_replicated_h3_layout() -> None:
     ids=[
         "missing-trajectory-field",
         "mixed-video-row-count",
-        "mixed-position-layout",
-        "mixed-modality-timestep",
         "malformed-joint-latent",
     ],
 )

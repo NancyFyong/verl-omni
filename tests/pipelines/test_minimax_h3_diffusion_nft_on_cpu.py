@@ -231,25 +231,25 @@ class TestMiniMaxH3Forward:
         # negated: H3's velocity is ``x0 - noise`` and the loss expects the opposite convention.
         out = MiniMaxH3DiffusionNFT.forward(
             module=_module(_identity),
-            model_config=MagicMock(use_packed_batch=False),
+            model_config=MagicMock(),
             model_inputs=model_inputs,
             negative_model_inputs=None,
         )
         assert out.shape == packed.shape
         torch.testing.assert_close(out, -packed)
 
-    def test_per_sample_loop_stacks_scaled_velocity_video_then_audio(self):
+    def test_packed_forward_stacks_scaled_velocity_video_then_audio(self):
         video_rows, audio_rows = _rows()
         model_inputs, _ = _prepared_inputs(video_rows, audio_rows, timesteps=torch.tensor([500.0, 250.0]))
 
         module = _module(lambda **kw: (kw["hidden_states"] * 2.0, kw["audio_hidden_states"] * 3.0))
         out = MiniMaxH3DiffusionNFT.forward(
             module=module,
-            model_config=MagicMock(use_packed_batch=False),
+            model_config=MagicMock(),
             model_inputs=model_inputs,
             negative_model_inputs=None,
         )
-        assert module.call_count == _BATCH
+        assert module.call_count == 1
         torch.testing.assert_close(out, pack_video_audio_rows(video_rows * -2.0, audio_rows * -3.0))
 
     def test_forward_calls_module_with_real_packed_sequence_kwargs(self):
@@ -259,22 +259,21 @@ class TestMiniMaxH3Forward:
         module = _module(_identity)
         MiniMaxH3DiffusionNFT.forward(
             module=module,
-            model_config=MagicMock(use_packed_batch=False),
+            model_config=MagicMock(),
             model_inputs=model_inputs,
             negative_model_inputs=None,
         )
         kwargs = module.call_args_list[0].kwargs
         seq_len = _TEXT_LEN + _NUM_VIDEO_ROWS + _NUM_AUDIO_ROWS
-        assert kwargs["hidden_states"].shape == (1, _NUM_VIDEO_ROWS, VIDEO_ROW_WIDTH)
-        assert kwargs["audio_hidden_states"].shape == (1, _NUM_AUDIO_ROWS, AUDIO_ROW_WIDTH)
-        assert kwargs["encoder_hidden_states"].shape == (1, _TEXT_LEN, _TEXT_DIM)
-        assert kwargs["timestep"].shape == (1,)
-        assert kwargs["token_tags"].shape == (seq_len,)
-        assert kwargs["position_ids"].shape == (seq_len, 3)
+        assert kwargs["hidden_states"].shape == (1, _BATCH * _NUM_VIDEO_ROWS, VIDEO_ROW_WIDTH)
+        assert kwargs["audio_hidden_states"].shape == (1, _BATCH * _NUM_AUDIO_ROWS, AUDIO_ROW_WIDTH)
+        assert kwargs["encoder_hidden_states"].shape == (1, _BATCH * _TEXT_LEN, _TEXT_DIM)
+        torch.testing.assert_close(kwargs["timestep"], torch.tensor([0.5, 0.75]))
+        assert kwargs["token_tags"].shape == (_BATCH * seq_len,)
+        assert kwargs["position_ids"].shape == (_BATCH * seq_len, 3)
         assert kwargs["return_dict"] is False
-        # Option C: the engine noised the whole packed latent at one level, so every row shares it.
-        assert kwargs["timestep_indices"].shape == (seq_len,)
-        assert torch.equal(kwargs["timestep_indices"], torch.zeros(seq_len, dtype=torch.long))
+        assert kwargs["sequence_layout"].cu_seqlens.tolist() == [0, seq_len, 2 * seq_len]
+        assert torch.equal(kwargs["timestep_indices"], torch.arange(_BATCH).repeat_interleave(seq_len))
 
     def test_forward_slices_encoder_to_true_text_length(self):
         video_rows, audio_rows = _rows()
@@ -286,12 +285,13 @@ class TestMiniMaxH3Forward:
         module = _module(_identity)
         MiniMaxH3DiffusionNFT.forward(
             module=module,
-            model_config=MagicMock(use_packed_batch=False),
+            model_config=MagicMock(),
             model_inputs=model_inputs,
             negative_model_inputs=None,
         )
-        assert module.call_args_list[0].kwargs["encoder_hidden_states"].shape == (1, 5, _TEXT_DIM)
-        assert module.call_args_list[1].kwargs["encoder_hidden_states"].shape == (1, _TEXT_LEN, _TEXT_DIM)
+        assert module.call_count == 1
+        assert module.call_args.kwargs["encoder_hidden_states"].shape == (1, 5 + _TEXT_LEN, _TEXT_DIM)
+        assert module.call_args.kwargs["text_sequence_layout"].cu_seqlens.tolist() == [0, 5, 5 + _TEXT_LEN]
 
     def test_fl2va_injects_condition_rows_and_crops_their_velocity(self):
         video_rows, audio_rows = _rows(batch=1)
@@ -314,7 +314,7 @@ class TestMiniMaxH3Forward:
             step=0,
         )
         module = _module(_identity)
-        output = MiniMaxH3DiffusionNFT.forward(module, MagicMock(use_packed_batch=False), model_inputs)
+        output = MiniMaxH3DiffusionNFT.forward(module, MagicMock(), model_inputs)
 
         kwargs = module.call_args.kwargs
         assert kwargs["hidden_states"].shape == (1, 12, VIDEO_ROW_WIDTH)
@@ -329,7 +329,7 @@ class TestMiniMaxH3Forward:
         with pytest.raises(TypeError, match="Unexpected MiniMax H3 transformer output"):
             MiniMaxH3DiffusionNFT.forward(
                 module=_module(lambda **kw: torch.randn(1, 8)),
-                model_config=MagicMock(use_packed_batch=False),
+                model_config=MagicMock(),
                 model_inputs=model_inputs,
                 negative_model_inputs=None,
             )

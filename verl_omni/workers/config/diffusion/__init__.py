@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from . import actor, distillation, minimax_h3, model, rollout
+from . import actor, distillation, model, rollout
 from .actor import *  # noqa: F401
 from .distillation import *  # noqa: F401
-from .minimax_h3 import *  # noqa: F401
 from .model import *  # noqa: F401
 from .rollout import *  # noqa: F401
 
-__all__ = actor.__all__ + distillation.__all__ + minimax_h3.__all__ + model.__all__ + rollout.__all__
+__all__ = actor.__all__ + distillation.__all__ + model.__all__ + rollout.__all__

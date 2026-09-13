@@ -21,8 +21,8 @@ from tensordict import TensorDict
 from torch.nn.utils.rnn import pad_sequence
 
 from tests.pipelines.test_minimax_h3_packed_forward_on_cpu import _inputs, _models
+from verl_omni.pipelines.minimax_h3_common import MiniMaxH3PackedTransformer3DModel
 from verl_omni.pipelines.minimax_h3_diffusion_nft.diffusers_training_adapter import MiniMaxH3DiffusionNFT
-from verl_omni.pipelines.minimax_h3_diffusion_nft.packed_forward import MiniMaxH3PackedTransformer3DModel
 from verl_omni.pipelines.minimax_h3_flow_grpo.common import (
     configure_flow_scheduler,
     flatten_joint_latents,
@@ -34,9 +34,8 @@ from verl_omni.trainer.diffusion.diffusion_algos import FlowGRPOLoss
 from verl_omni.workers.config.diffusion.actor import DiffusionLossConfig
 
 
-def _config(packed, sde_type="sde"):
+def _config(sde_type="sde"):
     return SimpleNamespace(
-        use_packed_batch=packed,
         algo=SimpleNamespace(noise_level=0.6, sde_type=sde_type),
         pipeline=SimpleNamespace(av_logprob_video_weight=0.25, av_logprob_audio_weight=0.75),
     )
@@ -98,9 +97,13 @@ def _flow_batch(model, task="t2va", lengths=(3, 5, 4), shared_steps=False):
 
 
 def _prepare(model, data, packed, step=0):
+    if not packed:
+        return MiniMaxH3FlowGRPO._prepare_batch_inputs(
+            data["all_latents"], data["all_timesteps"], data["prompt_embeds"], data["prompt_embeds_mask"], data, step
+        )[0]
     return MiniMaxH3FlowGRPO.prepare_model_inputs(
         model,
-        _config(packed),
+        _config(),
         data["all_latents"],
         data["all_timesteps"],
         data["prompt_embeds"],
@@ -113,10 +116,20 @@ def _prepare(model, data, packed, step=0):
 
 
 def _run(model, data, packed, schedulers, sde_type="sde", step=0):
+    if not packed:
+        inputs = _prepare(model, data, False, step)
+        device = data["all_latents"].device
+        kwargs = {
+            key: value.to(device) if isinstance(value, torch.Tensor) else value
+            for key, value in inputs.items()
+            if not key.startswith("_h3_")
+        }
+        video, audio = model(**kwargs)
+        return MiniMaxH3FlowGRPO._sample_previous_step(schedulers, _config(sde_type), inputs, data, video, audio, step)
     return MiniMaxH3FlowGRPO.forward_and_sample_previous_step(
         model,
         schedulers,
-        _config(packed, sde_type),
+        _config(sde_type),
         _prepare(model, data, packed, step),
         None,
         data,
@@ -170,6 +183,26 @@ def test_variable_batches_match_serial_transitions_loss_and_lora_gradients(task,
     assert norm > 0
 
 
+@pytest.mark.parametrize("steps", [[1, 0, 1], [1, 1, 0]])
+def test_reference_layouts_batch_scheduler_replay_by_step_and_restore_order(monkeypatch, steps):
+    from unittest.mock import Mock
+
+    serial, packed = _models()
+    data = _flow_batch(serial, "ref2va")
+    video_sigmas, audio_sigmas = (torch.tensor(sigmas) for sigmas in h3_sigma_schedules(4))
+    data["h3_step_indices"] = torch.tensor(steps)[:, None]
+    data["all_timesteps"] = video_sigmas[steps, None]
+    data["h3_audio_timesteps"] = audio_sigmas[steps, None]
+    expected = _serial(serial, data, _schedulers())
+    replay = Mock(wraps=MiniMaxH3FlowGRPO._sample_previous_step)
+    monkeypatch.setattr(MiniMaxH3FlowGRPO, "_sample_previous_step", replay)
+    actual = _run(packed, data, True, _schedulers())
+    assert replay.call_count == 2
+    assert [call.args[2]["hidden_states"].shape[0] for call in replay.call_args_list] == [2, 1]
+    for a, b in zip(actual, expected, strict=True):
+        torch.testing.assert_close(a, b, rtol=3e-4, atol=3e-5)
+
+
 def test_packed_matches_existing_dense_batch_when_layouts_are_shared():
     dense, packed = _models()
     data = _flow_batch(dense, lengths=(4, 4, 4), shared_steps=True)
@@ -185,9 +218,8 @@ def test_different_text_lengths_still_fail_closed_in_dense_mode():
         _prepare(dense, _flow_batch(dense), False)
 
 
-def test_flowgrpo_packed_loader_is_opt_in():
-    assert MiniMaxH3FlowGRPO.get_transformer_class(_config(False)) is None
-    assert MiniMaxH3FlowGRPO.get_transformer_class(_config(True)) is MiniMaxH3PackedTransformer3DModel
+def test_flowgrpo_packed_loader_is_default():
+    assert MiniMaxH3FlowGRPO.get_transformer_class(SimpleNamespace()) is MiniMaxH3PackedTransformer3DModel
     dense, _ = _models()
     with pytest.raises(ValueError, match="requires MiniMaxH3Packed"):
         _prepare(dense, _flow_batch(dense), True)
@@ -220,7 +252,7 @@ def test_engine_prepares_packed_replay_without_slicing_unrelated_nested_fields(t
         )
     engine = object.__new__(PPODiffusersFSDPEngine)
     engine.module = packed
-    engine.model_config = _config(True)
+    engine.model_config = _config()
     engine.model_config.architecture = "MiniMaxH3Pipeline"
     engine.model_config.algorithm = "flow_grpo"
     engine.model_config.external_lib = None
