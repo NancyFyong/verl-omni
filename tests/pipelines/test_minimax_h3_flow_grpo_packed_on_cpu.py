@@ -212,6 +212,29 @@ def test_packed_matches_existing_dense_batch_when_layouts_are_shared():
         torch.testing.assert_close(a, b, rtol=3e-4, atol=3e-5)
 
 
+def test_packed_ref2va_accepts_variable_reference_layouts_rejected_by_dense_batch():
+    dense, packed = _models()
+    data = _flow_batch(dense, task="ref2va", lengths=(4, 4, 4), shared_steps=True)
+    assert data["condition_video_row_count"].flatten().tolist() == [4, 8, 12]
+    assert data["condition_audio_row_count"].flatten().tolist() == [0, 4, 0]
+
+    with pytest.raises(ValueError, match="shared condition video row count"):
+        _prepare(dense, data, False)
+
+    prepared = _prepare(packed, data, True)
+    sequence_lengths = [sample["position_ids"].shape[0] for sample in prepared["_h3_samples"]]
+    assert len(set(sequence_lengths)) > 1
+
+    expected = _serial(dense, data, _schedulers())
+    calls = []
+    handle = packed.register_forward_pre_hook(lambda *_: calls.append(1))
+    actual = _run(packed, data, True, _schedulers())
+    handle.remove()
+    assert len(calls) == 1
+    for a, b in zip(actual, expected, strict=True):
+        torch.testing.assert_close(a, b, rtol=3e-4, atol=3e-5)
+
+
 def test_different_text_lengths_still_fail_closed_in_dense_mode():
     dense, _ = _models()
     with pytest.raises(ValueError, match="shared text length"):
