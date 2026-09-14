@@ -1097,21 +1097,26 @@ class DMDLoss(DiffusionLossFn):
             raise KeyError(f"Diffusion loss `{loss_name}` is missing model_output keys: {missing}")
 
     def __call__(self, *, config: DiffusionActorConfig, model_output: dict[str, Any], data: TensorDict):
-        """Adapt the selected engine computation to the existing loss dispatcher."""
+        """Dispatch DMD2 loss with an engine-provided mask, falling back to the batch mask."""
         self.validate_inputs(loss_name="dmd2", model_output=model_output, data=data)
         stage = tu.get_non_tensor_data(data, "dmd_stage", default="student")
+        gradient_mask = model_output.get("gradient_mask", data.get("gradient_mask"))
         if stage == "student":
             loss, metrics = self.compute_loss(
                 generated_x0=model_output["generated_x0"],
                 fake_x0=model_output["fake_x0"],
                 teacher_x0=model_output["teacher_x0"],
                 normalization_epsilon=tu.get_non_tensor_data(data, "dmd_normalization_epsilon", default=1e-6),
+                gradient_mask=gradient_mask,
             )
         else:
             from verl_omni.trainer.diffusion.distillation.utils import fake_score_loss
 
             loss, active = fake_score_loss(
-                model_output["noise_pred"], model_output["noise"], model_output["generated_x0"]
+                model_output["noise_pred"],
+                model_output["noise"],
+                model_output["generated_x0"],
+                gradient_mask=gradient_mask,
             )
             metrics = {"fake_score/loss": loss.detach(), "fake_score/active_elements": active}
         return DiffusionLossResult(loss=loss, metrics=metrics, add_loss_metric=True)

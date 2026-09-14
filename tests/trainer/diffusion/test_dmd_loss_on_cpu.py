@@ -18,7 +18,8 @@ from tensordict import TensorDict
 from verl.utils import tensordict_utils as tu
 
 from verl_omni.trainer.diffusion.diffusion_algos import DiffusionLossResult, DMDLoss, get_diffusion_loss_fn
-from verl_omni.workers.config import DiffusionActorConfig, DiffusionLossConfig
+from verl_omni.trainer.diffusion.distillation.utils import dmd_gradient, dmd_surrogate_loss
+from verl_omni.workers.config import DiffusionActorConfig, DiffusionDMDConfig, DiffusionLossConfig
 from verl_omni.workers.utils.losses import diffusion_loss
 
 
@@ -79,6 +80,81 @@ class TestDMDLoss:
         torch.testing.assert_close(loss, torch.tensor(1.0))
         assert student.grad is None and noise.grad is None
         torch.testing.assert_close(prediction.grad, torch.full_like(prediction, -2 / prediction.numel()))
+
+    @pytest.mark.parametrize("stage", ["student", "fake_score"])
+    @pytest.mark.parametrize("mask_source", ["model_output", "data"])
+    def test_mask_reaches_dispatcher_loss_and_gradient(self, stage, mask_source):
+        prediction = torch.arange(1.0, 9.0).reshape(2, 2, 2).requires_grad_()
+        mask = torch.tensor([[True, False], [True, True]])
+        expanded_mask = mask.unsqueeze(-1).expand_as(prediction)
+        batch = make_batch(2, stage, accumulation=2, sp_size=4)
+        if stage == "student":
+            output = {
+                "generated_x0": prediction,
+                "teacher_x0": torch.zeros_like(prediction),
+                "fake_x0": torch.ones_like(prediction),
+            }
+            normalizer = prediction.detach().abs().mean(dim=(1, 2), keepdim=True)
+            difference = torch.ones_like(prediction) / normalizer
+            expected_loss = 0.5 * difference.square()[expanded_mask].mean()
+            expected_gradient = difference * expanded_mask / expanded_mask.sum()
+            active_key = "dmd/active_elements"
+        else:
+            output = {
+                "noise_pred": prediction,
+                "generated_x0": torch.zeros_like(prediction),
+                "noise": torch.zeros_like(prediction),
+            }
+            expected_loss = prediction.detach().square()[expanded_mask].mean()
+            expected_gradient = 2 * prediction.detach() * expanded_mask / expanded_mask.sum()
+            active_key = "fake_score/active_elements"
+        if mask_source == "model_output":
+            output["gradient_mask"] = mask
+        else:
+            batch["gradient_mask"] = mask
+        result = DMDLoss()(config=make_actor(), model_output=output, data=batch)
+        assert result.metrics[active_key] == expanded_mask.sum().item()
+        torch.testing.assert_close(result.loss, expected_loss)
+        loss, _ = diffusion_loss(make_actor(), output, batch)
+        loss.backward()
+        torch.testing.assert_close(loss, expected_loss * 2)
+        torch.testing.assert_close(prediction.grad, expected_gradient * 2)
+
+    @pytest.mark.parametrize("stage", ["student", "fake_score"])
+    @pytest.mark.parametrize("mask_source", ["model_output", "data"])
+    def test_dispatcher_rejects_all_masked_loss(self, stage, mask_source):
+        output = {key: torch.ones(1, 2) for key in ("generated_x0", "teacher_x0", "fake_x0", "noise_pred", "noise")}
+        batch = make_batch(1, stage)
+        target = output if mask_source == "model_output" else batch
+        target["gradient_mask"] = torch.zeros(1, 2, dtype=torch.bool)
+        with pytest.raises(ValueError, match="all-masked"):
+            diffusion_loss(make_actor(), output, batch)
+
+    @pytest.mark.parametrize("stage", ["student", "fake_score"])
+    def test_model_output_mask_overrides_batch_mask(self, stage):
+        output = {key: torch.ones(1, 2) for key in ("generated_x0", "teacher_x0", "fake_x0", "noise_pred", "noise")}
+        output["gradient_mask"] = torch.zeros(1, 2, dtype=torch.bool)
+        batch = make_batch(1, stage)
+        batch["gradient_mask"] = torch.ones(1, 2, dtype=torch.bool)
+        with pytest.raises(ValueError, match="all-masked"):
+            diffusion_loss(make_actor(), output, batch)
+
+    def test_default_epsilon_matches_config_and_direct_math(self):
+        epsilon = DiffusionDMDConfig().normalization_epsilon
+        generated = torch.zeros(1, 2)
+        teacher = torch.zeros_like(generated)
+        fake = torch.full_like(generated, epsilon)
+        gradient, normalizer, _ = dmd_gradient(fake, teacher, generated)
+        torch.testing.assert_close(normalizer, torch.full((1, 1), epsilon))
+        torch.testing.assert_close(gradient, torch.ones_like(generated))
+        direct_loss, _ = dmd_surrogate_loss(generated, gradient)
+        computed_loss, _ = DMDLoss.compute_loss(generated_x0=generated, fake_x0=fake, teacher_x0=teacher)
+        dispatched_loss, _ = diffusion_loss(
+            make_actor(), {"generated_x0": generated, "fake_x0": fake, "teacher_x0": teacher}, make_batch(1)
+        )
+        torch.testing.assert_close(direct_loss, torch.tensor(0.5))
+        torch.testing.assert_close(computed_loss, direct_loss)
+        torch.testing.assert_close(dispatched_loss, direct_loss)
 
     @pytest.mark.parametrize("stage,missing", [("student", "teacher_x0"), ("fake_score", "noise_pred")])
     def test_stage_inputs_fail_closed(self, stage, missing):

@@ -47,7 +47,7 @@ def dmd_gradient(
     x0_fake: Tensor,
     x0_real: Tensor,
     x_g: Tensor,
-    normalization_epsilon: float = 1e-5,
+    normalization_epsilon: float = 1e-6,
 ) -> tuple[Tensor, Tensor, int]:
     """Return detached normalized fake-minus-real scores for tensors ``(B, ...)``.
 
