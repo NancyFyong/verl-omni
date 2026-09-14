@@ -1,6 +1,6 @@
 # MiniMax H3 T2VA, FL2VA, and Ref2VA DiffusionNFT
 
-Last updated: 09/12/2026
+Last updated: 09/14/2026
 
 These recipes train rank-64 MiniMax H3 LoRA adapters with online DiffusionNFT
 for text-to-audio-video (T2VA), first-frame image-to-audio-video (FL2VA), and
@@ -191,8 +191,13 @@ All H3 NFT launchers use `TEXT_ENCODER_TP=${TEXT_ENCODER_TP:-$ROLLOUT_TP}`,
 forwarded as `actor_rollout_ref.rollout.text_encoder_tp_size` (without `+`).
 For example, `ROLLOUT_TP=4 TEXT_ENCODER_TP=4` shards the encoder across all four
 DiT ranks; `TEXT_ENCODER_TP=1` keeps it unsharded. With the pinned backend, use
-ETP=1 or ETP=rollout TP, not an intermediate subgroup; H3 supports ETP 1/2/4/8.
-This applies to T2VA, FL2VA, and Ref2VA and is independent of CPU/layerwise offload.
+ETP=1 or exactly ETP=rollout TP, not an intermediate subgroup. This applies to
+T2VA, FL2VA, and Ref2VA and is independent of CPU/layerwise offload.
+
+> [!IMPORTANT]
+> The T2VA and FL2VA NFT launchers previously omitted ETP and therefore used
+> ETP=1. They now default to full rollout TP; set `TEXT_ENCODER_TP=1` to retain
+> the previous unsharded behavior.
 
 The legacy `+actor_rollout_ref.rollout.engine_kwargs.vllm_omni.text_encoder_tp_size`
 override remains supported. Prefer the typed field and do not set conflicting

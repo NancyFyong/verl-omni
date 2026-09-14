@@ -9,6 +9,7 @@ MODEL_PATH=${MODEL_PATH:-}
 DATA_DIR=${DATA_DIR:-$WORKSPACE/data/vid_prompt/verl_omni}
 NUM_GPUS=${NUM_GPUS:-8}
 ROLLOUT_TP=${ROLLOUT_TP:-2}
+# This now defaults to full rollout TP; set to 1 for the previous unsharded behavior.
 TEXT_ENCODER_TP=${TEXT_ENCODER_TP:-$ROLLOUT_TP}
 ROLLOUT_N=${ROLLOUT_N:-16}
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-1000}
