@@ -16,6 +16,7 @@ from io import BytesIO
 
 import pytest
 from PIL import Image
+from verl.utils.dataset.rl_dataset import RLHFDataset as UpstreamRLHFDataset
 
 from verl_omni.utils.dataset.rl_dataset import RLHFDataset
 
@@ -87,6 +88,49 @@ def test_text_only_messages_are_unchanged(dataset):
     prompt = [{"role": "user", "content": "A fox in snow."}]
     assert dataset._build_messages({"prompt": prompt}, key="prompt") == prompt
     assert dataset.processor is None
+
+
+def test_processor_free_media_parsing_does_not_call_upstream(dataset, monkeypatch):
+    def reject_delegation(*args, **kwargs):
+        raise AssertionError("media parsing must not bypass the upstream processor contract")
+
+    monkeypatch.setattr(UpstreamRLHFDataset, "_build_messages", reject_delegation)
+    messages = dataset._build_messages(
+        {"prompt": [{"role": "user", "content": "<image>Animate."}], "images": [Image.new("RGB", (56, 56))]},
+        key="prompt",
+    )
+    assert messages[0]["content"][0]["type"] == "image"
+    assert dataset.processor is None
+
+
+@pytest.mark.parametrize("with_processor", [False, True])
+@pytest.mark.parametrize("video_format", ["path", "frames", "dict"])
+@pytest.mark.parametrize("audio_format", ["path", "dict", "url", "nested"])
+def test_media_transport_preserves_video_audio_payloads(dataset, tmp_path, with_processor, video_format, audio_format):
+    dataset.processor = object() if with_processor else None
+    video_path = tmp_path / "video.mp4"
+    video = {"path": video_path, "frames": [tmp_path / "frame.png"], "dict": {"video": str(video_path), "fps": 2}}[
+        video_format
+    ]
+    audio = {
+        "path": "audio.wav",
+        "dict": {"audio": "audio.wav", "sample_rate": 24000},
+        "url": {"audio_url": "https://example.invalid/audio.wav"},
+        "nested": {"array": [0.0], "sampling_rate": 24000},
+    }[audio_format]
+    content = dataset._build_messages(
+        {"prompt": [{"role": "user", "content": "<video><audio>Describe."}], "videos": [video], "audios": [audio]},
+        key="prompt",
+    )[0]["content"]
+    expected_video = (
+        {"type": "video", **video}
+        if isinstance(video, dict)
+        else {"type": "video", "video": [str(frame) for frame in video] if isinstance(video, list) else str(video)}
+    )
+    expected_audio = (
+        {"type": "audio", **audio} if audio_format in ("dict", "url") else {"type": "audio", "audio": audio}
+    )
+    assert content == [expected_video, expected_audio, {"type": "text", "text": "Describe."}]
 
 
 @pytest.mark.parametrize("negative_content", ["", "blurry", "<image>blurry"])

@@ -14,6 +14,9 @@
 
 import asyncio
 import json
+import os
+import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -25,7 +28,8 @@ from tensordict import TensorDict
 from verl.utils.dataset.rl_dataset import get_dataset_class
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.ltx2.ltx2_conditioning import LTXPromptContext
-from vllm_omni.diffusion.models.ltx2.ltx2_denoise import LTXPhaseResult, _official_ltx_sigmas
+from vllm_omni.diffusion.models.ltx2.ltx2_denoise import LTXPhaseResult, _official_ltx_sigmas, build_transformer_kwargs
+from vllm_omni.diffusion.models.ltx2.ltx2_guidance import LTXGuidanceExecutor
 from vllm_omni.diffusion.models.ltx2.ltx2_latents import LTXAVState
 from vllm_omni.diffusion.models.ltx2.ltx2_recipes import LTXPhaseRecipe
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -41,6 +45,7 @@ from verl_omni.pipelines.ltx2_flow_grpo.diffusers_training_adapter import LTX23F
 from verl_omni.pipelines.ltx2_flow_grpo.vllm_omni_rollout_adapter import LTX23PipelineWithLogProb
 from verl_omni.pipelines.model_base import DiffusionI2IModelBase, DiffusionModelBase, VllmOmniPipelineBase
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
+from verl_omni.pipelines.utils import prepare_model_inputs
 from verl_omni.utils.dataset.rl_dataset import RLHFDataset, create_rl_dataset
 
 
@@ -186,6 +191,47 @@ def test_ltx2_agent_loop_keeps_image_out_of_text_tokens() -> None:
     assert calls[0][0] == "Animate this frame."
 
 
+@pytest.mark.parametrize("images", [None, []])
+def test_ltx2_t2av_agent_accepts_missing_or_empty_images(images) -> None:
+    async def run():
+        agent = object.__new__(LTX2DiffusionSingleTurnAgentLoop)
+        agent.tokenizer = MagicMock(return_value={"input_ids": [1, 2, 3]})
+        agent.rollout_config = SimpleNamespace(prompt_length=128)
+        agent.loop = asyncio.get_running_loop()
+        return await agent.ct_build_initial_tokens([{"role": "user", "content": "A fox in snow."}], images=images)
+
+    assert asyncio.run(run()) == [1, 2, 3]
+
+
+def test_ltx2_agent_rejects_multiple_images() -> None:
+    agent = object.__new__(LTX2DiffusionSingleTurnAgentLoop)
+    with pytest.raises(ValueError, match="exactly one image"):
+        asyncio.run(agent.ct_build_initial_tokens([], images=[object(), object()]))
+
+
+def test_ltx2_ti2va_launcher_preserves_validation_task(tmp_path) -> None:
+    script = Path(__file__).resolve().parents[2] / "examples/flowgrpo_trainer/ltx2/run_ltx2_3_ti2va_lora.sh"
+    args_path = tmp_path / "args.txt"
+    python = tmp_path / "python3"
+    python.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$LTX_TEST_ARGS"\n')
+    python.chmod(0o755)
+    subprocess.run(
+        ["bash", str(script)],
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path}:{os.environ['PATH']}",
+            "OUTPUT_DIR": str(tmp_path / "output"),
+            "LTX_TEST_ARGS": str(args_path),
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    overrides = dict(arg.split("=", 1) for arg in args_path.read_text().splitlines() if "=" in arg)
+    assert overrides["actor_rollout_ref.rollout.pipeline.task"] == "ti2va"
+    assert overrides["actor_rollout_ref.rollout.val_kwargs.pipeline.task"] == "ti2va"
+
+
 def test_ltx23_actor_schedule_matches_current_vllm_omni() -> None:
     config = {
         "base_image_seq_len": 1024,
@@ -300,6 +346,60 @@ def test_ltx2_training_adapter_reconstructs_first_frame_condition() -> None:
     assert negative is None
 
 
+@pytest.mark.parametrize("task", [None, "t2av", "ti2va"])
+@pytest.mark.parametrize("condition_kind", ["missing", "empty", "first_frame"])
+def test_ltx2_shared_dispatch_handles_optional_first_frame(task, condition_kind) -> None:
+    batch_size = 2
+    condition_rows = int(condition_kind == "first_frame")
+    video_rows = 4 - condition_rows
+    latents = torch.randn(batch_size, 1, video_rows + 2, 4)
+    prompt = torch.randn(batch_size, 4, 8)
+    mask = torch.ones(batch_size, 4)
+    micro_batch = TensorDict(
+        {
+            "audio_prompt_embeds": prompt,
+            "negative_audio_prompt_embeds": -prompt,
+            "video_seq_len": torch.full((batch_size,), video_rows),
+            "all_next_latents": torch.randn_like(latents),
+        },
+        batch_size=[batch_size],
+    )
+    if condition_kind != "missing":
+        micro_batch["condition_image_latents"] = torch.randn(batch_size, condition_rows, 4)
+    config = SimpleNamespace(
+        architecture="LTX2Pipeline",
+        algorithm="flow_grpo",
+        external_lib=None,
+        pipeline=SimpleNamespace(task=task, num_frames=25, height=32, width=32, frame_rate=24.0, guidance_scale=4.0),
+    )
+    kwargs = dict(
+        module=None,
+        model_config=config,
+        latents=latents,
+        timesteps=torch.full((batch_size, 1), 700.0),
+        prompt_embeds=prompt,
+        prompt_embeds_mask=mask,
+        negative_prompt_embeds=-prompt,
+        negative_prompt_embeds_mask=mask,
+        micro_batch=micro_batch,
+        step=0,
+    )
+    if task == "ti2va" and not condition_rows:
+        with pytest.raises(ValueError, match="TI2VA requires condition_image_latents"):
+            prepare_model_inputs(**kwargs)
+        return
+
+    positive, negative = prepare_model_inputs(**kwargs)
+    for inputs in (positive, negative):
+        assert inputs["hidden_states"].shape == (batch_size, 4, 4)
+        assert inputs["_condition_video_seq_len"] == condition_rows
+        torch.testing.assert_close(inputs["hidden_states"][:, condition_rows:], latents[:, 0, :video_rows])
+        torch.testing.assert_close(inputs["audio_hidden_states"], latents[:, 0, video_rows:])
+        if condition_rows:
+            torch.testing.assert_close(inputs["hidden_states"][:, :1], micro_batch["condition_image_latents"])
+            assert not inputs["timestep"][:, 0].any()
+
+
 def test_ltx2_ti2va_actor_rejects_empty_condition() -> None:
     target = torch.randn(1, 3, 4)
     model_inputs = {
@@ -410,6 +510,146 @@ def test_ltx2_i2av_actor_replays_target_only_log_prob() -> None:
     )
 
     torch.testing.assert_close(actor_log_prob, rollout_log_prob)
+
+
+@pytest.mark.parametrize("guidance_scale", [1.0, 4.0])
+def test_ltx2_t2av_first_step_ratio_matches_native_mask_contract(guidance_scale, record_property) -> None:
+    """Use native DiT kwargs and a mask-sensitive CPU mock, not a GPU model parity claim."""
+
+    class Transformer(torch.nn.Module):
+        config = SimpleNamespace(use_keyframes_abs_pos_embedding=False)
+
+        def forward(
+            self,
+            hidden_states,
+            audio_hidden_states,
+            encoder_hidden_states,
+            audio_encoder_hidden_states,
+            encoder_attention_mask=None,
+            audio_encoder_attention_mask=None,
+            **kwargs,
+        ):
+            def context_mean(context, mask):
+                weights = torch.ones_like(context[..., 0]) if mask is None else mask
+                return (context * weights[..., None]).sum(1, keepdim=True) / weights.sum(1)[:, None, None]
+
+            return (
+                hidden_states * 0.1 + context_mean(encoder_hidden_states, encoder_attention_mask),
+                audio_hidden_states * 0.1 + context_mean(audio_encoder_hidden_states, audio_encoder_attention_mask),
+            )
+
+    rollout_scheduler = FlowMatchSDEDiscreteScheduler()
+    actor_scheduler = FlowMatchSDEDiscreteScheduler()
+    for scheduler in (rollout_scheduler, actor_scheduler):
+        set_ltx23_timesteps(scheduler, 4, torch.device("cpu"))
+    timestep = rollout_scheduler.timesteps[:1]
+    sample = torch.arange(24, dtype=torch.float32).reshape(1, 6, 4) / 24
+    prompt = torch.arange(16, dtype=torch.float32).reshape(1, 4, 4) / 16
+    mask = torch.tensor([[0.0, 0.0, 1.0, 1.0]])
+    module = Transformer()
+    config = SimpleNamespace(
+        architecture="LTX2Pipeline",
+        algorithm="flow_grpo",
+        external_lib=None,
+        pipeline=SimpleNamespace(
+            task="t2av",
+            num_frames=25,
+            height=32,
+            width=32,
+            frame_rate=24.0,
+            guidance_scale=guidance_scale,
+        ),
+        algo=SimpleNamespace(noise_level=0.8, sde_type="cps"),
+    )
+    positive, negative = prepare_model_inputs(
+        module=module,
+        model_config=config,
+        latents=sample.unsqueeze(1),
+        timesteps=timestep.unsqueeze(1),
+        prompt_embeds=prompt,
+        prompt_embeds_mask=mask,
+        negative_prompt_embeds=-prompt,
+        negative_prompt_embeds_mask=mask,
+        micro_batch=TensorDict(
+            {
+                "audio_prompt_embeds": prompt,
+                "negative_audio_prompt_embeds": -prompt,
+                "video_seq_len": torch.tensor([4]),
+                "all_next_latents": sample.unsqueeze(1),
+            },
+            batch_size=[1],
+        ),
+        step=0,
+    )
+    pipeline = SimpleNamespace(
+        transformer=module,
+        _denoise_timestep_kwargs=lambda ts, _forward, _denoise, **counts: LTXGuidanceExecutor.timestep_kwargs(
+            ts, **counts, expand_for_sequence_parallel=True
+        ),
+    )
+    forward_ctx = SimpleNamespace(
+        latent_num_frames=4,
+        latent_height=1,
+        latent_width=1,
+        padded_audio_num_frames=2,
+        request_inputs=SimpleNamespace(frame_rate=24.0),
+        attention_kwargs=None,
+    )
+    denoise_ctx = SimpleNamespace(audio_attention_mask=None, video_coords=None, audio_coords=None)
+    predictions = []
+    for actor_inputs in (positive, negative):
+        if actor_inputs is None:
+            continue
+        native_inputs = build_transformer_kwargs(
+            pipeline,
+            forward_ctx,
+            denoise_ctx,
+            hidden_states=sample[:, :4],
+            audio_hidden_states=sample[:, 4:],
+            encoder_hidden_states=actor_inputs["encoder_hidden_states"],
+            audio_encoder_hidden_states=actor_inputs["audio_encoder_hidden_states"],
+            encoder_attention_mask=mask,
+            audio_encoder_attention_mask=mask,
+            ts=timestep,
+        )
+        for key in ("encoder_attention_mask", "audio_encoder_attention_mask"):
+            assert native_inputs[key] is None
+            assert actor_inputs[key] is None
+        video, audio = module(**native_inputs)
+        masked_video, _ = module(**{**native_inputs, "encoder_attention_mask": mask})
+        assert not torch.allclose(video, masked_video)
+        predictions.append(torch.cat([video, audio], dim=1))
+    prediction = predictions[0]
+    if guidance_scale > 1.0:
+        prediction = LTXGuidanceExecutor.combine_cfg_velocity(
+            sample,
+            predictions[0],
+            predictions[1],
+            timestep.view(1, 1, 1) / 1000,
+            guidance_scale,
+        )
+    next_sample, rollout_log_prob, _, _ = rollout_scheduler.step(
+        prediction,
+        timestep[0],
+        sample,
+        generator=torch.Generator().manual_seed(42),
+        noise_level=0.8,
+        sde_type="cps",
+        return_logprobs=True,
+        return_dict=False,
+    )
+    actor_log_prob, _, _, _ = LTX23FlowGRPO.forward_and_sample_previous_step(
+        module,
+        actor_scheduler,
+        config,
+        positive,
+        negative,
+        {"all_next_latents": next_sample.unsqueeze(1), "all_timesteps": timestep.unsqueeze(1)},
+        0,
+    )
+    ratio = torch.exp(actor_log_prob - rollout_log_prob)
+    torch.testing.assert_close(ratio, torch.ones_like(ratio), rtol=1e-6, atol=1e-6)
+    record_property("ratio_mean", ratio.mean().item())
 
 
 def test_ltx2_non_contiguous_sde_step_selection_is_seeded() -> None:

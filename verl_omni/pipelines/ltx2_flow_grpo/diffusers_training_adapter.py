@@ -113,6 +113,9 @@ class LTX23FlowGRPO(DiffusionI2IModelBase):
             "return_dict": False,
             "_require_image_condition": getattr(model_config.pipeline, "task", None) == "ti2va",
         }
+        # LTX connectors replace padding with learned registers. Match the native
+        # vLLM-Omni ltx2_denoise.build_transformer_kwargs: all context rows attend,
+        # regardless of the mask used earlier by the Gemma text encoder.
         model_inputs = {
             **common,
             "encoder_hidden_states": prompt_embeds,
@@ -143,12 +146,12 @@ class LTX23FlowGRPO(DiffusionI2IModelBase):
         micro_batch: TensorDict,
         latents: torch.Tensor,
         step: int,
-    ) -> dict[str, torch.Tensor] | None:
-        """Read the fixed first-frame latent captured by rollout."""
-        del latents, step
+    ) -> dict[str, torch.Tensor]:
+        """Read the fixed first frame, or supply zero condition rows for T2AV."""
+        del step
         image_latents = micro_batch.get("condition_image_latents")
         if image_latents is None:
-            return None
+            image_latents = latents.new_empty(latents.shape[0], 0, latents.shape[-1])
         return {"image_latents": image_latents}
 
     @classmethod

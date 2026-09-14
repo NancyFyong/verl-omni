@@ -97,8 +97,9 @@ bash examples/flowgrpo_trainer/ltx2/run_ltx2_3_t2av_lora.sh
 bash examples/flowgrpo_trainer/ltx2/run_ltx2_3_ti2va_lora.sh
 ```
 
-The GPU recipes default to 8 GPUs, vLLM-Omni tensor parallel size 2, and one
-reward worker. CLAP and ImageBind run on `cuda:0` and `cuda:1`, respectively.
+Both GPU recipes default to 8 GPUs and one reward worker. The rollout tensor
+parallel size defaults to 2 for T2AV and 1 for TI2VA. CLAP and ImageBind run on
+`cuda:0` and `cuda:1`, respectively.
 The TI2VA recipe supports exactly one first-frame image and does not train the
 fixed condition frame as part of the stochastic policy transition.
 

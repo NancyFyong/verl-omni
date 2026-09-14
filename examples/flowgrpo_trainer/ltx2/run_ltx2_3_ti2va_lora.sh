@@ -99,6 +99,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.rollout.val_kwargs.pipeline.width=384 \
     actor_rollout_ref.rollout.val_kwargs.pipeline.num_frames=121 \
     actor_rollout_ref.rollout.val_kwargs.pipeline.frame_rate=24.0 \
+    actor_rollout_ref.rollout.val_kwargs.pipeline.task=ti2va \
     actor_rollout_ref.rollout.val_kwargs.pipeline.num_inference_steps=50 \
     actor_rollout_ref.rollout.val_kwargs.pipeline.guidance_scale=4.0 \
     +actor_rollout_ref.rollout.val_kwargs.pipeline.output_type=pt \

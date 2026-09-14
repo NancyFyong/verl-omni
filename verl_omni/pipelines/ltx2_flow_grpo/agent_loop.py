@@ -82,7 +82,7 @@ class LTX2DiffusionSingleTurnAgentLoop(DiffusionSingleTurnAgentLoop):
         del tools
         if videos or audios:
             raise ValueError("LTX-2.3 TI2VA accepts one image but no reference video or audio.")
-        if images is not None and len(images) != 1:
+        if images is not None and len(images) > 1:
             raise ValueError(f"LTX-2.3 TI2VA expects exactly one image, got {len(images)}.")
         text = _messages_to_text(messages)
         prompt_length = self.rollout_config.prompt_length
