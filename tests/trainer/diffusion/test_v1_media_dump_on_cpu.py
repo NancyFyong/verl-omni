@@ -126,6 +126,29 @@ def test_v1_background_export_uses_submission_step_snapshot(tmp_path):
     assert json.loads((tmp_path / "7.jsonl").read_text())["step"] == 7
 
 
+def test_v1_background_export_owns_cpu_media_snapshot(tmp_path):
+    queued = []
+    trainer = object.__new__(_ConcreteTrainer)
+    trainer.global_steps = 7
+    trainer._dump_futures = []
+    trainer._dump_executor = SimpleNamespace(submit=lambda *args: queued.append(args) or Future())
+    outputs = torch.full((1, 3, 8, 8), 7, dtype=torch.uint8)
+    audio = torch.full((1, 8), 0.25)
+
+    trainer._dump_generations(["prompt"], outputs, [None], [1.0], {}, str(tmp_path), audios=[audio], media_kind="image")
+
+    _, _, _, dumped_outputs, *rest = queued[0]
+    dumped_audios = rest[6]
+    assert dumped_outputs.device.type == "cpu"
+    assert dumped_outputs.data_ptr() != outputs.data_ptr()
+    assert dumped_audios[0].device.type == "cpu"
+    assert dumped_audios[0].data_ptr() != audio.data_ptr()
+    outputs.zero_()
+    audio.zero_()
+    assert torch.all(dumped_outputs == 7)
+    assert torch.all(dumped_audios[0] == 0.25)
+
+
 @pytest.mark.parametrize("transport", ["top", "tool"])
 @pytest.mark.parametrize("kinds", [["image", "video"], [None, "video"], [None, None]])
 def test_v0_rollout_validates_all_declared_kinds(transport, kinds):
@@ -155,6 +178,69 @@ def test_v0_rollout_validates_all_declared_kinds(transport, kinds):
     else:
         ray_diffusion_trainer.BaseRayDiffusionTrainer._log_rollout_data(trainer, data, {}, {}, "/tmp/unused")
         assert captured["media_kind"] == kinds[-1]
+
+
+def test_v0_rollout_dump_prefers_current_batch_audio_over_tool_envelope():
+    captured = {}
+    audio = torch.stack((torch.full((1, 4), 2.0), torch.full((1, 4), 1.0)))
+    data = DataProto.from_dict(
+        tensors={
+            "prompts": torch.ones(2, 1, dtype=torch.long),
+            "responses": torch.zeros(2, 4, 3, 8, 8, dtype=torch.uint8),
+            "sample_level_scores": torch.zeros(2, 1),
+            "audio": audio,
+        },
+        non_tensors={
+            "reward_model": [{}, {}],
+            "audio_sample_rate": np.array([48_000, 48_000], dtype=object),
+            "media_kind": np.array(["video", "video"], dtype=object),
+            "tool_extra_fields": [{"media_kind": "video"}, {"media_kind": "video"}],
+        },
+    )
+    trainer = SimpleNamespace(
+        config=OmegaConf.create({"trainer": {}}),
+        tokenizer=SimpleNamespace(batch_decode=lambda *args, **kwargs: ["first", "second"]),
+        _dump_generations=lambda **kwargs: captured.update(kwargs),
+    )
+
+    ray_diffusion_trainer.BaseRayDiffusionTrainer._log_rollout_data(trainer, data, {}, {}, "/tmp/unused")
+
+    torch.testing.assert_close(captured["audios"][0], audio[0])
+    torch.testing.assert_close(captured["audios"][1], audio[1])
+    assert captured["audio_sample_rates"] == [48_000, 48_000]
+
+
+@pytest.mark.parametrize(
+    ("key", "tool_value"),
+    [
+        ("audio", torch.zeros(1, 4)),
+        ("audio_sample_rate", 16_000),
+    ],
+)
+def test_v0_rollout_dump_rejects_conflicting_tool_media(key, tool_value):
+    audio = torch.stack((torch.full((1, 4), 2.0), torch.full((1, 4), 1.0)))
+    data = DataProto.from_dict(
+        tensors={
+            "prompts": torch.ones(2, 1, dtype=torch.long),
+            "responses": torch.zeros(2, 4, 3, 8, 8, dtype=torch.uint8),
+            "sample_level_scores": torch.zeros(2, 1),
+            "audio": audio,
+        },
+        non_tensors={
+            "reward_model": [{}, {}],
+            "audio_sample_rate": np.array([48_000, 48_000], dtype=object),
+            "media_kind": np.array(["video", "video"], dtype=object),
+            "tool_extra_fields": [{key: tool_value}, {key: tool_value}],
+        },
+    )
+    trainer = SimpleNamespace(
+        config=OmegaConf.create({"trainer": {}}),
+        tokenizer=SimpleNamespace(batch_decode=lambda *args, **kwargs: ["first", "second"]),
+        _dump_generations=lambda **kwargs: None,
+    )
+
+    with pytest.raises(ValueError, match=rf"Conflicting rollout media field {key!r}"):
+        ray_diffusion_trainer.BaseRayDiffusionTrainer._log_rollout_data(trainer, data, {}, {}, "/tmp/unused")
 
 
 @pytest.mark.parametrize("trainer_cls", [ray_diffusion_trainer.BaseRayDiffusionTrainer, _ConcreteTrainer])
@@ -219,6 +305,24 @@ def test_v1_invalid_modality_fails_before_background_submission(tmp_path):
                 reward_extra_infos_dict={},
                 dump_path=str(tmp_path),
                 media_kind="depth",
+            )
+        assert trainer._dump_futures == []
+    finally:
+        trainer._shutdown_dump_executor()
+
+
+def test_v1_declared_image_rank_mismatch_fails_before_background_submission(tmp_path):
+    trainer = _trainer()
+    try:
+        with pytest.raises(ValueError, match="media_kind='image'.*rank 5"):
+            trainer._dump_generations(
+                inputs=["prompt"],
+                outputs=torch.zeros(1, 3, 2, 8, 8, dtype=torch.uint8),
+                gts=[None],
+                scores=[1.0],
+                reward_extra_infos_dict={},
+                dump_path=str(tmp_path),
+                media_kind="image",
             )
         assert trainer._dump_futures == []
     finally:

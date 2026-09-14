@@ -38,7 +38,9 @@ import verl_omni.trainer.diffusion.ray_diffusion_trainer as ray_diffusion_traine
 from verl_omni.trainer.diffusion.ray_diffusion_trainer import BaseRayDiffusionTrainer
 
 
-def _dump(dump_path, outputs, *, max_samples=None, global_steps=0, audios=None, audio_sample_rates=None):
+def _dump(
+    dump_path, outputs, *, max_samples=None, global_steps=0, audios=None, audio_sample_rates=None, media_kind=None
+):
     """Invoke the unbound ``_dump_generations`` with a minimal stub ``self``."""
     n = outputs.shape[0]
     stub = SimpleNamespace(global_steps=global_steps)
@@ -60,6 +62,7 @@ def _dump(dump_path, outputs, *, max_samples=None, global_steps=0, audios=None, 
         str(dump_path),
         max_samples=max_samples,
         fps=8,
+        media_kind=media_kind,
         **kwargs,
     )
 
@@ -126,6 +129,12 @@ class TestDumpGenerations:
         torch.testing.assert_close(fallback["video"], outputs[1])
         assert fallback["audio"] is None
         assert fallback["audio_sample_rate"] is None
+
+    def test_declared_image_rejects_rank_five_batch_before_layout_guessing(self, tmp_path):
+        outputs = torch.zeros(1, 3, 2, 8, 8, dtype=torch.uint8)
+
+        with pytest.raises(ValueError, match="media_kind='image'.*rank 5"):
+            _dump(tmp_path, outputs, media_kind="image")
 
     def test_image_batch_writes_one_jpg_per_sample(self, tmp_path):
         # Image regression: the 4-D path must stay byte-for-byte behaviour.

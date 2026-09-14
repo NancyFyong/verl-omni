@@ -54,6 +54,19 @@ def resolve_batch_media_kind(media_kinds: Iterable[str | None]) -> str | None:
     return resolved
 
 
+def validate_visual_media_batch_rank(ndim: int, media_kind: str | None) -> None:
+    """Validate declared image/video batches before legacy layout normalization."""
+    if media_kind is None:
+        return
+    if media_kind == "image" and ndim != 4:
+        raise ValueError(f"Declared media_kind='image' requires an NCHW batch, got rank {ndim}.")
+    if media_kind == "video" and ndim != 5:
+        raise ValueError(f"Declared media_kind='video' requires a rank-5 batch, got rank {ndim}.")
+    if media_kind == "audio":
+        raise ValueError("Cannot dump declared audio as a visual generation batch.")
+    resolve_is_video(ndim, media_kind)
+
+
 @dataclass(frozen=True)
 class MediaSpec:
     """Declaration of a single media stream produced by a diffusion pipeline.

@@ -56,7 +56,11 @@ from verl.utils.skip import SkipManager
 from verl.utils.tracking import Tracking, ValidationGenerationsLogger
 from verl.workers.rollout.llm_server import LLMServerManager
 
-from verl_omni.pipelines.rollout_media import resolve_batch_media_kind, resolve_is_video
+from verl_omni.pipelines.rollout_media import (
+    resolve_batch_media_kind,
+    resolve_is_video,
+    validate_visual_media_batch_rank,
+)
 from verl_omni.trainer.diffusion.diffusion_algos import get_diffusion_loss_fn
 from verl_omni.trainer.diffusion.diffusion_metric_utils import (
     compute_data_metrics_diffusion,
@@ -117,6 +121,17 @@ def get_diffusion_trainer_cls(name: str):
     except KeyError:
         available = ", ".join(sorted(DIFFUSION_TRAINER_REGISTRY)) or "<none>"
         raise ValueError(f"Unknown diffusion trainer '{name}'. Available: {available}.") from None
+
+
+def _copy_media_to_cpu(value):
+    """Return an independent CPU snapshot safe for background media export."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device="cpu", copy=True)
+    if isinstance(value, list):
+        return [_copy_media_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_copy_media_to_cpu(item) for item in value)
+    return value
 
 
 class PolicyGradientDiffusionTrainerV1(ABC):
@@ -1427,20 +1442,25 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         """Validate media synchronously, then submit best-effort I/O with a step snapshot."""
         _validate_generation_outputs(outputs)
         resolve_is_video(outputs.ndim, media_kind)
+        dump_ndim = outputs.ndim - 1 if outputs.ndim == 6 and outputs.shape[1] == 1 else outputs.ndim
+        validate_visual_media_batch_rank(dump_ndim, media_kind)
         global_step = self.global_steps
+        outputs_to_dump = _copy_media_to_cpu(outputs)
+        audios_to_dump = _copy_media_to_cpu(audios)
+        audio_sample_rates_to_dump = _copy_media_to_cpu(audio_sample_rates)
         future = self._dump_executor.submit(
             dump_generations,
             global_step,
             inputs,
-            outputs,
+            outputs_to_dump,
             gts,
             scores,
             reward_extra_infos_dict,
             dump_path,
             max_samples,
             fps,
-            audios,
-            audio_sample_rates,
+            audios_to_dump,
+            audio_sample_rates_to_dump,
             media_kind,
         )
         self._dump_futures.append((future, global_step))

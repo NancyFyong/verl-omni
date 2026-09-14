@@ -54,7 +54,11 @@ from verl.utils.py_functional import rename_dict
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.llm_server import LLMServerManager
 
-from verl_omni.pipelines.rollout_media import resolve_batch_media_kind, resolve_is_video
+from verl_omni.pipelines.rollout_media import (
+    resolve_batch_media_kind,
+    resolve_is_video,
+    validate_visual_media_batch_rank,
+)
 from verl_omni.trainer.config import DiffusionAlgoConfig
 from verl_omni.trainer.diffusion.diffusion_algos import (
     DiffusionAdvantageEstimator,
@@ -196,6 +200,36 @@ def _validate_generation_outputs(outputs) -> None:
         raise ValueError(f"Expected generation outputs to be a uint8 tensor, got {dtype}.")
 
 
+def _media_values_match(left, right) -> bool:
+    """Compare rollout media from the tensor and metadata envelopes."""
+    if isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor):
+        return left.device == right.device and torch.equal(left, right)
+    try:
+        return np.array_equal(left, right)
+    except (TypeError, ValueError):
+        return False
+
+
+def _resolve_rollout_media_field(batch: DataProto, tool_extra, key: str):
+    """Prefer current batch media and reject conflicting tool-envelope values."""
+    sources = [batch.batch.get(key), batch.non_tensor_batch.get(key)]
+    if tool_extra is not None:
+        sources.append([item.get(key) if isinstance(item, dict) else None for item in tool_extra])
+
+    values = [None] * len(batch)
+    for source in sources:
+        if source is None:
+            continue
+        for index, value in enumerate(batch_items(source, len(batch), key)):
+            if value is None:
+                continue
+            if values[index] is not None and not _media_values_match(values[index], value):
+                raise ValueError(f"Conflicting rollout media field {key!r} in batch and tool_extra_fields")
+            if values[index] is None:
+                values[index] = value
+    return values if any(value is not None for value in values) else None
+
+
 def dump_generations(
     global_steps,
     inputs,
@@ -226,12 +260,13 @@ def dump_generations(
     if outputs.ndim == 6:
         # Per-sample batch dim from single-seq rollouts: [N, 1, T, C, H, W].
         outputs = outputs.squeeze(1)
-    if outputs.ndim == 5 and outputs.shape[1] == 3 and outputs.shape[2] != 3:
+    # Prefer the adapter-declared media kind over legacy rank/layout inference.
+    validate_visual_media_batch_rank(outputs.ndim, media_kind)
+    is_video = resolve_is_video(outputs.ndim, media_kind)
+    if is_video and outputs.ndim == 5 and outputs.shape[1] == 3 and outputs.shape[2] != 3:
         # Channels-first [N, C, T, H, W] -> [N, T, C, H, W]. Layout normalization
         # is still heuristic; declaring/normalizing it is deferred to the layout PR.
         outputs = outputs.permute(0, 2, 1, 3, 4)
-    # Prefer the adapter-declared media kind over the tensor rank.
-    is_video = resolve_is_video(outputs.ndim, media_kind)
 
     try:
         os.makedirs(visual_folder, exist_ok=True)
@@ -565,26 +600,11 @@ class BaseRayDiffusionTrainer(ABC):
                     batch.non_tensor_batch["request_id"].tolist(),
                 )
 
-            # Audio rides in tool_extra_fields dicts from the agent loop;
-            # extract it so _dump_generations can mux it into the mp4 files.
             tool_extra = batch.non_tensor_batch.get("tool_extra_fields", None)
-            if tool_extra is not None:
-                audios_to_dump = [item.get("audio") if isinstance(item, dict) else None for item in tool_extra]
-                audio_rates_to_dump = [
-                    item.get("audio_sample_rate") if isinstance(item, dict) else None for item in tool_extra
-                ]
-            else:
-                audios_to_dump = batch.batch.get("audio", batch.non_tensor_batch.get("audio"))
-                audio_rates_to_dump = batch.non_tensor_batch.get(
-                    "audio_sample_rate", batch.batch.get("audio_sample_rate")
-                )
-
-            # One pipeline owns the batch; validate rather than silently choosing
-            # one sample's kind. Composite loops may retain the tool-extra envelope.
-            media_kind_values = batch.non_tensor_batch.get("media_kind")
-            if media_kind_values is None and tool_extra is not None:
-                media_kind_values = [item.get("media_kind") if isinstance(item, dict) else None for item in tool_extra]
-            media_kind = resolve_batch_media_kind(batch_items(media_kind_values, len(batch), "media_kind"))
+            audios_to_dump = _resolve_rollout_media_field(batch, tool_extra, "audio")
+            audio_rates_to_dump = _resolve_rollout_media_field(batch, tool_extra, "audio_sample_rate")
+            media_kind_values = _resolve_rollout_media_field(batch, tool_extra, "media_kind")
+            media_kind = resolve_batch_media_kind(media_kind_values or [])
 
             self._dump_generations(
                 inputs=inputs,
