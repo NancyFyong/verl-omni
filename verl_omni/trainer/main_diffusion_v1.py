@@ -32,6 +32,20 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
+def validate_v1_config(config) -> None:
+    """Reject unsupported DMD2 execution modes before creating Ray workers or services."""
+    if config.algorithm.trainer_type != "distribution_matching":
+        return
+
+    from verl_omni.trainer.diffusion.ray_diffusion_trainer import DistributionMatchingRayTrainer
+
+    if config.trainer.v1.trainer_mode != "sync":
+        raise ValueError("V1 DMD2 requires trainer.v1.trainer_mode=sync; asynchronous DMD2 is not implemented.")
+    if config.transfer_queue.enable:
+        raise ValueError("V1 DMD2 requires transfer_queue.enable=false; samples are generated inside the FSDP engine.")
+    DistributionMatchingRayTrainer.validate_config(config)
+
+
 def run_diffusion_v1(config, task_runner_class=None) -> None:
     """Initialize Ray and run distributed v1 diffusion training.
 
@@ -41,6 +55,7 @@ def run_diffusion_v1(config, task_runner_class=None) -> None:
                 settings, model paths, and training hyperparameters.
         task_runner_class: For recipe to change TaskRunner.
     """
+    validate_v1_config(config)
     enable_rl_insight(config)
 
     if not ray.is_initialized():
@@ -109,7 +124,17 @@ class DiffusionTaskRunnerV1:
             )
 
     def run(self, config: DictConfig):
-        """Run the v1 diffusion training process."""
+        """Run engine-local DMD2 or the existing rollout-driven V1 training path."""
+        validate_v1_config(config)
+        if config.algorithm.trainer_type == "distribution_matching":
+            from verl_omni.trainer.diffusion.task_runner import TaskRunner
+
+            self.config = config
+            self.trainer = TaskRunner().create_trainer(config)
+            self.trainer.init_workers()
+            self.trainer.fit()
+            return
+
         import transfer_queue as tq
 
         from verl_omni.trainer.diffusion.v1 import get_diffusion_trainer_cls

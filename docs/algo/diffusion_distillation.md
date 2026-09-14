@@ -1,6 +1,6 @@
 # Diffusion Distribution Matching: DMD2
 
-Last updated: 09/11/2026.
+Last updated: 09/14/2026.
 
 ## Background and scope
 
@@ -44,8 +44,17 @@ is online during training, despite the configuration name `offline`; it does not
 require precomputed student images or teacher trajectories. Keep
 `sample_source=offline` for this implementation.
 
-The supported launcher uses `verl_omni.trainer.main_diffusion`.
-`main_diffusion_v1.py` integration is not implemented for this DMD2 path.
+The launcher uses `verl_omni.trainer.main_diffusion_v1` with
+`trainer.use_v1=true`, `trainer.v1.trainer_mode=sync` and
+`transfer_queue.enable=false`. V1 selects the shared DMD2 trainer directly:
+it does not construct the policy-gradient ReplayBuffer, AgentLoop, reward or
+rollout services. `separate_async` and TransferQueue-enabled DMD2 configurations
+are rejected before Ray initialization.
+
+The legacy `main_diffusion` entrypoint remains supported and constructs the same
+trainer, workers and engine. This is V1 entrypoint integration, not a second DMD2
+training loop or an implementation of asynchronous DMD2. Existing PG and online
+preference V1 paths retain their TransferQueue-based lifecycle.
 
 ## Objectives and gradient boundaries
 
@@ -140,7 +149,9 @@ Score sigma is sampled separately for each sample:
 The implementation follows the existing loss/engine/worker/trainer structure:
 
 ```text
-main_diffusion.TaskRunner
+main_diffusion_v1.DiffusionTaskRunnerV1 (DMD2 branch)
+  -> diffusion.task_runner.TaskRunner.create_trainer
+     (also used by the legacy entrypoint)
   -> DistributionMatchingRayTrainer(BaseRayDiffusionTrainer)
      -> DMDTrainingWorker(TrainingWorker)
         -> DMDDiffusersFSDPEngine(DiffusersFSDPEngine)
@@ -150,6 +161,7 @@ main_diffusion.TaskRunner
 
 | Component | Responsibility |
 |---|---|
+| `TaskRunner` in `trainer/diffusion/task_runner.py` | Shared algorithm selection, dataset construction and worker/resource-pool mapping for both entrypoints |
 | `DistributionMatchingRayTrainer` in `trainer/diffusion/ray_diffusion_trainer.py` | Reuse offline initialization, resource pools, dataloaders and profiling; run the explicit 1:K loop; publish complete checkpoints and export |
 | `DMDTrainingWorker` in `workers/dmd_worker.py` | Reuse distributed setup, dispatch and mini/microbatch handling; constrain each actor call to one optimizer attempt |
 | `DMDDiffusersFSDPEngine` in `workers/engine/fsdp/dmd_impl.py` | Differentiable sampling, score calls, optimizer selection, RNG streams, numerical skips, EMA and DMD-specific checkpoint state |
@@ -320,6 +332,12 @@ are not additive CUDA kernel costs. Reuse `global_profiler.steps` and
 `actor_rollout_ref.actor.profiler` for traces; see [profiling](../perf/profiler.md).
 
 ## Checkpoint, resume and inference contracts
+
+Both entrypoints use the same checkpoint implementation, version and compatibility
+fingerprint. Switching only `trainer.use_v1` between runs does not require a
+checkpoint conversion; all existing data, model, optimizer and schedule
+compatibility checks still apply. V1 does not replace the DMD2 checkpoint with
+an actor-only or replay-buffer checkpoint.
 
 A training checkpoint and one inference artifact serve different purposes:
 

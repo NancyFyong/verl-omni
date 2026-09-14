@@ -7,7 +7,10 @@ GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-${NUM_GPUS}}
 OUTPUT_DIR=${OUTPUT_DIR:-outputs/qwen_image_dmd2}
 TOTAL_TRAIN_STEPS=${TOTAL_TRAIN_STEPS:-1000}
 
-python3 -m verl_omni.trainer.main_diffusion \
+python3 -m verl_omni.trainer.main_diffusion_v1 \
+    trainer.use_v1=true \
+    trainer.v1.trainer_mode=sync \
+    transfer_queue.enable=false \
     algorithm.trainer_type=distribution_matching \
     algorithm.sample_source=offline \
     data.train_files="${TRAIN_FILES:?Set TRAIN_FILES to prompt parquet}" \

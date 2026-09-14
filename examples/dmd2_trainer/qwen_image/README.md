@@ -1,6 +1,6 @@
 # Qwen-Image DMD2 distribution-only
 
-Last updated: 09/11/2026.
+Last updated: 09/14/2026.
 
 See the [algorithm and runtime contract](../../../docs/algo/diffusion_distillation.md)
 for the objectives, role ownership, configuration and checkpoint semantics.
@@ -34,9 +34,15 @@ NUM_GPUS=8 TOTAL_TRAIN_STEPS=1000 \
 bash examples/dmd2_trainer/qwen_image/run_qwen_image_dmd2_lora.sh
 ```
 
-The script selects the new route:
+The script selects the V1 entrypoint and the shared DMD2 runtime:
 
 ```yaml
+trainer:
+  use_v1: true
+  v1:
+    trainer_mode: sync
+transfer_queue:
+  enable: false
 algorithm:
   trainer_type: distribution_matching
   sample_source: offline
@@ -51,7 +57,15 @@ training on pre-generated images. The current student generates fresh samples
 from prompts and noise during training inside FSDP, retaining the graph needed
 for its objective. No independent vLLM rollout server or reward workers are
 started. Keep this configuration value `offline`; it does not make the student
-samples precomputed.
+samples precomputed. The V1 DMD2 branch does not initialize TransferQueue,
+ReplayBuffer or an AgentLoop. `separate_async` and `transfer_queue.enable=true`
+are unsupported for DMD2 and fail before worker allocation.
+
+The legacy entrypoint remains compatible. Append `trainer.use_v1=false` to this
+launcher to use it through V1's existing fallback, or invoke
+`python -m verl_omni.trainer.main_diffusion` directly with the same DMD2 overrides.
+Both paths construct the same trainer and use the same checkpoint format; switching
+entrypoints alone does not require checkpoint conversion.
 
 `dmd` is a separate top-level configuration group. Do **not** enable the existing
 OPD `distillation.enabled` or actor `use_distill_loss` flags. Existing

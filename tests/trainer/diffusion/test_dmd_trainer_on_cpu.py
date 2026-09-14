@@ -131,12 +131,31 @@ class TestDMDConfiguration:
         assert trainer.configuration_fingerprint() == first
 
 
+def run_dmd_trainer(trainer, entrypoint, monkeypatch):
+    if entrypoint == "legacy":
+        trainer.fit()
+        return
+
+    from verl_omni.trainer import main_diffusion_v1
+    from verl_omni.trainer.diffusion.task_runner import TaskRunner
+
+    trainer.config.trainer.use_v1 = True
+    trainer.init_workers = MagicMock()
+    monkeypatch.setattr(TaskRunner, "create_trainer", MagicMock(return_value=trainer))
+    runner = main_diffusion_v1.DiffusionTaskRunnerV1.__ray_metadata__.modified_class()
+    runner.init_agent_loop_manager = MagicMock(side_effect=AssertionError("DMD2 must not start an agent loop"))
+    runner.run(trainer.config)
+    trainer.init_workers.assert_called_once()
+    assert runner.trainer is trainer
+
+
 class TestDMDCycles:
-    def test_normal_and_skipped_cycles_keep_separate_success_counts(self, monkeypatch):
+    @pytest.mark.parametrize("entrypoint", ["legacy", "v1"])
+    def test_normal_and_skipped_cycles_keep_separate_success_counts(self, monkeypatch, entrypoint):
         monkeypatch.setattr("verl.utils.tracking.Tracking", FakeTracking)
         FakeTracking.records = []
         trainer = make_trainer([1, 1, 1, 0, 1, 0, 1, 0, 1])
-        trainer.fit()
+        run_dmd_trainer(trainer, entrypoint, monkeypatch)
         assert trainer.global_steps == 3
         assert trainer.optimizer_steps == {"student": 2, "fake_score": 4}
         assert trainer.actor_rollout_wg.stages == ["student", "fake_score", "fake_score"] * 3
@@ -145,20 +164,22 @@ class TestDMDCycles:
         assert "fake_score/1/loss" in FakeTracking.records[0][1]
         trainer.export_student.assert_called_once()
 
-    def test_all_skipped_budget_terminates_without_claiming_training_success(self, monkeypatch):
+    @pytest.mark.parametrize("entrypoint", ["legacy", "v1"])
+    def test_all_skipped_budget_terminates_without_claiming_training_success(self, monkeypatch, entrypoint):
         monkeypatch.setattr("verl.utils.tracking.Tracking", FakeTracking)
         trainer = make_trainer([0] * 9)
         with pytest.raises(RuntimeError, match="without successful updates"):
-            trainer.fit()
+            run_dmd_trainer(trainer, entrypoint, monkeypatch)
         assert trainer.global_steps == 3
         assert trainer.optimizer_steps == {"student": 0, "fake_score": 0}
         trainer.export_student.assert_not_called()
 
-    def test_partial_exception_is_not_a_numerical_retry(self, monkeypatch):
+    @pytest.mark.parametrize("entrypoint", ["legacy", "v1"])
+    def test_partial_exception_is_not_a_numerical_retry(self, monkeypatch, entrypoint):
         monkeypatch.setattr("verl.utils.tracking.Tracking", FakeTracking)
         trainer = make_trainer([1, RuntimeError("injected rank failure"), 1])
         with pytest.raises(RuntimeError, match="injected rank failure"):
-            trainer.fit()
+            run_dmd_trainer(trainer, entrypoint, monkeypatch)
         assert trainer.global_steps == 0
         assert trainer.optimizer_steps["student"] == 1  # This cannot roll back a real optimizer update.
         assert trainer.actor_rollout_wg.stages == ["student", "fake_score"]
@@ -171,6 +192,156 @@ class TestDMDCycles:
         trainer = make_trainer([0.5])
         with pytest.raises(RuntimeError, match="Malformed"):
             trainer.update_stage("student", 0)
+
+
+class TestDMDV1Routing:
+    @pytest.mark.parametrize("use_v1", [False, True])
+    def test_hydra_entrypoint_selects_requested_lifecycle(self, monkeypatch, use_v1):
+        from verl_omni.trainer import main_diffusion, main_diffusion_v1
+
+        config = make_config([f"trainer.use_v1={str(use_v1).lower()}"])
+        v1_run, legacy_run = MagicMock(), MagicMock()
+        monkeypatch.setattr(main_diffusion_v1, "run_diffusion_v1", v1_run)
+        monkeypatch.setattr(main_diffusion, "run_diffusion", legacy_run)
+        if use_v1:
+            main_diffusion_v1.main.__wrapped__(config)
+            v1_run.assert_called_once_with(config)
+            legacy_run.assert_not_called()
+        else:
+            with pytest.warns(DeprecationWarning, match="legacy diffusion trainer"):
+                main_diffusion_v1.main.__wrapped__(config)
+            legacy_run.assert_called_once_with(config)
+            v1_run.assert_not_called()
+
+    def test_checkpoint_identity_does_not_depend_on_entrypoint(self):
+        trainer = make_trainer([1] * 9)
+        legacy_fingerprint = trainer.configuration_fingerprint()
+        trainer.config.trainer.use_v1 = True
+        trainer.config.trainer.v1.trainer_mode = "sync"
+        assert trainer.configuration_fingerprint() == legacy_fingerprint
+
+    @pytest.mark.parametrize(
+        "override,match",
+        [
+            ("trainer.v1.trainer_mode=separate_async", "trainer_mode=sync"),
+            ("transfer_queue.enable=true", "transfer_queue.enable=false"),
+            ("algorithm.sample_source=online", "sample_source=offline"),
+            ("actor_rollout_ref.model.algorithm=dmd", "model.algorithm=dmd2"),
+            ("distillation.enabled=true", "OPD"),
+        ],
+    )
+    def test_invalid_dmd_fails_before_ray_or_services(self, monkeypatch, override, match):
+        from verl_omni.trainer import main_diffusion_v1
+
+        config = make_config(["trainer.use_v1=true", override])
+        ray_probe = MagicMock(side_effect=AssertionError("Must validate before Ray initialization"))
+        monkeypatch.setattr(main_diffusion_v1.ray, "is_initialized", ray_probe)
+        with pytest.raises(ValueError, match=match):
+            main_diffusion_v1.run_diffusion_v1(config)
+        ray_probe.assert_not_called()
+
+    @pytest.mark.parametrize("failure", [None, "create", "init", "fit"])
+    def test_dmd_bypasses_online_services_without_swallowing_errors(self, monkeypatch, failure):
+        import transfer_queue as tq
+
+        from verl_omni.trainer import main_diffusion_v1
+        from verl_omni.trainer.diffusion import task_runner, v1
+
+        config = make_config(["trainer.use_v1=true"])
+        tq_init, tq_close = MagicMock(), MagicMock()
+        online_selection = MagicMock(side_effect=AssertionError("Do not select a rollout-mode trainer"))
+        monkeypatch.setattr(tq, "init", tq_init)
+        monkeypatch.setattr(tq, "close", tq_close)
+        monkeypatch.setattr(v1, "get_diffusion_trainer_cls", online_selection)
+        trainer = MagicMock()
+        create = MagicMock(return_value=trainer)
+        monkeypatch.setattr(task_runner.TaskRunner, "create_trainer", create)
+        if failure:
+            target = {"create": create, "init": trainer.init_workers, "fit": trainer.fit}[failure]
+            target.side_effect = RuntimeError(f"injected {failure} failure")
+        runner = main_diffusion_v1.DiffusionTaskRunnerV1.__ray_metadata__.modified_class()
+        runner.init_agent_loop_manager = MagicMock()
+        if failure:
+            with pytest.raises(RuntimeError, match=f"injected {failure}"):
+                runner.run(config)
+        else:
+            runner.run(config)
+            trainer.init_workers.assert_called_once_with()
+            trainer.fit.assert_called_once_with()
+        if failure in {"create", "init"}:
+            trainer.fit.assert_not_called()
+        create.assert_called_once_with(config)
+        runner.init_agent_loop_manager.assert_not_called()
+        online_selection.assert_not_called()
+        tq_init.assert_not_called()
+        tq_close.assert_not_called()
+        assert config.transfer_queue.enable is False
+
+    @pytest.mark.parametrize("trainer_type", ["policy_gradient", "direct_preference"])
+    @pytest.mark.parametrize("failure", [None, "init", "fit"])
+    def test_online_v1_lifecycle_is_unchanged(self, monkeypatch, trainer_type, failure):
+        import transfer_queue as tq
+
+        from verl_omni.trainer import main_diffusion_v1
+        from verl_omni.trainer.diffusion import v1
+
+        config = make_config([f"algorithm.trainer_type={trainer_type}", "algorithm.sample_source=online"])
+        tq_init, tq_close = MagicMock(), MagicMock()
+        monkeypatch.setattr(tq, "init", tq_init)
+        monkeypatch.setattr(tq, "close", tq_close)
+        trainer = MagicMock()
+        trainer_class = MagicMock(return_value=trainer)
+        select = MagicMock(return_value=trainer_class)
+        monkeypatch.setattr(v1, "get_diffusion_trainer_cls", select)
+        if failure:
+            getattr(trainer, failure).side_effect = RuntimeError(f"injected {failure} failure")
+        runner = main_diffusion_v1.DiffusionTaskRunnerV1.__ray_metadata__.modified_class()
+        runner.agent_loop_manager = object()
+        runner.init_agent_loop_manager = MagicMock()
+        if failure:
+            with pytest.raises(RuntimeError, match=f"injected {failure}"):
+                runner.run(config)
+        else:
+            runner.run(config)
+            runner.init_agent_loop_manager.assert_called_once_with()
+            trainer.fit.assert_called_once_with(runner.agent_loop_manager)
+        select.assert_called_once_with("sync")
+        trainer_class.assert_called_once_with(config=config)
+        tq_init.assert_called_once_with(config.transfer_queue)
+        tq_close.assert_called_once_with()
+        assert config.transfer_queue.enable is True
+
+    def test_shared_construction_does_not_allocate_workers_or_start_training(self, monkeypatch, tmp_path):
+        import verl.utils
+
+        from verl_omni.pipelines.model_base import DiffusionModelBase
+        from verl_omni.trainer import main_diffusion
+        from verl_omni.trainer.diffusion import task_runner
+        from verl_omni.utils import fs
+        from verl_omni.utils.dataset import rl_dataset
+
+        assert main_diffusion.TaskRunner is task_runner.TaskRunner
+        config = make_config(["+actor_rollout_ref.model.architecture=QwenImagePipeline"])
+        monkeypatch.setattr(fs, "resolve_model_local_dir", MagicMock(return_value=str(tmp_path)))
+        monkeypatch.setattr(verl.utils, "hf_tokenizer", MagicMock(return_value="tokenizer"))
+        monkeypatch.setattr(verl.utils, "hf_processor", MagicMock(return_value="processor"))
+        adapter = MagicMock()
+        adapter.prepare_processor_files.return_value = None
+        monkeypatch.setattr(DiffusionModelBase, "get_class_by_name", MagicMock(return_value=adapter))
+        monkeypatch.setattr(rl_dataset, "create_rl_dataset", MagicMock(side_effect=["train", "val"]))
+        monkeypatch.setattr(rl_dataset, "create_rl_sampler", MagicMock(return_value="sampler"))
+        monkeypatch.setattr(rl_dataset, "get_collate_fn", MagicMock(return_value="collate"))
+        selected = MagicMock()
+        monkeypatch.setattr(task_runner, "get_diffusion_trainer_cls", MagicMock(return_value=selected))
+        runner = task_runner.TaskRunner()
+        trainer = runner.create_trainer(config)
+        assert trainer is selected.return_value
+        assert selected.call_args.kwargs["train_dataset"] == "train"
+        assert selected.call_args.kwargs["val_dataset"] == "val"
+        assert selected.call_args.kwargs["train_sampler"] == "sampler"
+        assert selected.call_args.kwargs["tokenizer"] == "tokenizer"
+        trainer.init_workers.assert_not_called()
+        trainer.fit.assert_not_called()
 
 
 class TestDMDCheckpoint:
