@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import json
 from copy import deepcopy
 from types import SimpleNamespace
@@ -223,6 +224,25 @@ class TestDMDAccumulation:
 
 
 class TestDMDWorker:
+    @pytest.mark.parametrize("source", ["snapshot", "download", "local"])
+    def test_export_provenance_is_computed_inside_the_dmd_worker(self, tmp_path, source):
+        revision = "a" * 40
+        root = tmp_path / "snapshots" / revision if source == "snapshot" else tmp_path
+        (root / "transformer").mkdir(parents=True)
+        config = b'{"in_channels": 64}'
+        (root / "transformer/config.json").write_bytes(config)
+        if source == "download":
+            metadata = root / ".cache/huggingface/download/model_index.json.metadata"
+            metadata.parent.mkdir(parents=True)
+            metadata.write_text(revision + "\netag\n0\n")
+        worker = object.__new__(DMDTrainingWorker)
+        worker.engine = SimpleNamespace(model_config=SimpleNamespace(local_path=str(root)))
+
+        value = worker.get_model_provenance()
+
+        assert value["base_model_revision"] == (None if source == "local" else revision)
+        assert value["base_transformer_config_sha256"] == hashlib.sha256(config).hexdigest()
+
     def test_reuses_one_minibatch_and_selects_before_context(self, monkeypatch):
         result = tu.get_tensordict({}, {"metrics": {"loss": [1.0]}})
         train = MagicMock(return_value=result)
