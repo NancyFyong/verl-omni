@@ -1,1 +1,0 @@
-../../../examples/dmd2_trainer/qwen_image/README.md
