@@ -13,6 +13,7 @@
 # limitations under the License.
 import asyncio
 import functools
+import hashlib
 import logging
 import os
 import time
@@ -21,6 +22,7 @@ from copy import deepcopy
 from dataclasses import replace
 from functools import partial
 from itertools import chain
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -44,6 +46,7 @@ from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerCon
 from verl.utils.py_functional import append_to_dict
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
 from verl.utils.torch_functional import allgather_dict_into_dict
+from verl.utils.tracking import RLInsightLogger
 from verl.workers.config import (
     ActorConfig,
     DistillationConfig,
@@ -553,6 +556,148 @@ def build_teacher_training_config(
     return teacher_training_config
 
 
+class DMDTrainingWorker(TrainingWorker):
+    """Own DMD worker construction without changing the generic worker lifecycle."""
+
+    def __init__(self, config, *, dmd_config, role="actor", distillation_config=None):
+        if role != "actor" or (distillation_config is not None and distillation_config.get("enabled", False)):
+            raise ValueError("DMD2 uses one offline actor group, not OPD teacher workers.")
+        self.dmd_config = omega_conf_to_dataclass(dmd_config)
+        self.actor_config = omega_conf_to_dataclass(config.actor)
+        model_config = omega_conf_to_dataclass(config.model)
+        profiler = self.actor_config.profiler
+        if profiler is not None and profiler.tool_config.get(profiler.tool) is not None:
+            profiler.tool_config[profiler.tool] = omega_conf_to_dataclass(
+                config.actor.profiler.tool_config[profiler.tool]
+            )
+        worker_config = TrainingWorkerConfig(
+            model_type="diffusion_dmd_model",
+            model_config=model_config,
+            engine_config=self.actor_config.engine,
+            optimizer_config=self.actor_config.optim,
+            checkpoint_config=self.actor_config.checkpoint,
+            profiler_config=profiler,
+        )
+
+        Worker.__init__(self)
+
+        from verl.workers.engine import BaseEngine, EngineRegistry
+
+        from verl_omni.workers.engine.fsdp import diffusers_impl  # noqa: F401
+
+        if is_npu_available:
+            os.environ["PYTORCH_NPU_ALLOC_CONF"] = "expandable_segments:True"
+
+        initialize_global_process_group_ray(timeout_second=None)
+        set_numa_affinity()
+
+        self.config = worker_config
+        self.model_config = self.config.model_config
+        self.engine_config = self.config.engine_config
+        self.optimizer_config = self.config.optimizer_config
+        self.checkpoint_config = self.config.checkpoint_config
+        self.device_name = get_device_name()
+
+        if self.engine_config is None:
+            assert self.optimizer_config is None
+            if self.config.auto_select_engine_optim_fn is None:
+                raise ValueError(
+                    "engine_config is not provided and auto_select_engine_optim_fn is not set. "
+                    "Cannot determine engine backend."
+                )
+            self.engine_config, self.optimizer_config = self.config.auto_select_engine_optim_fn(
+                self.model_config, self.device_name
+            )
+
+        self.engine_config.use_remove_padding = self.model_config.get("use_remove_padding", False)
+        self.engine_config.use_fused_kernels = self.model_config.get("use_fused_kernels", False)
+
+        self.profiler_config = self.config.profiler_config
+        if self.profiler_config is not None:
+            self.profiler_tool_config = self.profiler_config.tool_config.get(self.profiler_config.tool, {})
+        else:
+            self.profiler_tool_config = None
+
+        DistProfilerExtension.__init__(
+            self, DistProfiler(rank=self.rank, config=self.profiler_config, tool_config=self.profiler_tool_config)
+        )
+
+        self.model_config.model_type = self.config.model_type
+        self.engine: BaseEngine = EngineRegistry.new(
+            model_type=self.config.model_type,
+            backend=self.engine_config.strategy,
+            model_config=self.model_config,
+            engine_config=self.engine_config,
+            optimizer_config=self.optimizer_config,
+            checkpoint_config=self.checkpoint_config,
+            dmd_config=self.dmd_config,
+        )
+        self._register_dispatch_collect_info(
+            mesh_name="train",
+            dp_rank=self.engine.get_data_parallel_rank(),
+            is_collect=self.engine.is_mp_src_rank_with_outputs(),
+        )
+        self.flops_counter = DiffusionFlopsCounter(
+            architecture=getattr(self.model_config, "architecture", None),
+            transformer_config=getattr(self.model_config, "transformer_config", None),
+        )
+        self.loss_fn = partial(diffusion_loss, config=self.actor_config)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        """Reuse the standard worker reset/model initialization boundary."""
+        self.reset()
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=True)
+    def update_actor(self, data):
+        """Execute exactly one optimizer attempt using existing mini/microbatch machinery."""
+        stage = tu.get_non_tensor_data(data, "dmd_stage", default="student")
+        if stage not in {"student", "fake_score"}:
+            raise ValueError(f"Invalid DMD2 stage {stage!r}.")
+        if tu.get_non_tensor_data(data, "epochs", default=1) != 1:
+            raise ValueError("DMD2 update_actor performs one optimizer attempt, not multiple epochs.")
+        previous = self.engine.active_stage
+        self.engine.select_stage(stage)
+        tu.assign_non_tensor(
+            data,
+            global_token_num=None,
+            num_mini_batch=1,
+            mini_batch_size=None,
+            epochs=1,
+            dataloader_kwargs={"shuffle": False},
+            micro_batch_size_per_gpu=getattr(self.dmd_config, f"{stage}_micro_batch_size_per_gpu"),
+        )
+        try:
+            result = self.train_mini_batch(data)
+            if result is not None:
+                metrics = tu.get_non_tensor_data(result, "metrics", default=None)
+                metrics["dmd/update_applied"] = float(self.engine.last_step_succeeded)
+                metrics["dmd/skip_nonfinite"] = float(not self.engine.last_step_succeeded)
+            return result
+        finally:
+            self.engine.select_stage(previous)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_model_provenance(self):
+        """Read the base identity needed only by the DMD2 inference export."""
+        root = Path(self.engine.model_config.local_path)
+        revision = root.name if root.parent.name == "snapshots" else None
+        metadata = root / ".cache/huggingface/download/model_index.json.metadata"
+        if metadata.is_file():
+            with metadata.open() as file:
+                revision = file.readline().strip()
+        if not revision or len(revision) != 40 or any(char not in "0123456789abcdef" for char in revision):
+            revision = None
+        with (root / "transformer/config.json").open("rb") as file:
+            config_hash = hashlib.file_digest(file, "sha256").hexdigest()
+        return {"base_model_revision": revision, "base_transformer_config_sha256": config_hash}
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def export_student(self, directory, role="student"):
+        """Export the selected student adapter without exposing score-model weights."""
+        self.engine.export_student(directory, role)
+
+
 class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     """Hybrid worker that includes actor model, rollout and optional ref model.
     For standalone actor or rollout, use ActorWorker or BaseRollout respectively.
@@ -789,6 +934,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     mesh_name="teacher", **next(iter(self.teachers.values())).get_dispatch_collect()
                 )
 
+        # Rollout weight-sync knobs. Initialized for every role, not only when
+        # "rollout" is in self.role: with a separate rollout, update_weights()
+        # and the LoRA gather run on the actor worker and must not depend on
+        # rollout-role-only attributes.
+        self._init_weight_sync_knobs(model_config)
+
         # 3. build rollout engine
         if "rollout" in self.role:
             rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
@@ -812,12 +963,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
             )
 
-            # used for LoRA (base_sync_done is unused in merge-only mode but kept for Phase 2 adapter path)
-            self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
-            self.layered_summon = self.config.rollout.get("layered_summon", False)
-            self.peft_merge: bool = model_config.lora.get("merge", False)
-            self._zmq_update_seq = 0
-
         # 4. build checkpoint engine
         if "actor" in self.role:
             checkpoint_engine_config = omega_conf_to_dataclass(self.config.rollout.checkpoint_engine)
@@ -833,6 +978,24 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # Free cached GPU memory so colocated vLLM processes can see it via cudaMemGetInfo
         aggressive_empty_cache(force_sync=True)
+
+    def _init_weight_sync_knobs(self, model_config):
+        """Set rollout weight-sync state needed by actor-side methods.
+
+        update_weights() and the LoRA gather read these on workers whose role
+        may not include "rollout" (separate rollout layout), so they are derived
+        from config for every role instead of only when building the rollout
+        engine.
+        """
+        # LoRA: True while the rollout already holds the base weights, so
+        # adapter-only syncs can skip resending them. Only a dummy load_format
+        # starts False (the rollout never loaded real base weights).
+        self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
+        self.layered_summon = self.config.rollout.get("layered_summon", False)
+        # diffusion-only dual-adapter knob; the omni rollout config has no such field
+        self.rollout_adapter: str = self.config.rollout.get("rollout_adapter", "default")
+        self.peft_merge: bool = model_config.lora.get("merge", False)
+        self._zmq_update_seq = 0
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="ref"))
     @DistProfiler.annotate(color="olive", role="infer_ref_batch")
@@ -857,10 +1020,27 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         return output.cpu() if output is not None else None
 
+    # Upstream v1 names: verl's PPO v1 trainers call compute_log_prob / compute_ref_log_prob;
+    # the diffusion trainers call the infer_* names above.
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="ref"))
+    @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
+    @_with_routing_replay_flag(enabled=False)
+    def compute_ref_log_prob(self, data: TensorDict) -> TensorDict:
+        output = self.ref.infer_batch(data=data)
+        return output.cpu() if output is not None else None
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
+    @_with_routing_replay_flag(enabled=True)
+    def compute_log_prob(self, data: TensorDict) -> TensorDict:
+        output = self.actor.infer_batch(data)
+        return output.cpu() if output is not None else None
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
+        tu.assign_non_tensor(data, enable_timestep_staging=self.config.actor.get("enable_timestep_staging", False))
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 
@@ -979,7 +1159,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
             layered_summon=self.layered_summon,
             base_sync_done=True,
-            adapter_name=self.config.rollout.rollout_adapter,
+            adapter_name=self.rollout_adapter,
         )
         lora_weights = {name: tensor for name, tensor in per_tensor_param}
         if timings is not None:
@@ -1030,23 +1210,23 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             actor_has_lora = peft_module is not None and hasattr(peft_module, "peft_config")
 
             if actor_has_lora and not self.peft_merge:
-                logger.warning(
-                    "LORA_SYNC_PROOF actor send mode=adapter_only backend=%s global_steps=%s adapter=%s",
+                logger.debug(
+                    "adapter-only LoRA send: backend=%s global_steps=%s adapter=%s",
                     effective_mode,
                     global_steps,
-                    self.config.rollout.rollout_adapter,
+                    self.rollout_adapter,
                 )
                 per_tensor_param, _ = self.actor.engine.get_per_tensor_param(
                     base_sync_done=True,
-                    adapter_name=self.config.rollout.rollout_adapter,
+                    adapter_name=self.rollout_adapter,
                 )
-                await self.checkpoint_engine.send_weights(per_tensor_param)
+                with RLInsightLogger.trace_state("update_weights", state_lane_id=f"rank_{self.rank}"):
+                    await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
                 return
 
-            per_tensor_param, _ = self.actor.engine.get_per_tensor_param(
-                adapter_name=self.config.rollout.rollout_adapter
-            )
-            await self.checkpoint_engine.send_weights(per_tensor_param)
+            per_tensor_param, _ = self.actor.engine.get_per_tensor_param(adapter_name=self.rollout_adapter)
+            with RLInsightLogger.trace_state("update_weights", state_lane_id=f"rank_{self.rank}"):
+                await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
             return
 
         # Per-component wall-clock timings (seconds) for monitoring.
@@ -1124,9 +1304,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 bucket_size_mb=bucket_size_mb,
                 use_shm=self.rollout.use_shm,
             )
-            await sender.async_send_weights(lora_weights.items())
-            if future is not None:
-                await future
+            with RLInsightLogger.trace_state("update_weights", state_lane_id=f"rank_{self.rank}"):
+                await sender.async_send_weights(lora_weights.items())
+                if future is not None:
+                    await future
+            # Mirror ServerAdapter.update_weights: reset caches and stamp the weight version.
+            if self.rollout.rollout_rank == 0 and self.rollout._ensure_server_handle():
+                await self.rollout.server_handle.clear_kv_cache.remote()
+                if global_steps is not None:
+                    await self.rollout.server_handle.set_global_steps.remote(global_steps)
             timings["update_weights_sync"] = time.perf_counter() - sync_start
             offloaded = True
         else:
@@ -1140,7 +1326,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
                 layered_summon=self.layered_summon,
                 base_sync_done=True,
-                adapter_name=self.config.rollout.rollout_adapter,
+                adapter_name=self.rollout_adapter,
             )
 
             do_lora_base_sync = False
@@ -1153,15 +1339,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 per_tensor_param_base, peft_config = self.actor.engine.get_per_tensor_param(
                     layered_summon=self.layered_summon,
                     base_sync_done=False,
-                    adapter_name=self.config.rollout.rollout_adapter,
+                    adapter_name=self.rollout_adapter,
                 )
                 await self.rollout.update_weights(
                     per_tensor_param_base, peft_config=peft_config, base_sync_done=False, global_steps=global_steps
                 )
 
-            await self.rollout.update_weights(
-                per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps
-            )
+            with RLInsightLogger.trace_state("update_weights", state_lane_id=f"rank_{self.rank}"):
+                await self.rollout.update_weights(
+                    per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps
+                )
 
         log_gpu_memory_usage("After update_weights", logger=logger)
 
