@@ -393,6 +393,21 @@ option, not a trainer configuration backend.
 The standard model configuration is unchanged. The former per-sample forward
 is retained only as a numerical-test baseline.
 
+For opt-in deterministic CUDA execution, enable the existing flags on both sides:
+
+```bash
+actor_rollout_ref.actor.fsdp_config.full_determinism=true \
+actor_rollout_ref.ref.fsdp_config.full_determinism=true \
+actor_rollout_ref.rollout.full_determinism=true
+```
+
+H3 then uses cuBLASLt without BF16 reduced-precision reductions or split-K in the
+actor/ref and rollout workers. This requires PyTorch's cuBLASLt split-K control.
+The flags also enable the existing seed, NCCL and cuDNN determinism controls;
+they are not a GEMM-only performance switch. Defaults remain unchanged. Use
+matching settings when comparing actor and rollout; this does not guarantee
+bitwise-identical policies across their different implementations.
+
 The packer preserves sample-local positions, noise timesteps, reference rows and
 per-sample loss weighting. Both the main DiT and text token-refiner have independent
 sample boundaries. It changes neither rollout nor batch scheduling; micro-batch
@@ -415,7 +430,14 @@ NUM_GPUS=2 bash tests/special_e2e/run_minimax_h3_lora_sync_tp2.sh \
 
 The optional checks extend the existing LoRA sync regression with NFT/FlowGRPO
 loss, LoRA gradients, sample isolation, gradient checkpointing and FSDP2 comparisons
-between the original and packed forwards on a tiny transformer.
+between the original and packed forwards on a tiny transformer. They also check
+rank-64 LoRA GEMMs at the real H3 projection dimensions. The optional comparisons
+use cuBLASLt with BF16 reduced-precision reductions and split-K disabled, then
+restore the previous settings (requires PyTorch's cuBLASLt split-K control).
+Matching FA3 alone is insufficient: shape-dependent LoRA GEMM reductions can
+introduce small differences that the refiner and DiT amplify. Running these checks
+does not enable deterministic execution in recipes; use the explicit flags above
+when the same GEMM controls are required for training.
 It is not a rollout/trainer e2e or a production
 speed benchmark. Measure actor time, total step time and peak memory before using
 larger micro-batches; batching does not reduce the model's mathematical FLOPs.

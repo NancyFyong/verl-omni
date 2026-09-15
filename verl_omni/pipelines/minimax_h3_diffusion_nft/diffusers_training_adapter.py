@@ -41,6 +41,7 @@ from .common import (
     build_layout_from_meta,
     build_ref2va_layout_from_meta,
     build_row_timesteps,
+    configure_h3_deterministic_matmul,
     h3_dit_timestep,
     h3_velocity_to_flow_match,
     keyframe_indices_to_anchors,
@@ -286,6 +287,7 @@ def _find_h3_transformer(module):
 def enable_packed_forward(module):
     """Install sample-isolated packed execution on an AutoModel-loaded H3 transformer."""
     transformer = _find_h3_transformer(module)
+    configure_h3_deterministic_matmul()
     if getattr(transformer, "supports_packed_batch", False):
         return transformer
     attentions = [item for item in transformer.modules() if isinstance(item, MiniMaxH3Attention)]

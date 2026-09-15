@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from contextlib import contextmanager
 from tempfile import TemporaryDirectory
 
 import torch
@@ -138,6 +139,39 @@ def _check_text_encoder_tp(rank: int, tp_size: int, device: torch.device) -> Non
     assert torch.equal(received, expected), f"rank={rank} received a mismatched broadcast payload"
 
     print(f"rank={rank}: text_encoder_tp={tp_size} group={list(group.ranks)}, broadcast OK", flush=True)
+
+
+@contextmanager
+def _packed_matmul_context():
+    """Keep LoRA GEMM reductions comparable across serial and packed batch shapes."""
+    previous_backend = torch.backends.cuda.preferred_blas_library()
+    previous_reduction = (
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction_split_k,
+    )
+    try:
+        torch.backends.cuda.preferred_blas_library("cublaslt")
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = (False, False)
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = previous_reduction
+        torch.backends.cuda.preferred_blas_library(previous_backend)
+
+
+def _check_packed_lora_matmul(device):
+    """Cover the real H3 projection dimensions that tiny models do not exercise."""
+    generator = torch.Generator(device=device).manual_seed(33)
+    lengths = [384, 384, 768, 768, 1152, 1152, 1536, 1536]
+    inputs = torch.randn(sum(lengths), 5376, device=device, dtype=torch.bfloat16, generator=generator)
+    a = torch.randn(64, 5376, device=device, dtype=torch.bfloat16, generator=generator) * 0.008
+    b = torch.randn(7168, 64, device=device, dtype=torch.bfloat16, generator=generator) * 0.0001
+
+    def project(value):
+        return torch.nn.functional.linear(torch.nn.functional.linear(value, a), b)
+
+    expected = torch.cat([project(sample) for sample in inputs.split(lengths)])
+    torch.testing.assert_close(project(inputs), expected, rtol=0, atol=0)
+    print(f"rank={torch.distributed.get_rank()}: H3 rank-64 variable-length LoRA GEMM parity: PASS", flush=True)
 
 
 def _setup_packed_models(device, mesh, sharded, backend):
@@ -456,10 +490,12 @@ def main() -> None:
                 from torch.distributed.device_mesh import init_device_mesh
 
                 mesh = init_device_mesh("cuda", (tp_size,))
-                for sharded in (False, True):
-                    _check_packed_nft(device, mesh, sharded, args.attn_backend)
-                    for task in ("t2va", "fl2va", "ref2va"):
-                        _check_packed_flow_grpo(device, mesh, sharded, args.attn_backend, task)
+                with _packed_matmul_context():
+                    _check_packed_lora_matmul(device)
+                    for sharded in (False, True):
+                        _check_packed_nft(device, mesh, sharded, args.attn_backend)
+                        for task in ("t2va", "fl2va", "ref2va"):
+                            _check_packed_flow_grpo(device, mesh, sharded, args.attn_backend, task)
                 torch.distributed.barrier()
                 if rank == 0:
                     print("MiniMax H3 packed forward + varlen backward + FSDP2: PASS", flush=True)

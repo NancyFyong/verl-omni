@@ -46,6 +46,7 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from verl_omni.pipelines.diffusion_rollout_output import with_rollout_data
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
+    configure_h3_deterministic_matmul,
     ref2va_reference_image_short_edge,
     serialize_ref_blocks,
     validate_ref2va_reference_image_short_edge,
@@ -97,6 +98,7 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         self._reference_image_short_edge = validate_ref2va_reference_image_short_edge()
+        configure_h3_deterministic_matmul()
         super().__init__(od_config=od_config, prefix=prefix)
         self.install_h3_lora_layout()
         self._flow_grpo_noise_level = 0.8
