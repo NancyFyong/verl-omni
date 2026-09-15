@@ -71,7 +71,7 @@ def test_ltx2_processor_files_use_text_tokenizer_path(tmp_path) -> None:
     assert result == str(tokenizer_dir)
 
 
-def test_ltx2_ti2va_default_dataset_forwards_image_without_hf_processor(tmp_path) -> None:
+def test_ltx2_ti2va_default_dataset_forwards_image_without_hf_processor(tmp_path, monkeypatch) -> None:
     image = Image.new("RGB", (56, 56), "red")
     image_path = tmp_path / "frame.png"
     image.save(image_path)
@@ -94,6 +94,12 @@ def test_ltx2_ti2va_default_dataset_forwards_image_without_hf_processor(tmp_path
     assert dataset.processor is None
     row = dataset[0]
     assert row["raw_negative_prompt"] == [{"role": "user", "content": ""}]
+    # Verl delegates image loading to the optional qwen-vl-utils package. Mock
+    # that external boundary so the base CPU test environment need not install
+    # the vllm-omni extra while this test still covers dataset-to-agent transport.
+    media_loader = AsyncMock(return_value=([image], None, None))
+    agent_dataset_cls = get_dataset_class(data_config)
+    monkeypatch.setattr(agent_dataset_cls, "process_multi_modal_info", media_loader)
     server = SimpleNamespace(
         generate=AsyncMock(
             return_value=SimpleNamespace(
@@ -109,7 +115,7 @@ def test_ltx2_ti2va_default_dataset_forwards_image_without_hf_processor(tmp_path
             server_manager=server,
             tokenizer=tokenizer,
             processor=None,
-            dataset_cls=get_dataset_class(data_config),
+            dataset_cls=agent_dataset_cls,
             data_config=SimpleNamespace(config=data_config),
         )
         await agent.run({}, **row)
@@ -117,6 +123,7 @@ def test_ltx2_ti2va_default_dataset_forwards_image_without_hf_processor(tmp_path
 
     asyncio.run(run())
 
+    media_loader.assert_awaited_once_with(row["raw_prompt"], image_patch_size=14, config=data_config)
     call = server.generate.await_args.kwargs
     assert len(call["image_data"]) == 1
     assert call["image_data"][0].tobytes() == image.tobytes()
