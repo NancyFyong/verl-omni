@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -36,12 +37,23 @@ class TinyAdapters(torch.nn.Module):
             {key: torch.nn.Parameter(torch.ones(2)) for key in ("default", "fake_score", "student_ema")}
         )
         self.peft_config = {key: LoraConfig(r=2) for key in self.adapters}
+        self.adapters_enabled = True
         self.set_adapter("default")
+
+    @property
+    def active_adapters(self):
+        return [self.active_adapter]
 
     def set_adapter(self, name):
         self.active_adapter = name
         for key, value in self.adapters.items():
             value.requires_grad_(key == name)
+
+    def disable_adapters(self):
+        self.adapters_enabled = False
+
+    def enable_adapters(self):
+        self.adapters_enabled = True
 
 
 def constant_schedule(step):
@@ -141,6 +153,47 @@ class TestDMDOptimizer:
         engine.role_parameters["fake_score"][0].grad = torch.ones(2)
         with pytest.raises(RuntimeError, match="Gradient leaked"):
             engine.optimizer_step()
+
+
+class TestDMDAdapterContext:
+    def test_nested_and_exception_contexts_restore_the_active_dmd_role(self):
+        engine = engine_shell()
+        engine.select_stage("fake_score")
+        with engine.use_adapter("student_ema"):
+            assert engine.module.active_adapter == "student_ema"
+            with pytest.raises(RuntimeError, match="boom"):
+                with engine.use_adapter("default"):
+                    raise RuntimeError("boom")
+            assert engine.module.active_adapter == "student_ema"
+        assert engine.module.active_adapter == "fake_score"
+
+    def test_reference_context_restores_the_active_dmd_role(self):
+        engine = engine_shell()
+        engine.select_stage("fake_score")
+        with engine.use_adapter("reference"):
+            assert not engine.module.adapters_enabled
+        assert engine.module.adapters_enabled
+        assert engine.module.active_adapter == "fake_score"
+
+
+class TestDMDExport:
+    def test_ema_export_uses_its_role_specific_peft_config(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(diffusers_impl, "get_device_id", cpu_device)
+        engine = engine_shell()
+        engine.module.peft_config["student_ema"] = LoraConfig(r=4)
+        engine.engine_config = SimpleNamespace(strategy="fsdp2")
+        engine.rank = 0
+        engine.get_per_tensor_param = MagicMock(
+            return_value=(iter([("transformer.adapter.weight", torch.ones(2))]), {"r": 2})
+        )
+        monkeypatch.setattr(torch.distributed, "barrier", MagicMock())
+
+        destination = tmp_path / "ema"
+        engine.export_student(destination, role="student_ema")
+
+        metadata = json.loads((destination / "adapter_config.json").read_text())
+        assert metadata["r"] == 4
+        engine.get_per_tensor_param.assert_called_once_with(base_sync_done=True, adapter_name="student_ema")
 
 
 class TestDMDAccumulation:

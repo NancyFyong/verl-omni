@@ -110,6 +110,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
     def __init__(self, config: TrainingWorkerConfig):
         Worker.__init__(self)
 
+        from verl.workers.engine import BaseEngine, EngineRegistry
+
         # TODO(jhz): Switch to `set_expandable_segments` when the torch_npu library
         # supports `torch.npu.memory._set_allocator_settings`
         if is_npu_available:
@@ -154,7 +156,14 @@ class TrainingWorker(Worker, DistProfilerExtension):
         )
 
         self.model_config.model_type = self.config.model_type
-        self.engine = self.build_engine()
+        self.engine: BaseEngine = EngineRegistry.new(
+            model_type=self.config.model_type,
+            backend=self.engine_config.strategy,
+            model_config=self.model_config,
+            engine_config=self.engine_config,
+            optimizer_config=self.optimizer_config,
+            checkpoint_config=self.checkpoint_config,
+        )
 
         # build dispatch info
         self._register_dispatch_collect_info(
@@ -165,12 +174,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         if getattr(self.model_config, "hf_config", None) is not None:
             self.flops_counter = FlopsCounter(self.model_config.hf_config)
-        elif self.config.model_type in (
-            "diffusion_model",
-            "diffusion_dpo_model",
-            "diffusion_nft_model",
-            "diffusion_dmd_model",
-        ):
+        elif self.config.model_type in ("diffusion_model", "diffusion_dpo_model", "diffusion_nft_model"):
             self.flops_counter = DiffusionFlopsCounter(
                 architecture=getattr(self.model_config, "architecture", None),
                 transformer_config=getattr(self.model_config, "transformer_config", None),
@@ -179,19 +183,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
             self.flops_counter = None
 
         self.loss_fn = None
-
-    def build_engine(self):
-        """Construct the engine while allowing specialized workers to pass typed settings."""
-        from verl.workers.engine import EngineRegistry
-
-        return EngineRegistry.new(
-            model_type=self.config.model_type,
-            backend=self.engine_config.strategy,
-            model_config=self.model_config,
-            engine_config=self.engine_config,
-            optimizer_config=self.optimizer_config,
-            checkpoint_config=self.checkpoint_config,
-        )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):
@@ -564,7 +555,7 @@ def build_teacher_training_config(
 
 
 class DMDTrainingWorker(TrainingWorker):
-    """Pass DMD settings into the engine without duplicating worker initialization."""
+    """Own DMD worker construction without changing the generic worker lifecycle."""
 
     def __init__(self, config, *, dmd_config, role="actor", distillation_config=None):
         if role != "actor" or (distillation_config is not None and distillation_config.get("enabled", False)):
@@ -585,16 +576,52 @@ class DMDTrainingWorker(TrainingWorker):
             checkpoint_config=self.actor_config.checkpoint,
             profiler_config=profiler,
         )
-        super().__init__(worker_config)
-        self.loss_fn = partial(diffusion_loss, config=self.actor_config)
 
-    def build_engine(self):
-        """Use the registry with one additional typed DMD configuration."""
-        from verl.workers.engine import EngineRegistry
+        Worker.__init__(self)
+
+        from verl.workers.engine import BaseEngine, EngineRegistry
 
         from verl_omni.workers.engine.fsdp import diffusers_impl  # noqa: F401
 
-        return EngineRegistry.new(
+        if is_npu_available:
+            os.environ["PYTORCH_NPU_ALLOC_CONF"] = "expandable_segments:True"
+
+        initialize_global_process_group_ray(timeout_second=None)
+        set_numa_affinity()
+
+        self.config = worker_config
+        self.model_config = self.config.model_config
+        self.engine_config = self.config.engine_config
+        self.optimizer_config = self.config.optimizer_config
+        self.checkpoint_config = self.config.checkpoint_config
+        self.device_name = get_device_name()
+
+        if self.engine_config is None:
+            assert self.optimizer_config is None
+            if self.config.auto_select_engine_optim_fn is None:
+                raise ValueError(
+                    "engine_config is not provided and auto_select_engine_optim_fn is not set. "
+                    "Cannot determine engine backend."
+                )
+            self.engine_config, self.optimizer_config = self.config.auto_select_engine_optim_fn(
+                self.model_config, self.device_name
+            )
+
+        self.engine_config.use_remove_padding = self.model_config.get("use_remove_padding", False)
+        self.engine_config.use_fused_kernels = self.model_config.get("use_fused_kernels", False)
+
+        self.profiler_config = self.config.profiler_config
+        if self.profiler_config is not None:
+            self.profiler_tool_config = self.profiler_config.tool_config.get(self.profiler_config.tool, {})
+        else:
+            self.profiler_tool_config = None
+
+        DistProfilerExtension.__init__(
+            self, DistProfiler(rank=self.rank, config=self.profiler_config, tool_config=self.profiler_tool_config)
+        )
+
+        self.model_config.model_type = self.config.model_type
+        self.engine: BaseEngine = EngineRegistry.new(
             model_type=self.config.model_type,
             backend=self.engine_config.strategy,
             model_config=self.model_config,
@@ -603,6 +630,16 @@ class DMDTrainingWorker(TrainingWorker):
             checkpoint_config=self.checkpoint_config,
             dmd_config=self.dmd_config,
         )
+        self._register_dispatch_collect_info(
+            mesh_name="train",
+            dp_rank=self.engine.get_data_parallel_rank(),
+            is_collect=self.engine.is_mp_src_rank_with_outputs(),
+        )
+        self.flops_counter = DiffusionFlopsCounter(
+            architecture=getattr(self.model_config, "architecture", None),
+            transformer_config=getattr(self.model_config, "transformer_config", None),
+        )
+        self.loss_fn = partial(diffusion_loss, config=self.actor_config)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):

@@ -21,7 +21,7 @@ import os
 import time
 import warnings
 from abc import ABC, abstractmethod
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from pathlib import Path
 from typing import Callable, Optional
@@ -685,8 +685,13 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         """
         self.optimizer.zero_grad()
 
-    def clip_grad_norm(self):
-        """Clip gradients using the active FSDP strategy and return the global norm."""
+    def optimizer_step(self):
+        """
+        Clip gradients, skip update if non-finite, and step optimizer.
+
+        Returns:
+            grad_norm (float): Norm of gradients before clipping.
+        """
         assert self.optimizer_config.clip_grad is not None
 
         if isinstance(self.module, FSDP):
@@ -701,11 +706,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         if isinstance(grad_norm, DTensor):
             grad_norm = grad_norm.full_tensor()
 
-        return grad_norm
-
-    def optimizer_step(self):
-        """Clip gradients and step the optimizer only when the norm is finite."""
-        grad_norm = self.clip_grad_norm()
+        # if grad_norm is not finite, skip the update
         if not torch.isfinite(grad_norm):
             print(f"WARN: grad_norm is not finite: {grad_norm}")
             self.optimizer.zero_grad()
@@ -817,21 +818,15 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
         if hasattr(peft_model, "peft_config"):  # LoRA
             if not merge_lora:
-                resolved_adapter = adapter_name or "default"
-                peft_config = peft_model.peft_config.get(resolved_adapter, None)
-                if peft_config is None:
-                    raise ValueError(
-                        f"Cannot export unknown LoRA adapter {resolved_adapter!r}; "
-                        f"available adapters: {sorted(peft_model.peft_config)}."
-                    )
-                adapter_ctx = self.use_adapter(resolved_adapter)
+                peft_config = peft_model.peft_config.get("default", None)
+                adapter_ctx = self.use_adapter(adapter_name) if adapter_name is not None else nullcontext()
                 with adapter_ctx:
                     params = collect_lora_params(
                         module=self.module,
                         layered_summon=layered_summon,
                         base_sync_done=base_sync_done,
                         is_diffusers=True,
-                        adapter_name=resolved_adapter,
+                        adapter_name=adapter_name or "default",
                         layer_prefixes=self.model_config.fsdp_layer_prefixes,
                     )
             else:  # merge lora
@@ -1492,6 +1487,34 @@ class DMDDiffusersFSDPEngine(DiffusersFSDPEngine):
     }
     stream_offsets = {"initial_noise": 0, "rollout_decision": 1, "score_sigma": 3, "score_noise": 4}
 
+    def selected_adapter(self):
+        """Return the single active adapter so DMD contexts can restore their own role."""
+        module = getattr(self.module, "_fsdp_wrapped_module", self.module)
+        active = getattr(module, "active_adapters", None)
+        if callable(active):
+            active = active()
+        if active is None:
+            active = getattr(module, "active_adapter", None)
+        if isinstance(active, list | tuple):
+            if len(active) != 1:
+                raise ValueError(f"DMD2 requires one active adapter, got {active!r}.")
+            active = active[0]
+        return active or "default"
+
+    @contextmanager
+    def use_adapter(self, name):
+        """Switch one DMD role and restore the previously active role on exit."""
+        previous = self.selected_adapter()
+        if name == "reference":
+            with self.disable_adapter():
+                yield
+            return
+        self._set_adapter(name)
+        try:
+            yield
+        finally:
+            self._set_adapter(previous)
+
     def __init__(self, model_config, engine_config, optimizer_config, checkpoint_config, *, dmd_config):
         if model_config.lora_rank <= 0:
             raise ValueError("The DMD2 MVP requires LoRA; full-module training is not enabled.")
@@ -1790,12 +1813,25 @@ class DMDDiffusersFSDPEngine(DiffusersFSDPEngine):
         metrics["perf/max_memory_reserved_gib"] = Metric("max", device.max_memory_reserved() / 1024**3)
         return {"loss": losses, "metrics": metrics, "model_output": {}}
 
+    def clip_dmd_grad_norm(self):
+        """Clip DMD-owned gradients without changing the generic engine optimizer path."""
+        assert self.optimizer_config.clip_grad is not None
+        if isinstance(self.module, FSDP):
+            grad_norm = self.module.clip_grad_norm_(self.optimizer_config.clip_grad)
+        elif isinstance(self.module, FSDPModule):
+            grad_norm = fsdp2_clip_grad_norm_(self.module.parameters(), max_norm=self.optimizer_config.clip_grad)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.module.parameters(), max_norm=self.optimizer_config.clip_grad
+            )
+        return grad_norm.full_tensor() if isinstance(grad_norm, DTensor) else grad_norm
+
     def optimizer_step(self):
         """Agree on numerical skips before stepping, and update only the owning scheduler/EMA."""
         for stage, parameters in self.role_parameters.items():
             if stage != self.active_stage and any(parameter.grad is not None for parameter in parameters):
                 raise RuntimeError(f"Gradient leaked into inactive DMD2 role {stage}.")
-        norm = float(self.clip_grad_norm())
+        norm = float(self.clip_dmd_grad_norm())
         finite = torch.tensor(int(math.isfinite(norm) and self.forward_finite), device=get_device_id())
         torch.distributed.all_reduce(finite, op=torch.distributed.ReduceOp.MIN)
         self.last_step_succeeded = bool(finite.item())
@@ -1872,7 +1908,12 @@ class DMDDiffusersFSDPEngine(DiffusersFSDPEngine):
             )
         if self.engine_config.strategy == "fsdp":
             torch.distributed.all_reduce(expected)
-        tensors, peft_config = self.get_per_tensor_param(base_sync_done=True, adapter_name=adapter)
+        tensors, _ = self.get_per_tensor_param(base_sync_done=True, adapter_name=adapter)
+        peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
+        selected_config = getattr(peft_model, "peft_config", {}).get(adapter)
+        if selected_config is None:
+            raise ValueError(f"Missing PEFT configuration for DMD2 export role {role!r}.")
+        peft_config = selected_config.to_dict()
         state = {name.removeprefix("transformer."): value.detach().cpu().contiguous() for name, value in tensors}
         if sum(value.numel() for value in state.values()) != int(expected.item()):
             raise ValueError("Incomplete LoRA export: fsdp_layer_prefixes must cover every selected adapter parameter.")
