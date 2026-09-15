@@ -239,10 +239,10 @@ def _portable_config(config: dict) -> dict:
     return result
 
 
-def _transformer_schema(base: Path, source: Path, architecture: str):
+def _transformer_schema(base: Path, source_config_path: Path, architecture: str):
     cls = _transformer_class(architecture)
     base_config = read_json(base / "config.json")
-    source_config = read_json(source / "huggingface/config.json")
+    source_config = read_json(source_config_path)
     fields = set(inspect.signature(cls.__init__).parameters) - {"self"}
     for config in (base_config, source_config):
         if config.get("_class_name") != cls.__name__:
@@ -282,10 +282,10 @@ def _read_weight(mapping: Mapping[str, Path], key: str) -> torch.Tensor:
         return archive.get_tensor(key)
 
 
-def _h3_source_schema(source: Path, native_root: Path):
+def _h3_source_schema(source_config_path: Path, native_root: Path):
     """Validate equivalent Diffusers/native H3 configs and derive both tensor schemas."""
     cls = _transformer_class("MiniMaxH3Pipeline")
-    source_config = read_json(source / "huggingface/config.json")
+    source_config = read_json(source_config_path)
     native_config = read_json(native_root / "config.json")
     if source_config.get("_class_name") != cls.__name__ or native_config.get("_class_name") != _H3_NATIVE_CLASS:
         raise ValueError("MiniMax H3 requires a Diffusers actor config and native MiniMaxH3DiTModel base")
@@ -550,9 +550,22 @@ class FSDPModelMerger(BaseModelMerger):
                     raise ValueError(f"MiniMax H3 native tensor shape mismatch: {target}")
                 yield target, value
 
-    def merge_and_save(self) -> MergeResult:
+    def merge_and_save(self) -> MergeResult | dict:
+        if self.config.operation == "test":
+            from .output_validation import validate_artifact
+
+            if not self.config.test_hf_dir:
+                raise ValueError("test operation requires test_hf_dir")
+            return validate_artifact(self.config.test_hf_dir)
+        if not self.config.local_dir or not self.config.base_model or not self.config.target_dir:
+            raise ValueError("merge operation requires local_dir, base_model and target_dir")
+        if not self.config.hf_model_config_path:
+            raise ValueError("merge operation requires hf_model_config_path")
         source = Path(self.config.local_dir).resolve(strict=True)
         base = Path(self.config.base_model).resolve(strict=True)
+        source_config_path = Path(self.config.hf_model_config_path).resolve(strict=True) / "config.json"
+        if not source_config_path.is_file():
+            raise FileNotFoundError(source_config_path)
         raw_target = Path(self.config.target_dir)
         if os.path.lexists(raw_target):
             raise FileExistsError(raw_target)
@@ -564,12 +577,17 @@ class FSDPModelMerger(BaseModelMerger):
             for right in roots[i + 1 :]:
                 if left.is_relative_to(right) or right.is_relative_to(left):
                     raise ValueError("Source, base and target directories must not overlap")
+        config_root = source_config_path.parent
+        if source_config_path.is_relative_to(base):
+            raise ValueError("Actor hf_model_config_path must not come from the base model")
+        if target.is_relative_to(config_root) or config_root.is_relative_to(target):
+            raise ValueError("Actor config and target directories must not overlap")
         if (source / "merge_source.json").exists():
             raise ValueError("Save-time merge_source schemas are not supported by this initial exporter")
         if (source / "lora_train_meta.json").exists():
             raise ValueError("LoRA checkpoint metadata requires the future adapter export mode")
 
-        source_files = model_rank_files(source) + [source / "fsdp_config.json", source / "huggingface/config.json"]
+        source_files = model_rank_files(source) + [source / "fsdp_config.json"]
         index_path = base / "model_index.json"
         index = read_json(index_path) if index_path.is_file() else None
         pipeline_output = self.config.output_format == "pipeline"
@@ -598,13 +616,14 @@ class FSDPModelMerger(BaseModelMerger):
             if index is not None:
                 base_files.append(index_path)
         source_inventory = inventory(source, source_files)
+        source_config_inventory = inventory(source_config_path.parent, [source_config_path])
         base_inventory = inventory(base, base_files)
 
         native_weight_name = None
         if native_h3:
             _check_h3_pipeline(base)
             source_shapes, keep_fp32, source_config, native_mapping, native_shapes = _h3_source_schema(
-                source, model_root
+                source_config_path, model_root
             )
             raw_weights = self.iter_h3_native_weights(source_shapes, source_config, native_mapping, native_shapes)
             trained_weight_files = set(native_mapping.values())
@@ -612,7 +631,7 @@ class FSDPModelMerger(BaseModelMerger):
         else:
             if pipeline_output:
                 _check_pipeline(base, architecture, component)
-            source_shapes, keep_fp32 = _transformer_schema(model_root, source, architecture)
+            source_shapes, keep_fp32 = _transformer_schema(model_root, source_config_path, architecture)
             raw_weights = self.iter_merged_weights(source_shapes)
             trained_weight_files = set(weight_files(model_root).values())
 
@@ -665,12 +684,13 @@ class FSDPModelMerger(BaseModelMerger):
                     raise ValueError(f"Copied base asset verification failed: {name}")
             if (
                 inventory(source, source_files) != source_inventory
+                or inventory(source_config_path.parent, [source_config_path]) != source_config_inventory
                 or inventory(base, tree_files(base) if pipeline_output else base_files) != base_inventory
                 or read_json(model_root / "config.json") != component_config
                 or (index is not None and read_json(index_path) != index)
             ):
                 raise ValueError("Source/base inputs changed during export")
-            if model_rank_files(source) != source_files[:-2]:
+            if model_rank_files(source) != source_files[:-1]:
                 raise ValueError("Model rank inventory changed during export")
             import diffusers
 
@@ -688,9 +708,15 @@ class FSDPModelMerger(BaseModelMerger):
                 "tensor_directory": tensor_directory,
                 "dtype": self.config.dtype,
                 "max_shard_size_bytes": self.config.max_shard_size,
-                "source_fingerprint": fingerprint(source_inventory),
+                "source_fingerprint": fingerprint(
+                    source_inventory | {"huggingface/config.json": next(iter(source_config_inventory.values()))}
+                ),
                 "base_fingerprint": fingerprint(base_inventory),
                 "source_files": source_inventory,
+                "source_model_config": {
+                    "sha256": next(iter(source_config_inventory.values())),
+                    "logical_path": "huggingface/config.json",
+                },
                 "base_files": base_inventory,
                 "files": output_inventory,
                 "tensors": specs,
@@ -708,4 +734,6 @@ class FSDPModelMerger(BaseModelMerger):
             from .output_validation import validate_artifact
 
             validate_artifact(staging)
-        return MergeResult(target, target / MANIFEST_NAME)
+        result = MergeResult(target, target / MANIFEST_NAME)
+        self.upload_to_huggingface(result.output_dir)
+        return result

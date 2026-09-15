@@ -26,8 +26,8 @@ registered in the repository, independently of the training algorithm:
 | MiniMax H3 | MiniMaxH3Transformer3DModel | Yes | Yes, converted to the native fused H3 package |
 | Boogu-Image | BooguImageTransformer2DModel (`boogu-image`) | Yes | Yes, through the canonical external pipeline |
 
-`--output-format transformer` writes a standalone component loadable with its
-canonical class's `from_pretrained()`. `--output-format pipeline` (default)
+`--output_format transformer` writes a standalone component loadable with its
+canonical class's `from_pretrained()`. `--output_format pipeline` (default)
 replaces the selected complete transformer and preserves all other base
 components and assets. Missing actor parameters are **never** filled from the base.
 
@@ -103,20 +103,23 @@ python -m verl_omni.model_merge merge \
   --backend fsdp \
   --local_dir "$ACTOR_CHECKPOINT" \
   --target_dir "$OUTPUT" \
-  --base-model "$BASE_PIPELINE" \
+  --base_model "$BASE_PIPELINE" \
   --trust-checkpoint
 
-python -m verl_omni.model_merge validate --target_dir "$OUTPUT"
+python -m verl_omni.model_merge test \
+  --backend fsdp \
+  --test_hf_dir "$OUTPUT"
 ```
 
 For a standalone Diffusers component:
 
 ```bash
 python -m verl_omni.model_merge merge \
+  --backend fsdp \
   --local_dir "$ACTOR_CHECKPOINT" \
   --target_dir "$OUTPUT" \
-  --base-model "$DIFFUSERS_TRANSFORMER" \
-  --output-format transformer \
+  --base_model "$DIFFUSERS_TRANSFORMER" \
+  --output_format transformer \
   --trust-checkpoint
 ```
 
@@ -138,15 +141,16 @@ a separately trained `transformer_2` will require authoritative component
 metadata in the checkpoint; one actor checkpoint is never duplicated into both
 slots.
 
-For a complete native MiniMax H3 package, point `--base-model` at the
+For a complete native MiniMax H3 package, point `--base_model` at the
 T2VA/FL2VA/Ref2VA pipeline directory and explicitly trust its local component
 code:
 
 ```bash
 python -m verl_omni.model_merge merge \
+  --backend fsdp \
   --local_dir "$ACTOR_CHECKPOINT" \
   --target_dir "$OUTPUT" \
-  --base-model "$MINIMAX_H3_PIPELINE" \
+  --base_model "$MINIMAX_H3_PIPELINE" \
   --trust-checkpoint \
   --trust-remote-code
 ```
@@ -158,6 +162,8 @@ matching use the same publisher when they save the same complete transformer.
 from verl_omni.model_merge import ModelMergerConfig, merge_model, validate_artifact
 
 result = merge_model(ModelMergerConfig(
+    operation="merge",
+    backend="fsdp",
     local_dir=checkpoint_dir,
     target_dir=output_dir,
     base_model=base_pipeline_dir,
@@ -166,12 +172,18 @@ result = merge_model(ModelMergerConfig(
 validate_artifact(result.output_dir)
 ```
 
+The actor configuration defaults to `<local_dir>/huggingface`; use
+`--hf_model_config_path` to select another local Hugging Face config directory.
+`--hf_upload_path ORG/REPO` uploads a successfully published artifact, and
+`--private` requests a private repository. Upload happens only after local
+publication and validation; an upload failure does not delete the local artifact.
+
 The default dtype is **preserve**. `--dtype float32`, `float16` or `bfloat16`
 explicitly casts checkpoint-derived floating tensors, except declared fp32
 islands. Integer/bool buffers and copied frozen base weights are never cast.
 Non-finite source values and overflow during casting fail export.
 
-`--max-shard-size` is an output safetensors accumulation budget **in bytes**
+`--max_shard_size` is an output safetensors accumulation budget **in bytes**
 (default 2 GiB). An individual larger tensor gets its own shard. Rank archives
 are mmap-loaded on CPU and tensors are reconstructed one at a time; this avoids
 retaining a complete merged transformer, but it is **not a hard RSS limit**.
@@ -199,8 +211,10 @@ Known location-only config metadata (`_name_or_path`, `name_or_path`) is removed
 with a recorded deterministic transform. No source directory is recorded in the
 manifest. SHA256 validates consistency, not publisher authenticity.
 
-`validate` checks the published files, checksums, tensor metadata and index
-without loading source rank checkpoints. It does not rerun training or certify
+The verl-style `test --test_hf_dir` operation checks published files, checksums,
+tensor metadata and indexes without loading source rank checkpoints. The Python
+helper remains named `validate_artifact()` because that is its precise action.
+It does not rerun training or certify
 past source round-trip claims if the artifact and manifest are both replaced.
 
 Publication uses an exclusive lock and owned sibling staging. Linux

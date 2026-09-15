@@ -142,9 +142,11 @@ def _h3_pipeline_case(tmp_path):
     torch.save(model.state_dict(), source / "model_world_size_1_rank_0.pt")
     write_json(source / "fsdp_config.json", {"FSDP_version": 2, "world_size": 1})
     return ModelMergerConfig(
-        str(source),
-        str(tmp_path / "output"),
-        str(base),
+        operation="merge",
+        backend="fsdp",
+        local_dir=str(source),
+        target_dir=str(tmp_path / "output"),
+        base_model=str(base),
         output_format="pipeline",
         max_shard_size=4096,
         trust_checkpoint=True,
@@ -173,9 +175,11 @@ def _case(tmp_path, architecture, pipeline=False, dual_wan=False):
     torch.save(model.state_dict(), source / "model_world_size_1_rank_0.pt")
     write_json(source / "fsdp_config.json", {"FSDP_version": 2, "world_size": 1})
     return ModelMergerConfig(
-        str(source),
-        str(tmp_path / "output"),
-        str(base),
+        operation="merge",
+        backend="fsdp",
+        local_dir=str(source),
+        target_dir=str(tmp_path / "output"),
+        base_model=str(base),
         output_format="pipeline" if pipeline else "transformer",
         max_shard_size=4096,
         trust_checkpoint=True,

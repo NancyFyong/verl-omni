@@ -32,28 +32,33 @@ from tokenizers.pre_tokenizers import ByteLevel
 from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer
 
 from verl_omni.model_merge import ModelMergerConfig, merge_model, utils, validate_artifact
-from verl_omni.model_merge.base_model_merger import generate_config_from_args, parse_args
+from verl_omni.model_merge.base_model_merger import generate_config_from_args, parse_args, run_model_merger
 from verl_omni.model_merge.fsdp_model_merger import model_rank_files, reconstruct_tensor
 
 
-def test_cli_common_arguments_live_in_base_model_merger(monkeypatch, tmp_path):
+def test_cli_common_arguments_live_in_base_model_merger(monkeypatch):
     monkeypatch.setattr(
         sys,
         "argv",
         [
             "model_merge",
             "merge",
+            "--backend",
+            "fsdp",
             "--local_dir",
             "actor",
             "--target_dir",
             "output",
-            "--base-model",
+            "--base_model",
             "base",
             "--trust-checkpoint",
         ],
     )
     config = generate_config_from_args(parse_args())
+    assert config.operation == "merge" and config.backend == "fsdp"
     assert config.local_dir == "actor" and config.base_model == "base"
+    assert config.hf_model_config_path == str(Path("actor/huggingface"))
+    assert config.target_dir == "output" and not config.hf_upload
     assert not hasattr(config, "architecture") and not hasattr(config, "component")
 
 
@@ -126,7 +131,14 @@ def case(tmp_path, base_pipeline):
     state = model.state_dict()
     torch.save(state, source / "model_world_size_1_rank_0.pt")
     utils.write_json(source / "fsdp_config.json", {"world_size": 1, "FSDP_version": 2})
-    config = ModelMergerConfig(str(source), str(tmp_path / "output"), str(base_pipeline), trust_checkpoint=True)
+    config = ModelMergerConfig(
+        operation="merge",
+        backend="fsdp",
+        local_dir=str(source),
+        target_dir=str(tmp_path / "output"),
+        base_model=str(base_pipeline),
+        trust_checkpoint=True,
+    )
     return config, state, model
 
 
@@ -166,6 +178,75 @@ def test_full_pipeline_round_trip_and_forward(case, budget):
             assert (result.output_dir / name / path.relative_to(root)).read_bytes() == path.read_bytes()
     assert (result.output_dir / "LICENSE").read_bytes() == (Path(config.base_model) / "LICENSE").read_bytes()
     assert not list(result.output_dir.parent.glob(".output.merge*"))
+
+
+def test_verl_style_test_operation(case):
+    config, _, _ = case
+    result = merge_model(config)
+    test_config = ModelMergerConfig(
+        operation="test",
+        backend="fsdp",
+        test_hf_dir=str(result.output_dir),
+        hf_upload_path="ignored/repository",
+        private=True,
+    )
+    assert test_config.target_dir is None and test_config.hf_upload_path is None
+    assert not test_config.private and not test_config.hf_upload
+    manifest = run_model_merger(test_config)
+    assert isinstance(manifest, dict) and manifest["verification"]["integrity"] == "passed"
+
+
+def test_explicit_hf_model_config_path(case, tmp_path):
+    config, _, _ = case
+    original = Path(config.hf_model_config_path) / "config.json"
+    override = tmp_path / "actor-config"
+    override.mkdir()
+    (override / "config.json").write_bytes(original.read_bytes())
+    original.unlink()
+    result = merge_model(
+        replace(
+            config,
+            target_dir=str(tmp_path / "override-output"),
+            hf_model_config_path=str(override),
+        )
+    )
+    assert validate_artifact(result.output_dir)["verification"]["integrity"] == "passed"
+
+
+def test_huggingface_upload_uses_verl_style_config(case, tmp_path, monkeypatch):
+    config, _, _ = case
+    calls = []
+
+    class FakeApi:
+        def create_repo(self, **kwargs):
+            calls.append(("create_repo", kwargs))
+
+        def upload_folder(self, **kwargs):
+            calls.append(("upload_folder", kwargs))
+
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
+    result = merge_model(
+        replace(
+            config,
+            target_dir=str(tmp_path / "upload-output"),
+            hf_upload_path="organization/model",
+            private=True,
+        )
+    )
+    assert result.output_dir.is_dir()
+    assert calls == [
+        ("create_repo", {"repo_id": "organization/model", "private": True, "exist_ok": True}),
+        (
+            "upload_folder",
+            {
+                "folder_path": str(result.output_dir),
+                "repo_id": "organization/model",
+                "repo_type": "model",
+            },
+        ),
+    ]
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16", "float16"])
@@ -357,16 +438,19 @@ def test_real_cli_cpu_startup_and_export(case):
         timeout=120,
     )
     assert generated.returncode == 0, generated.stdout + generated.stderr
+    assert config.local_dir and config.target_dir and config.base_model
     command = [sys.executable, "-m", "verl_omni.model_merge"]
     run = subprocess.run(
         command
         + [
             "merge",
+            "--backend",
+            "fsdp",
             "--local_dir",
             config.local_dir,
             "--target_dir",
             config.target_dir,
-            "--base-model",
+            "--base_model",
             config.base_model,
             "--trust-checkpoint",
         ],
@@ -378,9 +462,9 @@ def test_real_cli_cpu_startup_and_export(case):
     )
     assert run.returncode == 0, run.stdout + run.stderr
     assert Path(config.target_dir, utils.MANIFEST_NAME).is_file()
-    # Validate with the actual CLI, not a test-only import bypass.
+    # Test with the actual verl-style CLI, not a test-only import bypass.
     run = subprocess.run(
-        command + ["validate", "--target_dir", config.target_dir],
+        command + ["test", "--backend", "fsdp", "--test_hf_dir", config.target_dir],
         env=env,
         cwd=root,
         capture_output=True,

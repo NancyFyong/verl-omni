@@ -15,30 +15,18 @@
 
 import json
 
-from .base_model_merger import generate_config_from_args, parse_args
-from .output_validation import validate_artifact
+from .base_model_merger import MergeResult, generate_config_from_args, parse_args, run_model_merger
 
 
 def main() -> None:
-    """Dispatch merge or portable validation from the shared CLI."""
-    args = parse_args()
-    if args.operation == "validate":
-        manifest = validate_artifact(args.target_dir)
-        print(json.dumps({"integrity": "passed", "architecture": manifest["architecture"]}))
-        return
-
-    config = generate_config_from_args(args)
-    if config.backend == "fsdp":
-        from .fsdp_model_merger import FSDPModelMerger
-
-        merger = FSDPModelMerger(config)
-    else:  # pragma: no cover - argparse and ModelMergerConfig both reject this.
-        raise NotImplementedError(f"Unknown backend: {config.backend}")
-    try:
-        result = merger.merge_and_save()
-    finally:
-        merger.cleanup()
-    print(json.dumps({"output_dir": str(result.output_dir), "manifest_path": str(result.manifest_path)}))
+    """Parse one operation, run its backend merger, and print the result."""
+    config = generate_config_from_args(parse_args())
+    result = run_model_merger(config)
+    if isinstance(result, MergeResult):
+        output = {"output_dir": str(result.output_dir), "manifest_path": str(result.manifest_path)}
+    else:
+        output = {"integrity": "passed", "architecture": result["architecture"]}
+    print(json.dumps(output))
 
 
 if __name__ == "__main__":
