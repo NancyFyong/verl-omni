@@ -38,7 +38,6 @@ from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 from .common import (
     AUDIO_ROW_WIDTH,
     MiniMaxH3RolloutWeightSyncMixin,
-    configure_h3_deterministic_matmul,
     pack_video_audio_rows,
     ref2va_reference_image_short_edge,
     serialize_ref_blocks,
@@ -63,7 +62,6 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
 
     def __init__(self, *, od_config: Any, prefix: str = "") -> None:
         self._reference_image_short_edge = validate_ref2va_reference_image_short_edge()
-        configure_h3_deterministic_matmul()
         super().__init__(od_config=od_config, prefix=prefix)
         if hasattr(self, "set_progress_bar_config"):
             self.set_progress_bar_config(disable=True)

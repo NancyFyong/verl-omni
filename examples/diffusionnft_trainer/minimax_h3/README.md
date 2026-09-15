@@ -401,12 +401,13 @@ actor_rollout_ref.ref.fsdp_config.full_determinism=true \
 actor_rollout_ref.rollout.full_determinism=true
 ```
 
-H3 then uses cuBLASLt without BF16 reduced-precision reductions or split-K in the
-actor/ref and rollout workers. This requires PyTorch's cuBLASLt split-K control.
-The flags also enable the existing seed, NCCL and cuDNN determinism controls;
-they are not a GEMM-only performance switch. Defaults remain unchanged. Use
-matching settings when comparing actor and rollout; this does not guarantee
-bitwise-identical policies across their different implementations.
+Deterministic execution also makes BF16 GEMM reductions batch-shape invariant,
+so packed and per-sample execution agree; verl's determinism helper already
+provides this through its cuBLAS workspace configuration. The flags further
+enable the existing seed, NCCL and cuDNN determinism controls, so they are not a
+GEMM-only switch. Defaults remain unchanged. Use matching settings when comparing
+actor and rollout; this does not guarantee bitwise-identical policies across
+their different implementations.
 
 The packer preserves sample-local positions, noise timesteps, reference rows and
 per-sample loss weighting. Both the main DiT and text token-refiner have independent

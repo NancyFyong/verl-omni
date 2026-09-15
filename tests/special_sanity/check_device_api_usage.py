@@ -31,7 +31,6 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "verl_omni/pipelines/qwen_image_flow_grpo/diffusers_training_adapter.py",  # docstring only
     "verl_omni/utils/mfu/diffusion_flops_counter.py",  # comment only
     "verl_omni/utils/diffusion_attention.py",  # CUDA-only by design: FA3 capability probe
-    "verl_omni/pipelines/minimax_h3_diffusion_nft/common.py",  # CUDA-only by design: cuBLAS GEMM reductions
     "verl_omni/utils/reward_score/hpsv3_reward.py",  # TODO: port to verl.utils.device
     "verl_omni/utils/reward_score/pickscore_reward.py",  # TODO: port to verl.utils.device
 ]

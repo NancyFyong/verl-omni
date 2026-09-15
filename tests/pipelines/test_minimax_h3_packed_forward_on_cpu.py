@@ -241,54 +241,6 @@ def test_unavailable_fa3_fails_instead_of_falling_back(monkeypatch):
     assert packed.transformer_blocks[0].attn.processor._attention_backend == "native"
 
 
-def test_packed_actor_configures_math_even_after_installation(monkeypatch):
-    from verl_omni.pipelines.minimax_h3_diffusion_nft import diffusers_training_adapter as adapter
-
-    _, model = _models(install_packed=False)
-    calls = []
-    monkeypatch.setattr(adapter, "configure_h3_deterministic_matmul", lambda: calls.append("math"))
-    enable_packed_forward(model)
-    enable_packed_forward(model)
-    assert calls == ["math", "math"]
-
-
-@pytest.mark.parametrize("algorithm", ["diffusion_nft", "flow_grpo"])
-def test_h3_rollout_configures_math_before_model_loading(monkeypatch, algorithm):
-    import importlib
-
-    adapter = importlib.import_module(f"verl_omni.pipelines.minimax_h3_{algorithm}.vllm_omni_rollout_adapter")
-    cls = (
-        adapter.MiniMaxH3DiffusionNFTPipeline if algorithm == "diffusion_nft" else adapter.MiniMaxH3PipelineWithLogProb
-    )
-    calls = []
-    monkeypatch.setattr(adapter, "configure_h3_deterministic_matmul", lambda: calls.append("math"))
-
-    def load(self, **kwargs):
-        torch.nn.Module.__init__(self)
-        calls.append("load")
-
-    monkeypatch.setattr(adapter.MiniMaxH3Pipeline, "__init__", load)
-    method = "_install_lora_layout" if algorithm == "diffusion_nft" else "install_h3_lora_layout"
-    monkeypatch.setattr(cls, method, lambda self: None)
-    monkeypatch.setattr(cls, "set_progress_bar_config", lambda self, **kwargs: None, raising=False)
-    cls(od_config=SimpleNamespace())
-    assert calls == ["math", "load"]
-
-
-@pytest.mark.parametrize("enabled,cuda", [(False, True), (True, False), (True, True)])
-def test_h3_deterministic_matmul_is_opt_in(monkeypatch, enabled, cuda):
-    from verl_omni.pipelines.minimax_h3_diffusion_nft import common
-
-    calls = []
-    matmul = SimpleNamespace(allow_bf16_reduced_precision_reduction=True)
-    monkeypatch.setattr(common, "is_cuda_available", cuda, raising=False)
-    monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: enabled)
-    monkeypatch.setattr(torch.backends, "cuda", SimpleNamespace(preferred_blas_library=calls.append, matmul=matmul))
-    common.configure_h3_deterministic_matmul()
-    assert calls == (["cublaslt"] if enabled and cuda else [])
-    assert matmul.allow_bf16_reduced_precision_reduction == ((False, False) if enabled and cuda else True)
-
-
 @pytest.mark.parametrize("fail", [False, True])
 def test_packed_numerical_matmul_settings_are_scoped(monkeypatch, fail):
     from tests.special_e2e.minimax_h3_lora_sync_tp2 import _packed_matmul_context

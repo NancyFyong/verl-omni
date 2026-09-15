@@ -23,7 +23,6 @@ from typing import Any
 
 import numpy as np
 import torch
-from verl.utils.device import is_cuda_available
 
 VIDEO_ROW_WIDTH = 96
 AUDIO_ROW_WIDTH = 32
@@ -55,7 +54,6 @@ __all__ = [
     "h3_dit_timestep",
     "h3_velocity_to_flow_match",
     "prepare_h3_processor_files",
-    "configure_h3_deterministic_matmul",
     "ref2va_reference_image_short_edge",
     "validate_ref2va_reference_image_short_edge",
     "keyframe_indices_to_anchors",
@@ -69,14 +67,6 @@ __all__ = [
 
 
 MINIMAX_H3_TOKEN_ID_NATIVE_KEY = "minimax_h3_token_id_native"
-
-
-def configure_h3_deterministic_matmul() -> None:
-    """Use stable CUDA GEMM reductions in explicitly deterministic H3 workers."""
-    if not is_cuda_available or not torch.are_deterministic_algorithms_enabled():
-        return
-    torch.backends.cuda.preferred_blas_library("cublaslt")
-    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = (False, False)
 
 
 def validate_ref2va_reference_image_short_edge(value: int | str | None = None) -> int:
