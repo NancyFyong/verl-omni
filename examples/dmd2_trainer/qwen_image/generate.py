@@ -29,9 +29,10 @@ from verl_omni.pipelines.qwen_image_dmd2.diffusers_training_adapter import (
     QwenImageDMD2,
     build_qwen_dmd_sigmas,
     load_qwen_dmd2_adapter,
+    qwen_dmd2_base_provenance,
 )
 from verl_omni.trainer.diffusion.distillation.utils import ode_euler_step
-from verl_omni.utils.fs import diffusion_model_provenance, resolve_model_local_dir
+from verl_omni.utils.fs import resolve_model_local_dir
 
 
 @torch.inference_mode()
@@ -48,7 +49,7 @@ def generate(artifact, prompt, seed, base_model=None, device=None):
             raise ValueError("Student artifact weight checksum does not match the manifest.")
     base_model = resolve_model_local_dir(base_model or metadata["base_model"])
     if "base_transformer_config_sha256" in metadata:
-        provenance = diffusion_model_provenance(base_model)
+        provenance = qwen_dmd2_base_provenance(base_model)
         if provenance["base_transformer_config_sha256"] != metadata["base_transformer_config_sha256"]:
             raise ValueError("Base transformer configuration does not match the student export.")
         if (

@@ -13,6 +13,7 @@
 # limitations under the License.
 import asyncio
 import functools
+import hashlib
 import logging
 import os
 import time
@@ -21,6 +22,7 @@ from copy import deepcopy
 from dataclasses import replace
 from functools import partial
 from itertools import chain
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -677,10 +679,18 @@ class DMDTrainingWorker(TrainingWorker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def get_model_provenance(self):
-        """Read the resolved checkpoint identity used by this worker, not a moving hub alias."""
-        from verl_omni.utils.fs import diffusion_model_provenance
-
-        return diffusion_model_provenance(self.engine.model_config.local_path)
+        """Read the base identity needed only by the DMD2 inference export."""
+        root = Path(self.engine.model_config.local_path)
+        revision = root.name if root.parent.name == "snapshots" else None
+        metadata = root / ".cache/huggingface/download/model_index.json.metadata"
+        if metadata.is_file():
+            with metadata.open() as file:
+                revision = file.readline().strip()
+        if not revision or len(revision) != 40 or any(char not in "0123456789abcdef" for char in revision):
+            revision = None
+        with (root / "transformer/config.json").open("rb") as file:
+            config_hash = hashlib.file_digest(file, "sha256").hexdigest()
+        return {"base_model_revision": revision, "base_transformer_config_sha256": config_hash}
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def export_student(self, directory, role="student"):

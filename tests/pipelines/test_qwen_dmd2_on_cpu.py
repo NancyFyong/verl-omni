@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import json
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -26,6 +27,7 @@ from verl_omni.pipelines.qwen_image_dmd2.diffusers_training_adapter import (
     QwenImageConditionProvider,
     QwenImageDMD2,
     load_qwen_dmd2_adapter,
+    qwen_dmd2_base_provenance,
 )
 
 
@@ -57,6 +59,20 @@ class ToyConditionPipeline:
 
 
 class TestQwenDMD2:
+    def test_base_provenance_is_owned_by_the_qwen_integration(self, tmp_path):
+        revision = "a" * 40
+        root = tmp_path / "snapshots" / revision
+        (root / "transformer").mkdir(parents=True)
+        config = b'{"in_channels": 64}'
+        (root / "transformer/config.json").write_bytes(config)
+
+        value = qwen_dmd2_base_provenance(root)
+
+        assert value == {
+            "base_model_revision": revision,
+            "base_transformer_config_sha256": hashlib.sha256(config).hexdigest(),
+        }
+
     def test_peft_export_loader_is_owned_by_the_qwen_integration(self, tmp_path):
         from safetensors.torch import save_file
 
