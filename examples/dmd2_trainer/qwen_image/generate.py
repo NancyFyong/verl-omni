@@ -28,10 +28,10 @@ from verl_omni.pipelines.qwen_image_dmd2.diffusers_training_adapter import (
     QwenImageConditionProvider,
     QwenImageDMD2,
     build_qwen_dmd_sigmas,
+    load_qwen_dmd2_adapter,
 )
 from verl_omni.trainer.diffusion.distillation.utils import ode_euler_step
 from verl_omni.utils.fs import diffusion_model_provenance, resolve_model_local_dir
-from verl_omni.workers.engine.lora_adapter_mixin import load_diffusers_lora_adapter
 
 
 @torch.inference_mode()
@@ -61,7 +61,7 @@ def generate(artifact, prompt, seed, base_model=None, device=None):
     pipeline.transformer.requires_grad_(False)
     pipeline.text_encoder.requires_grad_(False)
     pipeline.vae.requires_grad_(False)
-    load_diffusers_lora_adapter(pipeline.transformer, artifact, "student")
+    load_qwen_dmd2_adapter(pipeline.transformer, artifact, "student")
     pipeline.transformer.set_adapter("student")
     pipeline.transformer.eval()
     pipeline.transformer.set_attention_backend("native")

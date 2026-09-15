@@ -28,7 +28,20 @@ from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.pipelines.qwen_image_flow_grpo.common import QwenImageTokenIdPromptMixin
 from verl_omni.pipelines.qwen_image_flow_grpo.diffusers_training_adapter import QwenImage
 
-__all__ = ["QwenImageDMD2"]
+__all__ = ["QwenImageDMD2", "load_qwen_dmd2_adapter"]
+
+
+def load_qwen_dmd2_adapter(module, path, adapter_name="default"):
+    """Load the PEFT artifact emitted by the DMD2 engine into Qwen-Image."""
+    from safetensors.torch import load_file
+
+    path = Path(path)
+    weights = {
+        key.removeprefix("base_model.model.").removeprefix("transformer."): value
+        for key, value in load_file(path / "adapter_model.safetensors").items()
+    }
+    metadata = json.loads((path / "adapter_config.json").read_text())
+    module.load_lora_adapter(weights, adapter_name=adapter_name, prefix=None, metadata=metadata)
 
 
 def build_qwen_dmd_sigmas(num_inference_steps, shift, device):

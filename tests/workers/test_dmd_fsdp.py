@@ -29,6 +29,7 @@ from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig
 
+from verl_omni.pipelines.qwen_image_dmd2.diffusers_training_adapter import load_qwen_dmd2_adapter
 from verl_omni.workers.config import (
     DiffusionActorConfig,
     DiffusionDMDConfig,
@@ -37,7 +38,6 @@ from verl_omni.workers.config import (
     DiffusionPipelineConfig,
 )
 from verl_omni.workers.engine.fsdp.diffusers_impl import DMDDiffusersFSDPEngine
-from verl_omni.workers.engine.lora_adapter_mixin import load_diffusers_lora_adapter
 from verl_omni.workers.utils.losses import diffusion_loss
 
 
@@ -155,7 +155,7 @@ def test_qwen_dmd2_engine_update_resume_export(strategy, process_group):
         reloaded = QwenImageTransformer2DModel.from_pretrained(
             model_path, subfolder="transformer", torch_dtype=torch.bfloat16
         )
-        load_diffusers_lora_adapter(reloaded, directory / "inference", "reloaded")
+        load_qwen_dmd2_adapter(reloaded, directory / "inference", "reloaded")
         state = get_peft_model_state_dict(reloaded, adapter_name="reloaded")
         exported = load_file(directory / "inference" / "adapter_model.safetensors")
         assert state.keys() == exported.keys()
