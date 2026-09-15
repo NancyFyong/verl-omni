@@ -17,6 +17,7 @@ import inspect
 import os
 import shutil
 from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -46,7 +47,46 @@ _TRANSFORMERS = {
     "MiniMaxH3Pipeline": "MiniMaxH3Transformer3DModel",
     "BooguImagePipeline": "BooguImageTransformer2DModel",
 }
-_PIPELINES = frozenset(_TRANSFORMERS) - {"MiniMaxH3Pipeline", "BooguImagePipeline"}
+_PIPELINES = frozenset(_TRANSFORMERS)
+_H3_NATIVE_CLASS = "MiniMaxH3DiTModel"
+_H3_CONFIG_RENAMES = {
+    "num_refiner_layers": "token_refiner_num_layers",
+    "ffn_dim": "ffn_hidden_size",
+    "in_channels": "latents_dim",
+    "audio_in_channels": "audio_latents_dim",
+    "freq_dim": "timestep_input_dim",
+    "time_embed_hidden_dim": "time_embed_hidden_size",
+    "rope_freq_dim": "rope_inv_freq_len",
+}
+_H3_SHARED_CONFIG_FIELDS = (
+    "hidden_size",
+    "num_layers",
+    "num_attention_heads",
+    "attention_head_dim",
+    "patch_size",
+    "text_dim",
+    "time_embed_dim",
+    "norm_eps",
+    "qk_norm_eps",
+    "final_norm_eps",
+)
+_BOOGU_MODULE_ALIASES = {
+    "transformer_boogu": "boogu.models.transformers.transformer_boogu",
+    "scheduling_flow_match_euler_discrete_time_shifting": (
+        "boogu.schedulers.scheduling_flow_match_euler_discrete_time_shifting"
+    ),
+}
+_H3_TOPLEVEL_RENAMES = (
+    ("audio_proj_in", "audio_patch_proj"),
+    ("audio_proj_out", "final_layer.audio_out"),
+    ("proj_in", "video_patch_proj"),
+    ("proj_out", "final_layer.video_out"),
+    ("context_embedder", "condition_proj"),
+    ("time_embedder.linear_1", "time_embedder.proj_in"),
+    ("time_embedder.linear_2", "time_embedder.proj_out"),
+    ("norm_out.linear", "final_layer.adaln_proj.linear"),
+    ("norm_out.norm", "final_layer.norm"),
+)
 
 
 def _transformer_class(architecture: str):
@@ -58,18 +98,47 @@ def _transformer_class(architecture: str):
     return getattr(import_module(module), _TRANSFORMERS[architecture])
 
 
-def _resolve_architecture(index: dict | None, config: dict, explicit: str | None) -> str:
-    inferred = index.get("_class_name") if index is not None else None
-    if inferred is not None and explicit is not None and inferred != explicit:
-        raise ValueError("Explicit architecture conflicts with base model_index.json")
-    architecture = explicit or inferred
-    if architecture is None:
-        architecture = next((key for key, value in _TRANSFORMERS.items() if value == config.get("_class_name")), None)
+def _pipeline_class(architecture: str):
+    if architecture == "BooguImagePipeline":
+        from boogu.pipelines.boogu.pipeline_boogu import BooguImagePipeline
+
+        return BooguImagePipeline
+    import diffusers
+
+    return getattr(diffusers, architecture)
+
+
+def _resolve_architecture(index: dict | None, config: dict) -> str:
+    """Infer the architecture from the base artifact without a user-selected model name."""
+    if index is not None:
+        architecture = index.get("_class_name")
+    else:
+        model_class = config.get("_class_name")
+        # Qwen Image and Qwen Image Edit share one standalone transformer class;
+        # the component artifact does not need to guess which parent pipeline it came from.
+        architecture = next((key for key, value in _TRANSFORMERS.items() if value == model_class), None)
     if architecture not in _TRANSFORMERS:
         raise ValueError(f"Unsupported publishing architecture: {architecture}")
-    if config.get("_class_name") != _TRANSFORMERS[architecture]:
-        raise ValueError("Base must contain the canonical Diffusers transformer, not native/fused inference weights")
+    expected = (
+        _H3_NATIVE_CLASS if index is not None and architecture == "MiniMaxH3Pipeline" else _TRANSFORMERS[architecture]
+    )
+    if config.get("_class_name") != expected:
+        raise ValueError(f"Expected {expected} for {architecture}, got {config.get('_class_name')}")
     return architecture
+
+
+def _h3_native_name(name: str) -> str:
+    """Map one unfused Diffusers H3 parameter name to its native equivalent."""
+    name = name.replace("token_refiner.refiner_blocks.", "token_refiner.blocks.")
+    name = name.replace("transformer_blocks.", "blocks.")
+    name = name.replace(".attn.norm_q.", ".attn.q_norm.")
+    name = name.replace(".attn.norm_k.", ".attn.k_norm.")
+    name = name.replace(".attn.to_out.0.", ".attn.out_proj.")
+    name = name.replace(".ff.net.2.", ".mlp.fc2.")
+    for source, target in _H3_TOPLEVEL_RENAMES:
+        if name.startswith(source + "."):
+            return target + name[len(source) :]
+    return name
 
 
 def model_rank_files(root: Path) -> list[Path]:
@@ -199,18 +268,89 @@ def _transformer_schema(base: Path, source: Path, architecture: str):
     return shapes, keep_fp32
 
 
+def _weight_shapes(mapping: Mapping[str, Path]) -> dict[str, tuple[int, ...]]:
+    shapes = {}
+    for path in sorted(set(mapping.values())):
+        with safe_open(path, framework="pt", device="cpu") as archive:
+            for key in archive.keys():
+                shapes[key] = tuple(archive.get_slice(key).get_shape())
+    return shapes
+
+
+def _read_weight(mapping: Mapping[str, Path], key: str) -> torch.Tensor:
+    with safe_open(mapping[key], framework="pt", device="cpu") as archive:
+        return archive.get_tensor(key)
+
+
+def _h3_source_schema(source: Path, native_root: Path):
+    """Validate equivalent Diffusers/native H3 configs and derive both tensor schemas."""
+    cls = _transformer_class("MiniMaxH3Pipeline")
+    source_config = read_json(source / "huggingface/config.json")
+    native_config = read_json(native_root / "config.json")
+    if source_config.get("_class_name") != cls.__name__ or native_config.get("_class_name") != _H3_NATIVE_CLASS:
+        raise ValueError("MiniMax H3 requires a Diffusers actor config and native MiniMaxH3DiTModel base")
+    fields = set(inspect.signature(cls.__init__).parameters) - {"self"}
+    if any(key not in fields and not key.startswith("_") for key in source_config):
+        raise ValueError("Unrecognized MiniMax H3 actor config fields")
+    with torch.device("meta"):
+        module = cls.from_config(source_config)
+    source_shapes = {key: tuple(value.shape) for key, value in module.state_dict().items()}
+    keep_fp32 = tuple(getattr(module, "_keep_in_fp32_modules", None) or ())
+    del module
+
+    for name in _H3_SHARED_CONFIG_FIELDS:
+        if native_config.get(name) != source_config.get(name):
+            raise ValueError(f"MiniMax H3 native/base config mismatch: {name}")
+    for source_name, native_name in _H3_CONFIG_RENAMES.items():
+        if native_config.get(native_name) != source_config.get(source_name):
+            raise ValueError(f"MiniMax H3 native/base config mismatch: {native_name}")
+    hidden_size = source_config.get("hidden_size")
+    if native_config.get("adaln_out_features") != 18 * hidden_size:
+        raise ValueError("MiniMax H3 native adaln_out_features mismatch")
+    if native_config.get("final_adaln_out_features") != 2 * hidden_size:
+        raise ValueError("MiniMax H3 native final_adaln_out_features mismatch")
+
+    native_mapping = weight_files(native_root, "model.safetensors")
+    native_shapes = _weight_shapes(native_mapping)
+    return source_shapes, keep_fp32, source_config, native_mapping, native_shapes
+
+
+def _h3_conversion_plan(source_shapes: Mapping[str, tuple[int, ...]]) -> dict[str, tuple[str, tuple[str, ...]]]:
+    """Plan the complete Diffusers-to-native H3 tensor conversion."""
+    plan: dict[str, tuple[str, tuple[str, ...]]] = {}
+    qkv: dict[str, dict[str, str]] = {}
+    for name in source_shapes:
+        if name.endswith((".attn.to_q.weight", ".attn.to_k.weight", ".attn.to_v.weight")):
+            block, projection = name.rsplit(".attn.to_", 1)
+            target = f"{_h3_native_name(block)}.attn.qkv_proj.weight"
+            qkv.setdefault(target, {})[projection[0]] = name
+            continue
+        if name.endswith(".ff.net.0.proj.weight"):
+            target = _h3_native_name(name).replace(".ff.net.0.proj.", ".mlp.fc1.")
+            kind = "geglu"
+        else:
+            target = _h3_native_name(name)
+            kind = "identity"
+        if target in plan:
+            raise ValueError(f"Duplicate MiniMax H3 native target: {target}")
+        plan[target] = (kind, (name,))
+    for target, parts in qkv.items():
+        if set(parts) != {"q", "k", "v"} or target in plan:
+            raise ValueError(f"Incomplete MiniMax H3 QKV group: {target}")
+        plan[target] = ("qkv", tuple(parts[name] for name in ("q", "k", "v")))
+    return plan
+
+
 def _check_pipeline(base: Path, architecture: str, component: str) -> None:
     import diffusers
     import transformers
     from diffusers import ModelMixin, SchedulerMixin
     from transformers import AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
-    if architecture not in _PIPELINES:
-        raise ValueError(
-            f"{architecture} supports output_format=transformer only; native pipeline conversion is separate"
-        )
+    if architecture not in _PIPELINES or architecture == "MiniMaxH3Pipeline":
+        raise ValueError(f"Unsupported standard Diffusers pipeline: {architecture}")
     config = read_json(base / "model_index.json")
-    cls = getattr(diffusers, architecture)
+    cls = _pipeline_class(architecture)
     signature = inspect.signature(cls.__init__).parameters
     types = cls._get_signature_types()
     optional = cls._optional_components
@@ -236,13 +376,25 @@ def _check_pipeline(base: Path, architecture: str, component: str) -> None:
             raise ValueError(f"Invalid pipeline component: {key}")
         library, name = value
         modules = {"diffusers": diffusers, "transformers": transformers, "ltx2": diffusers.pipelines.ltx2}
-        if library not in modules or not isinstance(actual := getattr(modules[library], name, None), type):
+        module = modules.get(library)
+        if module is None and architecture == "BooguImagePipeline":
+            from importlib import import_module
+
+            module_name = _BOOGU_MODULE_ALIASES.get(library, library if library.startswith("boogu.") else None)
+            if module_name is not None:
+                module = import_module(module_name)
+        if module is None or not isinstance(actual := getattr(module, name, None), type):
             raise ValueError(f"Unsupported component class: {key}")
         tokenizer_match = issubclass(actual, PreTrainedTokenizerBase) and (
             AutoTokenizer in expected
             or any(name.removesuffix("Fast") == kind.__name__.removesuffix("Fast") for kind in expected)
         )
-        if not issubclass(actual, expected) and not tokenizer_match:
+        boogu_mllm_match = (
+            architecture == "BooguImagePipeline"
+            and key == "mllm"
+            and name in {"Qwen3VLModel", "Qwen3VLForConditionalGeneration"}
+        )
+        if not issubclass(actual, expected) and not tokenizer_match and not boogu_mllm_match:
             raise ValueError(f"Component class conflicts with pipeline: {key}")
         root = base / key
         if issubclass(actual, ModelMixin | PreTrainedModel):
@@ -261,7 +413,7 @@ def _check_pipeline(base: Path, architecture: str, component: str) -> None:
                 raise ValueError("Missing tokenizer vocabulary assets")
         else:
             # Processor / image processor assets are copied unchanged, never reconstructed.
-            assets = [root / name for name in ("processor_config.json", "preprocessor_config.json")]
+            assets = [root / name for name in ("config.json", "processor_config.json", "preprocessor_config.json")]
             if not any(path.is_file() for path in assets):
                 raise ValueError(f"Missing processor config: {key}")
             for path in assets:
@@ -275,11 +427,49 @@ def _check_pipeline(base: Path, architecture: str, component: str) -> None:
             raise ValueError("Dual-transformer Wan requires a boundary_ratio in (0, 1)")
 
 
-class FSDPModelMerger(BaseModelMerger):
-    """Recover FSDP checkpoints and publish canonical Diffusers artifacts."""
+def _check_h3_pipeline(base: Path) -> None:
+    """Validate the fixed native MiniMax H3 package boundary without importing GPU runtime code."""
+    index = read_json(base / "model_index.json")
+    expected = {
+        "transformer": "MiniMaxH3DiTModel",
+        "text_encoder": "MiniMaxH3Qwen3VLHFEncoder",
+        "video_vae": "MiniMaxH3VideoVAE",
+        "audio_vae": "MiniMaxH3AudioVAE",
+        "processor": "Qwen3VLProcessor",
+    }
+    for component, class_name in expected.items():
+        value = index.get(component)
+        if not isinstance(value, list) or len(value) != 2 or value[1] != class_name:
+            raise ValueError(f"Invalid MiniMax H3 component declaration: {component}")
+        root = base / component
+        if root.is_symlink() or not root.is_dir() or not (root / "config.json").is_file():
+            raise ValueError(f"Missing MiniMax H3 component: {component}")
+        read_json(root / "config.json")
+    tokenizer = index.get("tokenizer")
+    if (
+        not isinstance(tokenizer, list)
+        or len(tokenizer) != 2
+        or tokenizer[1]
+        not in {
+            "Qwen2Tokenizer",
+            "Qwen2TokenizerFast",
+        }
+    ):
+        raise ValueError("Invalid MiniMax H3 tokenizer declaration")
+    if not (base / "tokenizer/tokenizer_config.json").is_file():
+        raise ValueError("Missing MiniMax H3 tokenizer assets")
+    if index.get("scheduler") not in (None, [None, None]):
+        raise ValueError("MiniMax H3 native pipeline must not declare an external scheduler")
+    if not isinstance(index.get("_minimax_h3"), dict):
+        raise ValueError("Missing MiniMax H3 release metadata")
+    weight_files(base / "transformer", "model.safetensors")
 
-    def iter_merged_weights(self, expected_shapes: Mapping[str, tuple[int, ...]]) -> Iterator[tuple[str, torch.Tensor]]:
-        """Mmap rank files and yield complete schema-checked weights without initializing distributed."""
+
+class FSDPModelMerger(BaseModelMerger):
+    """Recover FSDP checkpoints and publish canonical Diffusers or native H3 artifacts."""
+
+    @contextmanager
+    def _rank_states(self, expected_shapes: Mapping[str, tuple[int, ...]]):
         states = []
         try:
             for path in model_rank_files(Path(self.config.local_dir)):
@@ -296,13 +486,69 @@ class FSDPModelMerger(BaseModelMerger):
                         f"unexpected={sorted(set(state) - set(expected_shapes))[:8]}"
                     )
                 states.append(state)
-            for key, shape in sorted(expected_shapes.items()):
-                try:
-                    yield key, reconstruct_tensor([state[key] for state in states], shape)
-                except (TypeError, ValueError) as exc:
-                    raise ValueError(f"Cannot reconstruct {key}: {exc}") from exc
+            yield states
         finally:
             states.clear()
+
+    @staticmethod
+    def _merged_tensor(states, key: str, shape: tuple[int, ...]) -> torch.Tensor:
+        try:
+            return reconstruct_tensor([state[key] for state in states], shape)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Cannot reconstruct {key}: {exc}") from exc
+
+    def iter_merged_weights(self, expected_shapes: Mapping[str, tuple[int, ...]]) -> Iterator[tuple[str, torch.Tensor]]:
+        """Mmap rank files and yield complete schema-checked weights without initializing distributed."""
+        with self._rank_states(expected_shapes) as states:
+            for key, shape in sorted(expected_shapes.items()):
+                yield key, self._merged_tensor(states, key, shape)
+
+    def iter_h3_native_weights(
+        self,
+        source_shapes: Mapping[str, tuple[int, ...]],
+        source_config: Mapping,
+        native_mapping: Mapping[str, Path],
+        native_shapes: Mapping[str, tuple[int, ...]],
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Convert complete Diffusers H3 tensors to the native fused checkpoint layout."""
+        plan = _h3_conversion_plan(source_shapes)
+        if set(plan) | {"rope.inv_freq"} != set(native_shapes):
+            raise ValueError(
+                "MiniMax H3 conversion does not cover the native schema: "
+                f"missing={sorted(set(native_shapes) - set(plan) - {'rope.inv_freq'})[:8]}, "
+                f"unexpected={sorted(set(plan) - set(native_shapes))[:8]}"
+            )
+        heads = int(source_config["num_attention_heads"])
+        head_dim = int(source_config["attention_head_dim"])
+        ff_half = int(source_config["ffn_dim"])
+        rope_len = int(source_config["rope_freq_dim"])
+        rope_theta = float(source_config.get("rope_theta", 10000.0))
+        with self._rank_states(source_shapes) as states:
+            for target in sorted(native_shapes):
+                if target == "rope.inv_freq":
+                    value = rope_theta ** (-(torch.arange(0, 2 * rope_len, 2, dtype=torch.float32) / (2 * rope_len)))
+                    if not torch.equal(value, _read_weight(native_mapping, target)):
+                        raise ValueError("MiniMax H3 base rope.inv_freq conflicts with the actor config")
+                else:
+                    kind, names = plan[target]
+                    values = [self._merged_tensor(states, name, source_shapes[name]) for name in names]
+                    if kind == "qkv":
+                        if any(value.shape[0] != heads * head_dim for value in values):
+                            raise ValueError(f"MiniMax H3 QKV shape mismatch: {target}")
+                        value = torch.stack([tensor.reshape(heads, head_dim, -1) for tensor in values], dim=1).reshape(
+                            heads * 3 * head_dim, -1
+                        )
+                    elif kind == "geglu":
+                        if values[0].shape[0] != 2 * ff_half:
+                            raise ValueError(f"MiniMax H3 GEGLU shape mismatch: {target}")
+                        up, gate = values[0].split(ff_half, dim=0)
+                        value = torch.cat([gate, up], dim=0)
+                    else:
+                        value = values[0]
+                value = value.contiguous()
+                if tuple(value.shape) != native_shapes[target]:
+                    raise ValueError(f"MiniMax H3 native tensor shape mismatch: {target}")
+                yield target, value
 
     def merge_and_save(self) -> MergeResult:
         source = Path(self.config.local_dir).resolve(strict=True)
@@ -322,46 +568,63 @@ class FSDPModelMerger(BaseModelMerger):
             raise ValueError("Save-time merge_source schemas are not supported by this initial exporter")
         if (source / "lora_train_meta.json").exists():
             raise ValueError("LoRA checkpoint metadata requires the future adapter export mode")
+
         source_files = model_rank_files(source) + [source / "fsdp_config.json", source / "huggingface/config.json"]
-        component = self.config.component
         index_path = base / "model_index.json"
         index = read_json(index_path) if index_path.is_file() else None
-        if component is None:
-            slots = [
-                key for key in ("transformer", "transformer_2") if index and index.get(key) not in (None, [None, None])
-            ]
-            if len(slots) > 1:
-                raise ValueError("Multiple transformers: explicitly select --component transformer or transformer_2")
-            component = slots[0] if slots else "transformer"
+        pipeline_output = self.config.output_format == "pipeline"
+        if pipeline_output and index is None:
+            raise ValueError("Pipeline export requires a complete base pipeline; use output_format=transformer")
+        component = "transformer"
         model_root = base / component if index is not None else base
         if model_root.is_symlink():
             raise ValueError("Component directory symlinks are unsupported")
         component_config = read_json(model_root / "config.json")
-        architecture = _resolve_architecture(index, component_config, self.config.architecture)
-        if component != "transformer" and architecture != "WanPipeline":
-            raise ValueError("Only Wan supports selecting transformer_2")
-        pipeline_output = self.config.output_format == "pipeline"
+        architecture = _resolve_architecture(index, component_config)
+        native_h3 = pipeline_output and architecture == "MiniMaxH3Pipeline"
+        if not pipeline_output and architecture == "MiniMaxH3Pipeline" and index is not None:
+            raise ValueError(
+                "Standalone MiniMax H3 export requires a canonical Diffusers transformer base, not a native pipeline"
+            )
+
         if pipeline_output:
-            if index is None:
-                raise ValueError("Pipeline export requires a complete base pipeline; use output_format=transformer")
             base_files = tree_files(base)
-            if any(path.suffix == ".py" for path in base_files):
-                raise ValueError("Custom-code pipeline assets are unsupported")
+            if any(path.suffix == ".py" for path in base_files) and not self.config.trust_remote_code:
+                raise ValueError(
+                    "Pipeline contains Python assets; pass --trust-remote-code for this audited local base"
+                )
         else:
-            # Never copy native/custom-code assets into a canonical Diffusers component.
             base_files = sorted(set(weight_files(model_root).values()) | {model_root / "config.json"})
             if index is not None:
                 base_files.append(index_path)
         source_inventory = inventory(source, source_files)
         base_inventory = inventory(base, base_files)
-        if pipeline_output:
-            _check_pipeline(base, architecture, component)
-        shapes, keep_fp32 = _transformer_schema(model_root, source, architecture)
+
+        native_weight_name = None
+        if native_h3:
+            _check_h3_pipeline(base)
+            source_shapes, keep_fp32, source_config, native_mapping, native_shapes = _h3_source_schema(
+                source, model_root
+            )
+            raw_weights = self.iter_h3_native_weights(source_shapes, source_config, native_mapping, native_shapes)
+            trained_weight_files = set(native_mapping.values())
+            native_weight_name = "model.safetensors"
+        else:
+            if pipeline_output:
+                _check_pipeline(base, architecture, component)
+            source_shapes, keep_fp32 = _transformer_schema(model_root, source, architecture)
+            raw_weights = self.iter_merged_weights(source_shapes)
+            trained_weight_files = set(weight_files(model_root).values())
+
+        for suffix in ("diffusion_pytorch_model.safetensors.index.json", "model.safetensors.index.json"):
+            path = model_root / suffix
+            if path.is_file():
+                trained_weight_files.add(path)
         dtype = None if self.config.dtype == "preserve" else getattr(torch, self.config.dtype)
 
         def weights():
-            for key, value in self.iter_merged_weights(shapes):
-                if dtype is not None and value.is_floating_point():
+            for key, value in raw_weights:
+                if dtype is not None and value.is_floating_point() and key != "rope.inv_freq":
                     effective_dtype = torch.float32 if any(part in key.split(".") for part in keep_fp32) else dtype
                     value = value.to(effective_dtype)
                     if not torch.isfinite(value).all():
@@ -370,14 +633,18 @@ class FSDPModelMerger(BaseModelMerger):
 
         with publication_directory(target) as staging:
             tensor_directory = component if pipeline_output else "."
-            specs = write_weights(staging / tensor_directory, weights(), self.config.max_shard_size)
+            specs = write_weights(
+                staging / tensor_directory,
+                weights(),
+                self.config.max_shard_size,
+                weights_name=native_weight_name,
+            )
             rewritten = []
             copy_files = base_files if pipeline_output else [model_root / "config.json"]
             copied = {}
             for path in copy_files:
                 relative = path.relative_to(base) if pipeline_output else Path("config.json")
-                # No pretrained transformer tensor can fill a missing checkpoint key.
-                if pipeline_output and relative.parts[0] == component and relative.name != "config.json":
+                if pipeline_output and path in trained_weight_files:
                     continue
                 copied[relative.as_posix()] = base_inventory[path.relative_to(base).as_posix()]
                 destination = staging / relative
@@ -407,9 +674,14 @@ class FSDPModelMerger(BaseModelMerger):
                 raise ValueError("Model rank inventory changed during export")
             import diffusers
 
+            artifact_type = (
+                "minimax_h3_pipeline"
+                if native_h3
+                else ("diffusers_pipeline" if pipeline_output else "diffusers_transformer")
+            )
             manifest = {
                 "schema_version": 1,
-                "artifact_type": "diffusers_pipeline" if pipeline_output else "diffusers_transformer",
+                "artifact_type": artifact_type,
                 "architecture": architecture,
                 "backend": "fsdp",
                 "trained_components": [component],

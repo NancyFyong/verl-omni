@@ -32,7 +32,29 @@ from tokenizers.pre_tokenizers import ByteLevel
 from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer
 
 from verl_omni.model_merge import ModelMergerConfig, merge_model, utils, validate_artifact
+from verl_omni.model_merge.base_model_merger import generate_config_from_args, parse_args
 from verl_omni.model_merge.fsdp_model_merger import model_rank_files, reconstruct_tensor
+
+
+def test_cli_common_arguments_live_in_base_model_merger(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "model_merge",
+            "merge",
+            "--local_dir",
+            "actor",
+            "--target_dir",
+            "output",
+            "--base-model",
+            "base",
+            "--trust-checkpoint",
+        ],
+    )
+    config = generate_config_from_args(parse_args())
+    assert config.local_dir == "actor" and config.base_model == "base"
+    assert not hasattr(config, "architecture") and not hasattr(config, "component")
 
 
 @pytest.fixture(scope="module")
@@ -216,9 +238,18 @@ def test_config_mismatch_even_with_same_weight_shapes(case):
         merge_model(config)
 
 
-def test_unknown_and_conflicting_architecture(case):
-    with pytest.raises(ValueError, match="architecture conflicts"):
-        merge_model(replace(case[0], architecture="MiniMaxH3Pipeline"))
+def test_unknown_architecture_is_rejected(case, tmp_path):
+    import shutil
+
+    config, _, _ = case
+    base = tmp_path / "unknown-base"
+    shutil.copytree(config.base_model, base)
+    path = base / "model_index.json"
+    data = utils.read_json(path)
+    data["_class_name"] = "UnknownPipeline"
+    utils.write_json(path, data)
+    with pytest.raises(ValueError, match="Unsupported publishing architecture"):
+        merge_model(replace(config, base_model=str(base)))
 
 
 def test_missing_and_extra_ranks(case):

@@ -270,6 +270,54 @@ def tiny_pipeline(architecture, transformer):
             t.UMT5Config(vocab_size=32, d_model=16, d_ff=32, d_kv=8, num_layers=1, num_heads=2)
         )
         return d.WanPipeline(**common, vae=vae, text_encoder=encoder, tokenizer=t.T5Tokenizer(extra_ids=0))
+    if architecture == "BooguImagePipeline":
+        from boogu.pipelines.boogu.pipeline_boogu import BooguImagePipeline
+        from boogu.schedulers.scheduling_flow_match_euler_discrete_time_shifting import (
+            FlowMatchEulerDiscreteScheduler,
+        )
+
+        vae = d.AutoencoderKL(
+            in_channels=3,
+            out_channels=3,
+            latent_channels=4,
+            block_out_channels=(8,),
+            down_block_types=("DownEncoderBlock2D",),
+            up_block_types=("UpDecoderBlock2D",),
+            layers_per_block=1,
+            norm_num_groups=4,
+            sample_size=4,
+        )
+        mllm = t.Qwen3VLForConditionalGeneration(
+            t.Qwen3VLConfig(
+                text_config=dict(
+                    vocab_size=32,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                    num_key_value_heads=1,
+                ),
+                vision_config=dict(
+                    depth=1,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_heads=2,
+                    out_hidden_size=16,
+                ),
+            )
+        )
+        processor = t.Qwen3VLProcessor(
+            image_processor=t.Qwen2VLImageProcessor(),
+            video_processor=t.Qwen3VLVideoProcessor(),
+            tokenizer=t.Qwen2Tokenizer(),
+        )
+        return BooguImagePipeline(
+            transformer=transformer,
+            vae=vae,
+            scheduler=FlowMatchEulerDiscreteScheduler(),
+            mllm=mllm,
+            processor=processor,
+        )
     from diffusers.pipelines.ltx2.connectors import LTX2TextConnectors
     from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
 

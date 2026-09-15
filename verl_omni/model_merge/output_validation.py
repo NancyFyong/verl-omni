@@ -36,23 +36,30 @@ def validate_artifact(target: str | Path) -> dict:
     if (
         type(manifest.get("schema_version")) is not int
         or manifest["schema_version"] != 1
-        or manifest.get("artifact_type") not in {"diffusers_pipeline", "diffusers_transformer"}
+        or manifest.get("artifact_type")
+        not in {
+            "diffusers_pipeline",
+            "diffusers_transformer",
+            "minimax_h3_pipeline",
+        }
         or manifest.get("architecture") not in _TRANSFORMERS
     ):
         raise ValueError("Unsupported merge manifest")
     component = manifest.get("trained_components")
     directory = manifest.get("tensor_directory")
-    pipeline = manifest["artifact_type"] == "diffusers_pipeline"
-    if component not in (["transformer"], ["transformer_2"]):
+    pipeline = manifest["artifact_type"] in {"diffusers_pipeline", "minimax_h3_pipeline"}
+    native_h3 = manifest["artifact_type"] == "minimax_h3_pipeline"
+    if component != ["transformer"]:
         raise ValueError("Invalid trained component")
-    if component == ["transformer_2"] and manifest["architecture"] != "WanPipeline":
-        raise ValueError("Unsupported second transformer")
-    if directory != (component[0] if pipeline else "."):
+    if directory != ("transformer" if pipeline else "."):
         raise ValueError("Invalid tensor directory")
     if pipeline and manifest["architecture"] not in _PIPELINES:
         raise ValueError("Unsupported pipeline artifact")
+    if native_h3 != (manifest["architecture"] == "MiniMaxH3Pipeline" and pipeline):
+        raise ValueError("Invalid native MiniMax H3 artifact")
     config = read_json(root / directory / "config.json")
-    if config.get("_class_name") != _TRANSFORMERS[manifest["architecture"]]:
+    expected_class = "MiniMaxH3DiTModel" if native_h3 else _TRANSFORMERS[manifest["architecture"]]
+    if config.get("_class_name") != expected_class:
         raise ValueError("Transformer config conflicts with manifest")
     if pipeline and read_json(root / "model_index.json").get("_class_name") != manifest["architecture"]:
         raise ValueError("Pipeline config conflicts with manifest")
@@ -70,7 +77,7 @@ def validate_artifact(target: str | Path) -> dict:
         raise ValueError("Output file inventory mismatch or external symlink")
     if inventory(root, [root / name for name in files]) != files:
         raise ValueError("Output checksum mismatch")
-    mapping = weight_files(root / directory)
+    mapping = weight_files(root / directory, "model.safetensors" if native_h3 else None)
     if set(mapping) != set(manifest.get("tensors", {})):
         raise ValueError("Output tensor inventory mismatch")
     for path in set(mapping.values()):

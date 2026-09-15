@@ -11,39 +11,34 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Command-line model merger; local_dir/target_dir follow the upstream verl CLI."""
+"""Command-line entrypoint for offline diffusion model publishing."""
 
-import argparse
 import json
 
-from . import ModelMergerConfig, merge_model, validate_artifact
+from .base_model_merger import generate_config_from_args, parse_args
+from .output_validation import validate_artifact
 
 
 def main() -> None:
-    """Merge a full Diffusers checkpoint or verify an existing artifact's integrity."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    commands = parser.add_subparsers(dest="operation", required=True)
-    merge = commands.add_parser("merge", help="Publish a Diffusers transformer or complete base pipeline")
-    merge.add_argument("--backend", choices=["fsdp"], default="fsdp")
-    merge.add_argument("--local_dir", required=True)
-    merge.add_argument("--target_dir", required=True)
-    merge.add_argument("--base-model", required=True)
-    merge.add_argument("--architecture")
-    merge.add_argument("--output-format", choices=["pipeline", "transformer"], default="pipeline")
-    merge.add_argument("--component", choices=["transformer", "transformer_2"])
-    merge.add_argument("--dtype", choices=["preserve", "float32", "float16", "bfloat16"], default="preserve")
-    merge.add_argument("--max-shard-size", type=int, default=2 * 1024**3, help="Output shard budget in bytes")
-    merge.add_argument("--trust-checkpoint", action="store_true", help="Acknowledge trusted pickle inputs")
-    validate = commands.add_parser("validate", help="Verify portable output hashes, tensor metadata and index")
-    validate.add_argument("--target_dir", required=True)
-    args = vars(parser.parse_args())
-    operation = args.pop("operation")
-    if operation == "validate":
-        manifest = validate_artifact(args["target_dir"])
+    """Dispatch merge or portable validation from the shared CLI."""
+    args = parse_args()
+    if args.operation == "validate":
+        manifest = validate_artifact(args.target_dir)
         print(json.dumps({"integrity": "passed", "architecture": manifest["architecture"]}))
-    else:
-        result = merge_model(ModelMergerConfig(**args))
-        print(json.dumps({"output_dir": str(result.output_dir), "manifest_path": str(result.manifest_path)}))
+        return
+
+    config = generate_config_from_args(args)
+    if config.backend == "fsdp":
+        from .fsdp_model_merger import FSDPModelMerger
+
+        merger = FSDPModelMerger(config)
+    else:  # pragma: no cover - argparse and ModelMergerConfig both reject this.
+        raise NotImplementedError(f"Unknown backend: {config.backend}")
+    try:
+        result = merger.merge_and_save()
+    finally:
+        merger.cleanup()
+    print(json.dumps({"output_dir": str(result.output_dir), "manifest_path": str(result.manifest_path)}))
 
 
 if __name__ == "__main__":

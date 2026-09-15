@@ -26,21 +26,141 @@ import torch
 from model_fixtures import run_forward, tiny_pipeline, tiny_transformer
 
 from verl_omni.model_merge import ModelMergerConfig, merge_model, validate_artifact
-from verl_omni.model_merge.fsdp_model_merger import _PIPELINES, _TRANSFORMERS
+from verl_omni.model_merge.fsdp_model_merger import (
+    _PIPELINES,
+    _TRANSFORMERS,
+    _h3_conversion_plan,
+    _h3_native_name,
+    _pipeline_class,
+)
 from verl_omni.model_merge.utils import inventory, read_json, tree_files, weight_files, write_json
 
 
-def _case(tmp_path, architecture, pipeline=False, component="transformer"):
+def _h3_native_config(diffusers_config):
+    renamed = {
+        "num_refiner_layers": "token_refiner_num_layers",
+        "ffn_dim": "ffn_hidden_size",
+        "in_channels": "latents_dim",
+        "audio_in_channels": "audio_latents_dim",
+        "freq_dim": "timestep_input_dim",
+        "time_embed_hidden_dim": "time_embed_hidden_size",
+        "rope_freq_dim": "rope_inv_freq_len",
+    }
+    shared = (
+        "hidden_size",
+        "num_layers",
+        "num_attention_heads",
+        "attention_head_dim",
+        "patch_size",
+        "text_dim",
+        "time_embed_dim",
+        "norm_eps",
+        "qk_norm_eps",
+        "final_norm_eps",
+    )
+    result = {name: diffusers_config[name] for name in shared}
+    result.update({target: diffusers_config[source] for source, target in renamed.items()})
+    result.update(
+        _class_name="MiniMaxH3DiTModel",
+        _diffusers_version=diffusers_config.get("_diffusers_version"),
+        adaln_out_features=18 * diffusers_config["hidden_size"],
+        final_adaln_out_features=2 * diffusers_config["hidden_size"],
+    )
+    return result
+
+
+def _h3_native_state(model):
+    state = model.state_dict()
+    plan = _h3_conversion_plan({name: tuple(value.shape) for name, value in state.items()})
+    heads = model.config.num_attention_heads
+    head_dim = model.config.attention_head_dim
+    ff_half = model.config.ffn_dim
+    result = {}
+    for target, (kind, names) in plan.items():
+        values = [state[name] for name in names]
+        if kind == "qkv":
+            result[target] = torch.stack([value.reshape(heads, head_dim, -1) for value in values], dim=1).reshape(
+                heads * 3 * head_dim, -1
+            )
+        elif kind == "geglu":
+            up, gate = values[0].split(ff_half, dim=0)
+            result[target] = torch.cat([gate, up], dim=0)
+        else:
+            result[target] = values[0]
+    rope_len = model.config.rope_freq_dim
+    result["rope.inv_freq"] = model.config.rope_theta ** (
+        -(torch.arange(0, 2 * rope_len, 2, dtype=torch.float32) / (2 * rope_len))
+    )
+    return result
+
+
+def _h3_pipeline_case(tmp_path):
+    base_model = tiny_transformer("MiniMaxH3Pipeline")
+    base = tmp_path / "base"
+    transformer = base / "transformer"
+    base.mkdir()
+    native_config = _h3_native_config(dict(base_model.config))
+    from verl_omni.model_merge import utils
+
+    utils.write_weights(
+        transformer,
+        iter(_h3_native_state(base_model).items()),
+        4096,
+        weights_name="model.safetensors",
+    )
+    write_json(transformer / "config.json", native_config)
+    components = {
+        "text_encoder": ["transformers", "MiniMaxH3Qwen3VLHFEncoder"],
+        "tokenizer": ["transformers", "Qwen2TokenizerFast"],
+        "video_vae": ["diffusers", "MiniMaxH3VideoVAE"],
+        "audio_vae": ["diffusers", "MiniMaxH3AudioVAE"],
+        "processor": ["transformers", "Qwen3VLProcessor"],
+    }
+    for name in components:
+        root = base / name
+        root.mkdir()
+        write_json(root / "config.json", {"_class_name": components[name][1]})
+    write_json(base / "tokenizer/tokenizer_config.json", {"tokenizer_class": "Qwen2TokenizerFast"})
+    write_json(
+        base / "model_index.json",
+        {
+            "_class_name": "MiniMaxH3Pipeline",
+            "_minimax_h3": {"schema_version": 1, "partition": "fl2va", "tasks": ["t2va", "fl2va"]},
+            "scheduler": None,
+            "transformer": ["diffusers", "MiniMaxH3DiTModel"],
+            **components,
+        },
+    )
+    model = tiny_transformer("MiniMaxH3Pipeline")
+    model.load_state_dict(base_model.state_dict())
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(0.005)
+    source = tmp_path / "actor"
+    source.mkdir()
+    model.save_config(source / "huggingface")
+    torch.save(model.state_dict(), source / "model_world_size_1_rank_0.pt")
+    write_json(source / "fsdp_config.json", {"FSDP_version": 2, "world_size": 1})
+    return ModelMergerConfig(
+        str(source),
+        str(tmp_path / "output"),
+        str(base),
+        output_format="pipeline",
+        max_shard_size=4096,
+        trust_checkpoint=True,
+    ), model
+
+
+def _case(tmp_path, architecture, pipeline=False, dual_wan=False):
     if architecture == "BooguImagePipeline":
         pytest.importorskip("boogu", reason="Install the optional boogu-image package to test its canonical class")
     model = tiny_transformer(architecture)
     base = tmp_path / "base"
     if pipeline:
         pipe = tiny_pipeline(architecture, model)
-        if component == "transformer_2":
+        if dual_wan:
             pipe.register_modules(transformer_2=tiny_transformer(architecture))
             pipe.register_to_config(boundary_ratio=0.875, expand_timesteps=True)
-            model = pipe.transformer_2
         pipe.save_pretrained(base)
     else:
         model.save_pretrained(base)
@@ -56,9 +176,7 @@ def _case(tmp_path, architecture, pipeline=False, component="transformer"):
         str(source),
         str(tmp_path / "output"),
         str(base),
-        architecture=architecture,
         output_format="pipeline" if pipeline else "transformer",
-        component=component,
         max_shard_size=4096,
         trust_checkpoint=True,
     ), model
@@ -105,12 +223,12 @@ def test_all_components_reload_and_forward(tmp_path, architecture, layout, reque
     assert not (result.output_dir / "model_index.json").exists()
 
 
-@pytest.mark.parametrize("architecture", sorted(_PIPELINES))
+@pytest.mark.parametrize("architecture", sorted(_PIPELINES - {"MiniMaxH3Pipeline"}))
 def test_all_pipelines_reload_and_forward(tmp_path, architecture):
     config, model = _case(tmp_path, architecture, pipeline=True)
     before = inventory(Path(config.base_model), tree_files(Path(config.base_model)))
     result = merge_model(config)
-    loaded = getattr(diffusers, architecture).from_pretrained(result.output_dir, local_files_only=True)
+    loaded = _pipeline_class(architecture).from_pretrained(result.output_dir, local_files_only=True)
     torch.testing.assert_close(loaded.transformer.state_dict(), model.state_dict(), rtol=0, atol=0)
     torch.testing.assert_close(
         run_forward(loaded.transformer, architecture), run_forward(model, architecture), rtol=1e-6, atol=1e-6
@@ -122,17 +240,54 @@ def test_all_pipelines_reload_and_forward(tmp_path, architecture):
     assert validate_artifact(result.output_dir)["trained_components"] == ["transformer"]
 
 
-def test_wan_second_transformer_and_options_are_not_confused(tmp_path):
-    config, model = _case(tmp_path, "WanPipeline", pipeline=True, component="transformer_2")
-    first = inventory(Path(config.base_model) / "transformer", tree_files(Path(config.base_model) / "transformer"))
+def test_boogu_local_module_aliases_require_trust_and_remain_portable(tmp_path):
+    config, _ = _case(tmp_path, "BooguImagePipeline", pipeline=True)
+    root = Path(config.base_model)
+    index = read_json(root / "model_index.json")
+    index["transformer"][0] = "transformer_boogu"
+    index["scheduler"][0] = "scheduling_flow_match_euler_discrete_time_shifting"
+    write_json(root / "model_index.json", index)
+    (root / "transformer/transformer_boogu.py").write_text(
+        "from boogu.models.transformers.transformer_boogu import BooguImageTransformer2DModel\n"
+    )
+    (root / "scheduler/scheduling_flow_match_euler_discrete_time_shifting.py").write_text(
+        "from boogu.schedulers.scheduling_flow_match_euler_discrete_time_shifting "
+        "import FlowMatchEulerDiscreteScheduler\n"
+    )
+    with pytest.raises(ValueError, match="trust-remote-code"):
+        merge_model(config)
+    trusted = replace(config, target_dir=str(tmp_path / "trusted-output"), trust_remote_code=True)
+    result = merge_model(trusted)
+    assert validate_artifact(result.output_dir)["architecture"] == "BooguImagePipeline"
+    assert (result.output_dir / "transformer/transformer_boogu.py").is_file()
+    loaded = _pipeline_class("BooguImagePipeline").from_pretrained(
+        result.output_dir,
+        local_files_only=True,
+        trust_remote_code=True,
+    )
+    assert type(loaded.transformer).__name__ == "BooguImageTransformer2DModel"
+
+
+def test_wan_exports_both_transformers_without_a_component_choice(tmp_path):
+    config, model = _case(tmp_path, "WanPipeline", pipeline=True, dual_wan=True)
+    second = inventory(
+        Path(config.base_model) / "transformer_2",
+        tree_files(Path(config.base_model) / "transformer_2"),
+    )
     result = merge_model(config)
     loaded = diffusers.WanPipeline.from_pretrained(result.output_dir, local_files_only=True)
-    torch.testing.assert_close(loaded.transformer_2.state_dict(), model.state_dict(), rtol=0, atol=0)
-    torch.testing.assert_close(run_forward(loaded.transformer_2, "WanPipeline"), run_forward(model, "WanPipeline"))
-    assert inventory(result.output_dir / "transformer", tree_files(result.output_dir / "transformer")) == first
+    torch.testing.assert_close(loaded.transformer.state_dict(), model.state_dict(), rtol=0, atol=0)
+    torch.testing.assert_close(run_forward(loaded.transformer, "WanPipeline"), run_forward(model, "WanPipeline"))
+    assert (
+        inventory(
+            result.output_dir / "transformer_2",
+            tree_files(result.output_dir / "transformer_2"),
+        )
+        == second
+    )
     index = read_json(result.output_dir / "model_index.json")
     assert index["boundary_ratio"] == 0.875 and index["expand_timesteps"] is True
-    assert validate_artifact(result.output_dir)["tensor_directory"] == "transformer_2"
+    assert validate_artifact(result.output_dir)["tensor_directory"] == "transformer"
 
 
 @pytest.mark.parametrize("architecture", sorted(_TRANSFORMERS))
@@ -146,15 +301,61 @@ def test_every_architecture_rejects_partial_checkpoint(tmp_path, architecture):
     assert not Path(config.target_dir).exists()
 
 
-def test_native_h3_is_not_a_diffusers_pipeline(tmp_path):
+def test_architecture_is_inferred_and_conflicting_base_fails(tmp_path):
     config, _ = _case(tmp_path, "MiniMaxH3Pipeline")
-    with pytest.raises(ValueError, match="complete base pipeline"):
-        merge_model(replace(config, output_format="pipeline"))
+    assert validate_artifact(merge_model(config).output_dir)["architecture"] == "MiniMaxH3Pipeline"
     data = read_json(Path(config.base_model) / "config.json")
     data["_class_name"] = "MiniMaxH3DiTModel"
     write_json(Path(config.base_model) / "config.json", data)
-    with pytest.raises(ValueError, match="native/fused"):
+    with pytest.raises(ValueError, match="Unsupported publishing architecture"):
+        merge_model(replace(config, target_dir=str(tmp_path / "bad-output")))
+
+
+@pytest.mark.parametrize("layout", ["single", "dtensor"])
+def test_minimax_h3_native_pipeline_conversion_is_complete(tmp_path, layout, request):
+    config, model = _h3_pipeline_case(tmp_path)
+    if layout == "dtensor":
+        config = replace(config, local_dir=str(request.getfixturevalue("dtensor_sources")["MiniMaxH3Pipeline"]))
+    expected = _h3_native_state(model)
+    result = merge_model(config)
+    manifest = validate_artifact(result.output_dir)
+    assert manifest["artifact_type"] == "minimax_h3_pipeline"
+    assert manifest["architecture"] == "MiniMaxH3Pipeline"
+    actual = {}
+    for path in set(weight_files(result.output_dir / "transformer", "model.safetensors").values()):
+        from safetensors.torch import load_file
+
+        actual.update(load_file(path))
+    assert set(actual) == set(expected)
+    for name in expected:
+        torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0)
+    source = model.state_dict()
+    qkv = torch.stack(
+        [
+            source[f"transformer_blocks.0.attn.to_{name}.weight"].reshape(
+                model.config.num_attention_heads,
+                model.config.attention_head_dim,
+                -1,
+            )
+            for name in ("q", "k", "v")
+        ],
+        dim=1,
+    ).reshape(model.config.num_attention_heads * 3 * model.config.attention_head_dim, -1)
+    torch.testing.assert_close(actual["blocks.0.attn.qkv_proj.weight"], qkv, rtol=0, atol=0)
+    up, gate = source["transformer_blocks.0.ff.net.0.proj.weight"].split(model.config.ffn_dim, dim=0)
+    torch.testing.assert_close(actual["blocks.0.mlp.fc1.weight"], torch.cat([gate, up]), rtol=0, atol=0)
+    assert _h3_native_name("transformer_blocks.0.attn.to_out.0.weight") == "blocks.0.attn.out_proj.weight"
+    for component in ("text_encoder", "tokenizer", "video_vae", "audio_vae", "processor"):
+        assert (result.output_dir / component / "config.json").is_file()
+
+
+def test_minimax_h3_custom_assets_require_explicit_trust(tmp_path):
+    config, _ = _h3_pipeline_case(tmp_path)
+    (Path(config.base_model) / "video_vae/native_module.py").write_text("VALUE = 1\n")
+    with pytest.raises(ValueError, match="trust-remote-code"):
         merge_model(config)
+    result = merge_model(replace(config, target_dir=str(tmp_path / "trusted-output"), trust_remote_code=True))
+    assert (result.output_dir / "video_vae/native_module.py").read_text() == "VALUE = 1\n"
 
 
 def test_component_export_from_pipeline_does_not_copy_other_assets(tmp_path):
@@ -164,12 +365,6 @@ def test_component_export_from_pipeline_does_not_copy_other_assets(tmp_path):
     torch.testing.assert_close(loaded.state_dict(), model.state_dict(), rtol=0, atol=0)
     assert not (result.output_dir / "vae").exists()
     assert not (result.output_dir / "model_index.json").exists()
-
-
-def test_only_wan_can_select_a_second_transformer(tmp_path):
-    config, _ = _case(tmp_path, "FluxPipeline")
-    with pytest.raises(ValueError, match="Only Wan"):
-        merge_model(replace(config, component="transformer_2"))
 
 
 @pytest.mark.parametrize("architecture", sorted(_TRANSFORMERS))
@@ -188,13 +383,6 @@ def test_every_architecture_dtype_policy_and_fp32_islands(tmp_path, architecture
             dtype = torch.float32 if any(part in key.split(".") for part in islands) else torch.bfloat16
             expected = value.to(dtype)
         torch.testing.assert_close(values[key], expected, rtol=0, atol=0)
-
-
-def test_dual_wan_requires_an_explicit_component(tmp_path):
-    config, _ = _case(tmp_path, "WanPipeline", pipeline=True, component="transformer_2")
-    with pytest.raises(ValueError, match="explicitly select"):
-        merge_model(replace(config, component=None))
-    assert not Path(config.target_dir).exists()
 
 
 @pytest.mark.parametrize("fault", ["option", "missing_model", "wrong_model", "wrong_tokenizer", "missing_processor"])

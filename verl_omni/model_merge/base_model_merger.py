@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Model-publishing lifecycle, following verl.model_merger without HF initialization."""
+"""Common model-merger configuration, CLI arguments, and lifecycle."""
 
+import argparse
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,18 +27,15 @@ class ModelMergerConfig:
     target_dir: str
     base_model: str
     backend: str = "fsdp"
-    architecture: str | None = None
     dtype: str = "preserve"
     max_shard_size: int = 2 * 1024**3
     trust_checkpoint: bool = False
+    trust_remote_code: bool = False
     output_format: str = "pipeline"
-    component: str | None = None
 
     def __post_init__(self):
         if self.output_format not in {"pipeline", "transformer"}:
             raise ValueError("output_format must be pipeline or transformer")
-        if self.component not in {None, "transformer", "transformer_2"}:
-            raise ValueError("component must be transformer or transformer_2")
         if self.backend != "fsdp":
             raise ValueError("Only the fsdp checkpoint backend is supported")
         if self.dtype not in {"preserve", "float32", "float16", "bfloat16"}:
@@ -72,8 +70,41 @@ class BaseModelMerger(ABC):
         return None
 
 
+def parse_args() -> argparse.Namespace:
+    """Parse the shared merge and validation CLI."""
+    parser = argparse.ArgumentParser(description="Publish or validate an offline diffusion model artifact")
+    commands = parser.add_subparsers(dest="operation", required=True)
+
+    merge = commands.add_parser("merge", help="Publish a transformer or complete pipeline")
+    merge.add_argument("--backend", choices=["fsdp"], default="fsdp")
+    merge.add_argument("--local_dir", required=True)
+    merge.add_argument("--target_dir", required=True)
+    merge.add_argument("--base-model", required=True)
+    merge.add_argument("--output-format", choices=["pipeline", "transformer"], default="pipeline")
+    merge.add_argument("--dtype", choices=["preserve", "float32", "float16", "bfloat16"], default="preserve")
+    merge.add_argument("--max-shard-size", type=int, default=2 * 1024**3, help="Output shard budget in bytes")
+    merge.add_argument("--trust-checkpoint", action="store_true", help="Acknowledge trusted pickle inputs")
+    merge.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Permit audited Python assets from a local MiniMax H3 or Boogu base pipeline",
+    )
+
+    validate = commands.add_parser("validate", help="Verify portable output hashes, tensor metadata and index")
+    validate.add_argument("--target_dir", required=True)
+    return parser.parse_args()
+
+
+def generate_config_from_args(args: argparse.Namespace) -> ModelMergerConfig:
+    """Build the common merger config from a parsed merge command."""
+    values = vars(args).copy()
+    if values.pop("operation") != "merge":
+        raise ValueError("Only the merge operation produces a ModelMergerConfig")
+    return ModelMergerConfig(**values)
+
+
 def merge_model(config: ModelMergerConfig) -> MergeResult:
-    """Run the audited Diffusers implementation through the common merger lifecycle."""
+    """Run the FSDP merger through the same lifecycle used by the CLI."""
     from .fsdp_model_merger import FSDPModelMerger
 
     merger = FSDPModelMerger(config)

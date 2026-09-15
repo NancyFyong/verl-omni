@@ -132,8 +132,15 @@ def tensor_spec(tensor: torch.Tensor) -> dict:
     return {"shape": list(tensor.shape), "dtype": str(tensor.dtype).removeprefix("torch.")}
 
 
-def write_weights(root: Path, weights: Iterable[tuple[str, torch.Tensor]], budget: int) -> dict[str, dict]:
+def write_weights(
+    root: Path,
+    weights: Iterable[tuple[str, torch.Tensor]],
+    budget: int,
+    *,
+    weights_name: str | None = None,
+) -> dict[str, dict]:
     """Write bounded safetensors shards and verify every reopened tensor against its source."""
+    weights_name = weights_name or WEIGHTS_NAME
     root.mkdir(exist_ok=True)
     if any(root.iterdir()):
         raise FileExistsError("Weight output directory must be empty")
@@ -176,15 +183,15 @@ def write_weights(root: Path, weights: Iterable[tuple[str, torch.Tensor]], budge
         raise ValueError("Cannot publish an empty transformer")
     weight_map = {}
     for number, (path, keys) in enumerate(shards, 1):
-        name = (
-            WEIGHTS_NAME
-            if len(shards) == 1
-            else f"diffusion_pytorch_model-{number:05d}-of-{len(shards):05d}.safetensors"
-        )
+        stem = weights_name.removesuffix(".safetensors")
+        name = weights_name if len(shards) == 1 else f"{stem}-{number:05d}-of-{len(shards):05d}.safetensors"
         path.rename(root / name)
         weight_map.update(dict.fromkeys(keys, name))
     if len(shards) > 1:
-        write_json(root / INDEX_NAME, {"metadata": {"total_size": total_bytes}, "weight_map": weight_map})
+        write_json(
+            root / f"{weights_name}.index.json",
+            {"metadata": {"total_size": total_bytes}, "weight_map": weight_map},
+        )
     return specs
 
 

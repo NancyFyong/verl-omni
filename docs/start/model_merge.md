@@ -1,11 +1,14 @@
-# Offline Diffusers model publishing
+# Offline diffusion model publishing
 
 Last updated: 09/15/2026
 
-`verl_omni.model_merge` converts an existing FSDP actor checkpoint into a local,
-Diffusers transformer or self-contained Diffusers pipeline. It follows verl's `ModelMergerConfig`,
-`merge_and_save()` and `cleanup()` lifecycle without routing Diffusers configs
-through Transformers `AutoConfig`.
+`verl_omni.model_merge` converts an existing FSDP actor checkpoint into a local
+transformer or self-contained inference pipeline. It follows verl's
+`ModelMergerConfig`, `merge_and_save()` and `cleanup()` lifecycle without routing
+diffusion configs through Transformers `AutoConfig`. The CLI entrypoint only
+parses and dispatches operations; shared arguments and configuration live in
+`base_model_merger.py`, while one `FSDPModelMerger` owns reconstruction and
+architecture-specific packaging.
 
 ## Supported architectures
 
@@ -18,22 +21,27 @@ registered in the repository, independently of the training algorithm:
 | Qwen-Image-Edit Plus | QwenImageTransformer2DModel | Yes | Yes, including processor |
 | SD3 / SD3.5 | SD3Transformer2DModel | Yes | Yes, including all three text encoders/tokenizers |
 | Flux | FluxTransformer2DModel | Yes | Yes |
-| Wan / Wan2.2 | WanTransformer3DModel | Yes | Yes, select the trained transformer |
+| Wan / Wan2.2 | WanTransformer3DModel | Yes | Yes, preserving an optional base `transformer_2` |
 | LTX-2 | LTX2VideoTransformer3DModel | Yes | Yes, including audio VAE, connectors and vocoder |
-| MiniMax H3 | MiniMaxH3Transformer3DModel | Yes | No: native inference layout differs |
-| Boogu-Image | BooguImageTransformer2DModel (`boogu-image`) | Yes | No: external custom pipeline |
+| MiniMax H3 | MiniMaxH3Transformer3DModel | Yes | Yes, converted to the native fused H3 package |
+| Boogu-Image | BooguImageTransformer2DModel (`boogu-image`) | Yes | Yes, through the canonical external pipeline |
 
 `--output-format transformer` writes a standalone component loadable with its
 canonical class's `from_pretrained()`. `--output-format pipeline` (default)
 replaces the selected complete transformer and preserves all other base
 components and assets. Missing actor parameters are **never** filled from the base.
 
-MiniMax H3 requires the **Diffusers actor transformer** as its base, not the
-native/fused `MiniMaxH3DiTModel` used by vLLM-Omni. Its component export does not
-convert parameter names into a native vLLM-Omni inference package. Boogu resolves
-the installed canonical class, never a Python shim inside the checkpoint.
+For standalone MiniMax H3 output, the base is the canonical Diffusers actor
+transformer. For complete Pipeline output, the base is a native MiniMax H3
+package: the exporter converts Diffusers names and QKV/GEGLU layouts to the
+fused `MiniMaxH3DiTModel` schema, synthesizes and checks `rope.inv_freq`, and
+preserves the remaining native audio/video/text components. Boogu resolves the
+installed canonical external classes. Both native H3 releases and some Boogu
+releases carry Python assets, so copying those local assets requires
+`--trust-remote-code`.
+
 BAGEL is deliberately excluded: its training class derives from
-`NonDiffusersModelBase` and needs native publishing.
+`NonDiffusersModelBase` and needs a different native publishing contract.
 
 Supported checkpoint representations:
 
@@ -44,7 +52,7 @@ Supported checkpoint representations:
   is exactly equal. Plain dim-0 shards are not guessed or concatenated.
 
 Not supported yet: adapter-bearing/LoRA checkpoints, FSDP1 `ShardedTensor`,
-HSDP/FSDP+TP, quantized weights, remote/custom full pipelines, architectures
+HSDP/FSDP+TP, quantized weights, unaudited custom pipelines, architectures
 outside the audited table, BAGEL and Omni publishing. Standard Transformers can
 continue using `python -m verl.model_merger`; delegation through this entrypoint
 is a follow-up. A training engine named `diffusers` does not establish that its
@@ -67,6 +75,7 @@ base/
   model_index.json
   transformer/config.json
   transformer/diffusion_pytorch_model.safetensors[.index.json]
+  # Native MiniMax H3 instead uses model.safetensors[.index.json].
   vae/...
   text_encoder/...
   tokenizer/...
@@ -77,9 +86,10 @@ The transformer config saved during training must agree with the base's
 behavior-affecting config. The exporter constructs a tiny-memory meta-device
 schema and checks exact trained keys and shapes. The base must contain standard
 safetensors files/indexes. Frozen assets are copied, not downloaded. Hub-cache
-file symlinks are dereferenced into regular output files; directory symlinks and
-custom Python files are rejected for full pipeline output. Component export reads
-only the selected config and safetensors, omitting unused assets/Python shims.
+file symlinks are dereferenced into regular output files and directory symlinks
+are rejected. Python assets are rejected unless `--trust-remote-code` is set;
+this is required for local native MiniMax H3 and custom Boogu releases. Component
+export reads only the selected config and safetensors, omitting unused assets.
 
 Only trusted checkpoint files may be opened: torch checkpoint deserialization is
 pickle-based. `--trust-checkpoint` explicitly acknowledges this; it is **not a
@@ -94,20 +104,18 @@ python -m verl_omni.model_merge merge \
   --local_dir "$ACTOR_CHECKPOINT" \
   --target_dir "$OUTPUT" \
   --base-model "$BASE_PIPELINE" \
-  --architecture QwenImagePipeline \
   --trust-checkpoint
 
 python -m verl_omni.model_merge validate --target_dir "$OUTPUT"
 ```
 
-For a standalone component (including MiniMax H3 and Boogu):
+For a standalone Diffusers component:
 
 ```bash
 python -m verl_omni.model_merge merge \
   --local_dir "$ACTOR_CHECKPOINT" \
   --target_dir "$OUTPUT" \
   --base-model "$DIFFUSERS_TRANSFORMER" \
-  --architecture MiniMaxH3Pipeline \
   --output-format transformer \
   --trust-checkpoint
 ```
@@ -116,17 +124,32 @@ Component output may also select a component from a full base pipeline. The
 output contains `config.json`, standard Diffusers safetensors and the manifest,
 not a misleading `model_index.json`.
 
-`--architecture` is optional; when supplied it must agree with the pipeline index
-and canonical transformer class. A standalone Qwen transformer cannot distinguish
-T2I from Edit, so its inferred label is QwenImagePipeline; supply the Edit label
-explicitly when that distinction matters.
+Architecture selection is automatic and fail-closed. Complete pipelines use
+`model_index.json['_class_name']`; standalone components use
+`config.json['_class_name']`. The actor config must match the selected canonical
+training class. Qwen-Image and Qwen-Image-Edit share one standalone transformer,
+so their component artifacts need no synthetic parent-pipeline choice.
 
-Wan pipelines containing both `transformer` and `transformer_2` **require** an
-explicit `--component transformer` or `--component transformer_2`. Only that
-component is replaced. The other model and `boundary_ratio` / `expand_timesteps`
-are preserved. To publish two independently trained checkpoints, export them in
-two passes into distinct output directories, using the first output as the second
-base. One actor checkpoint is never duplicated into both slots.
+Wan pipelines always treat the actor checkpoint as the repository-standard
+`transformer` training component. A base `transformer_2` and the
+`boundary_ratio` / `expand_timesteps` options are copied unchanged, so a dual-Wan
+output contains both transformers without a Wan-specific CLI choice. Publishing
+a separately trained `transformer_2` will require authoritative component
+metadata in the checkpoint; one actor checkpoint is never duplicated into both
+slots.
+
+For a complete native MiniMax H3 package, point `--base-model` at the
+T2VA/FL2VA/Ref2VA pipeline directory and explicitly trust its local component
+code:
+
+```bash
+python -m verl_omni.model_merge merge \
+  --local_dir "$ACTOR_CHECKPOINT" \
+  --target_dir "$OUTPUT" \
+  --base-model "$MINIMAX_H3_PIPELINE" \
+  --trust-checkpoint \
+  --trust-remote-code
+```
 
 The CLI does not expose an algorithm choice. FlowGRPO, NFT and distribution
 matching use the same publisher when they save the same complete transformer.
@@ -153,8 +176,9 @@ Non-finite source values and overflow during casting fail export.
 are mmap-loaded on CPU and tensors are reconstructed one at a time; this avoids
 retaining a complete merged transformer, but it is **not a hard RSS limit**.
 Mapped-page residency, reconstruction, serializer/verification copies and source
-metadata consume additional memory. No fallback to eager loading is performed
-for unsupported serialization.
+metadata consume additional memory. MiniMax H3 QKV conversion temporarily holds
+three source projections plus the fused output tensor. No fallback to eager
+loading is performed for unsupported serialization.
 
 ## Verification and failure semantics
 
@@ -189,9 +213,12 @@ Runtime validation is recorded as `not_run`: there is no implicit generation or
 GPU use during export. CPU tests exercise genuine two-rank Gloo DTensor
 serialization, fresh-process CLI export, tiny complete pipeline reload and
 transformer-forward parity across the eight architecture identities above.
-All eight also have dtype/fp32-island and incomplete-state checks; the six standard
-pipelines exercise their real complete `from_pretrained()` loader. Wan additionally
-covers its second transformer and non-component options. A registry coverage test
+All eight also have dtype/fp32-island and incomplete-state checks. Seven
+Diffusers-compatible pipelines exercise their canonical complete
+`from_pretrained()` loader; MiniMax H3 exercises exact native schema coverage,
+QKV interleaving, GEGLU reordering, rope synthesis, copied-component integrity,
+and both single-rank and real two-rank DTensor conversion. Wan additionally
+covers preservation of its second transformer and scalar options. A registry coverage test
 fails if a new Diffusers training architecture is added without exporter coverage.
 
 Run the matrix with the project's venv and optional `boogu-image` dependency:
