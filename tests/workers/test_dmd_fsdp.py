@@ -36,7 +36,7 @@ from verl_omni.workers.config import (
     DiffusionModelConfig,
     DiffusionPipelineConfig,
 )
-from verl_omni.workers.engine.fsdp.dmd_impl import DMDDiffusersFSDPEngine
+from verl_omni.workers.engine.fsdp.diffusers_impl import DMDDiffusersFSDPEngine
 from verl_omni.workers.engine.lora_adapter_mixin import load_diffusers_lora_adapter
 from verl_omni.workers.utils.losses import diffusion_loss
 
