@@ -194,7 +194,7 @@ class TaskRunner:
 
         if config.algorithm.trainer_type == "distribution_matching":
             from verl_omni.trainer.diffusion.ray_diffusion_trainer import DistributionMatchingRayTrainer
-            from verl_omni.workers.dmd_worker import DMDTrainingWorker
+            from verl_omni.workers.engine_workers import DMDTrainingWorker
 
             DistributionMatchingRayTrainer.validate_config(config)
             self.role_worker_mapping[Role.Actor] = ray.remote(DMDTrainingWorker)

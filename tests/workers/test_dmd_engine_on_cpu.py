@@ -24,10 +24,9 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.metric import Metric
 
 from verl_omni.workers.config import DiffusionDMDConfig
-from verl_omni.workers.dmd_worker import DMDTrainingWorker
-from verl_omni.workers.engine.fsdp import dmd_impl
-from verl_omni.workers.engine.fsdp.dmd_impl import DMDDiffusersFSDPEngine
-from verl_omni.workers.engine_workers import TrainingWorker
+from verl_omni.workers.engine.fsdp import diffusers_impl
+from verl_omni.workers.engine.fsdp.diffusers_impl import DMDDiffusersFSDPEngine
+from verl_omni.workers.engine_workers import DMDTrainingWorker, TrainingWorker
 
 
 class TinyAdapters(torch.nn.Module):
@@ -96,7 +95,7 @@ def engine_shell():
 class TestDMDOptimizer:
     @pytest.mark.parametrize("stage", ["student", "fake_score"])
     def test_nonfinite_gradient_does_not_step_scheduler_or_ema(self, monkeypatch, stage):
-        monkeypatch.setattr(dmd_impl, "get_device_id", cpu_device)
+        monkeypatch.setattr(diffusers_impl, "get_device_id", cpu_device)
         monkeypatch.setattr(torch.distributed, "all_reduce", no_collective)
         engine = engine_shell()
         engine.select_stage(stage)
@@ -111,7 +110,7 @@ class TestDMDOptimizer:
             torch.testing.assert_close(value, before[name])
 
     def test_peer_skip_is_agreed_before_local_step(self, monkeypatch):
-        monkeypatch.setattr(dmd_impl, "get_device_id", cpu_device)
+        monkeypatch.setattr(diffusers_impl, "get_device_id", cpu_device)
         monkeypatch.setattr(torch.distributed, "all_reduce", force_peer_nonfinite)
         engine = engine_shell()
         engine.role_parameters["student"][0].grad = torch.ones(2)
@@ -121,7 +120,7 @@ class TestDMDOptimizer:
         torch.testing.assert_close(engine.module.adapters["default"], torch.ones(2))
 
     def test_success_steps_only_owner_and_ema(self, monkeypatch):
-        monkeypatch.setattr(dmd_impl, "get_device_id", cpu_device)
+        monkeypatch.setattr(diffusers_impl, "get_device_id", cpu_device)
         monkeypatch.setattr(torch.distributed, "all_reduce", no_collective)
         engine = engine_shell()
         engine.role_parameters["student"][0].grad = torch.ones(2)
@@ -146,9 +145,9 @@ class TestDMDOptimizer:
 
 class TestDMDAccumulation:
     def test_metric_objects_and_unequal_microbatch_means(self, monkeypatch):
-        monkeypatch.setattr(dmd_impl, "get_device_id", cpu_device)
+        monkeypatch.setattr(diffusers_impl, "get_device_id", cpu_device)
         monkeypatch.setattr(
-            dmd_impl,
+            diffusers_impl,
             "get_torch_device",
             MagicMock(
                 return_value=MagicMock(
