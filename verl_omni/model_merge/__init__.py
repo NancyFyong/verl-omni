@@ -14,6 +14,6 @@
 """Offline model publishing with a verl-style merger lifecycle."""
 
 from .base_model_merger import MergeResult, ModelMergerConfig, merge_model
-from .utils import validate_artifact
+from .output_validation import validate_artifact
 
 __all__ = ["MergeResult", "ModelMergerConfig", "merge_model", "validate_artifact"]

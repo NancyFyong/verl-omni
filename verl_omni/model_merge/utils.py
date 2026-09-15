@@ -27,8 +27,6 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from .models import PIPELINES, TRANSFORMERS
-
 MANIFEST_NAME = "merge_manifest.json"
 WEIGHTS_NAME = "diffusion_pytorch_model.safetensors"
 INDEX_NAME = WEIGHTS_NAME + ".index.json"
@@ -224,55 +222,3 @@ def weight_files(root: Path, weights_name: str | None = None) -> dict[str, Path]
     if observed != result:
         raise ValueError("Safetensors index does not match actual tensor keys")
     return result
-
-
-def validate_artifact(target: str | Path) -> dict:
-    """Check portable output hashes, indexes and tensor metadata without source checkpoints."""
-    root = Path(target)
-    manifest = read_json(root / MANIFEST_NAME)
-    if (
-        type(manifest.get("schema_version")) is not int
-        or manifest["schema_version"] != 1
-        or manifest.get("artifact_type") not in {"diffusers_pipeline", "diffusers_transformer"}
-        or manifest.get("architecture") not in TRANSFORMERS
-    ):
-        raise ValueError("Unsupported merge manifest")
-    component = manifest.get("trained_components")
-    directory = manifest.get("tensor_directory")
-    pipeline = manifest["artifact_type"] == "diffusers_pipeline"
-    if component not in (["transformer"], ["transformer_2"]):
-        raise ValueError("Invalid trained component")
-    if component == ["transformer_2"] and manifest["architecture"] != "WanPipeline":
-        raise ValueError("Unsupported second transformer")
-    if directory != (component[0] if pipeline else "."):
-        raise ValueError("Invalid tensor directory")
-    if pipeline and manifest["architecture"] not in PIPELINES:
-        raise ValueError("Unsupported pipeline artifact")
-    config = read_json(root / directory / "config.json")
-    if config.get("_class_name") != TRANSFORMERS[manifest["architecture"]]:
-        raise ValueError("Transformer config conflicts with manifest")
-    if pipeline and read_json(root / "model_index.json").get("_class_name") != manifest["architecture"]:
-        raise ValueError("Pipeline config conflicts with manifest")
-    files = manifest.get("files")
-    if not isinstance(files, dict) or not files or MANIFEST_NAME in files:
-        raise ValueError("Invalid output inventory")
-    for name, digest in files.items():
-        relative_path(name)
-        if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
-            raise ValueError("Invalid SHA256 digest")
-    actual_files = tree_files(root)
-    if any(p.is_symlink() for p in actual_files) or set(files) != {
-        p.relative_to(root).as_posix() for p in actual_files if p.relative_to(root).as_posix() != MANIFEST_NAME
-    }:
-        raise ValueError("Output file inventory mismatch or external symlink")
-    if inventory(root, [root / name for name in files]) != files:
-        raise ValueError("Output checksum mismatch")
-    mapping = weight_files(root / directory)
-    if set(mapping) != set(manifest.get("tensors", {})):
-        raise ValueError("Output tensor inventory mismatch")
-    for path in set(mapping.values()):
-        with safe_open(path, framework="pt", device="cpu") as archive:
-            for key in archive.keys():
-                if tensor_spec(archive.get_tensor(key)) != manifest["tensors"][key]:
-                    raise ValueError(f"Output tensor metadata mismatch: {key}")
-    return manifest

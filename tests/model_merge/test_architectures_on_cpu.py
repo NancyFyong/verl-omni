@@ -26,7 +26,7 @@ import torch
 from model_fixtures import run_forward, tiny_pipeline, tiny_transformer
 
 from verl_omni.model_merge import ModelMergerConfig, merge_model, validate_artifact
-from verl_omni.model_merge.models import PIPELINES, TRANSFORMERS
+from verl_omni.model_merge.fsdp_model_merger import _PIPELINES, _TRANSFORMERS
 from verl_omni.model_merge.utils import inventory, read_json, tree_files, weight_files, write_json
 
 
@@ -68,7 +68,7 @@ def _case(tmp_path, architecture, pipeline=False, component="transformer"):
 def dtensor_sources(tmp_path_factory):
     root = tmp_path_factory.mktemp("architecture-dtensors")
     sources = {}
-    for architecture in TRANSFORMERS:
+    for architecture in _TRANSFORMERS:
         if architecture == "BooguImagePipeline" and importlib.util.find_spec("boogu") is None:
             continue
         config, _ = _case(root / architecture, architecture)
@@ -87,7 +87,7 @@ def dtensor_sources(tmp_path_factory):
 
 
 @pytest.mark.parametrize("layout", ["single", "dtensor"])
-@pytest.mark.parametrize("architecture", sorted(TRANSFORMERS))
+@pytest.mark.parametrize("architecture", sorted(_TRANSFORMERS))
 def test_all_components_reload_and_forward(tmp_path, architecture, layout, request):
     config, model = _case(tmp_path, architecture)
     if layout == "dtensor":
@@ -105,7 +105,7 @@ def test_all_components_reload_and_forward(tmp_path, architecture, layout, reque
     assert not (result.output_dir / "model_index.json").exists()
 
 
-@pytest.mark.parametrize("architecture", sorted(PIPELINES))
+@pytest.mark.parametrize("architecture", sorted(_PIPELINES))
 def test_all_pipelines_reload_and_forward(tmp_path, architecture):
     config, model = _case(tmp_path, architecture, pipeline=True)
     before = inventory(Path(config.base_model), tree_files(Path(config.base_model)))
@@ -135,7 +135,7 @@ def test_wan_second_transformer_and_options_are_not_confused(tmp_path):
     assert validate_artifact(result.output_dir)["tensor_directory"] == "transformer_2"
 
 
-@pytest.mark.parametrize("architecture", sorted(TRANSFORMERS))
+@pytest.mark.parametrize("architecture", sorted(_TRANSFORMERS))
 def test_every_architecture_rejects_partial_checkpoint(tmp_path, architecture):
     config, model = _case(tmp_path, architecture)
     state = dict(model.state_dict())
@@ -172,7 +172,7 @@ def test_only_wan_can_select_a_second_transformer(tmp_path):
         merge_model(replace(config, component="transformer_2"))
 
 
-@pytest.mark.parametrize("architecture", sorted(TRANSFORMERS))
+@pytest.mark.parametrize("architecture", sorted(_TRANSFORMERS))
 def test_every_architecture_dtype_policy_and_fp32_islands(tmp_path, architecture):
     from safetensors.torch import load_file
 
@@ -242,4 +242,4 @@ def test_registry_covers_repository_diffusers_training_architectures():
                 if isinstance(node.func.value, ast.Name) and node.func.value.id == "DiffusionModelBase":
                     found.add(ast.literal_eval(node.args[0]))
     # BAGEL builds NonDiffusersModelBase and requires native publishing, not ModelMixin.save_pretrained.
-    assert found - {"OmniBagelForConditionalGeneration"} == set(TRANSFORMERS)
+    assert found - {"OmniBagelForConditionalGeneration"} == set(_TRANSFORMERS)

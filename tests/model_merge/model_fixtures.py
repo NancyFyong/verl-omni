@@ -17,7 +17,7 @@ import diffusers as d
 import torch
 import transformers as t
 
-from verl_omni.model_merge.models import transformer_class
+from verl_omni.model_merge.fsdp_model_merger import _transformer_class
 
 CONFIGS = {
     "QwenImagePipeline": dict(
@@ -116,7 +116,7 @@ CONFIGS["QwenImageEditPlusPipeline"] = CONFIGS["QwenImagePipeline"]
 def tiny_transformer(architecture):
     """Construct the actual trainable class with small geometry."""
     torch.manual_seed(7)
-    return transformer_class(architecture)(**CONFIGS[architecture])
+    return _transformer_class(architecture)(**CONFIGS[architecture])
 
 
 def forward_inputs(architecture):

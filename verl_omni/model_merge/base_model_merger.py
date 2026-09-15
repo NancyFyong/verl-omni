@@ -74,9 +74,9 @@ class BaseModelMerger(ABC):
 
 def merge_model(config: ModelMergerConfig) -> MergeResult:
     """Run the audited Diffusers implementation through the common merger lifecycle."""
-    from .diffusers_model_merger import DiffusersFSDPModelMerger
+    from .fsdp_model_merger import FSDPModelMerger
 
-    merger = DiffusersFSDPModelMerger(config)
+    merger = FSDPModelMerger(config)
     try:
         return merger.merge_and_save()
     finally:

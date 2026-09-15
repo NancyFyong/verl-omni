@@ -459,10 +459,10 @@ def test_cast_overflow_fails_instead_of_publishing_inf(case):
 
 
 def test_input_mutation_during_export(case, monkeypatch):
-    from verl_omni.model_merge import diffusers_model_merger
+    from verl_omni.model_merge import fsdp_model_merger
 
     config, _, _ = case
-    original = diffusers_model_merger.write_weights
+    original = fsdp_model_merger.write_weights
 
     def mutate(*args, **kwargs):
         result = original(*args, **kwargs)
@@ -470,7 +470,7 @@ def test_input_mutation_during_export(case, monkeypatch):
         path.write_text(path.read_text() + "\n")
         return result
 
-    monkeypatch.setattr(diffusers_model_merger, "write_weights", mutate)
+    monkeypatch.setattr(fsdp_model_merger, "write_weights", mutate)
     with pytest.raises(ValueError, match="inputs changed"):
         merge_model(config)
     assert not Path(config.target_dir).exists()
