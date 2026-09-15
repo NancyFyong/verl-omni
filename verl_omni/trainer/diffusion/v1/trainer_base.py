@@ -45,7 +45,7 @@ from verl.single_controller.ray.base import split_resource_pool
 from verl.trainer.distillation import is_distillation_enabled
 from verl.trainer.ppo.metric_utils import compute_variance_proxy_metrics, process_validation_metrics
 from verl.trainer.ppo.reward import extract_reward
-from verl.trainer.ppo.utils import Role, need_reference_policy, need_reward_model
+from verl.trainer.ppo.utils import Role, need_reference_policy
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
 from verl.trainer.ppo.v1.utils import MetricsAggregator
 from verl.utils import tensordict_utils as tu
@@ -83,6 +83,12 @@ from verl_omni.trainer.diffusion.v1.tq_utils import (
     diffusion_tq_batch_to_dataproto,
     put_dataproto_fields_to_tq,
     sort_diffusion_tq_keys,
+)
+from verl_omni.workers.config.reward import (
+    reward_is_enabled,
+    reward_pool_is_separate,
+    reward_role_required,
+    streaming_reward_enabled,
 )
 from verl_omni.workers.engine_workers import ActorRolloutRefWorker, resolve_teacher_infer_micro_batch_size
 from verl_omni.workers.utils.padding import embeds_padding_2_no_padding
@@ -145,7 +151,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             self._has_old_adapter = False
         # DPO needs trainer-side ref noise preds even when KL is disabled.
         self.use_reference_policy = need_reference_policy(config) or (loss_mode == "dpo")
-        self.use_rm = need_reward_model(config)
+        self.use_rm = reward_is_enabled(config)
         self.use_teacher_policy = is_distillation_enabled(config.get("distillation"))
         self.distillation_config = omega_conf_to_dataclass(config.distillation) if self.use_teacher_policy else None
         validate_distillation_config(config)
@@ -375,8 +381,12 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         # [OPTIONAL] colocated reward model
         if self.reward_loop_manager.reward_loop_worker_handles is None and self.use_rm:
             with marked_timer("reward", timing_raw, color="yellow"):
-                # Free rollout-engine GPU memory so the colocated RM fits.
-                self.checkpoint_manager.sleep_replicas()
+                # Sync sampling hooks already put colocated rollout replicas to
+                # sleep. Sleeping them again can unmap the same accelerator
+                # memory twice. Async modes still need the explicit mid-cycle
+                # sleep because they do not share the sync hook guarantee.
+                if self.trainer_mode != "sync":
+                    self.checkpoint_manager.sleep_replicas()
                 data = data.union(self._compute_reward_colocate(data))
                 if self.trainer_mode != "sync":
                     # Async modes have no guaranteed per-step wake of the
@@ -806,15 +816,18 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         global_pool_id = "global_pool"
         resource_pool_spec = {global_pool_id: [self.config.trainer.n_gpus_per_node] * self.config.trainer.nnodes}
 
-        if self.use_rm and self.config.reward.reward_model.enable_resource_pool:
-            reward_pool = [self.config.reward.reward_model.n_gpus_per_node] * self.config.reward.reward_model.nnodes
+        if reward_role_required(self.config) and reward_pool_is_separate(self.config):
+            reward_gpus = self.config.reward.reward_model.n_gpus_per_node
+            reward_nnodes = self.config.reward.reward_model.nnodes
+            reward_pool = [reward_gpus] * reward_nnodes
             resource_pool_spec["reward_pool"] = reward_pool
             self.mapping[Role.RewardModel] = "reward_pool"
         else:
-            if self.use_rm:
+            if reward_role_required(self.config):
                 self.config.reward.reward_model.nnodes = self.config.trainer.nnodes
                 self.config.reward.reward_model.n_gpus_per_node = self.config.trainer.n_gpus_per_node
-            self.mapping[Role.RewardModel] = "global_pool"
+            if reward_role_required(self.config):
+                self.mapping[Role.RewardModel] = "global_pool"
 
         if self.use_teacher_policy and self.distillation_config.nnodes > 0:
             if self.distillation_config.n_gpus_per_node <= 0:
@@ -824,7 +837,6 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             resource_pool_spec["teacher_pool"] = [
                 self.distillation_config.n_gpus_per_node
             ] * self.distillation_config.nnodes
-
         self.resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
 
     def _init_colocated_workers(self):
@@ -899,17 +911,21 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
     def _init_online_rollout_stack(self, actor_rollout_resource_pool):
         """Initialize reward loop, LLM server, and checkpoint engine managers."""
-        from verl_omni.reward_loop.local_accelerator_reward_loop import create_v1_reward_loop_manager
+        from verl_omni.reward_loop import OmniRewardLoopManager
 
-        resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel) if self.use_rm else None
-        self.reward_loop_manager = create_v1_reward_loop_manager(
+        resource_pool = (
+            self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+            if reward_role_required(self.config)
+            else None
+        )
+        self.reward_loop_manager = OmniRewardLoopManager(
             config=self.config,
             rm_resource_pool=resource_pool,
             accelerator_resource_pool=actor_rollout_resource_pool,
         )
 
         # Streaming agent reward loop when there is no rm, or the rm has a separate pool.
-        self.enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
+        self.enable_agent_reward_loop = streaming_reward_enabled(self.config)
 
         self.llm_server_manager = LLMServerManager.create(
             config=self.config,

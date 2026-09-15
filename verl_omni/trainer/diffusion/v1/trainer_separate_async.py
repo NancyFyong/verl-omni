@@ -52,6 +52,7 @@ from verl_omni.trainer.diffusion.v1.trainer_base import (
     register_diffusion_trainer,
 )
 from verl_omni.workers.checkpoint_engine import OmniCheckpointEngineManager
+from verl_omni.workers.config.reward import reward_role_required, streaming_reward_enabled
 from verl_omni.workers.detach_actor_worker import DiffusionDetachActorWorker
 from verl_omni.workers.rollout.diffusion_llm_server import DiffusionWholeSampleRetryLLMServerClient
 
@@ -170,9 +171,17 @@ class PolicyGradientDiffusionTrainerV1SeparateAsync(PolicyGradientDiffusionTrain
         """
         from verl_omni.reward_loop import OmniRewardLoopManager
 
-        resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel) if self.use_rm else None
-        self.reward_loop_manager = OmniRewardLoopManager(config=self.config, rm_resource_pool=resource_pool)
-        self.enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
+        resource_pool = (
+            self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+            if reward_role_required(self.config)
+            else None
+        )
+        self.reward_loop_manager = OmniRewardLoopManager(
+            config=self.config,
+            rm_resource_pool=resource_pool,
+            accelerator_resource_pool=actor_rollout_resource_pool,
+        )
+        self.enable_agent_reward_loop = streaming_reward_enabled(self.config)
 
         # Colocated rollout replicas (share GPUs with the actor).
         self.llm_server_manager = LLMServerManager.create(
