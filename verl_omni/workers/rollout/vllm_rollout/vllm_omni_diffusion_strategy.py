@@ -103,7 +103,7 @@ class DiffusionStrategy(OmniStrategyBase):
         return _GPU_WORKER_EXTENSION
 
     def prepare_engine_args(self, engine_args: dict[str, Any], args: Namespace) -> None:
-        # The pinned OmniEngineArgs drops the CLI-only text_encoder_tp_size field.
+        # TODO(vllm-omni#7564): Drop this pin-compat shim; tracked in verl-omni#445.
         text_encoder_tp = self.server.config.text_encoder_tp_size
         cli_text_encoder_tp = getattr(args, "text_encoder_tp_size", None)
         if cli_text_encoder_tp is not None:
