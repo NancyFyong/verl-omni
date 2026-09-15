@@ -195,6 +195,17 @@ def test_audio_metadata_projection_keeps_copy_and_scalar_mapping_compatibility()
     assert original == {"id": "kept", "audio": "conditioning audio"}
 
 
+def test_conditioning_audio_in_dataset_extra_info_is_not_scored_as_rollout_audio():
+    data = _data()
+    data.non_tensor_batch["extra_info"][0].update(
+        {"audio": np.ones(8, dtype=np.float32), "audio_sample_rate": 24_000, "media_kind": "audio"}
+    )
+    manager = _manager(lambda **kwargs: pytest.fail("Conditioning audio reached the scorer"))
+
+    with pytest.raises(KeyError, match=r"requires extra_info\['audio'\]"):
+        manager.loop.run_until_complete(manager.run_single(data))
+
+
 def test_run_single_reads_finalized_top_level_audio_layout():
     def compute_score(solution_audio, extra_info, **kwargs):
         waveform, sample_rate = solution_audio

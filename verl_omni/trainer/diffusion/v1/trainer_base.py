@@ -76,6 +76,7 @@ from verl_omni.trainer.diffusion.diffusion_trainer_utils import (
 )
 from verl_omni.trainer.diffusion.ray_diffusion_trainer import (
     BaseRayDiffusionTrainer,
+    _resolve_rollout_media_field,
     _to_diffusion_worker_tensordict,
     _validate_generation_outputs,
     compute_advantage,
@@ -93,7 +94,6 @@ from verl_omni.trainer.diffusion.v1.tq_utils import (
     put_dataproto_fields_to_tq,
     sort_diffusion_tq_keys,
 )
-from verl_omni.utils.tracking import batch_items
 from verl_omni.workers.config.reward import (
     reward_is_enabled,
     reward_pool_is_separate,
@@ -1369,16 +1369,10 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             )
             sample_inputs.extend(input_texts)
             sample_outputs.append(output_images)
-            batch_size = len(output_images)
-            sample_audios.extend(batch_items(data.batch.get("audio"), batch_size, "audio"))
-            sample_audio_sample_rates.extend(
-                batch_items(
-                    data.non_tensor_batch.get("audio_sample_rate", data.batch.get("audio_sample_rate")),
-                    batch_size,
-                    "audio_sample_rate",
-                )
-            )
-            sample_media_kinds.extend(batch_items(data.non_tensor_batch.get("media_kind"), batch_size, "media_kind"))
+            tool_extra = data.non_tensor_batch.get("tool_extra_fields")
+            sample_audios.extend(_resolve_rollout_media_field(data, tool_extra, "audio"))
+            sample_audio_sample_rates.extend(_resolve_rollout_media_field(data, tool_extra, "audio_sample_rate"))
+            sample_media_kinds.extend(_resolve_rollout_media_field(data, tool_extra, "media_kind"))
             uids = data.non_tensor_batch.get("uid")
             sample_uids.extend(list(uids) if uids is not None else [None] * len(data))
 
@@ -1513,13 +1507,10 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 if rm_meta is not None
                 else [None] * len(data)
             )
-            audios = batch_items(data.batch.get("audio"), len(data), "audio")
-            audio_sample_rates = batch_items(
-                data.non_tensor_batch.get("audio_sample_rate", data.batch.get("audio_sample_rate")),
-                len(data),
-                "audio_sample_rate",
-            )
-            media_kinds = batch_items(data.non_tensor_batch.get("media_kind"), len(data), "media_kind")
+            tool_extra = data.non_tensor_batch.get("tool_extra_fields")
+            audios = _resolve_rollout_media_field(data, tool_extra, "audio")
+            audio_sample_rates = _resolve_rollout_media_field(data, tool_extra, "audio_sample_rate")
+            media_kinds = _resolve_rollout_media_field(data, tool_extra, "media_kind")
 
             sort_idx = sort_diffusion_tq_keys(list(batch_meta.keys))
             inputs = [inputs[i] for i in sort_idx]

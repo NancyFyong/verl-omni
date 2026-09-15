@@ -282,6 +282,16 @@ def test_validation_logger_failures_are_best_effort(monkeypatch, tmp_path, caplo
 
 
 @pytest.mark.parametrize("trainer_cls", [ray_diffusion_trainer.BaseRayDiffusionTrainer, _ConcreteTrainer])
+def test_empty_validation_outputs_skip_logging_validation(trainer_cls):
+    trainer = SimpleNamespace(
+        global_steps=1,
+        config=OmegaConf.create({"trainer": {"logger": ["wandb"], "log_val_generations": 1}}),
+    )
+
+    trainer_cls._maybe_log_val_generations(trainer, [], torch.empty(0), [])
+
+
+@pytest.mark.parametrize("trainer_cls", [ray_diffusion_trainer.BaseRayDiffusionTrainer, _ConcreteTrainer])
 def test_invalid_modality_is_not_hidden_by_logging(trainer_cls):
     trainer = SimpleNamespace(
         global_steps=1,
@@ -387,3 +397,29 @@ def test_v1_rollout_dump_sorts_and_forwards_media_metadata(monkeypatch, media_ki
     assert captured["media_kind"] == "video"
     assert captured["max_samples"] == 1
     assert captured["fps"] == 12
+
+
+def test_v1_rollout_dump_uses_tool_media_when_batch_has_no_generated_media(monkeypatch):
+    trainer = object.__new__(_ConcreteTrainer)
+    trainer.config = OmegaConf.create({"trainer": {"rollout_data_max_samples": 1, "video_fps": 12}})
+    trainer.tokenizer = SimpleNamespace(pad_token_id=0, batch_decode=lambda prompts, skip_special_tokens: ["prompt"])
+    captured = {}
+    trainer._dump_generations = lambda **kwargs: captured.update(kwargs)
+    audio = torch.full((1, 4), 0.5)
+    data = _FakeData(
+        batch={
+            "prompts": torch.tensor([[1]]),
+            "responses": torch.zeros(1, 2, 3, 4, 4, dtype=torch.uint8),
+            "sample_level_scores": torch.tensor([[1.0]]),
+        },
+        non_tensor_batch={
+            "tool_extra_fields": [{"audio": audio, "audio_sample_rate": 48_000, "media_kind": "video"}],
+        },
+    )
+    monkeypatch.setattr(trainer_base_module, "diffusion_tq_batch_to_dataproto", lambda *args, **kwargs: data)
+
+    trainer._log_rollout_data(SimpleNamespace(keys=["sample_0_0"], partition_id="train"), {}, "/tmp/unused")
+
+    torch.testing.assert_close(captured["audios"][0], audio)
+    assert captured["audio_sample_rates"] == [48_000]
+    assert captured["media_kind"] == "video"

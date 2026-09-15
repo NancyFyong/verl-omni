@@ -33,15 +33,20 @@ def _reward_extra_info(data_item) -> dict:
     """Copy metadata and project generated media, rejecting conflicting sources."""
     extra_info = _metadata_mapping(data_item.non_tensor_batch.get("extra_info"))
     tool_extra_fields = _metadata_mapping(data_item.non_tensor_batch.get("tool_extra_fields"))
-    extra_info.update(tool_extra_fields)
+    generated_media_keys = ("audio", "audio_sample_rate", "media_kind")
+    for key in generated_media_keys:
+        extra_info.pop(key, None)
+    extra_info.update({key: value for key, value in tool_extra_fields.items() if key not in generated_media_keys})
     tensor_fields = data_item.batch if data_item.batch is not None else {}
-    for key in ("audio", "audio_sample_rate", "media_kind"):
+    for key in generated_media_keys:
+        tool_value = tool_extra_fields.get(key)
         value = tensor_fields.get(key)
         if value is None:
             value = data_item.non_tensor_batch.get(key)
         if value is None:
+            value = tool_value
+        if value is None:
             continue
-        tool_value = tool_extra_fields.get(key)
         if tool_value is not None and tool_value is not value:
             if isinstance(value, torch.Tensor) and isinstance(tool_value, torch.Tensor):
                 matches = value.device == tool_value.device and torch.equal(value, tool_value)

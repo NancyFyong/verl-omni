@@ -15,7 +15,7 @@
 
 import pytest
 
-from verl_omni.utils.tracking import resolve_is_video
+from verl_omni.pipelines.rollout_media import resolve_is_video
 
 
 class TestResolveIsVideo:

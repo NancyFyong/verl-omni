@@ -30,7 +30,10 @@ def _manager(monkeypatch, manager_cls, scorer):
     config = OmegaConf.create(
         {
             "actor_rollout_ref": {"rollout": {"pipeline": {"output_type": "pt"}}},
-            "reward": {"reward_functions": {"audio": {"path": "test", "name": "score", "required": True}}},
+            "reward": {
+                "reward_functions": {"audio": {"path": "test", "name": "score", "required": True}},
+                "reward_model": {"rollout": {}},
+            },
         }
     )
     monkeypatch.setattr(multi, "load_extern_object", lambda *args: scorer)

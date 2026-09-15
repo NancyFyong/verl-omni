@@ -228,7 +228,7 @@ def _resolve_rollout_media_field(batch: DataProto, tool_extra, key: str):
                 raise ValueError(f"Conflicting rollout media field {key!r} in batch and tool_extra_fields")
             if values[index] is None:
                 values[index] = value
-    return values if any(value is not None for value in values) else None
+    return values
 
 
 def dump_generations(
@@ -634,7 +634,7 @@ class BaseRayDiffusionTrainer(ABC):
 
         generations_to_log = self.config.trainer.log_val_generations
 
-        if generations_to_log == 0:
+        if generations_to_log == 0 or len(inputs) == 0:
             return
         _validate_generation_outputs(outputs)
 
@@ -778,18 +778,12 @@ class BaseRayDiffusionTrainer(ABC):
             # Store generated outputs
             output_images = test_output_gen_batch.batch["responses"]
             sample_outputs.append(output_images)
-            batch_size = len(output_images)
-            sample_audios.extend(batch_items(test_output_gen_batch.batch.get("audio"), batch_size, "audio"))
+            tool_extra = test_output_gen_batch.non_tensor_batch.get("tool_extra_fields")
+            sample_audios.extend(_resolve_rollout_media_field(test_output_gen_batch, tool_extra, "audio"))
             sample_audio_sample_rates.extend(
-                batch_items(
-                    test_output_gen_batch.non_tensor_batch.get("audio_sample_rate"),
-                    batch_size,
-                    "audio_sample_rate",
-                )
+                _resolve_rollout_media_field(test_output_gen_batch, tool_extra, "audio_sample_rate")
             )
-            sample_media_kinds.extend(
-                batch_items(test_output_gen_batch.non_tensor_batch.get("media_kind"), batch_size, "media_kind")
-            )
+            sample_media_kinds.extend(_resolve_rollout_media_field(test_output_gen_batch, tool_extra, "media_kind"))
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
