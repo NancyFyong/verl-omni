@@ -224,9 +224,16 @@ staging/lock, never the source or another exporter's files. Existing targets are
 not overwritten; automatic crash recovery/resume is not implemented.
 
 Runtime validation is recorded as `not_run`: there is no implicit generation or
-GPU use during export. CPU tests exercise genuine two-rank Gloo DTensor
-serialization, fresh-process CLI export, tiny complete pipeline reload and
-transformer-forward parity across the eight architecture identities above.
+GPU use during export. A two-rank CPU/Gloo integration test trains every available
+tiny transformer for one real forward/backward/AdamW step under FSDP2, saves it
+through `FSDPCheckpointManager`, merges the resulting rank-local DTensors, reloads
+the published component or pipeline, and matches the trained actor's fixed-input
+forward output. The MiniMax H3 case additionally loads every converted tensor
+through the native vLLM-Omni `MiniMaxH3DiTModel.load_weights()` path.
+
+CPU tests also exercise standalone genuine DTensor serialization, fresh-process
+CLI export, tiny complete pipeline reload and transformer-forward parity across
+the eight architecture identities above.
 All eight also have dtype/fp32-island and incomplete-state checks. Seven
 Diffusers-compatible pipelines exercise their canonical complete
 `from_pretrained()` loader; MiniMax H3 exercises exact native schema coverage,
@@ -248,9 +255,9 @@ revision `25f8f888298224a94e5ec2abafb98abea9031a0d` on PYTHONPATH, without chang
 the shared venv. Boogu's declared dependency ranges differ from that venv; source
 execution is not dependency-resolver or clean-install validation.
 
-These tests are not real-weight/GPU FSDPCheckpointManager
-or production image-quality evidence. Real checkpoint save/export/load remains
-a release acceptance gate.
+These tests use random tiny weights on CPU; they are not real-weight/GPU or
+production image-quality evidence. Real checkpoint save/export/load remains a
+release acceptance gate.
 
 For a manual loader check after export:
 

@@ -229,6 +229,15 @@ def reconstruct_tensor(values: list[torch.Tensor], shape: tuple[int, ...]) -> to
     return merged
 
 
+def _canonical_config_value(value):
+    """Normalize JSON-equivalent containers before comparing model behavior."""
+    if isinstance(value, Mapping):
+        return tuple(sorted((key, _canonical_config_value(item)) for key, item in value.items()))
+    if isinstance(value, list | tuple):
+        return tuple(_canonical_config_value(item) for item in value)
+    return value
+
+
 def _portable_config(config: dict) -> dict:
     """Remove only location metadata; never rewrite behavior-affecting values."""
     result = {}
@@ -252,7 +261,10 @@ def _transformer_schema(base: Path, source_config_path: Path, architecture: str)
     with torch.device("meta"):
         base_module = cls.from_config(base_config)
         source_module = cls.from_config(source_config)
-    if any(base_module.config[key] != source_module.config[key] for key in fields):
+    if any(
+        _canonical_config_value(base_module.config[key]) != _canonical_config_value(source_module.config[key])
+        for key in fields
+    ):
         raise ValueError("Checkpoint/base transformer configuration mismatch")
     shapes = {key: tuple(value.shape) for key, value in base_module.state_dict().items()}
     keep_fp32 = tuple(getattr(base_module, "_keep_in_fp32_modules", None) or ())
@@ -299,10 +311,12 @@ def _h3_source_schema(source_config_path: Path, native_root: Path):
     del module
 
     for name in _H3_SHARED_CONFIG_FIELDS:
-        if native_config.get(name) != source_config.get(name):
+        if _canonical_config_value(native_config.get(name)) != _canonical_config_value(source_config.get(name)):
             raise ValueError(f"MiniMax H3 native/base config mismatch: {name}")
     for source_name, native_name in _H3_CONFIG_RENAMES.items():
-        if native_config.get(native_name) != source_config.get(source_name):
+        if _canonical_config_value(native_config.get(native_name)) != _canonical_config_value(
+            source_config.get(source_name)
+        ):
             raise ValueError(f"MiniMax H3 native/base config mismatch: {native_name}")
     hidden_size = source_config.get("hidden_size")
     if native_config.get("adaln_out_features") != 18 * hidden_size:

@@ -15,6 +15,8 @@
 
 import ast
 import importlib.util
+import os
+import shutil
 import subprocess
 import sys
 from dataclasses import replace
@@ -34,6 +36,10 @@ from verl_omni.model_merge.fsdp_model_merger import (
     _pipeline_class,
 )
 from verl_omni.model_merge.utils import inventory, read_json, tree_files, weight_files, write_json
+
+
+def _tensor_outputs(output):
+    return output if isinstance(output, tuple) else (output,)
 
 
 def _h3_native_config(diffusers_config):
@@ -242,6 +248,108 @@ def test_all_pipelines_reload_and_forward(tmp_path, architecture):
         if not name.startswith("transformer/"):
             assert after[name] == digest, name
     assert validate_artifact(result.output_dir)["trained_components"] == ["transformer"]
+
+
+def test_all_tiny_models_train_one_step_save_with_fsdp2_and_merge(tmp_path):
+    architectures = sorted(_TRANSFORMERS)
+    if importlib.util.find_spec("boogu") is None:
+        architectures.remove("BooguImagePipeline")
+    cases = {}
+    for architecture in architectures:
+        root = tmp_path / architecture
+        root.mkdir()
+        if architecture == "MiniMaxH3Pipeline":
+            config, _ = _h3_pipeline_case(root)
+        else:
+            config, _ = _case(
+                root,
+                architecture,
+                pipeline=True,
+                dual_wan=architecture == "WanPipeline",
+            )
+        shutil.rmtree(config.local_dir)
+        cases[architecture] = config
+
+    env = os.environ.copy()
+    nvidia_root = Path(torch.__file__).parents[1] / "nvidia"
+    nvidia_libraries = [str(path) for path in sorted(nvidia_root.glob("*/lib"))]
+    env.update(
+        PYTHONPATH=os.pathsep.join(filter(None, (str(Path.cwd()), env.get("PYTHONPATH")))),
+        LD_LIBRARY_PATH=os.pathsep.join(filter(None, (*nvidia_libraries, env.get("LD_LIBRARY_PATH")))),
+        DIFFUSION_ATTENTION_BACKEND="TORCH_SDPA",
+        TORCH_COMPILE_DISABLE="1",
+        TORCHINDUCTOR_DISABLE="1",
+        OMP_NUM_THREADS="1",
+        MKL_NUM_THREADS="1",
+    )
+    run = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc_per_node=2",
+            str(Path(__file__).with_name("fsdp2_tiny_train_checkpoint.py")),
+            str(tmp_path),
+            *architectures,
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    assert run.returncode == 0, run.stdout + run.stderr
+
+    for architecture, config in cases.items():
+        evidence = torch.load(tmp_path / architecture / "expected.pt", weights_only=True)
+        assert torch.isfinite(torch.tensor(evidence["loss"]))
+        expected = evidence["after"]
+        if architecture == "MiniMaxH3Pipeline":
+            diffusers_base = tmp_path / architecture / "diffusers-base"
+            tiny_transformer(architecture).save_pretrained(diffusers_base)
+            diffusers_result = merge_model(
+                replace(
+                    config,
+                    target_dir=str(tmp_path / architecture / "diffusers-output"),
+                    base_model=str(diffusers_base),
+                    output_format="transformer",
+                )
+            )
+            loaded = type(tiny_transformer(architecture)).from_pretrained(
+                diffusers_result.output_dir,
+                local_files_only=True,
+            )
+            torch.testing.assert_close(
+                _tensor_outputs(run_forward(loaded, architecture)), expected, rtol=1e-5, atol=1e-6
+            )
+            native_result = merge_model(config)
+            actual = {}
+            for path in set(weight_files(native_result.output_dir / "transformer", "model.safetensors").values()):
+                from safetensors.torch import load_file
+
+                actual.update(load_file(path))
+            native_expected = _h3_native_state(loaded)
+            assert set(actual) == set(native_expected)
+            for name in actual:
+                torch.testing.assert_close(actual[name], native_expected[name], rtol=0, atol=0)
+            native_load = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).with_name("minimax_h3_native_load.py")),
+                    str(native_result.output_dir),
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            assert native_load.returncode == 0, native_load.stdout + native_load.stderr
+        else:
+            result = merge_model(config)
+            pipeline = _pipeline_class(architecture).from_pretrained(result.output_dir, local_files_only=True)
+            torch.testing.assert_close(
+                _tensor_outputs(run_forward(pipeline.transformer, architecture)), expected, rtol=1e-5, atol=1e-6
+            )
 
 
 def test_boogu_local_module_aliases_require_trust_and_remain_portable(tmp_path):
