@@ -17,7 +17,7 @@ from pathlib import Path
 
 from safetensors import safe_open
 
-from .fsdp_model_merger import _PIPELINES, _TRANSFORMERS
+from .architectures import _PIPELINES, _TRANSFORMERS
 from .utils import (
     MANIFEST_NAME,
     inventory,

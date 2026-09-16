@@ -24,6 +24,7 @@ import torch
 from safetensors import safe_open
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
+from .architectures import _PIPELINES, _TRANSFORMERS
 from .base_model_merger import BaseModelMerger, MergeResult
 from .utils import (
     MANIFEST_NAME,
@@ -37,17 +38,6 @@ from .utils import (
     write_weights,
 )
 
-_TRANSFORMERS = {
-    "QwenImagePipeline": "QwenImageTransformer2DModel",
-    "QwenImageEditPlusPipeline": "QwenImageTransformer2DModel",
-    "StableDiffusion3Pipeline": "SD3Transformer2DModel",
-    "FluxPipeline": "FluxTransformer2DModel",
-    "WanPipeline": "WanTransformer3DModel",
-    "LTX2Pipeline": "LTX2VideoTransformer3DModel",
-    "MiniMaxH3Pipeline": "MiniMaxH3Transformer3DModel",
-    "BooguImagePipeline": "BooguImageTransformer2DModel",
-}
-_PIPELINES = frozenset(_TRANSFORMERS)
 _H3_NATIVE_CLASS = "MiniMaxH3DiTModel"
 _H3_CONFIG_RENAMES = {
     "num_refiner_layers": "token_refiner_num_layers",
@@ -147,8 +137,8 @@ def model_rank_files(root: Path) -> list[Path]:
     world_size = metadata.get("world_size")
     if type(world_size) is not int or world_size < 1:
         raise ValueError("fsdp_config.json must declare a positive integer world_size")
-    if type(metadata.get("FSDP_version")) is not int or metadata["FSDP_version"] not in (1, 2):
-        raise ValueError("Unsupported FSDP checkpoint version")
+    if type(metadata.get("FSDP_version")) is not int or metadata["FSDP_version"] != 2:
+        raise ValueError("Only FSDP2 checkpoints are supported")
     expected = [root / f"model_world_size_{world_size}_rank_{rank}.pt" for rank in range(world_size)]
     if set(root.glob("model_world_size_*_rank_*.pt")) != set(expected) or not all(p.is_file() for p in expected):
         raise ValueError("Missing or unexpected model rank files")

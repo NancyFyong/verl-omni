@@ -346,6 +346,14 @@ def test_missing_and_extra_ranks(case):
         model_rank_files(source)
 
 
+def test_fsdp1_checkpoint_is_rejected_upfront(case):
+    config, _, _ = case
+    source = Path(config.local_dir)
+    utils.write_json(source / "fsdp_config.json", {"world_size": 1, "FSDP_version": 1})
+    with pytest.raises(ValueError, match="Only FSDP2 checkpoints are supported"):
+        model_rank_files(source)
+
+
 def test_existing_target_and_input_overlap(case):
     config, _, _ = case
     with pytest.raises(FileExistsError):

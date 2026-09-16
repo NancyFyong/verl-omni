@@ -28,9 +28,8 @@ import torch
 from model_fixtures import run_forward, tiny_pipeline, tiny_transformer
 
 from verl_omni.model_merger import ModelMergerConfig, merge_model, validate_artifact
+from verl_omni.model_merger.architectures import _PIPELINES, _TRANSFORMERS
 from verl_omni.model_merger.fsdp_model_merger import (
-    _PIPELINES,
-    _TRANSFORMERS,
     _h3_conversion_plan,
     _h3_native_name,
     _pipeline_class,
