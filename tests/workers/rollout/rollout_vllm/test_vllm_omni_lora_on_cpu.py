@@ -24,7 +24,6 @@ from verl_omni.workers.rollout.vllm_rollout.utils import vLLMOmniColocateWorkerE
 @pytest.mark.parametrize("enabled,seed", [(None, "42"), ("0", "42"), ("1", None), ("1", "7")])
 def test_diffusion_worker_restores_explicit_determinism(monkeypatch, enabled, seed):
     from verl.workers.engine import utils as engine_utils
-    from vllm.distributed import parallel_state
 
     from verl_omni.workers.rollout.vllm_rollout import utils as rollout_utils
 
@@ -35,13 +34,12 @@ def test_diffusion_worker_restores_explicit_determinism(monkeypatch, enabled, se
             monkeypatch.setenv(key, value)
     calls = []
     monkeypatch.setattr(engine_utils, "enable_full_determinism", lambda seed: calls.append(("seed", seed)))
-    monkeypatch.setattr(parallel_state, "set_custom_all_reduce", lambda enabled: calls.append(("custom_ar", enabled)))
     monkeypatch.setattr(torch.utils.deterministic, "fill_uninitialized_memory", True, raising=False)
     monkeypatch.setattr(rollout_utils, "set_death_signal", lambda: None)
     monkeypatch.setattr(rollout_utils.VLLMOmniHijack, "hijack", lambda: None)
     vLLMOmniColocateWorkerExtension.__new__(vLLMOmniColocateWorkerExtension)
     restored = enabled == "1" and seed is not None
-    assert calls == ([("seed", int(seed)), ("custom_ar", False)] if restored else [])
+    assert calls == ([("seed", int(seed))] if restored else [])
     # Deterministic algorithms fill torch.empty buffers with NaN, which would reach
     # the rollout latents, so the rollout path must turn that back off.
     assert torch.utils.deterministic.fill_uninitialized_memory is not restored

@@ -33,22 +33,20 @@ def _split_visible_devices(value: str) -> list[str]:
 
 
 def enable_rollout_determinism(seed: int) -> None:
-    """Enable verl's full determinism, then undo the parts vLLM cannot tolerate.
+    """Enable verl's full determinism without poisoning uninitialized buffers.
 
     ``torch.use_deterministic_algorithms`` also turns on
-    ``fill_uninitialized_memory``, which poisons every ``torch.empty`` buffer with
-    NaN. Diffusion rollout keeps such scratch buffers (for example the packed
-    per-step latent trajectory), so the NaNs reach the actor's replay tensors, and
-    vLLM's custom all-reduce IPC buffers fault with a CUDA misaligned address.
-    vLLM disables that kernel itself under ``VLLM_BATCH_INVARIANT``, but the
-    diffusion worker builds its parallel state directly and never applies it.
+    ``fill_uninitialized_memory``, which fills every ``torch.empty`` buffer with
+    NaN. Diffusion rollout keeps such scratch buffers, for example the packed
+    per-step latent trajectory, so those NaNs reach the actor's replay tensors and
+    every update reports a non-finite gradient norm. The fill also corrupts vLLM's
+    custom all-reduce IPC buffers, which aborts the worker with a CUDA misaligned
+    address, so disabling it addresses both failures.
     """
     from verl.workers.engine.utils import enable_full_determinism
-    from vllm.distributed import parallel_state
 
     enable_full_determinism(seed=seed)
     torch.utils.deterministic.fill_uninitialized_memory = False
-    parallel_state.set_custom_all_reduce(False)
 
 
 class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
