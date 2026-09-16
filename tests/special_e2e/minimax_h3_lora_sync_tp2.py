@@ -331,9 +331,12 @@ def main() -> None:
         # BF16 GEMM reductions are batch-shape dependent, so serial and packed
         # execution only agree under deterministic matmul. Enable it before any
         # CUDA or distributed work so the cuBLAS workspace setting still applies.
-        from verl_omni.workers.rollout.vllm_rollout.utils import enable_rollout_determinism
+        from verl.workers.engine.utils import enable_full_determinism
 
-        enable_rollout_determinism(seed=33)
+        enable_full_determinism(seed=33)
+        # Deterministic algorithms also fill uninitialized memory with NaN, which
+        # poisons the torch.empty scratch buffers these checks allocate.
+        torch.utils.deterministic.fill_uninitialized_memory = False
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     tp_size = int(os.environ["WORLD_SIZE"])

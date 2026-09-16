@@ -32,23 +32,6 @@ def _split_visible_devices(value: str) -> list[str]:
     return [entry.strip() for entry in value.split(",") if entry.strip()]
 
 
-def enable_rollout_determinism(seed: int) -> None:
-    """Enable verl's full determinism without poisoning uninitialized buffers.
-
-    ``torch.use_deterministic_algorithms`` also turns on
-    ``fill_uninitialized_memory``, which fills every ``torch.empty`` buffer with
-    NaN. Diffusion rollout keeps such scratch buffers, for example the packed
-    per-step latent trajectory, so those NaNs reach the actor's replay tensors and
-    every update reports a non-finite gradient norm. The fill also corrupts vLLM's
-    custom all-reduce IPC buffers, which aborts the worker with a CUDA misaligned
-    address, so disabling it addresses both failures.
-    """
-    from verl.workers.engine.utils import enable_full_determinism
-
-    enable_full_determinism(seed=seed)
-    torch.utils.deterministic.fill_uninitialized_memory = False
-
-
 class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
     """
     The class for vLLM-Omni's worker to inherit from, in the colocate setting.
@@ -67,10 +50,6 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
 
     def __new__(cls, **kwargs):
         set_death_signal()
-
-        # Restore the parent's explicit rollout determinism in the worker subprocess.
-        if os.environ.get("VERL_FULL_DETERMINISM") == "1" and "VERL_SEED" in os.environ:
-            enable_rollout_determinism(seed=int(os.environ["VERL_SEED"]))
 
         # 1. patch for Lora
         VLLMOmniHijack.hijack()
