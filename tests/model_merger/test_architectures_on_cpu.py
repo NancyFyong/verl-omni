@@ -271,12 +271,8 @@ def test_all_tiny_models_train_one_step_save_with_fsdp2_and_merge(tmp_path):
         cases[architecture] = config
 
     env = os.environ.copy()
-    nvidia_root = Path(torch.__file__).parents[1] / "nvidia"
-    nvidia_libraries = [str(path) for path in sorted(nvidia_root.glob("*/lib"))]
     env.update(
         PYTHONPATH=os.pathsep.join(filter(None, (str(Path.cwd()), env.get("PYTHONPATH")))),
-        LD_LIBRARY_PATH=os.pathsep.join(filter(None, (*nvidia_libraries, env.get("LD_LIBRARY_PATH")))),
-        DIFFUSION_ATTENTION_BACKEND="TORCH_SDPA",
         TORCH_COMPILE_DISABLE="1",
         TORCHINDUCTOR_DISABLE="1",
         OMP_NUM_THREADS="1",

@@ -17,6 +17,7 @@ import argparse
 import json
 import socket
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 from safetensors import safe_open
@@ -27,6 +28,8 @@ from vllm.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from vllm_omni.diffusion.attention import selector
+from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3DiTModel
 
@@ -61,7 +64,10 @@ def main() -> None:
                 dtype=torch.float32,
                 parallel_config=DiffusionParallelConfig(tensor_parallel_size=1),
             )
-            model = MiniMaxH3DiTModel(diffusion_config)
+            # The CPU platform deliberately has no runtime attention backend.
+            # This helper verifies native checkpoint loading, not backend dispatch.
+            with patch.object(selector, "_cached_get_backend_cls", return_value=SDPABackend):
+                model = MiniMaxH3DiTModel(diffusion_config)
             published = set()
 
             def weights():
