@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import os
-from contextlib import contextmanager
 from tempfile import TemporaryDirectory
 
 import torch
@@ -139,23 +138,6 @@ def _check_text_encoder_tp(rank: int, tp_size: int, device: torch.device) -> Non
     assert torch.equal(received, expected), f"rank={rank} received a mismatched broadcast payload"
 
     print(f"rank={rank}: text_encoder_tp={tp_size} group={list(group.ranks)}, broadcast OK", flush=True)
-
-
-@contextmanager
-def _packed_matmul_context():
-    """Keep LoRA GEMM reductions comparable across serial and packed batch shapes."""
-    previous_backend = torch.backends.cuda.preferred_blas_library()
-    previous_reduction = (
-        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
-        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction_split_k,
-    )
-    try:
-        torch.backends.cuda.preferred_blas_library("cublaslt")
-        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = (False, False)
-        yield
-    finally:
-        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = previous_reduction
-        torch.backends.cuda.preferred_blas_library(previous_backend)
 
 
 def _check_packed_lora_matmul(device):
@@ -345,6 +327,13 @@ def main() -> None:
         "--attn-backend", choices=["_flash_3_varlen_hub", "torch_varlen", "native"], default="_flash_3_varlen_hub"
     )
     args = parser.parse_args()
+    if args.check_packed_forward:
+        # BF16 GEMM reductions are batch-shape dependent, so serial and packed
+        # execution only agree under deterministic matmul. Enable it before any
+        # CUDA or distributed work so the cuBLAS workspace setting still applies.
+        from verl_omni.workers.rollout.vllm_rollout.utils import enable_rollout_determinism
+
+        enable_rollout_determinism(seed=33)
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     tp_size = int(os.environ["WORLD_SIZE"])
@@ -490,12 +479,11 @@ def main() -> None:
                 from torch.distributed.device_mesh import init_device_mesh
 
                 mesh = init_device_mesh("cuda", (tp_size,))
-                with _packed_matmul_context():
-                    _check_packed_lora_matmul(device)
-                    for sharded in (False, True):
-                        _check_packed_nft(device, mesh, sharded, args.attn_backend)
-                        for task in ("t2va", "fl2va", "ref2va"):
-                            _check_packed_flow_grpo(device, mesh, sharded, args.attn_backend, task)
+                _check_packed_lora_matmul(device)
+                for sharded in (False, True):
+                    _check_packed_nft(device, mesh, sharded, args.attn_backend)
+                    for task in ("t2va", "fl2va", "ref2va"):
+                        _check_packed_flow_grpo(device, mesh, sharded, args.attn_backend, task)
                 torch.distributed.barrier()
                 if rank == 0:
                     print("MiniMax H3 packed forward + varlen backward + FSDP2: PASS", flush=True)

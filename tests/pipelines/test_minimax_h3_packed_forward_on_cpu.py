@@ -241,34 +241,6 @@ def test_unavailable_fa3_fails_instead_of_falling_back(monkeypatch):
     assert packed.transformer_blocks[0].attn.processor._attention_backend == "native"
 
 
-@pytest.mark.parametrize("fail", [False, True])
-def test_packed_numerical_matmul_settings_are_scoped(monkeypatch, fail):
-    from tests.special_e2e.minimax_h3_lora_sync_tp2 import _packed_matmul_context
-
-    backend_calls = []
-
-    def preferred_backend(backend=None):
-        if backend is not None:
-            backend_calls.append(backend)
-        return "original"
-
-    matmul = SimpleNamespace(
-        allow_bf16_reduced_precision_reduction=True,
-        allow_bf16_reduced_precision_reduction_split_k=True,
-    )
-    monkeypatch.setattr(
-        torch.backends, "cuda", SimpleNamespace(preferred_blas_library=preferred_backend, matmul=matmul)
-    )
-    with pytest.raises(RuntimeError, match="test failure") if fail else nullcontext():
-        with _packed_matmul_context():
-            assert matmul.allow_bf16_reduced_precision_reduction == (False, False)
-            assert backend_calls == ["cublaslt"]
-            if fail:
-                raise RuntimeError("test failure")
-    assert matmul.allow_bf16_reduced_precision_reduction == (True, True)
-    assert backend_calls == ["cublaslt", "original"]
-
-
 def test_varlen_layout_does_not_materialize_native_padding():
     layout = PackedSequenceLayout.from_lengths([2, 4], torch.device("cpu"))
     assert layout.total_tokens == 6

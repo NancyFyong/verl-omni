@@ -433,12 +433,11 @@ The optional checks extend the existing LoRA sync regression with NFT/FlowGRPO
 loss, LoRA gradients, sample isolation, gradient checkpointing and FSDP2 comparisons
 between the original and packed forwards on a tiny transformer. They also check
 rank-64 LoRA GEMMs at the real H3 projection dimensions. The optional comparisons
-use cuBLASLt with BF16 reduced-precision reductions and split-K disabled, then
-restore the previous settings (requires PyTorch's cuBLASLt split-K control).
-Matching FA3 alone is insufficient: shape-dependent LoRA GEMM reductions can
-introduce small differences that the refiner and DiT amplify. Running these checks
-does not enable deterministic execution in recipes; use the explicit flags above
-when the same GEMM controls are required for training.
+enable deterministic execution for the test process, which is what makes BF16 GEMM
+reductions batch-shape invariant; matching FA3 alone is insufficient, because
+shape-dependent LoRA GEMM reductions introduce small differences that the refiner
+and DiT amplify. Recipes are unaffected: use the explicit flags above when the same
+determinism is required for training.
 It is not a rollout/trainer e2e or a production
 speed benchmark. Measure actor time, total step time and peak memory before using
 larger micro-batches; batching does not reduce the model's mathematical FLOPs.
