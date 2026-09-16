@@ -31,9 +31,9 @@ from safetensors.torch import load_file
 from tokenizers.pre_tokenizers import ByteLevel
 from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer
 
-from verl_omni.model_merge import ModelMergerConfig, merge_model, utils, validate_artifact
-from verl_omni.model_merge.base_model_merger import generate_config_from_args, parse_args, run_model_merger
-from verl_omni.model_merge.fsdp_model_merger import model_rank_files, reconstruct_tensor
+from verl_omni.model_merger import ModelMergerConfig, merge_model, utils, validate_artifact
+from verl_omni.model_merger.base_model_merger import generate_config_from_args, parse_args, run_model_merger
+from verl_omni.model_merger.fsdp_model_merger import model_rank_files, reconstruct_tensor
 
 
 def test_cli_common_arguments_live_in_base_model_merger(monkeypatch):
@@ -41,7 +41,7 @@ def test_cli_common_arguments_live_in_base_model_merger(monkeypatch):
         sys,
         "argv",
         [
-            "model_merge",
+            "model_merger",
             "merge",
             "--backend",
             "fsdp",
@@ -439,7 +439,7 @@ def test_real_cli_cpu_startup_and_export(case):
     )
     assert generated.returncode == 0, generated.stdout + generated.stderr
     assert config.local_dir and config.target_dir and config.base_model
-    command = [sys.executable, "-m", "verl_omni.model_merge"]
+    command = [sys.executable, "-m", "verl_omni.model_merger"]
     run = subprocess.run(
         command
         + [
@@ -574,7 +574,7 @@ def test_cast_overflow_fails_instead_of_publishing_inf(case):
 
 
 def test_input_mutation_during_export(case, monkeypatch):
-    from verl_omni.model_merge import fsdp_model_merger
+    from verl_omni.model_merger import fsdp_model_merger
 
     config, _, _ = case
     original = fsdp_model_merger.write_weights

@@ -27,15 +27,15 @@ import pytest
 import torch
 from model_fixtures import run_forward, tiny_pipeline, tiny_transformer
 
-from verl_omni.model_merge import ModelMergerConfig, merge_model, validate_artifact
-from verl_omni.model_merge.fsdp_model_merger import (
+from verl_omni.model_merger import ModelMergerConfig, merge_model, validate_artifact
+from verl_omni.model_merger.fsdp_model_merger import (
     _PIPELINES,
     _TRANSFORMERS,
     _h3_conversion_plan,
     _h3_native_name,
     _pipeline_class,
 )
-from verl_omni.model_merge.utils import inventory, read_json, tree_files, weight_files, write_json
+from verl_omni.model_merger.utils import inventory, read_json, tree_files, weight_files, write_json
 
 
 def _tensor_outputs(output):
@@ -106,7 +106,7 @@ def _h3_pipeline_case(tmp_path):
     transformer = base / "transformer"
     base.mkdir()
     native_config = _h3_native_config(dict(base_model.config))
-    from verl_omni.model_merge import utils
+    from verl_omni.model_merger import utils
 
     utils.write_weights(
         transformer,

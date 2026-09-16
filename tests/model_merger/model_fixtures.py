@@ -17,7 +17,7 @@ import diffusers as d
 import torch
 import transformers as t
 
-from verl_omni.model_merge.fsdp_model_merger import _transformer_class
+from verl_omni.model_merger.fsdp_model_merger import _transformer_class
 
 CONFIGS = {
     "QwenImagePipeline": dict(

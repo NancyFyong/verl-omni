@@ -2,7 +2,7 @@
 
 Last updated: 09/15/2026
 
-`verl_omni.model_merge` converts an existing FSDP actor checkpoint into a local
+`verl_omni.model_merger` converts an existing FSDP actor checkpoint into a local
 transformer or self-contained inference pipeline. It follows verl's
 `ModelMergerConfig`, `merge_and_save()` and `cleanup()` lifecycle without routing
 diffusion configs through Transformers `AutoConfig`. The CLI entrypoint only
@@ -99,14 +99,14 @@ are checked again before publication.
 ## CLI and Python
 
 ```bash
-python -m verl_omni.model_merge merge \
+python -m verl_omni.model_merger merge \
   --backend fsdp \
   --local_dir "$ACTOR_CHECKPOINT" \
   --target_dir "$OUTPUT" \
   --base_model "$BASE_PIPELINE" \
   --trust-checkpoint
 
-python -m verl_omni.model_merge test \
+python -m verl_omni.model_merger test \
   --backend fsdp \
   --test_hf_dir "$OUTPUT"
 ```
@@ -114,7 +114,7 @@ python -m verl_omni.model_merge test \
 For a standalone Diffusers component:
 
 ```bash
-python -m verl_omni.model_merge merge \
+python -m verl_omni.model_merger merge \
   --backend fsdp \
   --local_dir "$ACTOR_CHECKPOINT" \
   --target_dir "$OUTPUT" \
@@ -146,7 +146,7 @@ T2VA/FL2VA/Ref2VA pipeline directory and explicitly trust its local component
 code:
 
 ```bash
-python -m verl_omni.model_merge merge \
+python -m verl_omni.model_merger merge \
   --backend fsdp \
   --local_dir "$ACTOR_CHECKPOINT" \
   --target_dir "$OUTPUT" \
@@ -159,7 +159,7 @@ The CLI does not expose an algorithm choice. FlowGRPO, NFT and distribution
 matching use the same publisher when they save the same complete transformer.
 
 ```python
-from verl_omni.model_merge import ModelMergerConfig, merge_model, validate_artifact
+from verl_omni.model_merger import ModelMergerConfig, merge_model, validate_artifact
 
 result = merge_model(ModelMergerConfig(
     operation="merge",
@@ -246,7 +246,7 @@ Run the matrix with the project's venv and optional `boogu-image` dependency:
 
 ```bash
 TORCH_COMPILE_DISABLE=1 TORCHINDUCTOR_DISABLE=1 OMP_NUM_THREADS=1 \
-  python -m pytest tests/model_merge/test_architectures_on_cpu.py -v
+  python -m pytest tests/model_merger/test_architectures_on_cpu.py -v
 ```
 
 Without `boogu-image`, only its cases are skipped; this is not evidence that Boogu

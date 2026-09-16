@@ -31,7 +31,7 @@ start/install_npu.md
 start/models.md
 start/flowgrpo_quickstart.md
 start/multi_node_training.md
-start/model_merge.md
+start/model_merger.md
 start/metrics.md
 ```
 
