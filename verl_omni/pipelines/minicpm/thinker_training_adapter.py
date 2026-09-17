@@ -44,7 +44,12 @@ class _MiniCPMAutoModel:
 
             model_cls.__init__ = _init
             model_cls._verl_post_init = True
-        return model_cls.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        model = model_cls.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        if hasattr(model, "resampler"):
+            # Transformers initializes unknown non-persistent buffers to zero.
+            resampler = model.resampler
+            resampler._set_2d_pos_cache(resampler.max_size, device=resampler.pos_embed.device)
+        return model
 
 
 def _bounds_are_empty(bounds) -> bool:
@@ -83,6 +88,16 @@ def _offset_media_bounds(data: dict[str, Any], attention_mask: torch.Tensor | No
             )
             for index, bound in enumerate(bounds)
         ]
+
+
+def _minicpmo_rotary_apply(self, fn, recurse=True):
+    def preserve_frequency_dtype(tensor):
+        converted = fn(tensor)
+        if converted.dtype != tensor.dtype:
+            return tensor.to(device=converted.device)
+        return converted
+
+    return self._verl_minicpmo_original_apply(preserve_frequency_dtype, recurse=recurse)
 
 
 def _minicpmo_whisper_attention_forward(self, *args, **kwargs):
@@ -256,7 +271,14 @@ class MiniCPMThinkerAdapter(OmniModelBase):
 
     @classmethod
     def configure_model(cls, module, model_config):
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
+
         module = super().configure_model(module, model_config)
+        # Whole-model casts must not quantize non-persistent RoPE frequencies.
+        for child in module.llm.modules():
+            if isinstance(child, Qwen3RotaryEmbedding):
+                child._verl_minicpmo_original_apply = child._apply
+                child._apply = types.MethodType(_minicpmo_rotary_apply, child)
         module._verl_minicpmo_original_forward = module.forward
         module.forward = types.MethodType(_minicpmo_forward, module)
         module.config.stream_input = False

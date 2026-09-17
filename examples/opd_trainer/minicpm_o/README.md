@@ -1,6 +1,6 @@
 # MiniCPM-o 4.5 simplex thinker OPD
 
-Last updated: 09/09/2026.
+Last updated: 09/15/2026.
 
 This recipe implements the first, thinker-stage part of [RFC #565](https://github.com/verl-project/verl-omni/issues/565), under [#345](https://github.com/verl-project/verl-omni/issues/345). The student generates a complete text response; a frozen teacher scores the same tokens and the existing verl reverse-KL policy-gradient loss updates the student.
 
@@ -34,6 +34,8 @@ python examples/opd_trainer/minicpm_o/prepare_noised_student.py \
 ```
 
 The script copies the complete checkpoint but perturbs only nonzero floating-point `llm.*` tensors. For every perturbed tensor it samples a Gaussian direction and rescales it so that `||ΔW||₂ / ||W||₂ = 0.20`, within the checkpoint dtype's rounding precision. The frozen vision/audio encoders, processor, tokenizer, and other model components remain identical to the teacher. The output contains `noise_manifest.json` recording the scope, ratio, and seed. The destination must not already exist.
+
+This is optional diagnostic tooling, not a validated recovery recipe: it perturbs embeddings, MLPs, and norms as well as attention, whereas the launcher trains attention LoRA only.
 
 Teacher and student must retain the same tokenizer and special-token mapping; vocabulary compatibility is checked before worker allocation. Using an identical unperturbed checkpoint on both sides is useful for a consistency smoke test, **not evidence of useful distillation or quality improvement**.
 
@@ -97,6 +99,19 @@ bash examples/opd_trainer/minicpm_o/run_simplex_opd_lora_mmk12.sh
 
 This wrapper changes the base objective from teacher-only OPD to **task reward plus OPD** by enabling `distillation.distillation_loss.use_task_rewards`. It selects `mmk12_reward.py`, whose normalized score combines answer correctness from `math_verify` with progressive `<answer>` and `\boxed{}` format credit. `REWARD_FUNCTION_PATH` can override the scorer path. Validation runs every ten steps by default, without validation before training.
 
+**Known reward limitation:** the pinned reward manager decodes with `skip_special_tokens=True`, which removes MiniCPM's `<answer>` delimiters. This disables their format credit and can make the scorer read reasoning instead of the final answer. The recipe does not yet fix this decode contract; do not treat its scores as validated final-answer accuracy.
+
+For a conservative evaluation-only alternative, select `mmk12_final_answer.py` and disable training task rewards:
+
+```bash
+REWARD_FUNCTION_PATH="$PWD/verl_omni/utils/reward_score/mmk12_final_answer.py" \
+bash examples/opd_trainer/minicpm_o/run_simplex_opd_lora_mmk12.sh \
+  distillation.distillation_loss.use_task_rewards=false \
+  trainer.val_before_train=true
+```
+
+Supply `STUDENT_MODEL`, `TEACHER_MODEL`, and `DATA_DIR` as above. This scorer accepts final A–E choices or numeric literals, awards no format bonus, and reports answer coverage separately. It rejects unsupported expressions and responses reaching the token budget, even if an answer is present; the budget flag is length-based, not a native finish reason. It is not a general symbolic grader or a fix for deleted delimiters, and its metrics are not interchangeable with the original MMK12 reward.
+
 Important settings:
 
 | Setting | Requirement |
@@ -122,13 +137,17 @@ The agent snapshots native processor outputs before rollout. Serving receives th
 
 Frozen encoder embeddings remain buffers under their original checkpoint names, avoiding conditional FSDP collectives and direct reads of sharded Whisper positional weights. Vision insertion is out of place so PEFT input-gradient hooks remain valid. Teacher fields are resized in synthetic zero-loss padding samples.
 
+The loader rebuilds the resampler's non-persistent positional cache after Transformers checkpoint loading. Whole-model casts preserve Qwen3 RoPE frequency precision. Floating weight synchronization follows `actor.fsdp_config.mixed_precision.param_dtype` (BF16 by default) instead of always downcasting FP32 controls. These fixes do not establish BF16 actor/rollout parity: merging small LoRA updates into BF16 weights can still introduce rounding differences. Validate the chosen precision and synchronization path with an identical-student/teacher control before interpreting a learning curve.
+
 CPU contracts are in:
 
 ```bash
 TORCH_COMPILE_DISABLE=1 TORCHINDUCTOR_DISABLE=1 python -m pytest -q --asyncio-mode=auto \
   tests/pipelines/test_minicpm_simplex_on_cpu.py \
   tests/trainer/omni/test_omni_distillation_on_cpu.py \
-  tests/workers/rollout/rollout_vllm/test_omni_teacher_on_cpu.py
+  tests/workers/rollout/rollout_vllm/test_omni_teacher_on_cpu.py \
+  tests/workers/test_omni_fsdp_engine_on_cpu.py \
+  tests/utils/reward_score/test_mmk12_final_answer_on_cpu.py
 ```
 
 For real-weight validation, check complete rollout → teacher scoring → actor update → weight sync → fresh rollout over multiple steps, and repeat with image/audio prompts. Token equality alone does not establish probability parity or generation quality. Monitor distillation loss, gradients, teacher coverage, and post-sync behavior; missing/misaligned teacher or replay fields must fail the sample.

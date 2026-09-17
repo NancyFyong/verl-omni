@@ -232,6 +232,79 @@ def test_frozen_whisper_positions_keep_checkpoint_names_without_sharding():
     assert "apm.embed_positions.weight" not in dict(model.named_parameters())
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_actor_model_cast_preserves_rotary_frequencies(dtype):
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+
+    config = Qwen3Config(
+        vocab_size=32,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        rope_theta=1000000.0,
+    )
+    model = torch.nn.Module()
+    model.config = SimpleNamespace()
+    model.llm = Qwen3ForCausalLM(config)
+    rotary = model.llm.model.rotary_emb
+    frequencies = rotary.inv_freq.clone()
+    x = torch.zeros(1, 3, 64, dtype=dtype)
+    positions = torch.tensor([[0, 1023, 4095]])
+    expected = rotary(x, positions)
+
+    MiniCPMThinkerAdapter.configure_model(model, SimpleNamespace())
+    model.to(dtype=dtype)
+
+    assert model.llm.model.embed_tokens.weight.dtype == dtype
+    assert rotary.inv_freq.dtype == torch.float32
+    assert rotary.original_inv_freq.dtype == torch.float32
+    torch.testing.assert_close(rotary.inv_freq, frequencies, atol=0, rtol=0)
+    torch.testing.assert_close(rotary.original_inv_freq, frequencies, atol=0, rtol=0)
+    for actual, reference in zip(rotary(x, positions), expected, strict=True):
+        torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+    assert not any("inv_freq" in key for key in model.state_dict())
+
+
+def test_remote_loader_restores_nonpersistent_resampler_positions(monkeypatch, tmp_path):
+    import transformers.dynamic_module_utils as dynamic
+    from transformers import PretrainedConfig, PreTrainedModel
+
+    class Resampler(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(2, 2)
+            self.max_size = (2, 2)
+            self._set_2d_pos_cache(self.max_size)
+
+        def _set_2d_pos_cache(self, size, device="cpu"):
+            positions = torch.arange(size[0] * size[1], dtype=torch.float32, device=device).cos()
+            self.register_buffer("pos_embed", positions, persistent=False)
+
+    class NativeModel(PreTrainedModel):
+        config_class = PretrainedConfig
+
+        def __init__(self, config):
+            super().__init__(config)
+            self.resampler = Resampler()
+
+    config = PretrainedConfig(auto_map={"AutoModel": "model.NativeModel"})
+    source = NativeModel(config)
+    source.post_init()
+    source.resampler._set_2d_pos_cache(source.resampler.max_size)
+    expected = source.resampler.pos_embed.clone()
+    source.save_pretrained(tmp_path)
+    monkeypatch.setattr(dynamic, "get_class_from_dynamic_module", lambda *args: NativeModel)
+
+    loaded = _MiniCPMAutoModel.from_pretrained(str(tmp_path), config=config, trust_remote_code=True)
+
+    torch.testing.assert_close(loaded.resampler.pos_embed, expected, atol=0, rtol=0)
+    assert "resampler.pos_embed" not in loaded.state_dict()
+    torch.testing.assert_close(loaded.resampler.proj.weight, source.resampler.proj.weight)
+
+
 def test_remote_loader_initializes_transformers_metadata_once(monkeypatch):
     import transformers.dynamic_module_utils as dynamic
 
@@ -306,3 +379,35 @@ def test_replay_worker_requires_snapshot():
     actual = worker._compute_multi_modal_inputs(output, None)
     actual["image_bound"].zero_()
     assert output._minicpm_actor_inputs["image_bound"].tolist() == [[1, 3]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response_length", [3, 4])
+async def test_agent_exposes_token_budget_to_evaluation(monkeypatch, response_length):
+    import asyncio
+
+    import verl_omni.pipelines.minicpm.agent_loop as module
+
+    agent = object.__new__(module.MiniCPMSimplexAgentLoop)
+    agent.loop = asyncio.get_running_loop()
+    agent.processor = object()
+    agent.tokenizer = SimpleNamespace(encode=lambda *args, **kwargs: [1, 2])
+    agent.apply_chat_template_kwargs = {}
+    agent.rollout_config = SimpleNamespace(prompt_length=16)
+    agent.response_length = 4
+    agent.process_multi_modal_info = AsyncMock(return_value={})
+    agent._get_mm_processor_kwargs = lambda audios: {}
+    response = SimpleNamespace(
+        token_ids=[3] * response_length,
+        log_probs=[0.0] * response_length,
+        extra_fields={"rollout_prompt_ids": [1, 2]},
+        num_preempted=0,
+    )
+    agent.server_manager = SimpleNamespace(generate=AsyncMock(return_value=response))
+    monkeypatch.setattr(module, "render_minicpmo_messages", lambda *args, **kwargs: "prompt")
+    monkeypatch.setattr(module, "prepare_minicpmo_inputs", lambda *args, **kwargs: {})
+    monkeypatch.setattr(module, "split_minicpmo_actor_inputs", lambda inputs: ([1, 2], {}))
+
+    output = await agent.run({}, raw_prompt=[{"role": "user", "content": "prompt"}])
+
+    assert output.extra_fields["response_at_token_limit"] == (response_length == 4)

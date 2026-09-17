@@ -126,6 +126,7 @@ class MiniCPMSimplexAgentLoop(SingleTurnAgentLoop):
         metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
         extra_fields = dict(output.extra_fields)
         extra_fields.pop("rollout_prompt_ids")
+        extra_fields["response_at_token_limit"] = len(output.token_ids) == self.response_length
         result = AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=output.token_ids,
