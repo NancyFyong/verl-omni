@@ -55,6 +55,7 @@ def _fast_path_worker(rollout_rank=0):
             checkpoint_engine=SimpleNamespace(backend="naive", update_weights_bucket_megabytes=16),
         )
     )
+    worker._rank = 0
     worker.peft_merge = False
     worker.base_sync_done = True
     worker.layered_summon = False
@@ -65,10 +66,15 @@ def _fast_path_worker(rollout_rank=0):
 
 
 def _run_update(worker, **kwargs):
+    # This regression test covers weight-version stamping, not background thread scheduling.
+    async def run_in_event_loop(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
     sender = MagicMock()
     sender.async_send_weights = AsyncMock()
     with (
         patch.object(ew, "BucketedWeightSender", return_value=sender),
+        patch.object(ew.asyncio, "to_thread", run_in_event_loop),
         patch.object(ew, "log_gpu_memory_usage", MagicMock()),
         patch.object(ew, "set_expandable_segments", MagicMock()),
     ):
