@@ -989,40 +989,36 @@ def test_ltx2_rollout_forward_attaches_trajectory_and_metadata() -> None:
 
 
 def test_ltx_phase_passes_declared_sampler_to_pinned_forward_context(monkeypatch):
-    from verl_omni.pipelines.ltx2_flow_grpo import vllm_omni_rollout_adapter as adapter
+    pipeline = object.__new__(LTX23PipelineWithLogProb)
+    pipeline.device = torch.device("cpu")
+    pipeline._flow_grpo_task = None
+    pipeline._select_sde_steps = lambda count, device: [0]
+    phase_recipe = SimpleNamespace(sampler="euler", adapter_slot=None)
+    sentinel = object()
 
-    class ContextCaptured(Exception):
-        pass
+    def run_parent(self, *args, **kwargs):
+        assert kwargs["phase_recipe"] is phase_recipe
+        pipeline._current_latents = [torch.zeros(1, 2, 3)]
+        pipeline._next_latents = [torch.zeros(1, 2, 3)]
+        pipeline._selected_timesteps = [torch.tensor(1.0)]
+        pipeline._log_probs = []
+        pipeline._flow_grpo_video_seq_len = 2
+        pipeline._flow_grpo_condition_image_latents = torch.zeros(1, 1, 3)
+        return sentinel
 
-    pipe = SimpleNamespace(
-        device=torch.device("cpu"),
-        scheduler=SimpleNamespace(config={}),
-        _check_forward_inputs=lambda *args, **kwargs: None,
-        _setup_forward_runtime=lambda *args: False,
-        _resolve_video_latent_dimensions=lambda *args: (2, 2, 2),
-        _prepare_video_latents_stage=lambda *args, **kwargs: (torch.zeros(1, 8, 32), None),
-        _prepare_audio_latents_stage=lambda *args, **kwargs: (torch.zeros(1, 2, 32), 2, 2, 16),
+    monkeypatch.setattr(LTX23PipelineWithLogProb.__bases__[0], "run_phase", run_parent)
+    result = pipeline.run_phase(
+        SimpleNamespace(),
+        SimpleNamespace(num_inference_steps=2),
+        noise_scale=1.0,
+        sigmas=None,
+        timesteps=None,
+        attention_kwargs=None,
+        phase_recipe=phase_recipe,
+        prompt_context=SimpleNamespace(),
     )
-    monkeypatch.setattr(adapter, "retrieve_timesteps", lambda *args, **kwargs: (torch.tensor([1.0, 0.5]), 2))
-    monkeypatch.setattr(adapter, "LTXVideoAudioStepAdapter", lambda *args, **kwargs: object())
 
-    def capture(pipeline, context, *args):
-        assert context.sampler == "euler"
-        raise ContextCaptured
-
-    monkeypatch.setattr(adapter, "prepare_rope_coords_stage", capture)
-    with pytest.raises(ContextCaptured):
-        adapter.LTX23PipelineWithLogProb.run_phase(
-            pipe,
-            SimpleNamespace(),
-            SimpleNamespace(num_inference_steps=2),
-            noise_scale=1.0,
-            sigmas=None,
-            timesteps=None,
-            attention_kwargs=None,
-            phase_recipe=SimpleNamespace(sampler="euler"),
-            prompt_context=SimpleNamespace(),
-        )
+    assert result is sentinel
 
 
 def test_ltx_warmup_does_not_emit_serving_media_without_request_metadata():

@@ -19,7 +19,7 @@ from verl import DataProto
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
 from verl.utils.reward_score import default_compute_score as _upstream_default_compute_score
 
-from verl_omni.pipelines.rollout_artifacts import ArtifactContractError, PRIMARY_ARTIFACT
+from verl_omni.pipelines.rollout_artifacts import PRIMARY_ARTIFACT, ArtifactContractError
 from verl_omni.utils.reward_score import default_compute_score_image
 
 from .media import _reward_extra_info

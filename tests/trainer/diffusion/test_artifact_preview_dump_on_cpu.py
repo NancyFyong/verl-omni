@@ -60,7 +60,6 @@ def test_latent_primary_dumps_declared_preview_without_axis_guessing(monkeypatch
             context._dump_executor = executor
             context._dump_futures = []
             context._drain_dump_futures = lambda: None
-            context._write_generations = V1._write_generations
             V1._dump_generations(context, **args)
             for future, step in context._dump_futures:
                 future.result()
@@ -165,7 +164,6 @@ def test_v1_dump_queue_is_bounded_and_does_not_retain_full_batch_storage(tmp_pat
     future = Future()
     context = SimpleNamespace(global_steps=1, _dump_executor=Mock(), _dump_futures=[])
     context._dump_executor.submit.return_value = future
-    context._write_generations = V1._write_generations
     context._drain_dump_futures = lambda: V1._drain_dump_futures(context)
     context._report_dump_failure = V1._report_dump_failure
     pixels = torch.zeros(4, 3, 8, 8, dtype=torch.uint8)
@@ -181,11 +179,11 @@ def test_v1_dump_queue_is_bounded_and_does_not_retain_full_batch_storage(tmp_pat
         max_samples=1,
     )
     V1._dump_generations(context, **args)
-    queued = context._dump_executor.submit.call_args.args[1:]
-    assert queued[1] is None  # No unused primary/training tensor is retained.
-    assert queued[4]["uid"] == ["0"]
-    assert len(queued[12]) == 1
-    copy = queued[12][0].data
+    queued = context._dump_executor.submit.call_args.args
+    assert queued[3] is None  # No unused primary/training tensor is retained.
+    assert queued[6]["uid"] == ["0"]
+    assert len(queued[13]) == 1
+    copy = queued[13][0].data
     assert copy.data_ptr() != pixels[0].data_ptr()
     assert copy.untyped_storage().nbytes() == pixels[0].numel()
     V1._dump_generations(context, **args)

@@ -54,7 +54,7 @@ from verl.utils.py_functional import rename_dict
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.llm_server import LLMServerManager
 
-from verl_omni.pipelines.rollout_artifacts import previews_from_batch, validate_previews
+from verl_omni.pipelines.rollout_artifacts import previews_from_batch, validate_audio, validate_previews
 from verl_omni.pipelines.rollout_media import (
     resolve_batch_media_kind,
     resolve_is_video,
@@ -256,6 +256,8 @@ def dump_generations(
     Media failures are recorded in JSONL; filesystem failures warn and skip the dump.
     """
     previews = validate_previews(previews, len(inputs))
+    if previews == []:
+        return
     if previews is not None:
         outputs = torch.stack([preview.data for preview in previews])
         media_kind = previews[0].spec.modality
@@ -266,9 +268,6 @@ def dump_generations(
     visual_folder = os.path.join(dump_path, f"{global_steps}")
 
     n = n_full if max_samples is None else min(max_samples, n_full)
-    if previews is None and outputs.ndim == 6:
-        # Per-sample batch dim from single-seq rollouts: [N, 1, T, C, H, W].
-        outputs = outputs.squeeze(1)
     # Prefer the adapter-declared media kind over legacy rank/layout inference.
     validate_visual_media_batch_rank(outputs.ndim, media_kind)
     is_video = resolve_is_video(outputs.ndim, media_kind)
@@ -276,6 +275,12 @@ def dump_generations(
         # Channels-first [N, C, T, H, W] -> [N, T, C, H, W]. Layout normalization
         # is still heuristic; declaring/normalizing it is deferred to the layout PR.
         outputs = outputs.permute(0, 2, 1, 3, 4)
+
+    if is_video:
+        audios = batch_items(audios, n_full, "audio")
+        audio_sample_rates = batch_items(audio_sample_rates, n_full, "audio_sample_rate")
+        for audio, audio_sample_rate in zip(audios, audio_sample_rates, strict=True):
+            validate_audio(audio, audio_sample_rate, context="generation dump")
 
     try:
         os.makedirs(visual_folder, exist_ok=True)
@@ -288,8 +293,6 @@ def dump_generations(
     video_export_errors = [None] * n
     image_export_errors = [None] * n
     if is_video:
-        audios = batch_items(audios, n_full, "audio")
-        audio_sample_rates = batch_items(audio_sample_rates, n_full, "audio_sample_rate")
         for i in range(n):
             video_path = os.path.join(visual_folder, f"{i}.mp4")
             try:

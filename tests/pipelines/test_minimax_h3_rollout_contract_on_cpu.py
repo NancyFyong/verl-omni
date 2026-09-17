@@ -146,7 +146,7 @@ def test_dump_consumes_adapter_normalized_preview(layout, shape, monkeypatch, tm
 def test_dump_rejects_undeclared_extra_batch_axis(tmp_path):
     from verl_omni.trainer.diffusion.ray_diffusion_trainer import BaseRayDiffusionTrainer
 
-    with pytest.raises(ValueError, match="canonical batched"):
+    with pytest.raises(ValueError, match="requires a rank-5 batch, got rank 6"):
         BaseRayDiffusionTrainer._dump_generations(
             SimpleNamespace(global_steps=1),
             inputs=["a"],

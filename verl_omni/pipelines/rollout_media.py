@@ -23,12 +23,13 @@ Modality = Literal["image", "video", "audio"]
 
 
 def resolve_is_video(ndim: int, media_kind: str | None) -> bool:
-    """Prefer the declared modality, retaining rank fallback for legacy outputs."""
-    if media_kind is not None:
-        if media_kind not in ("image", "video", "audio"):
-            raise ValueError(f"Unsupported media kind: {media_kind!r}")
-        return media_kind == "video"
-    return ndim == 5
+    """Read the declared modality; rank is never a modality discriminator."""
+    del ndim
+    if media_kind is None:
+        raise ValueError("Explicit media_kind required, got None")
+    if media_kind not in ("image", "video", "audio"):
+        raise ValueError(f"Unsupported media kind: {media_kind!r}")
+    return media_kind == "video"
 
 
 def resolve_batch_media_kind(media_kinds: Iterable[str | None]) -> str | None:

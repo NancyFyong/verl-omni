@@ -170,7 +170,7 @@ async def test_native_reward_function_computes_score_from_model_output():
         data_source="test",
         solution_image=torch.zeros(3, 2, 2, dtype=torch.uint8),
         ground_truth="prompt",
-        extra_info={},
+        extra_info={"media_kind": "image"},
         reward_model=_NativeModelHandle(),
     )
 
@@ -252,7 +252,7 @@ async def test_consumer_isolates_invalid_image_from_batch(monkeypatch):
     await consumer
 
     assert results[0] == 1.0
-    assert isinstance(results[1], TypeError)
+    assert isinstance(results[1], AssertionError)
     assert results[2] == 3.0
     assert len(inferencer.batches) == 1
     assert inferencer.batches[0][0] == ["prompt", "prompt"]
@@ -298,7 +298,7 @@ async def test_engine_reward_posts_openai_embedding_payloads(monkeypatch):
         data_source="test",
         solution_image=torch.zeros(3, 2, 2, dtype=torch.uint8),
         ground_truth="prompt",
-        extra_info={},
+        extra_info={"media_kind": "image"},
         reward_router_address="router:8000",
         model_name="pickscore",
         logit_scale=98.0,

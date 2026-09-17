@@ -236,7 +236,9 @@ def test_raw_and_engine_preprocessed_images_are_distinct_named_views(monkeypatch
         "multi_modal_data": {"image": [raw] if as_list else raw},
         "additional_information": {"condition_images": [processed], "vae_image_sizes": [(1024, 1024)]},
     }
-    request = SimpleNamespace(prompts=[prompt], sampling_params=SimpleNamespace(height=64, width=64, output_type="image"))
+    request = SimpleNamespace(
+        prompts=[prompt], sampling_params=SimpleNamespace(height=64, width=64, output_type="image")
+    )
 
     def capture(images, sizes, **kwargs):
         assert images == [raw]

@@ -211,7 +211,7 @@ def wrap_val_samples_for_wandb(samples, fps=24, output_dir=None, media_kinds=Non
             if media_kind == "image":
                 out = out.normalized(context="W&B", name="preview").data
         output_ndim = getattr(out, "ndim", -1)
-        is_video = resolve_is_video(output_ndim, media_kind) if media_kind is not None else output_ndim in (4, 5)
+        is_video = resolve_is_video(output_ndim, media_kind)
         if is_video and output_ndim == 5:
             # Batched video [B, T, C, H, W], [B, C, T, H, W], or [B, T, H, W, C].
             out = out[0]

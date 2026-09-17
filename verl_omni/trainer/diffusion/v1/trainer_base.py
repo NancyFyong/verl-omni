@@ -17,9 +17,9 @@ import math
 import os
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import replace
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from numbers import Integral
 from pprint import pprint
 
@@ -58,7 +58,7 @@ from verl.utils.skip import SkipManager
 from verl.utils.tracking import Tracking, ValidationGenerationsLogger
 from verl.workers.rollout.llm_server import LLMServerManager
 
-from verl_omni.pipelines.rollout_artifacts import MediaArtifact, previews_from_batch, validate_previews
+from verl_omni.pipelines.rollout_artifacts import MediaArtifact, previews_from_batch, validate_audio, validate_previews
 from verl_omni.pipelines.rollout_media import (
     resolve_batch_media_kind,
     resolve_is_video,
@@ -99,6 +99,7 @@ from verl_omni.trainer.diffusion.v1.tq_utils import (
     put_dataproto_fields_to_tq,
     sort_diffusion_tq_keys,
 )
+from verl_omni.utils.tracking import batch_items
 from verl_omni.workers.config.reward import (
     reward_is_enabled,
     reward_pool_is_separate,
@@ -1495,13 +1496,43 @@ class PolicyGradientDiffusionTrainerV1(ABC):
     ):
         """Validate media synchronously, then submit best-effort I/O with a step snapshot."""
         previews = validate_previews(previews, len(inputs))
+        if previews == []:
+            return
+        effective_media_kind = previews[0].spec.modality if previews is not None else media_kind
         if previews is None:
             _validate_generation_outputs(outputs)
-            resolve_is_video(outputs.ndim, media_kind)
-            dump_ndim = outputs.ndim - 1 if outputs.ndim == 6 and outputs.shape[1] == 1 else outputs.ndim
-            validate_visual_media_batch_rank(dump_ndim, media_kind)
+            resolve_is_video(outputs.ndim, effective_media_kind)
+            validate_visual_media_batch_rank(outputs.ndim, effective_media_kind)
+        if effective_media_kind == "video":
+            for audio, audio_sample_rate in zip(
+                batch_items(audios, len(inputs), "audio"),
+                batch_items(audio_sample_rates, len(inputs), "audio_sample_rate"),
+                strict=True,
+            ):
+                validate_audio(audio, audio_sample_rate, context="generation dump")
+        self._drain_dump_futures()
+        if self._dump_futures:
+            logger.warning("Skipping media dump at step %s: previous dump is still running", self.global_steps)
+            return
+        full_count = len(inputs)
+        retained_count = full_count if max_samples is None else min(max_samples, full_count)
+        if retained_count != full_count:
+            inputs = list(inputs)[:retained_count]
+            gts = list(gts)[:retained_count]
+            scores = list(scores)[:retained_count]
+            reward_extra_infos_dict = {
+                key: list(values)[:retained_count] if len(values) == full_count else values
+                for key, values in reward_extra_infos_dict.items()
+            }
+            audios = batch_items(audios, full_count, "audio")[:retained_count]
+            audio_sample_rates = batch_items(audio_sample_rates, full_count, "audio_sample_rate")[:retained_count]
+            if previews is not None:
+                previews = previews[:retained_count]
+            else:
+                outputs = outputs[:retained_count]
+            max_samples = None
         global_step = self.global_steps
-        outputs_to_dump = _copy_media_to_cpu(outputs)
+        outputs_to_dump = None if previews is not None else _copy_media_to_cpu(outputs)
         audios_to_dump = _copy_media_to_cpu(audios)
         audio_sample_rates_to_dump = _copy_media_to_cpu(audio_sample_rates)
         previews_to_dump = _copy_media_to_cpu(previews)
@@ -1522,7 +1553,6 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             previews_to_dump,
         )
         self._dump_futures.append((future, global_step))
-        self._drain_dump_futures()
 
     def _log_rollout_data(self, batch_meta: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
         """Fetch rollout rows from TQ and dump sorted by uid."""

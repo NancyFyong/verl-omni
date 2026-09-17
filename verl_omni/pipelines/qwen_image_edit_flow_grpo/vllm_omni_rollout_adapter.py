@@ -41,7 +41,7 @@ from verl_omni.pipelines.qwen_image_flow_grpo.common import (
     coalesce_not_none,
 )
 from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
-from verl_omni.pipelines.rollout_request import prompt_ids_from_payload
+from verl_omni.pipelines.rollout_request import condition_images_from_payload, prompt_ids_from_payload
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 
 __all__ = ["QwenImageEditPlusPipelineWithLogProb"]

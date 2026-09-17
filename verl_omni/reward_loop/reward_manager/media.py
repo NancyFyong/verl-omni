@@ -46,7 +46,7 @@ def _reward_extra_info(data_item) -> dict:
     artifact_keys = {
         key
         for fields in (tensor_fields, data_item.non_tensor_batch, tool_extra_fields)
-        for key in fields
+        for key in fields.keys()
         if key.startswith(ARTIFACT_PREFIX)
     }
     generated_media_keys = {
