@@ -1,6 +1,6 @@
 # Diffusion Distribution Matching: DMD2 Runtime
 
-Last updated: 09/14/2026.
+Last updated: 09/18/2026.
 
 ## Scope
 
@@ -44,7 +44,7 @@ attempt samples fresh student latents from prompt batches and random noise insid
 the FSDP engine, where the selected student forward can retain its autograd
 graph. No independent rollout server, reward worker or replay buffer is started.
 
-## Objective and gradient boundaries
+## Algorithm
 
 For flow corruption and a velocity model using the `noise - clean` convention,
 
@@ -94,7 +94,7 @@ The corrupted fake-stage input and target are detached from the student. Pure
 tensor equations and `DMDLoss` live in the preceding loss/config PR; this runtime
 provides their model execution and optimizer ownership.
 
-## Runtime structure
+## How verl-omni Implements DMD2
 
 ```text
 main_diffusion.TaskRunner
@@ -121,7 +121,7 @@ order without importing unrelated semantics. Dataloader, resources, worker
 initialization, FSDP and mini/microbatch machinery are inherited rather than
 reimplemented.
 
-### Required model-adapter contract
+### Architecture adapter contract
 
 The engine resolves the stateless `DiffusionModelBase` adapter registered for the
 selected `(architecture, dmd2)` pair and requires these methods:
@@ -300,7 +300,7 @@ This is a base-dependent LoRA, not a merged standalone pipeline. The inference
 tool verifies the manifest, transformer-config hash and adapter checksum before
 decoding.
 
-## Checkpoint and export contracts
+## Checkpoint and Export
 
 A resumable checkpoint and an inference adapter are distinct artifacts:
 
@@ -342,21 +342,14 @@ base provenance, transformer-config hash and artifact checksum. A concrete model
 integration owns decoded-generation instructions and validates that the exported
 adapter reloads into its architecture.
 
-## Validation boundary
+## Limitations
 
-The parent runtime covers routing, 1:K accounting, numerical skips, unequal
-microbatch tails, checkpoint publication/rejection, named-adapter ownership,
-EMA and semantic export. This integration adds CPU tests for Qwen registration,
-prompt templating, cached conditioning, geometry and packing; a real multi-rank
-tiny-Qwen FSDP1/FSDP2 update/resume/export test; and a production smoke launcher.
-The example README records the exact commands and separates CPU, GPU and
-real-model evidence.
+The Qwen-Image integration is limited to base text-to-image generation with
+LoRA and SP=1. It does not include automatic validation-replica synchronization,
+vLLM-Omni serving, request batching, standalone score transport, full finetuning
+or NPU validation.
 
-No automatic validation-replica synchronization, vLLM-Omni serving, request
-batching, standalone score transport, full finetuning or NPU validation is
-included in this runtime.
-
-Further reading:
+## References
 
 - [DMD2 paper](https://arxiv.org/abs/2405.14867) and [reference implementation](https://github.com/tianweiy/DMD2).
 - [Diffusion OPD](diffusion_opd.md), a separate frozen-teacher transition-supervision path.

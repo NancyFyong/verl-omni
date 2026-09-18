@@ -24,11 +24,18 @@ from peft import LoraConfig
 from tensordict import TensorDict
 from verl.utils import tensordict_utils as tu
 from verl.utils.metric import Metric
+from verl.workers.config import TrainingWorkerConfig
 
+import verl_omni.workers.engine_workers as engine_workers
 from verl_omni.workers.config import DiffusionDMDConfig
 from verl_omni.workers.engine.fsdp import diffusers_impl
 from verl_omni.workers.engine.fsdp.diffusers_impl import DMDDiffusersFSDPEngine
 from verl_omni.workers.engine_workers import DMDTrainingWorker, TrainingWorker
+
+
+class WorkerModelConfig(SimpleNamespace):
+    def get(self, name, default=None):
+        return getattr(self, name, default)
 
 
 class TinyAdapters(torch.nn.Module):
@@ -71,6 +78,26 @@ def no_collective(tensor, **kwargs):
 
 def force_peer_nonfinite(tensor, **kwargs):
     tensor.zero_()
+
+
+def initialize_worker_for_test(worker):
+    worker._rank = 0
+
+
+def initialize_dmd_parent_for_test(worker, config, *, dmd_config=None):
+    worker.config = config
+    worker.model_config = config.model_config
+    worker.received_dmd_config = dmd_config
+
+
+def make_training_worker_config():
+    return TrainingWorkerConfig(
+        model_type="test_model",
+        model_config=WorkerModelConfig(model_type=None, hf_config=None),
+        engine_config=SimpleNamespace(strategy="test"),
+        optimizer_config=SimpleNamespace(),
+        checkpoint_config=SimpleNamespace(),
+    )
 
 
 def microbatch_metrics(batch, loss_function, forward_only):
@@ -224,6 +251,46 @@ class TestDMDAccumulation:
 
 
 class TestDMDWorker:
+    def test_training_worker_forwards_optional_dmd_config(self, monkeypatch):
+        from verl.workers.engine import EngineRegistry
+
+        registered_engine = MagicMock()
+        registered_engine.get_data_parallel_rank.return_value = 0
+        registered_engine.is_mp_src_rank_with_outputs.return_value = True
+        registry_new = MagicMock(return_value=registered_engine)
+        monkeypatch.setattr(engine_workers.Worker, "__init__", initialize_worker_for_test)
+        monkeypatch.setattr(engine_workers, "initialize_global_process_group_ray", MagicMock())
+        monkeypatch.setattr(engine_workers, "set_numa_affinity", MagicMock())
+        monkeypatch.setattr(engine_workers, "DistProfiler", MagicMock())
+        monkeypatch.setattr(engine_workers.DistProfilerExtension, "__init__", MagicMock(return_value=None))
+        monkeypatch.setattr(TrainingWorker, "_register_dispatch_collect_info", MagicMock())
+        monkeypatch.setattr(EngineRegistry, "new", registry_new)
+
+        TrainingWorker(make_training_worker_config())
+        assert "dmd_config" not in registry_new.call_args.kwargs
+
+        marker = object()
+        TrainingWorker(make_training_worker_config(), dmd_config=marker)
+        assert registry_new.call_args.kwargs["dmd_config"] is marker
+
+    def test_dmd_worker_delegates_shared_initialization(self, monkeypatch):
+        monkeypatch.setattr(TrainingWorker, "__init__", initialize_dmd_parent_for_test)
+        monkeypatch.setattr(engine_workers, "omega_conf_to_dataclass", lambda value: value)
+        monkeypatch.setattr(engine_workers, "DiffusionFlopsCounter", MagicMock())
+        actor_config = SimpleNamespace(
+            profiler=None,
+            engine=SimpleNamespace(),
+            optim=SimpleNamespace(),
+            checkpoint=SimpleNamespace(),
+        )
+        model_config = WorkerModelConfig()
+        dmd_config = DiffusionDMDConfig()
+
+        worker = DMDTrainingWorker(SimpleNamespace(actor=actor_config, model=model_config), dmd_config=dmd_config)
+
+        assert worker.config.model_type == "diffusion_dmd_model"
+        assert worker.received_dmd_config is dmd_config
+
     @pytest.mark.parametrize("source", ["snapshot", "download", "local"])
     def test_export_provenance_is_computed_inside_the_dmd_worker(self, tmp_path, source):
         revision = "a" * 40

@@ -67,6 +67,7 @@ from verl_omni.utils.mfu import (
 )
 from verl_omni.workers.config import (
     DiffusionActorConfig,
+    DiffusionDMDConfig,
     DiffusionModelConfig,
     OmniModelConfig,
 )
@@ -109,7 +110,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
     and do not provide exact APIs as Tinker does. But this can be added in the future.
     """
 
-    def __init__(self, config: TrainingWorkerConfig):
+    def __init__(self, config: TrainingWorkerConfig, *, dmd_config: Optional[DiffusionDMDConfig] = None):
         Worker.__init__(self)
 
         from verl.workers.engine import BaseEngine, EngineRegistry
@@ -158,6 +159,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         )
 
         self.model_config.model_type = self.config.model_type
+        engine_kwargs = {"dmd_config": dmd_config} if dmd_config is not None else {}
         self.engine: BaseEngine = EngineRegistry.new(
             model_type=self.config.model_type,
             backend=self.engine_config.strategy,
@@ -165,6 +167,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
             engine_config=self.engine_config,
             optimizer_config=self.optimizer_config,
             checkpoint_config=self.checkpoint_config,
+            **engine_kwargs,
         )
 
         # build dispatch info
@@ -579,64 +582,9 @@ class DMDTrainingWorker(TrainingWorker):
             profiler_config=profiler,
         )
 
-        Worker.__init__(self)
-
-        from verl.workers.engine import BaseEngine, EngineRegistry
-
         from verl_omni.workers.engine.fsdp import diffusers_impl  # noqa: F401
 
-        if is_npu_available:
-            os.environ["PYTORCH_NPU_ALLOC_CONF"] = "expandable_segments:True"
-
-        initialize_global_process_group_ray(timeout_second=None)
-        set_numa_affinity()
-
-        self.config = worker_config
-        self.model_config = self.config.model_config
-        self.engine_config = self.config.engine_config
-        self.optimizer_config = self.config.optimizer_config
-        self.checkpoint_config = self.config.checkpoint_config
-        self.device_name = get_device_name()
-
-        if self.engine_config is None:
-            assert self.optimizer_config is None
-            if self.config.auto_select_engine_optim_fn is None:
-                raise ValueError(
-                    "engine_config is not provided and auto_select_engine_optim_fn is not set. "
-                    "Cannot determine engine backend."
-                )
-            self.engine_config, self.optimizer_config = self.config.auto_select_engine_optim_fn(
-                self.model_config, self.device_name
-            )
-
-        self.engine_config.use_remove_padding = self.model_config.get("use_remove_padding", False)
-        self.engine_config.use_fused_kernels = self.model_config.get("use_fused_kernels", False)
-
-        self.profiler_config = self.config.profiler_config
-        if self.profiler_config is not None:
-            self.profiler_tool_config = self.profiler_config.tool_config.get(self.profiler_config.tool, {})
-        else:
-            self.profiler_tool_config = None
-
-        DistProfilerExtension.__init__(
-            self, DistProfiler(rank=self.rank, config=self.profiler_config, tool_config=self.profiler_tool_config)
-        )
-
-        self.model_config.model_type = self.config.model_type
-        self.engine: BaseEngine = EngineRegistry.new(
-            model_type=self.config.model_type,
-            backend=self.engine_config.strategy,
-            model_config=self.model_config,
-            engine_config=self.engine_config,
-            optimizer_config=self.optimizer_config,
-            checkpoint_config=self.checkpoint_config,
-            dmd_config=self.dmd_config,
-        )
-        self._register_dispatch_collect_info(
-            mesh_name="train",
-            dp_rank=self.engine.get_data_parallel_rank(),
-            is_collect=self.engine.is_mp_src_rank_with_outputs(),
-        )
+        super().__init__(worker_config, dmd_config=self.dmd_config)
         self.flops_counter = DiffusionFlopsCounter(
             architecture=getattr(self.model_config, "architecture", None),
             transformer_config=getattr(self.model_config, "transformer_config", None),
