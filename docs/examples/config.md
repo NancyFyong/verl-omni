@@ -1,6 +1,6 @@
 # Config Explanation
 
-Last updated: 08/23/2026
+Last updated: 09/18/2026
 
 VeRL-Omni builds on [verl](https://github.com/verl-project/verl) and reuses the
 same Hydra config surface for shared RL trainer fields (`data`, FSDP actor /
@@ -60,8 +60,8 @@ algorithm:
   rollout_correction: { ... }   # mirrors upstream RolloutCorrectionConfig
 ```
 
-- `algorithm.trainer_type`: Trainer loop. `policy_gradient` (FlowGRPO, MixGRPO, Flow-DPPO, …) or `direct_preference` (DPO, DiffusionNFT, AWM).
-- `algorithm.sample_source`: `online` (rollout + reward engines) or `offline` (actor-only, precomputed batches).
+- `algorithm.trainer_type`: Trainer loop. `policy_gradient` (FlowGRPO, MixGRPO, Flow-DPPO, …), `direct_preference` (DPO, DiffusionNFT, AWM), or `distribution_matching` (DMD2).
+- `algorithm.sample_source`: `online` uses rollout and reward engines. `offline` selects actor-only execution; DMD2 uses it for fresh differentiable samples inside the training engine rather than pregenerated images.
 - `algorithm.adv_estimator`: Advantage estimator name; defaults to `actor_rollout_ref.model.algorithm` (e.g. `flow_grpo`).
 - `algorithm.norm_adv_by_std_in_grpo`: Normalize advantages by within-group std (GRPO-style).
 - `algorithm.global_std`: Use a global (cross-group) std for advantage normalization.
@@ -110,8 +110,13 @@ standalone rollout GPUs from the Ray cluster.
 `actor_rollout_ref.rollout.agent.num_workers` controls CPU request concurrency; it
 does not allocate rollout GPUs and does not need to match `rollout.n_gpus_per_node`.
 
-On a CUDA Ray cluster, the Wan2.2 auto-device recipe forwards trailing Hydra
-overrides, so the same topology can be launched with the NCCL checkpoint backend:
+This topology is v0-only (`trainer.use_v1=false`). The default CUDA DanceGRPO
+recipe is now the V1 sync launcher (`run_wan22_5b_t2v_hpsv3_v1.sh`); use the
+**deprecated** v0 auto-detect script below when you need
+`actor_rollout_ref.separate`.
+
+On a CUDA Ray cluster, that v0 recipe forwards trailing Hydra overrides, so the
+same topology can be launched with the NCCL checkpoint backend:
 
 ```bash
 bash examples/dancegrpo_trainer/wan22/run_wan22_5b_t2v_hpsv3_auto.sh \
@@ -224,6 +229,17 @@ Shared PPO / FSDP / optim fields (`ppo_mini_batch_size`, `ppo_epochs`, `optim.lr
 
 VeOmni engine path (`strategy=veomni`) adds `veomni_config` / VeOmni optimizer fields; see {doc}`../start/install` and the `run_*_veomni.sh` recipes.
 
+### `dmd` — `DiffusionDMDConfig`
+
+The independent top-level `dmd` group configures distribution-only DMD2 when
+`algorithm.trainer_type=distribution_matching` and
+`algorithm.sample_source=offline`. It owns the student/fake-score update ratio,
+per-role microbatch sizes, fake-score optimizer, teacher guidance, score-sigma
+sampling, EMA and inference-export role. Do not combine it with
+`distillation.enabled`; that group belongs to diffusion OPD. See
+{doc}`../algo/diffusion_distillation` for the objective, runtime contract and
+field defaults.
+
 ### `actor_rollout_ref.rollout` — `DiffusionRolloutConfig`
 
 Diffusion-specific blocks sit under `pipeline`, `algo`, and `val_kwargs`. Several engine knobs are shared with verl vLLM rollout but have diffusion defaults.
@@ -317,7 +333,10 @@ These sit on the diffusion trainer YAML (in addition to shared verl trainer fiel
 - `trainer.video_fps`: FPS for videos written to `rollout_data_dir` / `validation_data_dir` and logged to W&B (image runs ignore this).
 - `trainer.rollout_data_save_freq`: Dump train rollout every N steps (`1` = every step, `<= 0` = never).
 - `trainer.rollout_data_max_samples` / `validation_data_max_samples`: Cap samples dumped per train / val run (`null` = all).
-- `trainer.use_v1`: Use the V1 trainer (TransferQueue + ReplayBuffer). When `false`, legacy v0 diffusion trainer.
+- `trainer.use_v1`: Use the V1 trainer (TransferQueue + ReplayBuffer). When `false`,
+  the legacy v0 diffusion trainer. Wan2.2 DanceGRPO on CUDA now defaults to V1
+  via `run_wan22_5b_t2v_hpsv3_v1.sh`; the v0 auto-detect launcher is deprecated
+  for CUDA.
 - `trainer.v1.*`: V1 mode / sampler / async placeholders (`trainer_mode`, `max_off_policy_threshold`, …). See {doc}`../start/diffusion_v1`.
 
 ### `reward` — visual reward manager

@@ -43,7 +43,7 @@ class DiffusionAlgoConfig(BaseConfig):
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
 
     def __post_init__(self):
-        valid_trainer_types = {"policy_gradient", "direct_preference", "distillation"}
+        valid_trainer_types = {"policy_gradient", "direct_preference", "distribution_matching"}
         if self.trainer_type not in valid_trainer_types:
             raise ValueError(f"Invalid trainer_type: {self.trainer_type}. Must be one of {sorted(valid_trainer_types)}")
         valid_adv_modes = {"continuous", "positive_only", "negative_only", "one_only", "binary"}

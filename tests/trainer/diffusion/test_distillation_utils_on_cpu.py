@@ -24,15 +24,11 @@ import pytest
 import torch
 
 from verl_omni.trainer.diffusion.distillation.utils import (
-    consistency_renoise_step,
     dmd_gradient,
     dmd_surrogate_loss,
-    epsilon_to_x0,
     fake_score_loss,
     fake_score_target,
-    legacy_cfg,
     ode_euler_step,
-    ode_regression_loss,
     standard_cfg,
     timestep_shift,
     velocity_to_x0,
@@ -55,24 +51,10 @@ class TestCanonicalConversion:
         velocity = noise - x0
         torch.testing.assert_close(velocity_to_x0(x_sigma, velocity, sigma), x0, atol=1e-5, rtol=1e-5)
 
-    def test_epsilon_to_x0_roundtrip(self):
-        x0 = torch.randn(2, 3, 4, 4)
-        noise = torch.randn(2, 3, 4, 4)
-        sigma = torch.rand(2, 1, 1, 1) * 0.9
-        x_sigma = (1 - sigma) * x0 + sigma * noise
-        converted = epsilon_to_x0(x_sigma, noise, sigma, lambda value: 1 - value, lambda value: value)
-        torch.testing.assert_close(converted, x0, atol=1e-5, rtol=1e-5)
-
     def test_canonical_conversions_return_fp32(self):
         value = torch.randn(1, 2, dtype=torch.float16)
         sigma = torch.full((1, 1), 0.5, dtype=torch.float16)
         assert velocity_to_x0(value, value, sigma).dtype == torch.float32
-        assert epsilon_to_x0(value, value, sigma, lambda item: 1 - item, lambda item: item).dtype == torch.float32
-
-    def test_epsilon_conversion_rejects_zero_signal_coefficient(self):
-        value = torch.randn(1, 2)
-        with pytest.raises(ValueError, match="a\\(sigma\\) is zero"):
-            epsilon_to_x0(value, value, torch.ones(1, 1), lambda sigma: 1 - sigma, lambda sigma: sigma)
 
 
 class TestDMDGradient:
@@ -119,10 +101,18 @@ class TestDMDGradient:
         assert nonfinite > 0
         assert torch.isfinite(g_norm).all()
 
-    def test_invalid_normalization_epsilon_raises(self):
+    @pytest.mark.parametrize("epsilon", [0, -1, float("nan"), float("inf")])
+    def test_invalid_normalization_epsilon_raises(self, epsilon):
         tensor = torch.zeros(1, 2)
         with pytest.raises(ValueError, match="greater than zero"):
-            dmd_gradient(tensor, tensor, tensor, normalization_epsilon=0)
+            dmd_gradient(tensor, tensor, tensor, normalization_epsilon=epsilon)
+
+    def test_score_gradient_and_normalizer_are_detached(self):
+        generated = torch.ones(1, 3, requires_grad=True)
+        fake = torch.ones(1, 3, requires_grad=True)
+        real = torch.zeros(1, 3, requires_grad=True)
+        gradient, normalizer, _ = dmd_gradient(fake, real, generated)
+        assert not gradient.requires_grad and not normalizer.requires_grad
 
     def test_mismatched_shapes_raise(self):
         with pytest.raises(ValueError, match="identical shapes"):
@@ -275,59 +265,12 @@ def test_incompatible_gradient_mask_is_rejected(loss_kind):
             fake_score_loss(value, value, value, mask)
 
 
-class TestODERegression:
-    def test_masked_mse_uses_only_nonzero_timestep_positions(self):
-        prediction = torch.tensor([[1.0, 3.0], [5.0, 7.0]], requires_grad=True)
-        target = torch.zeros_like(prediction)
-        valid_mask = torch.tensor([[True, False], [True, False]])
-        loss, active = ode_regression_loss(prediction, target, valid_mask)
-        assert active == 2
-        assert loss.item() == pytest.approx(13.0)
-        loss.backward()
-        torch.testing.assert_close(prediction.grad, torch.tensor([[1.0, 0.0], [5.0, 0.0]]))
-
-    def test_frame_mask_broadcasts_over_latent_dimensions(self):
-        prediction = torch.ones(1, 2, 1, 2, 2)
-        target = torch.zeros_like(prediction)
-        loss, active = ode_regression_loss(prediction, target, torch.tensor([[True, False]]))
-        assert active == 4
-        assert loss.item() == pytest.approx(1.0)
-
-    def test_target_is_detached(self):
-        prediction = torch.ones(1, 2, requires_grad=True)
-        target = torch.zeros(1, 2, requires_grad=True)
-        loss, _ = ode_regression_loss(prediction, target)
-        loss.backward()
-        assert prediction.grad is not None
-        assert target.grad is None
-
-    def test_all_masked_ode_loss_raises(self):
-        tensor = torch.zeros(1, 2)
-        with pytest.raises(ValueError, match="all-masked"):
-            ode_regression_loss(tensor, tensor, torch.zeros_like(tensor, dtype=torch.bool))
-
-
 class TestRolloutTransitions:
     def test_ode_euler_uses_deterministic_velocity_transition(self):
         latents = torch.tensor([[1.0, 2.0]])
         velocity = torch.tensor([[2.0, -1.0]])
         result = ode_euler_step(latents, velocity, torch.tensor(0.8), torch.tensor(0.3))
         torch.testing.assert_close(result, torch.tensor([[0.0, 2.5]]))
-
-    def test_consistency_transition_renoises_clean_prediction(self):
-        x0 = torch.tensor([[2.0, 4.0]])
-        noise = torch.tensor([[0.0, 2.0]])
-        result = consistency_renoise_step(x0, noise, torch.tensor(0.25))
-        torch.testing.assert_close(result, torch.tensor([[1.5, 3.5]]))
-
-    def test_euler_and_consistency_transitions_are_not_interchangeable(self):
-        latents = torch.randn(2, 3)
-        velocity = torch.randn(2, 3)
-        x0 = torch.randn(2, 3)
-        noise = torch.randn(2, 3)
-        euler = ode_euler_step(latents, velocity, torch.tensor(0.8), torch.tensor(0.3))
-        renoised = consistency_renoise_step(x0, noise, torch.tensor(0.3))
-        assert not torch.allclose(euler, renoised)
 
 
 class TestCFG:
@@ -336,18 +279,6 @@ class TestCFG:
         uncond = torch.randn(2, 8)
         out = standard_cfg(cond, uncond, 3.0)
         assert torch.allclose(out, uncond + 3.0 * (cond - uncond), atol=1e-6)
-
-    def test_legacy_cfg_differs_from_standard(self):
-        """Self-Forcing's cond + s*(cond-uncond) is not the standard definition."""
-        cond = torch.randn(2, 8)
-        uncond = torch.randn(2, 8)
-        assert not torch.allclose(standard_cfg(cond, uncond, 3.0), legacy_cfg(cond, uncond, 3.0))
-
-    def test_legacy_cfg_equals_standard_with_shifted_scale(self):
-        """cond + s*(cond-uncond) == uncond + (s+1)*(cond-uncond)."""
-        cond = torch.randn(2, 8)
-        uncond = torch.randn(2, 8)
-        assert torch.allclose(legacy_cfg(cond, uncond, 3.0), standard_cfg(cond, uncond, 4.0), atol=1e-6)
 
     def test_cfg_scale_zero_returns_unconditional(self):
         cond = torch.randn(2, 8)
