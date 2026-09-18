@@ -138,7 +138,7 @@ The HPSv3 reward is the only validated configuration. Other reward functions
 |----------|--------|
 | **Hugging Face ID** | `dg845/LTX-2.3-Diffusers` |
 | **Architecture** | LTX-2 DiT; checkpoint `_class_name` is `LTX2Pipeline` (rollout uses vLLM-Omni `LTX23Pipeline`) |
-| **Modality** | Text → Video + Audio |
+| **Modality** | Text → Video + Audio; Text + first-frame image → Video + Audio |
 | **Pipeline** | Flow-matching with joint audio-video CPS transitions |
 | **Default recipe** | `sde_window_size=3`, `sde_window_range=[0,10]`, `sde_contiguous=False` |
 
@@ -149,8 +149,9 @@ For dataset layout and launch overrides, see
 
 | Trainer | Example script | GPU config |
 |---------|---------------|------------|
-| Flow-GRPO (LoRA) | `examples/flowgrpo_trainer/ltx2/run_ltx2_3_t2av_lora.sh` | 8×GPU (TP=2) |
-| Flow-GRPO (LoRA, NPU) | `examples/flowgrpo_trainer/ltx2/run_ltx2_3_t2av_lora_npu.sh` | 16×NPU (TP=4) |
+| Flow-GRPO (T2AV LoRA) | `examples/flowgrpo_trainer/ltx2/run_ltx2_3_t2av_lora.sh` | 8×GPU (TP=2) |
+| Flow-GRPO (TI2VA LoRA) | `examples/flowgrpo_trainer/ltx2/run_ltx2_3_ti2va_lora.sh` | 8×GPU (TP=1) |
+| Flow-GRPO (T2AV LoRA, NPU) | `examples/flowgrpo_trainer/ltx2/run_ltx2_3_t2av_lora_npu.sh` | 16×NPU (TP=4) |
 
 **Reward models:** CLAP (`laion/larger_clap_general`) and ImageBind (local
 `.pth`, CC-BY-NC-SA 4.0) for audio-video alignment.
@@ -244,13 +245,22 @@ parquet pairs and does not start rollout or reward workers.
 | Property | Detail |
 |----------|--------|
 | **Hugging Face ID** | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` |
-| **Trainable component** | Talker codec-0 policy, full-parameter example |
+| **Trainable component** | Talker codec-0 policy; full-parameter and Hindi SFT-LoRA examples |
 | **Rollout** | Two-stage vLLM-Omni Talker + code2wav pipeline |
 | **Algorithm** | Stock GRPO, vanilla PPO loss, optional direct KL |
-| **Reward** | Generic decoded-audio reward; SpeechJudge-BTRM external scorer example |
+| **Reward** | Generic decoded-audio reward; SpeechJudge-BTRM and Whisper CER external scorers |
 
-The example uses two training GPUs and an independently deployed audio scorer.
+Both examples use two training GPUs and an independently deployed audio scorer.
+The Hindi recipe starts from the public Hindi SFT adapter merged into the Base,
+then trains a fresh rank-8 GRPO LoRA on IndicVoices-R prompts.
 See [Qwen3-TTS GRPO with an audio reward](../../examples/grpo_trainer/qwen3_tts/README.md).
+
+**Supported trainers:**
+
+| Trainer | Example script | GPU config |
+|---------|---------------|------------|
+| GRPO (full parameters) | `examples/grpo_trainer/qwen3_tts/run_qwen3_tts_grpo.sh` | 2×GPU |
+| GRPO (Hindi SFT-LoRA) | `examples/grpo_trainer/qwen3_tts/run_qwen3_tts_hindi_grpo.sh` | 2×GPU |
 
 ---
 
@@ -284,6 +294,7 @@ See [Qwen3-TTS GRPO with an audio reward](../../examples/grpo_trainer/qwen3_tts/
 | DiNa-LRM | HTTP latent scorer | Diffusion latents | SD3.5 (Flow-GRPO DRM) | Separate `diffusion-rm` process, safetensors HTTP |
 | HTTP scorer | External HTTP service | Image/audio | Any model | Pickle image or JSON audio protocol |
 | SpeechJudge-BTRM | `RMSnow/SpeechJudge-BTRM` | Audio quality | Qwen3-TTS example | External service; CC-BY-NC-4.0 |
+| Whisper large-v3-turbo | `openai/whisper-large-v3-turbo` | Audio (ASR CER) | Qwen3-TTS Hindi GRPO | External JSON audio scorer |
 | JPEG incompressibility | Rule-based | Image stats | Any diffusion model | No model process needed |
 
 For end-to-end instructions on setting up each reward, see the respective

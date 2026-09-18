@@ -83,6 +83,13 @@ class vLLMOmniHttpServer(vLLMHttpServer):
 
     def _post_init(self, cuda_visible_devices: str) -> None:
         """Run strategy post-init and preserve the replica device list."""
+        if getattr(self.config, "full_determinism", False):
+            from verl.workers.engine.utils import enable_full_determinism
+
+            rollout_seed = getattr(self.config, "seed", 42)
+            enable_full_determinism(seed=rollout_seed)
+            os.environ["VERL_SEED"] = str(rollout_seed)
+            os.environ["VLLM_BATCH_INVARIANT"] = "1"
         # Set before vllm-omni narrows per-stage visible devices; stage workers
         # remap their ZMQ ranks through this replica-level list.
         os.environ["VERL_ZMQ_BASE_VISIBLE_DEVICES"] = cuda_visible_devices
@@ -223,9 +230,16 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         return ["kv_cache", "weights"]
 
     def _resolve_sleep_level(self) -> int:
-        """
-        # TODO (andy): use sleep_level=2 when vllm-omni implements wake_up
-        after level-2 sleep AND the trainer syncs the full pipeline.
+        """Level 1 is the correct phase-separation level for vllm-omni diffusion.
+
+        Unlike upstream vLLM (whose LLM level-1 keeps weights resident and only
+        drops KV cache), vllm-omni's diffusion-worker level-1 sleep offloads the
+        whole "weights" pool — transformer + text encoder + VAE — to pinned host
+        memory and unmaps the GPU pages, and ``wake_up(tags=["weights"])``
+        restores them via DMA. Level 2 additionally discards the CPU copy but
+        ``AsyncOmni.wake_up`` deliberately raises NotImplementedError after a
+        level-2 sleep, and the trainer would have to re-upload the full
+        pipeline each cycle. Keep 1 until both change.
         """
         return 1
 

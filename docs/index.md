@@ -1,6 +1,6 @@
 # Welcome to VeRL-Omni's documentation!
 
-Last updated: 09/09/2026
+Last updated: 09/15/2026
 
 [VeRL-Omni](https://github.com/verl-project/verl-omni) is a general RL training framework focused on multimodal generative models, built on top of [verl](https://github.com/verl-project/verl). It originated from the multi-modal generation RL effort in `verl`, and now has a dedicated home so it can evolve in a more focused way.
 
@@ -31,6 +31,7 @@ start/install_npu.md
 start/models.md
 start/flowgrpo_quickstart.md
 start/multi_node_training.md
+start/model_merger.md
 start/metrics.md
 ```
 
@@ -46,6 +47,7 @@ examples/config.md
 :caption: Advanced Features
 
 algo/async_reward.md
+algo/named_reward_models.md
 algo/rollout_correction.md
 algo/separate_async_omni.md
 start/rollout_batching.md
@@ -66,6 +68,7 @@ algo/grpo_guard.md
 algo/mixgrpo.md
 algo/diffusion_opd.md
 algo/omni_opd.md
+algo/deterministic_post_training.md
 algo/performance.md
 ```
 
@@ -87,6 +90,7 @@ examples/diffusionopd_trainer.md
 examples/flowgrpo_trainer_sd35_drm.md
 examples/bagel/flowgrpo_trainer_bagel.md
 examples/qwen3_tts/grpo_trainer_qwen3_tts.md
+examples/qwen_image/flowgrpo_trainer_qwen_image.md
 examples/qwen_image_edit/flowgrpo_trainer_qwen_image_edit.md
 examples/ltx2/flowgrpo_trainer_ltx2.md
 examples/minimax_h3/diffusionnft_trainer_minimax_h3.md
@@ -98,6 +102,7 @@ examples/minimax_h3/flowgrpo_trainer_minimax_h3.md
 :maxdepth: 1
 :caption: Performance Tuning Guide
 
+perf/tuning_guide.md
 perf/diffusion_mfu.md
 perf/profiler.md
 ```
