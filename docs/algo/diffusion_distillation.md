@@ -1,6 +1,6 @@
 # Diffusion Distribution Matching: DMD2 Runtime
 
-Last updated: 09/14/2026.
+Last updated: 09/18/2026.
 
 ## Scope
 
@@ -44,7 +44,7 @@ attempt samples fresh student latents from prompt batches and random noise insid
 the FSDP engine, where the selected student forward can retain its autograd
 graph. No independent rollout server, reward worker or replay buffer is started.
 
-## Objective and gradient boundaries
+## Algorithm
 
 For flow corruption and a velocity model using the `noise - clean` convention,
 
@@ -94,7 +94,7 @@ The corrupted fake-stage input and target are detached from the student. Pure
 tensor equations and `DMDLoss` live in the preceding loss/config PR; this runtime
 provides their model execution and optimizer ownership.
 
-## Runtime structure
+## How verl-omni Implements DMD2
 
 ```text
 main_diffusion.TaskRunner
@@ -121,7 +121,7 @@ order without importing unrelated semantics. Dataloader, resources, worker
 initialization, FSDP and mini/microbatch machinery are inherited rather than
 reimplemented.
 
-### Required model-adapter contract
+### Architecture adapter contract
 
 The engine resolves the stateless `DiffusionModelBase` adapter registered for the
 selected `(architecture, dmd2)` pair and requires these methods:
@@ -222,7 +222,7 @@ checkpoints. FSDP1 additionally requires `use_orig_params=true`.
 | `ema_start_step` | `0` | Successful student-update threshold for EMA |
 | `export_role` | `student` | Export `student` or explicit `student_ema` |
 
-## Checkpoint and export contracts
+## Checkpoint and Export
 
 A resumable checkpoint and an inference adapter are distinct artifacts:
 
@@ -264,28 +264,15 @@ base provenance, transformer-config hash and artifact checksum. A concrete model
 integration owns decoded-generation instructions and validates that the exported
 adapter reloads into its architecture.
 
-## Validation boundary
+## Limitations
 
-Runtime CPU tests cover routing, 1:K accounting, numerical skips, unequal
-microbatch tails, checkpoint publication/rejection, named-adapter ownership,
-EMA and semantic export. Tests use fake modules or test-local adapters so this
-slice does not gain an implicit production architecture.
+This runtime does not include a production architecture, automatic
+validation-replica synchronization, vLLM-Omni serving, request batching,
+standalone score transport, full finetuning or NPU validation. Concrete model
+integrations supply their own conditioning, packing, export/reload and
+real-model validation.
 
-A dependent architecture PR must additionally provide:
-
-1. adapter-boundary CPU tests for conditioning, geometry, packing, prediction
-   conversion and sigma construction;
-2. real multi-rank FSDP1/FSDP2 updates and checkpoint restoration with a tiny
-   checkpoint;
-3. student export, exact PEFT reload and decoded generation;
-4. a production entrypoint smoke and explicit real-model evidence where merge
-   policy requires it.
-
-No automatic validation-replica synchronization, vLLM-Omni serving, request
-batching, standalone score transport, full finetuning or NPU validation is
-included in this runtime.
-
-Further reading:
+## References
 
 - [DMD2 paper](https://arxiv.org/abs/2405.14867) and [reference implementation](https://github.com/tianweiy/DMD2).
 - [Diffusion OPD](diffusion_opd.md), a separate frozen-teacher transition-supervision path.
