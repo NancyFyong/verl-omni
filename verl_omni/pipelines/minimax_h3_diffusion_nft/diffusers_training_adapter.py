@@ -17,6 +17,7 @@ from typing import Optional
 
 import torch
 from tensordict import TensorDict
+from verl.utils import tensordict_utils as tu
 
 from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.workers.config import DiffusionModelConfig
@@ -33,6 +34,7 @@ from .common import (
     split_dual_velocity,
     unpack_video_audio_rows,
     validate_lora_target_modules,
+    validate_standard_ulysses_sequence_length,
 )
 
 __all__ = ["MiniMaxH3DiffusionNFT"]
@@ -113,6 +115,7 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
             "encoder_mask": prompt_embeds_mask,
             "timestep": h3_dit_timestep(timesteps.float()),
             "latent_meta": meta,
+            "_h3_sp_size": tu.get_non_tensor_data(micro_batch, "sp_size", default=1),
         }
         return model_inputs, None
 
@@ -140,6 +143,7 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
         encoder_mask = model_inputs["encoder_mask"]
         timestep = model_inputs["timestep"]
         meta = model_inputs["latent_meta"]
+        sp_size = model_inputs.get("_h3_sp_size", 1)
         device = video_rows.device
         raw_patch = getattr(getattr(module, "config", None), "patch_size", (1, 2, 2))
         patch_size = (int(raw_patch[0]), int(raw_patch[1]), int(raw_patch[2]))
@@ -175,6 +179,7 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
             position_ids, token_tags, video_indices, audio_indices, text_indices, num_cond_video, num_cond_audio = (
                 layout
             )
+            validate_standard_ulysses_sequence_length(position_ids.shape[0], sp_size)
             sample_video_condition = condition_video_rows[index]
             if condition_video_row_count is not None:
                 sample_video_condition = sample_video_condition[: int(condition_video_row_count[index].reshape(-1)[0])]

@@ -56,6 +56,7 @@ __all__ = [
     "prepare_h3_processor_files",
     "ref2va_reference_image_short_edge",
     "validate_ref2va_reference_image_short_edge",
+    "validate_standard_ulysses_sequence_length",
     "keyframe_indices_to_anchors",
     "serialize_ref_blocks",
     "build_packed_sequence",
@@ -67,6 +68,20 @@ __all__ = [
 
 
 MINIMAX_H3_TOKEN_ID_NATIVE_KEY = "minimax_h3_token_id_native"
+
+
+def validate_standard_ulysses_sequence_length(sequence_length: int, sp_size: int | None) -> None:
+    """Require H3's unpadded joint sequence to split evenly across Ulysses ranks."""
+    if sp_size is None or sp_size == 1:
+        return
+    if sp_size <= 0:
+        raise ValueError(f"MiniMax H3 Actor SP size must be positive, got {sp_size}.")
+    if sequence_length % sp_size:
+        raise ValueError(
+            "MiniMax H3 standard Ulysses requires the packed text/video/audio sequence length "
+            f"to be divisible by the Actor SP size, got sequence_length={sequence_length} and sp_size={sp_size}. "
+            "Use ACTOR_SP=1 or prepare inputs whose packed layouts divide evenly."
+        )
 
 
 def validate_ref2va_reference_image_short_edge(value: int | str | None = None) -> int:

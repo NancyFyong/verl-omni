@@ -21,6 +21,7 @@ from typing import Optional
 import torch
 from diffusers import ModelMixin
 from tensordict import TensorDict
+from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_name
 from vllm_omni.diffusion.models.minimax_h3.denoise_loop import (
     MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
@@ -30,6 +31,7 @@ from vllm_omni.diffusion.models.minimax_h3.denoise_loop import (
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     build_ref2va_layout_from_meta,
     prepare_h3_processor_files,
+    validate_standard_ulysses_sequence_length,
 )
 from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
@@ -214,6 +216,10 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
             ).bool()
             audio_update_mask = torch.ones(audio_rows, dtype=torch.bool)
 
+        validate_standard_ulysses_sequence_length(
+            seq_len,
+            tu.get_non_tensor_data(micro_batch, "sp_size", default=1),
+        )
         original_step = _shared_int(micro_batch["h3_step_indices"][:, step], "scheduler step")
         step_timesteps = torch.stack((timesteps[:, step], micro_batch["h3_audio_timesteps"][:, step]), dim=-1)
         if step_timesteps.shape[0] > 1 and not torch.all(step_timesteps == step_timesteps[0]):

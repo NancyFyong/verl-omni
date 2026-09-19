@@ -633,6 +633,14 @@ def test_actor_accepts_a_shared_replicated_h3_layout() -> None:
     module.assert_not_called()
 
 
+def test_actor_rejects_a_packed_layout_that_standard_ulysses_cannot_split() -> None:
+    payload = _trajectory()
+    payload["sp_size"] = 2
+
+    with pytest.raises(ValueError, match="sequence_length=7 and sp_size=2"):
+        _prepare_actor_payload(payload)
+
+
 @pytest.mark.parametrize(
     ("mutate", "error_type", "message"),
     [

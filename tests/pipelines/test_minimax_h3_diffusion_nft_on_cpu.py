@@ -281,6 +281,21 @@ class TestMiniMaxH3Forward:
         assert module.call_args_list[0].kwargs["encoder_hidden_states"].shape == (1, 5, _TEXT_DIM)
         assert module.call_args_list[1].kwargs["encoder_hidden_states"].shape == (1, _TEXT_LEN, _TEXT_DIM)
 
+    def test_forward_rejects_a_packed_layout_that_standard_ulysses_cannot_split(self):
+        video_rows, audio_rows = _rows()
+        mask = torch.zeros(_BATCH, _TEXT_LEN, dtype=torch.int32)
+        mask[:, :5] = 1
+        model_inputs, _ = _prepared_inputs(video_rows, audio_rows, timesteps=torch.tensor([500.0, 250.0]), mask=mask)
+        model_inputs["_h3_sp_size"] = 2
+
+        with pytest.raises(ValueError, match="sequence_length=15 and sp_size=2"):
+            MiniMaxH3DiffusionNFT.forward(
+                module=_module(_identity),
+                model_config=MagicMock(),
+                model_inputs=model_inputs,
+                negative_model_inputs=None,
+            )
+
     def test_fl2va_injects_condition_rows_and_crops_their_velocity(self):
         video_rows, audio_rows = _rows(batch=1)
         condition_rows = torch.randn(1, 8, VIDEO_ROW_WIDTH)
