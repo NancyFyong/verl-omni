@@ -12,7 +12,7 @@ model_name=Qwen/Qwen-Image
 reward_model_name=Qwen/Qwen3-VL-8B-Instruct
 reward_function_path=verl_omni/utils/reward_score/genrm_ocr.py
 
-NUM_GPUS_ACTOR_ROLLOUT_REWARD=${NUM_GPUS:-4}
+NUM_GPUS_ACTOR_ROLLOUT_REWARD=${NUM_GPUS:-8}
 NUM_NODES=${NUM_NODES:-1}
 ROLLOUT_TP=1
 REWARD_TP=4
@@ -20,8 +20,8 @@ REWARD_TP=4
 ENGINE=vllm_omni
 REWARD_ENGINE=vllm
 TRAINER_BACKEND=veomni
-MAX_NUM_SEQS=${MAX_NUM_SEQS:-8}
-REQUEST_BATCH_MAX_WAIT_MS=${REQUEST_BATCH_MAX_WAIT_MS:-10}
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-32}
+REQUEST_BATCH_MAX_WAIT_MS=${REQUEST_BATCH_MAX_WAIT_MS:-50}
 
 python3 -m verl_omni.trainer.main_diffusion \
     diffusion/model_engine=veomni_diffusion \
@@ -42,6 +42,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.actor.strategy=$TRAINER_BACKEND \
     actor_rollout_ref.actor.veomni_config.strategy=$TRAINER_BACKEND \
     actor_rollout_ref.actor.veomni_config.ulysses_parallel_size=1 \
+    actor_rollout_ref.actor.veomni_config.attn_implementation=flash_attention_3_hub \
     actor_rollout_ref.actor.veomni_config.param_offload=True \
     actor_rollout_ref.actor.veomni_config.optimizer_offload=True \
     actor_rollout_ref.actor.diffusion_loss.loss_mode=flow_grpo \
@@ -65,6 +66,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.max_num_seqs=$MAX_NUM_SEQS \
     +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.request_batch_max_wait_ms=$REQUEST_BATCH_MAX_WAIT_MS \
     actor_rollout_ref.ref.veomni_config.strategy=$TRAINER_BACKEND \
+    actor_rollout_ref.ref.veomni_config.attn_implementation=flash_attention_3_hub \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=32 \
     reward.num_workers=$((NUM_GPUS_ACTOR_ROLLOUT_REWARD / REWARD_TP)) \
     reward.reward_model.enable=True \
@@ -75,9 +77,9 @@ python3 -m verl_omni.trainer.main_diffusion \
     reward.custom_reward_function.name=compute_score_ocr \
     trainer.logger='["console", "wandb"]' \
     trainer.project_name=flow_grpo \
-    trainer.experiment_name=qwen_image_ocr_lora_veomni \
+    trainer.experiment_name=qwen_image_ocr_lora_veomni_8gpu_fa3 \
     trainer.log_val_generations=8 \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     trainer.n_gpus_per_node=$((NUM_GPUS_ACTOR_ROLLOUT_REWARD / NUM_NODES)) \
     trainer.nnodes=$NUM_NODES \
     trainer.save_freq=30 \
