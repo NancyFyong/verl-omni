@@ -150,13 +150,35 @@ def test_adapter_sync_exports_peft_formatted_lora_tensors(monkeypatch):
 
     assert peft_config["peft_type"] == "LORA"
     assert peft_config["r"] == 4
-    # PEFT on-disk keys, prefixed for the rollout engine.
+    # Transformer-relative keys for live rollout sync, not PEFT file prefixes.
     assert set(params) == {
-        "transformer.base_model.model.transformer_blocks.0.to_q.lora_A.weight",
-        "transformer.base_model.model.transformer_blocks.0.to_q.lora_B.weight",
-        "transformer.base_model.model.transformer_blocks.0.to_k.lora_A.weight",
-        "transformer.base_model.model.transformer_blocks.0.to_k.lora_B.weight",
+        "transformer.transformer_blocks.0.to_q.lora_A.weight",
+        "transformer.transformer_blocks.0.to_q.lora_B.weight",
+        "transformer.transformer_blocks.0.to_k.lora_A.weight",
+        "transformer.transformer_blocks.0.to_k.lora_B.weight",
     }
+
+
+def test_adapter_sync_keys_resolve_in_actual_diffusion_lora_manager(monkeypatch):
+    from vllm.lora.lora_model import LoRAModel
+    from vllm.lora.peft_helper import PEFTHelper
+    from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
+
+    engine = _make_engine(_lora_module(), lora_rank=4, target_modules=["to_q", "to_k"])
+    params, config = _export(engine, monkeypatch, base_sync_done=True)
+    loaded = LoRAModel.from_lora_tensors(
+        lora_model_id=1,
+        tensors=params,
+        peft_helper=PEFTHelper.from_dict(config),
+        device="cpu",
+        dtype=torch.float32,
+    )
+    manager = object.__new__(DiffusionLoRAManager)
+    for target in ("to_q", "to_k"):
+        runtime_name = f"transformer.transformer_blocks.0.{target}"
+        assert manager._get_lora_weights(loaded, runtime_name) is not None, (
+            f"Exported LoRA cannot bind to {runtime_name}; loaded names: {list(loaded.loras)}"
+        )
 
 
 def test_base_sync_exports_plain_transformer_keys(monkeypatch):

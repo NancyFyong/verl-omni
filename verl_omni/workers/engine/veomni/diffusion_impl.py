@@ -643,6 +643,10 @@ class VeOmniDiffusionEngine(BaseEngine):
         lora_config = peft_model.get_lora_config(adapter_name)
         if base_sync_done:
             params = get_lora_state_dict(peft_model, adapter_name=adapter_name or "default", config=lora_config)
+            # Sync keys are relative to the transformer, unlike PEFT checkpoint
+            # keys. vLLM only strips base_model.model at the start of a key;
+            # retaining it after the transformer prefix silently binds no layers.
+            params = {name.removeprefix("base_model.model."): param for name, param in params.items()}
             if not params:
                 raise RuntimeError(
                     "VeOmni LoRA export produced no adapter tensors for "
