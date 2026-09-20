@@ -262,7 +262,7 @@ def test_disable_adapter_is_a_no_op_without_lora():
 
 
 # --------------------------------------------------------------------------
-# startup validation: reject LoRA settings veomni.lora cannot honor
+# startup validation
 # --------------------------------------------------------------------------
 
 

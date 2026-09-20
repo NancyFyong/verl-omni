@@ -52,23 +52,12 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
-# ``veomni.lora`` implements Kaiming-uniform A / zero B only; PEFT spellings such as
-# the ``lora_init_weights`` default "gaussian" would otherwise be silently ignored.
+# veomni.lora implements Kaiming-uniform A / zero B only; other PEFT spellings are ignored.
 _VEOMNI_SUPPORTED_LORA_INIT = ("true", "kaiming")
 
 
 def _validate_veomni_lora_support(model_config: DiffusionModelConfig) -> None:
-    """Reject LoRA settings that ``veomni.lora`` cannot honor.
-
-    Each setting below works on the FSDP/PEFT path but has no VeOmni equivalent, so
-    without this gate the run would train something other than the config describes.
-
-    Args:
-        model_config: Model config holding the LoRA fields to validate.
-
-    Raises:
-        NotImplementedError: A configured LoRA feature is unsupported on this backend.
-    """
+    """Reject LoRA settings that ``veomni.lora`` would silently ignore."""
     if model_config.lora.get("merge", False):
         raise NotImplementedError(
             "VeOmni diffusion backend does not support model.lora.merge=True yet; "
@@ -208,10 +197,7 @@ class VeOmniDiffusionEngine(BaseEngine):
         return build_scheduler(self.model_config)
 
     def _build_veomni_lora_config(self) -> dict:
-        """Translate the verl-omni LoRA fields into VeOmni's ``lora_config`` dict.
-
-        An empty dict keeps VeOmni on full-parameter training.
-        """
+        """Translate the verl-omni LoRA fields into VeOmni's ``lora_config`` dict (empty: no LoRA)."""
         if not self._is_lora:
             return {}
 
@@ -681,12 +667,7 @@ class VeOmniDiffusionEngine(BaseEngine):
             offload_optimizer(self.optimizer)
 
     def _lora_per_tensor_param(self, base_sync_done: bool, adapter_name: str | None):
-        """Export adapter (or base) weights for a rollout LoRA sync.
-
-        VeOmni keeps LoRA in its own ``veomni.lora`` wrappers, whose module layout
-        and state-dict keys already match PEFT on disk, so the rollout side
-        consumes this exactly like the FSDP backend's PEFT export.
-        """
+        """Export adapter (or base) weights for a rollout LoRA sync, in PEFT on-disk key format."""
         from veomni.lora import is_veomni_lora_model
         from veomni.lora.state_dict import get_lora_state_dict
 
@@ -697,8 +678,7 @@ class VeOmniDiffusionEngine(BaseEngine):
                 "was never injected, so a sync would ship frozen base weights."
             )
 
-        # vLLM only strips base_model.model at the start of a key, so a non-default
-        # adapter name would survive into the sync and bind zero rollout layers.
+        # A named adapter would survive into the sync keys and bind zero rollout layers.
         requested_adapter = adapter_name or "default"
         if requested_adapter != "default":
             raise NotImplementedError(
@@ -707,10 +687,7 @@ class VeOmniDiffusionEngine(BaseEngine):
                 "actor_rollout_ref.actor.strategy=fsdp2."
             )
 
-        # Callers gate the adapter fast path on ``hasattr(module, "peft_config")``, which
-        # VeOmniLoraModel lacks, so a repeated base sync means the actor trains while the
-        # rollout keeps replaying base weights. getattr: tests build engines via
-        # ``object.__new__``, skipping ``__init__``.
+        # A second base sync with no adapter sync in between leaves the rollout on base weights.
         if not base_sync_done:
             if getattr(self, "_lora_base_synced", False) and not getattr(self, "_lora_adapter_synced", False):
                 raise RuntimeError(
@@ -726,9 +703,7 @@ class VeOmniDiffusionEngine(BaseEngine):
         lora_config = peft_model.get_lora_config(adapter_name)
         if base_sync_done:
             params = get_lora_state_dict(peft_model, adapter_name=adapter_name or "default", config=lora_config)
-            # Sync keys are relative to the transformer, unlike PEFT checkpoint
-            # keys. vLLM only strips base_model.model at the start of a key;
-            # retaining it after the transformer prefix silently binds no layers.
+            # vLLM only strips base_model.model at the start of a key; keeping it binds no layers.
             params = {name.removeprefix("base_model.model."): param for name, param in params.items()}
             if not params:
                 raise RuntimeError(
@@ -736,9 +711,7 @@ class VeOmniDiffusionEngine(BaseEngine):
                     f"adapter={adapter_name or 'default'!r}; the rollout would keep the previous policy."
                 )
         else:
-            # The first sync ships base weights. Read them off the inner base model so the
-            # keys match the plain transformer the rollout engine loaded, with no LoRA
-            # wrapper prefix.
+            # First sync ships base weights; strip the wrapper so keys match the plain transformer.
             params = {
                 name.replace(".base_layer", ""): param
                 for name, param in peft_model.get_base_model().state_dict().items()
@@ -778,12 +751,7 @@ class VeOmniDiffusionEngine(BaseEngine):
 
     @contextmanager
     def disable_adapter(self):
-        """Temporarily bypass the LoRA adapters (used for the reference policy).
-
-        ``veomni.lora`` has no enable/disable switch, but ``LoraLinear.forward``
-        returns the base output when the active adapter is unknown, so point the
-        active adapter at a sentinel and restore it afterwards.
-        """
+        """Temporarily bypass the LoRA adapters (used for the reference policy)."""
         if not self._is_lora:
             yield
             return
@@ -803,6 +771,7 @@ class VeOmniDiffusionEngine(BaseEngine):
             raise RuntimeError("LoRA is configured but no VeOmni LoRA layers were injected.")
 
         try:
+            # LoraLinear.forward falls back to the base output when the adapter is unknown.
             for module, _ in saved:
                 module.active_adapter = "__verl_omni_disabled__"
             yield
