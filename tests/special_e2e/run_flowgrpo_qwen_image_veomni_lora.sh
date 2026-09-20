@@ -25,7 +25,10 @@ max_prompt_length=256
 ATTN_BACKEND=native
 ROLLOUT_ATTN_BACKEND=TORCH_SDPA
 
-# BACKEND=veomni|fsdp2 -- both arms share every other setting so the A/B is matched.
+# BACKEND=veomni|fsdp2 -- both arms share every other setting so the A/B is matched,
+# except lora_init_weights: veomni.lora only implements Kaiming-uniform A / zero B and
+# rejects PEFT's "gaussian" rather than silently substituting it, while PEFT rejects the
+# string "true". The two arms therefore differ in LoRA init scale by construction.
 BACKEND=${BACKEND:-veomni}
 if [[ "${BACKEND}" == "veomni" ]]; then
     engine_args=(
@@ -35,6 +38,7 @@ if [[ "${BACKEND}" == "veomni" ]]; then
         actor_rollout_ref.actor.veomni_config.param_offload=True
         actor_rollout_ref.actor.veomni_config.optimizer_offload=True
         actor_rollout_ref.ref.veomni_config.strategy=veomni
+        actor_rollout_ref.model.lora_init_weights=true
     )
 elif [[ "${BACKEND}" == "fsdp2" ]]; then
     engine_args=(

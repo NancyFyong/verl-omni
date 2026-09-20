@@ -259,3 +259,108 @@ def test_disable_adapter_is_a_no_op_without_lora():
     engine = _make_engine(_ToyTransformer())
     with engine.disable_adapter():
         pass
+
+
+# --------------------------------------------------------------------------
+# startup validation: reject LoRA settings veomni.lora cannot honor
+# --------------------------------------------------------------------------
+
+
+def _model_config(**overrides):
+    """A DiffusionModelConfig carrying only the fields the validator reads."""
+    config = object.__new__(DiffusionModelConfig)
+    defaults = {
+        "lora": {},
+        "policy_state_adapters": ("default",),
+        "lora_dtype": None,
+        "target_parameters": None,
+        "lora_init_weights": "true",
+    }
+    for name, value in {**defaults, **overrides}.items():
+        object.__setattr__(config, name, value)
+    return config
+
+
+def test_validation_accepts_the_supported_lora_setup():
+    veomni_impl._validate_veomni_lora_support(_model_config())
+
+
+@pytest.mark.parametrize("value", [True, "true", "True", "kaiming"])
+def test_validation_accepts_every_spelling_of_kaiming_init(value):
+    veomni_impl._validate_veomni_lora_support(_model_config(lora_init_weights=value))
+
+
+def test_validation_rejects_merge():
+    with pytest.raises(NotImplementedError, match="merge=True"):
+        veomni_impl._validate_veomni_lora_support(_model_config(lora={"merge": True}))
+
+
+def test_validation_rejects_named_policy_state_adapters():
+    """VeOmniLoraModel is single-adapter, so old/EMA policy states cannot exist."""
+    with pytest.raises(NotImplementedError, match="policy_state_adapters"):
+        veomni_impl._validate_veomni_lora_support(_model_config(policy_state_adapters=("default", "old")))
+
+
+def test_validation_rejects_lora_dtype():
+    with pytest.raises(NotImplementedError, match="lora_dtype"):
+        veomni_impl._validate_veomni_lora_support(_model_config(lora_dtype="float32"))
+
+
+def test_validation_rejects_target_parameters():
+    with pytest.raises(NotImplementedError, match="target_parameters"):
+        veomni_impl._validate_veomni_lora_support(_model_config(target_parameters=["experts.gate_up_proj"]))
+
+
+def test_validation_rejects_gaussian_init():
+    """The verl-omni default; VeOmni would silently Kaiming-init instead."""
+    with pytest.raises(NotImplementedError, match="lora_init_weights"):
+        veomni_impl._validate_veomni_lora_support(_model_config(lora_init_weights="gaussian"))
+
+
+def test_veomni_really_only_implements_kaiming_init():
+    """Guards the reason the check above exists, not just the check itself."""
+    import inspect
+
+    from veomni.lora.layers import LoraLinear
+
+    source = inspect.getsource(LoraLinear.reset_lora_parameters)
+    assert "kaiming_uniform_" in source
+    assert "normal_" not in source
+
+
+def test_gaussian_default_would_have_reached_the_engine_unnoticed():
+    """``lora_init_weights`` defaults to PEFT's gaussian, which VeOmni cannot honor."""
+    field = DiffusionModelConfig.__dataclass_fields__["lora_init_weights"]
+    assert field.default == "gaussian"
+
+
+# --------------------------------------------------------------------------
+# export-side guards
+# --------------------------------------------------------------------------
+
+
+def test_export_rejects_a_named_rollout_adapter(monkeypatch):
+    """``rollout_adapter=old`` would otherwise raise a bare KeyError mid-training."""
+    engine = _make_engine(_lora_module(), lora_rank=4, target_modules=["to_q", "to_k"])
+
+    with pytest.raises(NotImplementedError, match="'default' adapter only"):
+        _export(engine, monkeypatch, base_sync_done=True, adapter_name="old")
+
+
+def test_export_rejects_a_second_base_sync_without_an_adapter_sync(monkeypatch):
+    """Callers gating on ``peft_config`` never advance past base sync; fail loudly."""
+    engine = _make_engine(_lora_module(), lora_rank=4, target_modules=["to_q", "to_k"])
+
+    _export(engine, monkeypatch, base_sync_done=False)
+    with pytest.raises(RuntimeError, match="second base-weight sync"):
+        _export(engine, monkeypatch, base_sync_done=False)
+
+
+def test_export_allows_repeated_adapter_syncs(monkeypatch):
+    """The steady-state path: base once, then adapter every step."""
+    engine = _make_engine(_lora_module(), lora_rank=4, target_modules=["to_q", "to_k"])
+
+    _export(engine, monkeypatch, base_sync_done=False)
+    for _ in range(3):
+        params, _ = _export(engine, monkeypatch, base_sync_done=True)
+        assert params
