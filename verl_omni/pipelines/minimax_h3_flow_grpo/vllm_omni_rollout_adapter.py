@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -41,8 +43,22 @@ from vllm_omni.diffusion.models.minimax_h3.packed_tokens import (
     minimax_h3_unpack_audio_tokens,
     minimax_h3_unpatchify_video_tokens,
 )
+from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+    _STEP_AUDIO_ANCHOR,
+    _STEP_AUDIO_NOISE_PRED,
+    _STEP_AUDIO_ROWS,
+    _STEP_BRANCH,
+    _STEP_COND_ANCHOR,
+    _STEP_SHAPE,
+    _STEP_SIGMAS_AUDIO,
+    _STEP_SIGMAS_VIDEO,
+    _STEP_TRANSFORMER,
+)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.utils import StepRequestState
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 from verl_omni.pipelines.diffusion_rollout_output import with_rollout_data
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
@@ -68,6 +84,40 @@ from .weight_sync import MiniMaxH3WeightSyncMixin
 __all__ = ["MiniMaxH3PipelineWithLogProb"]
 
 
+@dataclass
+class _FlowGRPOState:
+    """Algorithm-private state; never shared between in-flight requests."""
+
+    task: str
+    noise_level: float
+    sde_type: str
+    selected: set[int]
+    generator: torch.Generator
+    video_scheduler: FlowMatchSDEDiscreteScheduler
+    audio_scheduler: FlowMatchSDEDiscreteScheduler
+    replay: dict[str, torch.Tensor]
+    current_latents: list[torch.Tensor] = field(default_factory=list)
+    next_latents: list[torch.Tensor] = field(default_factory=list)
+    log_probs: list[torch.Tensor] = field(default_factory=list)
+    step_indices: list[int] = field(default_factory=list)
+
+
+def _flow_grpo_options(sampling) -> dict[str, Any]:
+    """Resolve the same sampling options for serial and request-local execution."""
+    if int(sampling.num_outputs_per_prompt or 1) != 1:
+        raise NotImplementedError("MiniMax H3 FlowGRPO supports one output per request.")
+    extra = sampling.extra_args or {}
+    return {
+        "noise_level": float(extra.get("noise_level", 0.8)),
+        "sde_type": str(extra.get("sde_type", "cps")),
+        "window_size": extra.get("sde_window_size"),
+        "window_range": extra.get("sde_window_range"),
+        "sde_contiguous": bool(extra.get("sde_contiguous", True)),
+        "seed": int(extra.get("sde_window_seed", 42)) + max(int(extra.get("global_steps", 1)) - 1, 0),
+        "max_text_len": int(sampling.max_sequence_length or 1024),
+    }
+
+
 def _pad_first_dim(value: torch.Tensor, target: int) -> torch.Tensor:
     if value.shape[0] > target:
         raise ValueError(f"MiniMax H3 metadata length {value.shape[0]} exceeds configured cap {target}.")
@@ -76,19 +126,18 @@ def _pad_first_dim(value: torch.Tensor, target: int) -> torch.Tensor:
 
 @VllmOmniPipelineBase.register("MiniMaxH3Pipeline", algorithm="flow_grpo")
 class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
-    """Adapt ``MiniMaxH3Pipeline`` for single-request T2VA, FL2VA, and Ref2VA FlowGRPO.
+    """Adapt H3 FlowGRPO for request and step batching with isolated replay state.
 
     Overrides:
-        - ``__init__`` adds request-scoped FlowGRPO and CPS state.
-        - ``diffuse`` replaces the standard denoise loop with CPS sampling and records target-only video/audio
-          transitions, log probabilities, and Actor replay metadata.
-        - ``forward`` preserves Agent Loop token IDs, configures FlowGRPO, and attaches the trajectory to
-          ``DiffusionOutput``.
+        - ``diffuse`` retains the serial/offload loop with FlowGRPO transitions.
+        - Step hooks keep dual schedulers, RNG and replay data in each request's state.
+        - ``forward`` runs either a serial request or a finite wave using those same hooks.
+          Agent Loop token IDs and the training-output contract are preserved in both modes.
 
     The weight-sync mixin extends upstream prompt encoding while retaining its text-encoder TP collectives.
     """
 
-    supports_request_batch = False
+    supports_request_batch = True
 
     diffusion_io_spec = DiffusionIOSpec(
         primary=MediaSpec("video"),
@@ -109,19 +158,10 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
         self._h3_max_text_len = 1024
 
     def _configure_flow_grpo(self, request: OmniDiffusionRequest) -> None:
-        if request.sampling_params.extra_args is None:
-            request.sampling_params.extra_args = {}
-        extra_args = request.sampling_params.extra_args
-        if int(request.sampling_params.num_outputs_per_prompt or 1) != 1:
-            raise NotImplementedError("MiniMax H3 FlowGRPO v1 supports one output per request.")
-        self._flow_grpo_noise_level = float(extra_args.get("noise_level", 0.8))
-        self._flow_grpo_sde_type = str(extra_args.get("sde_type", "cps"))
-        self._flow_grpo_window_size = extra_args.get("sde_window_size")
-        self._flow_grpo_window_range = extra_args.get("sde_window_range")
-        self._flow_grpo_sde_contiguous = bool(extra_args.get("sde_contiguous", True))
-        global_step = int(extra_args.get("global_steps", 1))
-        self._flow_grpo_seed = int(extra_args.get("sde_window_seed", 42)) + max(global_step - 1, 0)
-        self._h3_max_text_len = int(request.sampling_params.max_sequence_length or 1024)
+        options = _flow_grpo_options(request.sampling_params)
+        self._h3_max_text_len = options.pop("max_text_len")
+        for name, value in options.items():
+            setattr(self, f"_flow_grpo_{name}", value)
         self._flow_grpo_trajectory = {}
 
     def _layout_outputs(
@@ -129,25 +169,26 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
         branch: MiniMaxH3DenoiseBranch,
         packed: dict[str, torch.Tensor],
         text_embeddings: torch.Tensor,
+        *,
+        max_text_len: int | None = None,
     ) -> dict[str, torch.Tensor]:
+        max_text_len = self._h3_max_text_len if max_text_len is None else max_text_len
         used_seq_len = int(packed["cu_seqlens"][1].item())
         video_rows = int(branch.img_pos.shape[0])
         audio_rows = int(branch.audio_pos.shape[0])
-        layout_cap = video_rows + audio_rows + self._h3_max_text_len
+        layout_cap = video_rows + audio_rows + max_text_len
         text_len = int(text_embeddings.shape[0])
-        if text_len > self._h3_max_text_len:
-            raise ValueError(
-                f"MiniMax H3 encoded text length {text_len} exceeds max_sequence_length={self._h3_max_text_len}."
-            )
+        if text_len > max_text_len:
+            raise ValueError(f"MiniMax H3 encoded text length {text_len} exceeds max_sequence_length={max_text_len}.")
 
-        prompt = F.pad(text_embeddings, (0, 0, 0, self._h3_max_text_len - text_len)).unsqueeze(0)
+        prompt = F.pad(text_embeddings, (0, 0, 0, max_text_len - text_len)).unsqueeze(0)
         prompt_mask = F.pad(
             torch.ones(text_len, dtype=torch.long, device=text_embeddings.device),
-            (0, self._h3_max_text_len - text_len),
+            (0, max_text_len - text_len),
         ).unsqueeze(0)
         position_ids = _pad_first_dim(packed["img_position_ids"][:used_seq_len], layout_cap).unsqueeze(0)
         token_tags = _pad_first_dim(branch.static_kwargs["token_tags"][:used_seq_len], layout_cap).unsqueeze(0)
-        text_indices = _pad_first_dim(packed["text_pos"].view(-1), self._h3_max_text_len).unsqueeze(0)
+        text_indices = _pad_first_dim(packed["text_pos"].view(-1), max_text_len).unsqueeze(0)
         return {
             "prompt_embeds": prompt,
             "prompt_embeds_mask": prompt_mask,
@@ -176,18 +217,18 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
         latent_h: int,
         latent_w: int,
         audio_t: int,
+        max_text_len: int | None = None,
     ) -> dict[str, torch.Tensor]:
+        max_text_len = self._h3_max_text_len if max_text_len is None else max_text_len
         text_len = int(text_embeddings.shape[0])
-        if text_len > self._h3_max_text_len:
-            raise ValueError(
-                f"MiniMax H3 encoded text length {text_len} exceeds max_sequence_length={self._h3_max_text_len}."
-            )
-        prompt = F.pad(text_embeddings, (0, 0, 0, self._h3_max_text_len - text_len)).unsqueeze(0)
+        if text_len > max_text_len:
+            raise ValueError(f"MiniMax H3 encoded text length {text_len} exceeds max_sequence_length={max_text_len}.")
+        prompt = F.pad(text_embeddings, (0, 0, 0, max_text_len - text_len)).unsqueeze(0)
         prompt_mask = F.pad(
             torch.ones(text_len, dtype=torch.long, device=text_embeddings.device),
-            (0, self._h3_max_text_len - text_len),
+            (0, max_text_len - text_len),
         ).unsqueeze(0)
-        prompt_tags = F.pad(text_tags, (0, self._h3_max_text_len - text_len)).unsqueeze(0)
+        prompt_tags = F.pad(text_tags, (0, max_text_len - text_len)).unsqueeze(0)
         ref_block_meta, ref_block_count = serialize_ref_blocks(ref_blocks)
         condition_video = (
             visual_anchor
@@ -214,8 +255,10 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
             "ref_block_count": torch.tensor([[ref_block_count]], dtype=torch.long),
         }
 
-    def diffuse(
+    def _prepare_flow_state(
         self,
+        state: StepRequestState,
+        options: dict[str, Any],
         *,
         task: str,
         text_embeddings: torch.Tensor,
@@ -238,7 +281,7 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
         audio_condition_lengths: list[int] | None = None,
         keyframe_frame_indices: list[int] | None = None,
         base_schedule: Sequence[float] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> StepRequestState:
         target_video_rows, target_audio_rows = self._initial_noise(
             seed=seed,
             latent_t=latent_t,
@@ -359,107 +402,24 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
         configure_flow_scheduler(video_scheduler, video_sigmas, self.device)
         configure_flow_scheduler(audio_scheduler, audio_sigmas, self.device)
         num_transitions = num_steps - 1
-        if self._flow_grpo_window_size is None:
+        if options["window_size"] is None:
             selected = set(range(num_transitions))
         else:
-            window_size = int(self._flow_grpo_window_size)
-            low, high = self._flow_grpo_window_range or [0, num_transitions]
+            window_size = int(options["window_size"])
+            low, high = options["window_range"] or [0, num_transitions]
             high = min(high, num_transitions)
             if low < 0 or window_size <= 0 or high - low < window_size:
                 raise ValueError(
                     f"Invalid MiniMax H3 SDE window: size={window_size}, "
                     f"range={[low, high]}, transitions={num_transitions}."
                 )
-            step_generator = torch.Generator().manual_seed(self._flow_grpo_seed)
-            if self._flow_grpo_sde_contiguous:
+            step_generator = torch.Generator().manual_seed(options["seed"])
+            if options["sde_contiguous"]:
                 start = int(torch.randint(low, high - window_size + 1, (1,), generator=step_generator).item())
                 selected = set(range(start, start + window_size))
             else:
                 order = torch.randperm(high - low, generator=step_generator)[:window_size].tolist()
                 selected = {low + index for index in order}
-        generator = torch.Generator(device=self.device).manual_seed(seed + 1)
-        current_latents = []
-        next_latents = []
-        log_probs = []
-        step_indices = []
-        selected_video_sigmas = []
-        selected_audio_sigmas = []
-
-        transformer = self._transformer_for_task(task)
-        with self._resident_dit_layers_on_device(enabled=transformer is self.transformer):
-            with self.progress_bar(total=num_transitions) as progress:
-                for step in range(num_transitions):
-                    video_sigma = float(video_sigmas[step])
-                    audio_sigma = float(audio_sigmas[step])
-                    video_t = 1.0 - video_sigma
-                    audio_timestep = 1.0 - audio_sigma
-                    self.record_denoise_step(step, normalized_timestep=video_sigma)
-                    model_inputs = branch.forward_kwargs(
-                        video_rows=video_rows,
-                        audio_rows=audio_rows,
-                        t_video=video_t,
-                        t_audio=audio_timestep,
-                        imgvid_cond_timestep=max(video_t, MINIMAX_H3_IMGVID_COND_TIMESTEP),
-                        audio_ref_cond_timestep=max(audio_timestep, MINIMAX_H3_AUDIO_REF_COND_TIMESTEP),
-                    )
-                    video_velocity, audio_velocity = transformer(**model_inputs)
-                    is_selected = step in selected
-                    video_transition = sample_h3_transition(
-                        video_scheduler,
-                        video_rows[branch.update_mask_dev].unsqueeze(0),
-                        video_velocity[branch.update_mask_dev].unsqueeze(0),
-                        step,
-                        noise_level=self._flow_grpo_noise_level if is_selected else 0.0,
-                        sde_type=self._flow_grpo_sde_type,
-                        generator=generator,
-                        return_log_prob=is_selected,
-                    )
-                    audio_transition = sample_h3_transition(
-                        audio_scheduler,
-                        audio_rows[branch.audio_update_mask_dev].unsqueeze(0),
-                        audio_velocity[branch.audio_update_mask_dev].unsqueeze(0),
-                        step,
-                        noise_level=self._flow_grpo_noise_level if is_selected else 0.0,
-                        sde_type=self._flow_grpo_sde_type,
-                        generator=generator,
-                        return_log_prob=is_selected,
-                    )
-                    next_video_rows = video_rows.clone()
-                    next_video_rows[branch.update_mask_dev] = video_transition[0][0]
-                    if visual_anchor is not None:
-                        next_video_rows[~branch.update_mask_dev] = visual_anchor
-                    next_audio_rows = audio_rows.clone()
-                    next_audio_rows[branch.audio_update_mask_dev] = audio_transition[0][0]
-                    if audio_anchor is not None:
-                        next_audio_rows[~branch.audio_update_mask_dev] = audio_anchor
-                    if is_selected:
-                        video_log_prob = video_transition[1]
-                        audio_log_prob = audio_transition[1]
-                        if video_log_prob is None or audio_log_prob is None:
-                            raise RuntimeError("MiniMax H3 rollout did not compute log probabilities.")
-                        if task == "ref2va":
-                            current_video = video_rows[branch.update_mask_dev]
-                            current_audio = audio_rows[branch.audio_update_mask_dev]
-                            next_video = next_video_rows[branch.update_mask_dev]
-                            next_audio = next_audio_rows[branch.audio_update_mask_dev]
-                        else:
-                            current_video, current_audio = video_rows, audio_rows
-                            next_video, next_audio = next_video_rows, next_audio_rows
-                        current_latents.append(
-                            flatten_joint_latents(current_video.unsqueeze(0), current_audio.unsqueeze(0))
-                        )
-                        next_latents.append(flatten_joint_latents(next_video.unsqueeze(0), next_audio.unsqueeze(0)))
-                        log_probs.append(combine_log_probs(video_log_prob, audio_log_prob))
-                        step_indices.append(step)
-                        selected_video_sigmas.append(video_sigma)
-                        selected_audio_sigmas.append(audio_sigma)
-                    video_rows = next_video_rows
-                    audio_rows = next_audio_rows
-                    progress.update()
-        self.record_denoise_step(None)
-
-        if not current_latents:
-            raise RuntimeError("MiniMax H3 rollout selected no stochastic transitions.")
         if task == "ref2va":
             replay_outputs = self._ref2va_replay_outputs(
                 text_embeddings=text_embeddings,
@@ -473,35 +433,242 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
                 latent_h=latent_h,
                 latent_w=latent_w,
                 audio_t=audio_t,
+                max_text_len=options["max_text_len"],
             )
         else:
-            replay_outputs = self._layout_outputs(branch, packed, text_embeddings)
-        self._flow_grpo_trajectory = {
-            "all_latents": torch.stack(current_latents, dim=1),
-            "all_next_latents": torch.stack(next_latents, dim=1),
-            "all_timesteps": (1.0 - torch.tensor(selected_video_sigmas, device=self.device)).unsqueeze(0),
-            "all_log_probs": torch.stack(log_probs, dim=1),
-            "h3_step_indices": torch.tensor(step_indices, device=self.device).unsqueeze(0),
-            "h3_audio_timesteps": (1.0 - torch.tensor(selected_audio_sigmas, device=self.device)).unsqueeze(0),
-            **replay_outputs,
+            replay_outputs = self._layout_outputs(branch, packed, text_embeddings, max_text_len=options["max_text_len"])
+        state.latents = video_rows.float()
+        state.timesteps = 1.0 - torch.tensor(video_sigmas[:-1], dtype=torch.float32, device=self.device)
+        state.step_index = 0
+        state.do_true_cfg = False
+        state.extra.update(
+            {
+                _STEP_BRANCH: branch,
+                _STEP_TRANSFORMER: self._transformer_for_task(task),
+                _STEP_AUDIO_ROWS: audio_rows.float(),
+                _STEP_COND_ANCHOR: visual_anchor,
+                _STEP_AUDIO_ANCHOR: audio_anchor,
+                _STEP_SIGMAS_VIDEO: video_sigmas,
+                _STEP_SIGMAS_AUDIO: audio_sigmas,
+                _STEP_SHAPE: {"latent_t": latent_t, "latent_h": latent_h, "latent_w": latent_w, "audio_t": audio_t},
+                "flow_grpo": _FlowGRPOState(
+                    task=task,
+                    noise_level=options["noise_level"],
+                    sde_type=options["sde_type"],
+                    selected=selected,
+                    generator=torch.Generator(device=self.device).manual_seed(seed + 1),
+                    video_scheduler=video_scheduler,
+                    audio_scheduler=audio_scheduler,
+                    replay=replay_outputs,
+                ),
+            }
+        )
+        return state
+
+    def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs) -> None:
+        """Shared FlowGRPO transition for serial, request-batch and step execution."""
+        flow = state.extra["flow_grpo"]
+        branch = state.extra[_STEP_BRANCH]
+        video_rows, audio_rows = state.latents, state.extra[_STEP_AUDIO_ROWS]
+        audio_velocity = state.extra.pop(_STEP_AUDIO_NOISE_PRED)
+        step = state.step_index
+        selected = step in flow.selected
+        video_transition = sample_h3_transition(
+            flow.video_scheduler,
+            video_rows[branch.update_mask_dev].unsqueeze(0),
+            noise_pred[branch.update_mask_dev].unsqueeze(0),
+            step,
+            noise_level=flow.noise_level if selected else 0.0,
+            sde_type=flow.sde_type,
+            generator=flow.generator,
+            return_log_prob=selected,
+        )
+        audio_transition = sample_h3_transition(
+            flow.audio_scheduler,
+            audio_rows[branch.audio_update_mask_dev].unsqueeze(0),
+            audio_velocity[branch.audio_update_mask_dev].unsqueeze(0),
+            step,
+            noise_level=flow.noise_level if selected else 0.0,
+            sde_type=flow.sde_type,
+            generator=flow.generator,
+            return_log_prob=selected,
+        )
+        next_video_rows, next_audio_rows = video_rows.clone(), audio_rows.clone()
+        next_video_rows[branch.update_mask_dev] = video_transition[0][0]
+        next_audio_rows[branch.audio_update_mask_dev] = audio_transition[0][0]
+        if state.extra[_STEP_COND_ANCHOR] is not None:
+            next_video_rows[~branch.update_mask_dev] = state.extra[_STEP_COND_ANCHOR]
+        if state.extra[_STEP_AUDIO_ANCHOR] is not None:
+            next_audio_rows[~branch.audio_update_mask_dev] = state.extra[_STEP_AUDIO_ANCHOR]
+        if selected:
+            video_log_prob, audio_log_prob = video_transition[1], audio_transition[1]
+            if video_log_prob is None or audio_log_prob is None:
+                raise RuntimeError("MiniMax H3 rollout did not compute log probabilities.")
+            if flow.task == "ref2va":
+                current_video, current_audio = (
+                    video_rows[branch.update_mask_dev],
+                    audio_rows[branch.audio_update_mask_dev],
+                )
+                next_video, next_audio = (
+                    next_video_rows[branch.update_mask_dev],
+                    next_audio_rows[branch.audio_update_mask_dev],
+                )
+            else:
+                current_video, current_audio = video_rows, audio_rows
+                next_video, next_audio = next_video_rows, next_audio_rows
+            flow.current_latents.append(flatten_joint_latents(current_video.unsqueeze(0), current_audio.unsqueeze(0)))
+            flow.next_latents.append(flatten_joint_latents(next_video.unsqueeze(0), next_audio.unsqueeze(0)))
+            flow.log_probs.append(combine_log_probs(video_log_prob, audio_log_prob))
+            flow.step_indices.append(step)
+        state.latents = next_video_rows.float()
+        state.extra[_STEP_AUDIO_ROWS] = next_audio_rows.float()
+        state.step_index += 1
+
+    def _trajectory(self, state: StepRequestState) -> dict[str, torch.Tensor]:
+        """Materialize one request's selected transitions and Actor replay metadata."""
+        flow = state.extra["flow_grpo"]
+        if not flow.current_latents:
+            raise RuntimeError("MiniMax H3 rollout selected no stochastic transitions.")
+        video_sigmas = [state.extra[_STEP_SIGMAS_VIDEO][i] for i in flow.step_indices]
+        audio_sigmas = [state.extra[_STEP_SIGMAS_AUDIO][i] for i in flow.step_indices]
+        return {
+            "all_latents": torch.stack(flow.current_latents, dim=1),
+            "all_next_latents": torch.stack(flow.next_latents, dim=1),
+            "all_timesteps": (1.0 - torch.tensor(video_sigmas, device=self.device)).unsqueeze(0),
+            "all_log_probs": torch.stack(flow.log_probs, dim=1),
+            "h3_step_indices": torch.tensor(flow.step_indices, device=self.device).unsqueeze(0),
+            "h3_audio_timesteps": (1.0 - torch.tensor(audio_sigmas, device=self.device)).unsqueeze(0),
+            **flow.replay,
         }
 
+    def diffuse(self, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+        """Preserve the serial/offload path while sharing transitions with step mode."""
+        options = {
+            name: getattr(self, f"_flow_grpo_{name}")
+            for name in (
+                "noise_level",
+                "sde_type",
+                "window_size",
+                "window_range",
+                "sde_contiguous",
+                "seed",
+            )
+        }
+        options["max_text_len"] = self._h3_max_text_len
+        state = self._prepare_flow_state(
+            StepRequestState(request_id="serial", sampling=OmniDiffusionSamplingParams()), options, **kwargs
+        )
+        branch, transformer = state.extra[_STEP_BRANCH], state.extra[_STEP_TRANSFORMER]
+        with self._resident_dit_layers_on_device(enabled=transformer is self.transformer):
+            with self.progress_bar(total=state.total_steps) as progress:
+                while not state.denoise_completed:
+                    step = state.step_index
+                    sigma = float(state.extra[_STEP_SIGMAS_VIDEO][step])
+                    video_t, audio_t = 1.0 - sigma, 1.0 - float(state.extra[_STEP_SIGMAS_AUDIO][step])
+                    self.record_denoise_step(step, normalized_timestep=sigma)
+                    video_velocity, audio_velocity = transformer(
+                        **branch.forward_kwargs(
+                            video_rows=state.latents,
+                            audio_rows=state.extra[_STEP_AUDIO_ROWS],
+                            t_video=video_t,
+                            t_audio=audio_t,
+                            imgvid_cond_timestep=max(video_t, MINIMAX_H3_IMGVID_COND_TIMESTEP),
+                            audio_ref_cond_timestep=max(audio_t, MINIMAX_H3_AUDIO_REF_COND_TIMESTEP),
+                        )
+                    )
+                    state.extra[_STEP_AUDIO_NOISE_PRED] = audio_velocity
+                    self.step_scheduler(state, video_velocity)
+                    progress.update()
+        self.record_denoise_step(None)
+        self._flow_grpo_trajectory = self._trajectory(state)
         video_latent = minimax_h3_unpatchify_video_tokens(
-            video_rows[branch.update_mask_dev],
-            latent_shape=(latent_t, latent_h // 2, latent_w // 2, 24),
+            state.latents[branch.update_mask_dev],
+            latent_shape=(kwargs["latent_t"], kwargs["latent_h"] // 2, kwargs["latent_w"] // 2, 24),
             patch_size=(1, 2, 2),
         )
         audio_latent = minimax_h3_unpack_audio_tokens(
-            audio_rows[branch.audio_update_mask_dev],
-            audio_t=audio_t * 2,
+            state.extra[_STEP_AUDIO_ROWS][branch.audio_update_mask_dev],
+            audio_t=kwargs["audio_t"] * 2,
             audio_channel=2,
         )
         return video_latent, audio_latent
 
+    def prepare_encode(self, state: StepRequestState, **kwargs) -> StepRequestState:
+        """Encode one request; shared by continuous and whole-request batching."""
+        options = _flow_grpo_options(state.sampling)
+        if getattr(self, "_dlo_residency_controller", None) is not None:
+            raise ValueError(
+                "MiniMax H3 FlowGRPO batching/step execution does not support distributed layerwise offload."
+            )
+        if getattr(state.sampling, "quality", None) == "high":
+            raise ValueError("MiniMax H3 FlowGRPO batching/step execution does not support quality=high Cache-DiT.")
+        cache_backend = getattr(getattr(self, "od_config", None), "cache_backend", None)
+        if cache_backend not in (None, "none"):
+            raise ValueError("MiniMax H3 FlowGRPO batching/step execution does not support cache acceleration.")
+        extra = state.sampling.extra_args or {}
+        short_edge = extra.get(
+            "reference_image_short_edge", getattr(state.sampling, "reference_image_short_edge", None)
+        )
+        if short_edge is None:
+            short_edge = getattr(self, "_reference_image_short_edge", None)
+        with ref2va_reference_image_short_edge(short_edge):
+            try:
+                self._ensure_prompt_text(SimpleNamespace(prompt=state.prompt, sampling_params=state.sampling))
+                prompt, media = self._extract_prompt(state.prompt)
+                context = self._prepare_request_inputs(
+                    prompt=prompt,
+                    multi_modal_data=media,
+                    sampling=state.sampling,
+                    text_conditioning=self._extract_text_conditioning(state.prompt),
+                    prepared_reference_videos=self._extract_prepared_reference_videos(state.prompt),
+                )
+            finally:
+                self._h3_prompt_ids = None
+        self._prepare_flow_state(state, options, **self._denoise_kwargs(context))
+        state.extra[_STEP_SHAPE].update(height=context["height"], width=context["width"])
+        state.extra["flow_grpo_policy_version"] = extra.get("global_steps")
+        return state
+
+    def denoise_step(self, input_batch, *, states=None, **kwargs):
+        """Reuse upstream packed/fallback forwards without mixing policy labels."""
+        batch_states = list(input_batch.states if states is None else states)
+        versions = {state.extra["flow_grpo_policy_version"] for state in batch_states}
+        if len(versions) != 1:
+            raise ValueError("MiniMax H3 cannot batch requests from different rollout policy versions.")
+        return super().denoise_step(input_batch, states=batch_states, **kwargs)
+
+    def post_decode(self, state: StepRequestState, **kwargs) -> DiffusionOutput:
+        """Decode both modalities and attach this request's CPU training payload."""
+        return self._with_trajectory(super().post_decode(state, **kwargs), self._trajectory(state))
+
+    def _forward_batch(self, request: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        """Run a finite request wave through the same per-request step lifecycle."""
+        versions = {(req.sampling_params.extra_args or {}).get("global_steps") for req in request.requests}
+        if len(versions) != 1:
+            raise ValueError("MiniMax H3 cannot batch requests from different rollout policy versions.")
+        states = []
+        for req in request.requests:
+            states.append(
+                self.prepare_encode(
+                    StepRequestState(request_id=req.request_id, prompt=req.prompt, sampling=req.sampling_params)
+                )
+            )
+        # The upstream H3 denoise_step packs compatible requests and falls back
+        # to per-request forwards for mixed DiTs / unsupported attention backends.
+        # It stores audio predictions per state; video predictions are row-concatenated.
+        while active := [state for state in states if not state.denoise_completed]:
+            prediction = self.denoise_step(InputBatch.make_batch(active), states=active)
+            pieces = prediction.split([state.latents.shape[0] for state in active])
+            for state, noise_pred in zip(active, pieces, strict=True):
+                self.step_scheduler(state, noise_pred)
+        return [self.post_decode(state) for state in states]
+
     @torch.no_grad()
-    def forward(self, request: DiffusionRequestBatch) -> DiffusionOutput:
-        if len(request.requests) != 1:
-            raise ValueError(f"MiniMax H3 FlowGRPO expects one request, got {len(request.requests)}.")
+    def forward(self, request: OmniDiffusionRequest | DiffusionRequestBatch) -> DiffusionOutput | list[DiffusionOutput]:
+        if isinstance(request, OmniDiffusionRequest):
+            request = DiffusionRequestBatch(requests=[request])
+        if len(request.requests) > 1:
+            return self._forward_batch(request)
         req = request.requests[0]
         self._configure_flow_grpo(req)
         extra_args = req.sampling_params.extra_args or {}
@@ -519,10 +686,11 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
                 self._h3_prompt_ids = None
         if not self._flow_grpo_trajectory:
             raise RuntimeError("MiniMax H3 FlowGRPO rollout produced no trajectory.")
-        trajectory = {
-            key: value.detach().cpu() if isinstance(value, torch.Tensor) else value
-            for key, value in self._flow_grpo_trajectory.items()
-        }
+        return self._with_trajectory(output, self._flow_grpo_trajectory)
+
+    @staticmethod
+    def _with_trajectory(output: DiffusionOutput, trajectory: dict[str, torch.Tensor]) -> DiffusionOutput:
+        """Use one output schema for serial, request-batch and stepwise rollouts."""
         replay_fields = (
             "all_next_latents",
             "h3_step_indices",

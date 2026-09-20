@@ -34,6 +34,10 @@ from typing import Any
 _CONFIG_ENV = "VERL_OMNI_MINIMAX_H3_TINY_TEXT_CONFIG"
 _TARGET_MODULE = "vllm_omni.diffusion.models.minimax_h3.encoder"
 _HIDDEN_DIM_NAME = "MINIMAX_H3_QWEN3VL_HIDDEN_DIM"
+_PIPELINES = {
+    "verl_omni.pipelines.minimax_h3_flow_grpo.vllm_omni_rollout_adapter": "MiniMaxH3PipelineWithLogProb",
+    "verl_omni.pipelines.minimax_h3_diffusion_nft.vllm_omni_rollout_adapter": "MiniMaxH3DiffusionNFTPipeline",
+}
 
 
 def _configured_hidden_size() -> int | None:
@@ -61,9 +65,14 @@ class _PatchLoader(importlib.abc.Loader):
 
     def exec_module(self, module: ModuleType) -> None:
         self._wrapped.exec_module(module)
-        if not hasattr(module, _HIDDEN_DIM_NAME):
-            raise RuntimeError(f"{_TARGET_MODULE} no longer exposes {_HIDDEN_DIM_NAME}; update the tiny E2E patch")
-        setattr(module, _HIDDEN_DIM_NAME, self._hidden_size)
+        if module.__name__ in _PIPELINES:
+            from smoke_trace import instrument_pipeline
+
+            instrument_pipeline(getattr(module, _PIPELINES[module.__name__]), os.environ[_CONFIG_ENV])
+        else:
+            if not hasattr(module, _HIDDEN_DIM_NAME):
+                raise RuntimeError(f"{_TARGET_MODULE} no longer exposes {_HIDDEN_DIM_NAME}; update the tiny E2E patch")
+            setattr(module, _HIDDEN_DIM_NAME, self._hidden_size)
 
 
 class _PatchFinder(importlib.abc.MetaPathFinder):
@@ -72,7 +81,7 @@ class _PatchFinder(importlib.abc.MetaPathFinder):
 
     def find_spec(self, fullname: str, path=None, target=None):
         del target
-        if fullname != _TARGET_MODULE:
+        if fullname != _TARGET_MODULE and fullname not in _PIPELINES:
             return None
         spec = importlib.machinery.PathFinder.find_spec(fullname, path)
         if spec is None or spec.loader is None:

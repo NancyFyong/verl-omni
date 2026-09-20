@@ -13,6 +13,7 @@
 # limitations under the License.
 """GPU rollout adapter for MiniMax H3 DiffusionNFT."""
 
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -23,13 +24,28 @@ from vllm_omni.diffusion.models.minimax_h3.condition_noise import (
 from vllm_omni.diffusion.models.minimax_h3.denoise_loop import (
     MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
     MINIMAX_H3_IMGVID_COND_TIMESTEP,
+    minimax_h3_prepare_denoise_rows,
 )
 from vllm_omni.diffusion.models.minimax_h3.packed_tokens import (
     minimax_h3_pack_audio_latent,
     minimax_h3_patchify_video_latent,
 )
-from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+    _STEP_AUDIO_ANCHOR,
+    _STEP_AUDIO_ROWS,
+    _STEP_BRANCH,
+    _STEP_COND_ANCHOR,
+    _STEP_SHAPE,
+    _STEP_SIGMAS_AUDIO,
+    _STEP_SIGMAS_VIDEO,
+    _STEP_TRANSFORMER,
+    MiniMaxH3Pipeline,
+)
 from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.input_batch import InputBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.utils import StepRequestState
 
 from verl_omni.pipelines.diffusion_rollout_output import with_rollout_data
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
@@ -52,6 +68,8 @@ _VIDEO_PATCH_SIZE = (1, 2, 2)
 @VllmOmniPipelineBase.register("MiniMaxH3Pipeline", algorithm="diffusion_nft")
 class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pipeline):
     """Rollout pipeline for MiniMax H3 used by DiffusionNFT."""
+
+    supports_request_batch = True
 
     #: Declares the joint video/audio rollout streams so the diffusion strategy
     #: does not hard-code the audio tuple position or its 32 kHz sample rate.
@@ -79,7 +97,13 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
             raise ValueError("MiniMax H3 Ref2VA requires reference block metadata.")
 
         video_latent, audio_latent = super().diffuse(**kwargs)
+        self._nft_capture = self._capture(video_latent, audio_latent, kwargs)
+        return video_latent, audio_latent
 
+    def _capture(self, video_latent, audio_latent, kwargs) -> dict[str, Any]:
+        """Build the same final-latent/condition payload for either execution mode."""
+        task = str(kwargs.get("task", "t2va"))
+        ref_blocks = list(kwargs.get("ref_blocks") or [])
         condition_rows = video_latent.new_zeros((0, 96), dtype=torch.float32)
         condition_audio_rows = audio_latent.new_zeros((0, AUDIO_ROW_WIDTH), dtype=torch.float32)
         keyframe_indices: list[int] = []
@@ -124,7 +148,7 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
                 )
             ref_block_meta, ref_block_count = serialize_ref_blocks(ref_blocks)
 
-        self._nft_capture = {
+        return {
             "video_latent": video_latent,
             "audio_latent": audio_latent,
             "condition_video_rows": condition_rows,
@@ -143,10 +167,31 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
             "video_shift": float(kwargs.get("video_shift", self.default_video_shift)),
             "base_schedule": kwargs.get("base_schedule"),
         }
-        return video_latent, audio_latent
 
+    @torch.no_grad()
     def forward(self, request: Any):
         """Generate video+audio and attach DiffusionNFT training tensors."""
+        if isinstance(request, OmniDiffusionRequest):
+            request = DiffusionRequestBatch(requests=[request])
+        if isinstance(request, DiffusionRequestBatch) and len(request.requests) > 1:
+            versions = {(req.sampling_params.extra_args or {}).get("global_steps") for req in request.requests}
+            if len(versions) != 1:
+                raise ValueError("MiniMax H3 cannot batch requests from different rollout policy versions.")
+            states = [
+                self.prepare_encode(
+                    StepRequestState(
+                        request_id=req.request_id,
+                        prompt=req.prompt,
+                        sampling=req.sampling_params,
+                    )
+                )
+                for req in request.requests
+            ]
+            while active := [state for state in states if not state.denoise_completed]:
+                prediction = self.denoise_step(InputBatch.make_batch(active), states=active)
+                for state, noise in zip(active, prediction.split([s.latents.shape[0] for s in active]), strict=True):
+                    self.step_scheduler(state, noise)
+            return [self.post_decode(state) for state in states]
         if int(request.sampling_params.num_outputs_per_prompt or 1) != 1:
             raise NotImplementedError("MiniMax H3 DiffusionNFT requires one output per rollout request.")
         extra_args = request.sampling_params.extra_args or {}
@@ -166,7 +211,10 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
         self._nft_capture = None
         if capture is None:
             return output
+        return self._with_capture(output, capture)
 
+    def _with_capture(self, output, capture):
+        """Attach final clean latents, training timesteps and conditioning only."""
         video_rows = minimax_h3_patchify_video_latent(capture["video_latent"], patch_size=_VIDEO_PATCH_SIZE)
         audio_rows = minimax_h3_pack_audio_latent(capture["audio_latent"])
         latents_clean = pack_video_audio_rows(video_rows, audio_rows).float()
@@ -227,6 +275,90 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
             rl=rl,
             to_cpu=True,
         )
+
+    def prepare_encode(self, state: StepRequestState, **kwargs) -> StepRequestState:
+        """Keep native H3 Euler denoising and NFT conditioning local to each request."""
+        if int(state.sampling.num_outputs_per_prompt or 1) != 1:
+            raise NotImplementedError("MiniMax H3 DiffusionNFT requires one output per rollout request.")
+        if getattr(self, "_dlo_residency_controller", None) is not None:
+            raise ValueError("MiniMax H3 NFT batching does not support distributed layerwise offload.")
+        if getattr(state.sampling, "quality", None) == "high":
+            raise ValueError("MiniMax H3 NFT batching does not support quality=high Cache-DiT.")
+        if getattr(getattr(self, "od_config", None), "cache_backend", None) not in (None, "none"):
+            raise ValueError("MiniMax H3 NFT batching does not support cache acceleration.")
+        extra = state.sampling.extra_args or {}
+        short_edge = extra.get(
+            "reference_image_short_edge", getattr(state.sampling, "reference_image_short_edge", None)
+        )
+        if short_edge is None:
+            short_edge = getattr(self, "_reference_image_short_edge", None)
+        with ref2va_reference_image_short_edge(short_edge):
+            try:
+                self._ensure_prompt_text(SimpleNamespace(prompts=[state.prompt], sampling_params=state.sampling))
+                prompt, media = self._extract_prompt(state.prompt)
+                context = self._prepare_request_inputs(
+                    prompt=prompt,
+                    multi_modal_data=media,
+                    sampling=state.sampling,
+                    text_conditioning=self._extract_text_conditioning(state.prompt),
+                    prepared_reference_videos=self._extract_prepared_reference_videos(state.prompt),
+                )
+            finally:
+                self._h3_prompt_ids = None
+        denoise_kwargs = self._denoise_kwargs(context)
+        inputs = self._build_denoise_inputs(**denoise_kwargs)
+        if len(inputs["sigmas_video"]) < 2:
+            raise ValueError("MiniMax H3 NFT requires at least one denoise transition.")
+        video, audio, video_anchor, audio_anchor = minimax_h3_prepare_denoise_rows(
+            positive=inputs["branch"],
+            initial_video_rows=inputs["video_rows"],
+            initial_audio_rows=inputs["audio_rows"],
+            keyframe_cond_rows=inputs["cond_anchor"],
+            audio_ref_rows=inputs["audio_anchor"],
+            device=self.device,
+        )
+        state.latents = video
+        state.timesteps = torch.tensor(
+            [1.0 - sigma for sigma in inputs["sigmas_video"][:-1]], dtype=torch.float32, device=self.device
+        )
+        state.step_index = 0
+        state.do_true_cfg = False
+        state.extra.update(
+            {
+                _STEP_BRANCH: inputs["branch"],
+                _STEP_TRANSFORMER: self._transformer_for_task(context["task"]),
+                _STEP_AUDIO_ROWS: audio,
+                _STEP_COND_ANCHOR: video_anchor,
+                _STEP_AUDIO_ANCHOR: audio_anchor,
+                _STEP_SIGMAS_VIDEO: inputs["sigmas_video"],
+                _STEP_SIGMAS_AUDIO: inputs["sigmas_audio"],
+                _STEP_SHAPE: {
+                    key: context[key] for key in ("height", "width", "latent_t", "latent_h", "latent_w", "audio_t")
+                },
+                "nft_context": denoise_kwargs,
+                "nft_policy_version": extra.get("global_steps"),
+            }
+        )
+        return state
+
+    def denoise_step(self, input_batch, *, states=None, **kwargs):
+        """Use upstream packed/fallback prediction without mixing policy labels."""
+        states = list(input_batch.states if states is None else states)
+        if len({state.extra["nft_policy_version"] for state in states}) != 1:
+            raise ValueError("MiniMax H3 cannot batch requests from different rollout policy versions.")
+        return super().denoise_step(input_batch, states=states, **kwargs)
+
+    def post_decode(self, state: StepRequestState, **kwargs):
+        """Decode and attach NFT's clean-latent payload, not an SDE trajectory."""
+        shape = state.extra[_STEP_SHAPE]
+        video, audio = self._unpack_denoised_rows(
+            state.extra[_STEP_BRANCH],
+            state.latents,
+            state.extra[_STEP_AUDIO_ROWS],
+            **{key: shape[key] for key in ("latent_t", "latent_h", "latent_w", "audio_t")},
+        )
+        capture = self._capture(video, audio, state.extra["nft_context"])
+        return self._with_capture(super().post_decode(state, **kwargs), capture)
 
     @staticmethod
     def _build_train_timesteps(capture: dict[str, Any]) -> torch.Tensor:

@@ -1,6 +1,6 @@
 # MiniMax H3 T2VA, FL2VA, and Ref2VA DiffusionNFT
 
-Last updated: 09/14/2026
+Last updated: 09/20/2026
 
 These recipes train rank-64 MiniMax H3 LoRA adapters with online DiffusionNFT
 for text-to-audio-video (T2VA), first-frame image-to-audio-video (FL2VA), and
@@ -231,6 +231,47 @@ NUM_GPUS=8 ROLLOUT_TP=4 ROLLOUT_N=4 INFER_STEPS=50 \
 TOTAL_TRAINING_STEPS=100 OUTPUT_DIR=/path/to/output \
 bash examples/diffusionnft_trainer/minimax_h3/run_minimax_h3_t2va_lora.sh
 ```
+
+## Batched production-profile launchers
+
+Use `run_minimax_h3_{t2va,fl2va,ref2va}_lora_batch.sh` for the opt-in batching
+profile. The [shared launch guide](../../minimax_h3/README.md) lists all six
+FlowGRPO/NFT entrypoints, FL2VA V1 common hyperparameters and the new
+`ROLLOUT_MODE=request|stepwise`, `MAX_NUM_SEQS`, `REQUEST_BATCH_MAX_WAIT_MS` controls.
+NFT keeps its direct-preference trainer, loss and old-policy adapter; it does
+not switch to V1 or FlowGRPO. `MODEL_PATH` is always the checkpoint root.
+
+## Rollout batching and step execution
+
+The existing `diffusion_nft` rollout adapter supports whole-request batching
+(`step_execution=False`) and stepwise scheduling (`step_execution=True`). Set
+`actor_rollout_ref.rollout.max_num_seqs=2` to opt in; recipes retain the single-request
+default. Both paths preserve native H3 Euler video/audio schedules and emit clean
+latents, training timesteps and conditioning metadata, not FlowGRPO SDE trajectories.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python tests/special_e2e/run_flowgrpo_minimax_h3_tiny.py \
+  --algorithm diffusion_nft --task t2va --num-gpus 2 --rollout-tp 2 \
+  --total-steps 2 --height 64 --width 96 --max-num-seqs 2
+# Add --step-execution for the stepwise test.
+```
+
+The shared tiny runner uses two synthetic prompts, two responses per prompt,
+a test-local reward and tiny model components. It records batch admission and
+finite training payloads under the tiny checkpoint's `smoke_traces/` directory.
+The T2VA smoke validates the real engine and trainer with native/SDPA attention;
+this uses upstream per-request attention fallback, not fused FlashAttention.
+Add `--attention flash` on Hopper to pair actor `_flash_3_varlen_hub` with rollout
+`FLASH_ATTN`. Two-GPU H20 tests with `fa3_fwd_interface` completed both modes with
+actual two-request packed DiT forwards, including refiner attention. Captured
+kernel replay and document-isolation checks passed; eight matched request/step
+outputs were identical, while comparison with SDPA had small clean-latent differences.
+FL2VA/Ref2VA isolation has CPU coverage, not equivalent GPU qualification.
+
+Batching rejects distributed layerwise offload, cache acceleration and
+`quality=high`. Keep adapter updates behind the rollout-completion barrier;
+mixed policy labels are rejected, but in-flight adapter replacement is not supported.
+These tiny tests do not establish production throughput, quality or convergence.
 
 ## FL2VA (image-conditioned) training
 

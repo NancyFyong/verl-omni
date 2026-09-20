@@ -1,6 +1,6 @@
 # MiniMax H3 T2VA, FL2VA, and Ref2VA FlowGRPO
 
-Last updated: 09/14/2026
+Last updated: 09/20/2026
 
 These recipes train `MiniMaxAI/MiniMax-H3` LoRA adapters with FlowGRPO for
 text-to-audio-video (T2VA), first-frame image-to-audio-video (FL2VA), and
@@ -316,6 +316,86 @@ MiniMax H3 requires a named `ASPECT_RATIO`, one of `21:9`, `16:9`, `4:3`,
 `1:1`, `3:4`, or `9:16`. The explicit height and width select the generated
 canvas and must be multiples of 32; the provided launchers use `256x384` with
 `ASPECT_RATIO=16:9`.
+
+## Batched production-profile launchers
+
+The [six task/algorithm entrypoints](../../minimax_h3/README.md) provide
+`run_minimax_h3_{t2va,fl2va,ref2va}_lora_batch.sh` in this directory and the NFT
+directory. They reuse FL2VA V1 hyperparameters with the tested `main_diffusion`
+trainer, add `ROLLOUT_MODE=request|stepwise`, `MAX_NUM_SEQS` and
+`REQUEST_BATCH_MAX_WAIT_MS`, and default to packed `FLASH_ATTN` rollout.
+Their `MODEL_PATH` always points to the checkpoint root, not its `FL2VA/` partition.
+
+## Rollout request batching and step execution
+
+The FlowGRPO adapter provides both execution modes under the existing
+`MiniMaxH3Pipeline` / `flow_grpo` registration. The recipes explicitly retain
+`max_num_seqs=1`; raise it only after checking memory and correctness on your
+workload. Actor micro-batching is independent of rollout request batching.
+
+```bash
+# Whole-request batching: each request keeps its own RNG, SDE window and replay data.
+bash examples/flowgrpo_trainer/minimax_h3/run_minimax_h3_t2va_lora.sh \
+  actor_rollout_ref.rollout.step_execution=False \
+  actor_rollout_ref.rollout.max_num_seqs=2
+
+# Step-wise scheduling: requests can enter and finish at different denoise steps.
+bash examples/flowgrpo_trainer/minimax_h3/run_minimax_h3_t2va_lora.sh \
+  actor_rollout_ref.rollout.step_execution=True \
+  actor_rollout_ref.rollout.max_num_seqs=2
+```
+
+Both modes share the serial path's video/audio CPS/SDE transition implementation,
+including fixed condition anchors, FP32 live latents, joint log probabilities,
+`all_next_latents`, and Ref2VA target-only replay. One output per request remains
+the contract; use independent requests for multiple samples.
+
+The adapter reuses vLLM-Omni's H3 packed denoise forward. Actual fusion requires
+all attention layers, including the token refiner, to isolate packed documents.
+Mixed DiTs, unsupported attention backends or incompatible Ring attention fall
+back to per-request forwards. `max_num_seqs > 1` therefore does not prove fusion
+or a throughput improvement. Different per-request schedules and text lengths
+are retained rather than overwritten by the first request; the engine may still
+separate requests according to its own compatibility keys.
+
+Step execution and multi-request forward reject distributed layerwise offload,
+cache acceleration and `quality=high` Cache-DiT. The original single-request
+forward retains its existing offload path. Keep weight updates behind the
+trainer's rollout-completion barrier: checking batch policy-version labels does
+not make mid-trajectory adapter replacement safe. Separate-async and NPU batching
+have not been validated by this integration.
+
+CPU coverage uses real H3 packing and SDE schedulers with encoder/DiT/VAE doubles
+for T2VA, FL2VA and Ref2VA. It is not GPU kernel, train-infer numerical parity,
+throughput or convergence evidence. Run the real-engine tiny trainer checks on
+available GPUs before using these modes for training:
+
+```bash
+python tests/special_e2e/run_flowgrpo_minimax_h3_tiny.py \
+  --task t2va --num-gpus 2 --total-steps 2 --max-num-seqs 2
+python tests/special_e2e/run_flowgrpo_minimax_h3_tiny.py \
+  --task t2va --num-gpus 2 --total-steps 2 --step-execution --max-num-seqs 2
+```
+
+The portable smoke uses native/SDPA and exercises the per-request attention
+fallback, not fused FlashAttention performance. The two-GPU T2VA smoke completed
+two updates in both modes with finite training payloads and nonzero gradients.
+This is not bitwise numerical parity: the sampled mode comparison retained equal
+log probabilities and replay metadata but small nonzero latent differences.
+Repeat with the intended production attention backend for numerical and
+throughput qualification. Test-local batch-size/payload traces are written under
+the tiny checkpoint's `smoke_traces/` directory.
+
+For Hopper FlashAttention coverage, add `--attention flash` to the tiny runner.
+This pairs actor `_flash_3_varlen_hub` with rollout `FLASH_ATTN`; in the tested
+H20 environment the latter loads `fa3_fwd_interface`. It is deliberately not
+`FLASH_ATTN_3_HUB`, whose current capability gate does not enable H3 multi-document
+packing. Two-GPU T2VA runs completed two training updates in both modes, with
+traces confirming two requests per DiT forward and real packed FA3 calls in
+both the refiner and main blocks. Captured kernel replay and document-isolation
+checks passed; full FlowGRPO trajectories still have small nonzero mode/backend
+differences. This is functional/numerical smoke coverage, not production throughput
+or convergence qualification.
 
 Common environment overrides are:
 

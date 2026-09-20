@@ -77,6 +77,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm_omni \
+    actor_rollout_ref.rollout.max_num_seqs=1 \
     actor_rollout_ref.rollout.rollout_attn_backend=FLASH_ATTN_3_HUB \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP \
     actor_rollout_ref.rollout.text_encoder_tp_size=$TEXT_ENCODER_TP \

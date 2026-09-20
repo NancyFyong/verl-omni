@@ -71,4 +71,22 @@ run_test 9 "Diffusion OPD v1 separate_async standalone teachers e2e" \
     env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" NUM_GPUS="${NUM_GPUS}" SMOKE=async \
     bash tests/special_e2e/run_diffusion_teacher_smoke.sh
 
+# Native/SDPA validates the multi-request lifecycle and RL payload via the
+# upstream per-request attention fallback; packed FlashAttention needs L3 testing.
+run_test 10 "MiniMax-H3 FlowGRPO request-batch trainer e2e" \
+    env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" NUM_GPUS="${NUM_GPUS}" ROLLOUT_TP=2 TOTAL_TRAINING_STEPS=2 \
+    python3 tests/special_e2e/run_flowgrpo_minimax_h3_tiny.py --task t2va --max-num-seqs 2
+
+run_test 11 "MiniMax-H3 FlowGRPO stepwise trainer e2e" \
+    env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" NUM_GPUS="${NUM_GPUS}" ROLLOUT_TP=2 TOTAL_TRAINING_STEPS=2 \
+    python3 tests/special_e2e/run_flowgrpo_minimax_h3_tiny.py --task t2va --step-execution --max-num-seqs 2
+
+run_test 12 "MiniMax-H3 NFT request-batch trainer e2e" \
+    env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" NUM_GPUS="${NUM_GPUS}" ROLLOUT_TP=2 TOTAL_TRAINING_STEPS=2 \
+    python3 tests/special_e2e/run_flowgrpo_minimax_h3_tiny.py --algorithm diffusion_nft --task t2va --max-num-seqs 2
+
+run_test 13 "MiniMax-H3 NFT stepwise trainer e2e" \
+    env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" NUM_GPUS="${NUM_GPUS}" ROLLOUT_TP=2 TOTAL_TRAINING_STEPS=2 \
+    python3 tests/special_e2e/run_flowgrpo_minimax_h3_tiny.py --algorithm diffusion_nft --task t2va --step-execution --max-num-seqs 2
+
 gpu_smoke_summary

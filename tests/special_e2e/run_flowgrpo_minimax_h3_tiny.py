@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MiniMax-H3 T2VA, FL2VA, and Ref2VA FlowGRPO GPU smoke runner.
+"""MiniMax-H3 T2VA, FL2VA, and Ref2VA FlowGRPO / DiffusionNFT GPU smoke runner.
 
 Assembles one minimal ``verl_omni.trainer.main_diffusion`` invocation per task
 with a self-contained tiny random-weight MiniMax-H3 checkpoint, synthetic
@@ -29,6 +29,11 @@ checkpoint config instead of its production-only 5120-wide constant.
 Usage:
     python tests/special_e2e/run_flowgrpo_minimax_h3_tiny.py \
         --task all --num-gpus 2 --total-steps 2
+
+Use ``--algorithm diffusion_nft`` to exercise the direct-preference trainer,
+final clean-latent payload and old-policy adapter instead of reverse SDE replay.
+Only two synthetic prompts are needed with two GPUs; epochs cover every requested
+training step. Test-local traces record actual batch sizes and finite payloads.
 
 The GPU-smoke harness passes ``--task t2va`` explicitly to keep CI within its
 time budget; FL2VA and Ref2VA remain available for targeted manual validation.
@@ -138,19 +143,27 @@ def _hydra_overrides(
     width: int,
     num_frames: int,
     num_inference_steps: int,
+    step_execution: bool = False,
+    max_num_seqs: int = 1,
+    algorithm: str = "flow_grpo",
+    attention: str = "sdpa",
 ) -> list[str]:
-    """Build a minimal task-specific MiniMax H3 FlowGRPO Hydra invocation."""
+    """Build a minimal task-specific H3 policy-gradient or NFT invocation."""
     micro_bsz_per_gpu = 1
     # The Ref2VA rollout path requires exactly one output per request, while
     # T2VA and FL2VA use two responses to exercise grouped advantages.
     n_resp_per_prompt = 1 if task == "ref2va" else 2
     mini_bsz = max(1, num_gpus * micro_bsz_per_gpu)
-    train_batch_size = mini_bsz * n_resp_per_prompt
+    train_batch_size = mini_bsz
     partition_dir = "Ref2VA" if task == "ref2va" else "FL2VA"
     rollout_model = f"{tiny_model_dir}/{partition_dir}"
     actor_transformer = f"{tiny_model_dir}/transformer"
     h3_lora_targets = "['to_q','to_k','to_v','to_out.0','ff.net.0.proj','ff.net.2']"
 
+    actor_attention, rollout_attention = {
+        "sdpa": ("native", "TORCH_SDPA"),
+        "flash": ("_flash_3_varlen_hub", "FLASH_ATTN"),
+    }[attention]
     overrides = [
         # data
         f"data.train_files={train_parquet}",
@@ -171,7 +184,7 @@ def _hydra_overrides(
         "+actor_rollout_ref.model.architecture=MiniMaxH3Pipeline",
         "actor_rollout_ref.model.algorithm=flow_grpo",
         "actor_rollout_ref.model.transformer_subfolder=transformer",
-        "actor_rollout_ref.model.attn_backend=native",
+        f"actor_rollout_ref.model.attn_backend={actor_attention}",
         "actor_rollout_ref.model.enable_gradient_checkpointing=True",
         "actor_rollout_ref.model.lora_rank=8",
         "actor_rollout_ref.model.lora_alpha=16",
@@ -198,8 +211,10 @@ def _hydra_overrides(
         "actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=1",
         # rollout
         "actor_rollout_ref.rollout.name=vllm_omni",
-        "actor_rollout_ref.rollout.max_num_seqs=1",
-        "actor_rollout_ref.rollout.rollout_attn_backend=TORCH_SDPA",
+        "actor_rollout_ref.rollout.enforce_eager=True",
+        f"actor_rollout_ref.rollout.max_num_seqs={max_num_seqs}",
+        f"actor_rollout_ref.rollout.step_execution={step_execution}",
+        f"actor_rollout_ref.rollout.rollout_attn_backend={rollout_attention}",
         f"actor_rollout_ref.rollout.tensor_model_parallel_size={rollout_tp}",
         f"actor_rollout_ref.rollout.n={n_resp_per_prompt}",
         "actor_rollout_ref.rollout.seed=42",
@@ -260,10 +275,35 @@ def _hydra_overrides(
         "trainer.save_freq=-1",
         "trainer.test_freq=-1",
         "trainer.resume_mode=disable",
-        "trainer.total_epochs=1",
+        f"trainer.total_epochs={total_training_steps}",
         f"trainer.total_training_steps={total_training_steps}",
         f"ray_kwargs.ray_init.num_cpus={ray_num_cpus}",
     ]
+    if algorithm == "diffusion_nft":
+        replacements = {
+            "algorithm.trainer_type": "direct_preference",
+            "actor_rollout_ref.model.algorithm": "diffusion_nft",
+            "actor_rollout_ref.actor.diffusion_loss.loss_mode": "diffusion_nft",
+            "actor_rollout_ref.rollout.calculate_log_probs": "False",
+            "trainer.experiment_name": f"nft-minimax-h3-tiny-{task}",
+        }
+        overrides = [
+            f"{key}={replacements[key]}" if key in replacements else value
+            for value in overrides
+            for key in [value.split("=", 1)[0]]
+        ]
+        overrides.extend(
+            [
+                "actor_rollout_ref.model.model_type=diffusion_nft_model",
+                "actor_rollout_ref.model.policy_state_adapters=['default','old']",
+                "actor_rollout_ref.rollout.rollout_adapter=old",
+                "algorithm.timestep_fraction=1.0",
+                "algorithm.old_policy_update_interval=2",
+                "algorithm.adv_mode=continuous",
+            ]
+        )
+    elif algorithm != "flow_grpo":
+        raise ValueError(f"Unsupported smoke algorithm: {algorithm}")
     if task == "fl2va":
         overrides.extend(
             [
@@ -292,8 +332,12 @@ def run_smoke(
     num_frames: int,
     num_inference_steps: int,
     force_rebuild: bool,
+    step_execution: bool = False,
+    max_num_seqs: int = 1,
+    algorithm: str = "flow_grpo",
+    attention: str = "sdpa",
 ) -> int:
-    """Run one task-specific MiniMax H3 FlowGRPO training step."""
+    """Run the requested tiny H3 training steps with the selected algorithm."""
     if task not in {"t2va", "fl2va", "ref2va"}:
         raise ValueError(f"unsupported MiniMax H3 FlowGRPO smoke task: {task!r}")
 
@@ -306,10 +350,8 @@ def run_smoke(
     ensure_tiny_minimax_h3_checkpoint(tiny_model_dir, skip_if_exists=not force_rebuild)
 
     micro_bsz_per_gpu = 1
-    # Match the rollout n in ``_hydra_overrides``: Ref2VA supports one output per
-    # request, while T2VA and FL2VA sample two responses per prompt.
-    n_resp_per_prompt = 1 if task == "ref2va" else 2
-    train_batch_size = max(1, num_gpus * micro_bsz_per_gpu) * n_resp_per_prompt
+    # One prompt per actor rank; repeated responses are created by the trainer.
+    train_batch_size = max(1, num_gpus * micro_bsz_per_gpu)
     print(f"[2/3] ensuring dummy {task} parquet at {data_dir}", flush=True)
     if task == "t2va":
         train_parquet, val_parquet = build_dummy_h3_t2va_data(
@@ -360,11 +402,15 @@ def run_smoke(
         width=width,
         num_frames=num_frames,
         num_inference_steps=num_inference_steps,
+        step_execution=step_execution,
+        max_num_seqs=max_num_seqs,
+        algorithm=algorithm,
+        attention=attention,
     )
     cmd = [sys.executable, "-m", "verl_omni.trainer.main_diffusion", *overrides]
     child_env = _tiny_patch_environment(tiny_model_dir, task)
     print(
-        f"[3/3] launching FlowGRPO {task.upper()} main_diffusion (num_gpus={num_gpus}, tp={rollout_tp}, "
+        f"[3/3] launching {algorithm} {task.upper()} main_diffusion (num_gpus={num_gpus}, tp={rollout_tp}, "
         f"te_tp={text_encoder_tp}, steps={total_training_steps})",
         flush=True,
     )
@@ -398,6 +444,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=288)
     parser.add_argument("--num-frames", type=int, default=97)
     parser.add_argument("--num-inference-steps", type=int, default=4)
+    parser.add_argument("--algorithm", choices=("flow_grpo", "diffusion_nft"), default="flow_grpo")
+    parser.add_argument("--step-execution", action="store_true", help="Exercise the FlowGRPO step lifecycle.")
+    parser.add_argument("--max-num-seqs", type=int, default=1, help="Concurrent requests per rollout replica.")
+    parser.add_argument(
+        "--attention",
+        choices=("sdpa", "flash"),
+        default="sdpa",
+        help="Paired actor/rollout attention; flash uses actor FA3-hub and rollout FLASH_ATTN (Hopper).",
+    )
     parser.add_argument("--force-rebuild", action="store_true")
     return parser.parse_args()
 
@@ -407,7 +462,7 @@ def main() -> None:
     _require_minimax_h3_diffusers()
     tasks = ("t2va", "fl2va", "ref2va") if args.task == "all" else (args.task,)
     for index, task in enumerate(tasks, start=1):
-        print(f"===== MiniMax-H3 FlowGRPO {task.upper()} smoke ({index}/{len(tasks)}) =====", flush=True)
+        print(f"===== MiniMax-H3 {args.algorithm} {task.upper()} smoke ({index}/{len(tasks)}) =====", flush=True)
         rc = run_smoke(
             task=task,
             tiny_model_dir=args.tiny_model_dir,
@@ -423,11 +478,15 @@ def main() -> None:
             num_frames=args.num_frames,
             num_inference_steps=args.num_inference_steps,
             force_rebuild=args.force_rebuild and index == 1,
+            step_execution=args.step_execution,
+            max_num_seqs=args.max_num_seqs,
+            algorithm=args.algorithm,
+            attention=args.attention,
         )
         if rc != 0:
             sys.exit(rc)
     completed_tasks = " + ".join(task.upper() for task in tasks)
-    print(f"MiniMax-H3 tiny FlowGRPO {completed_tasks} smoke PASSED.")
+    print(f"MiniMax-H3 tiny {args.algorithm} {completed_tasks} smoke PASSED.")
 
 
 if __name__ == "__main__":
