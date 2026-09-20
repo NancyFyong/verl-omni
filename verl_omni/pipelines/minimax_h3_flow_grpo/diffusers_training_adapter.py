@@ -35,6 +35,7 @@ from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 from verl_omni.workers.config import DiffusionModelConfig
 
+from . import veomni_training_adapter as veomni
 from .common import (
     combine_log_probs,
     configure_flow_scheduler,
@@ -43,7 +44,7 @@ from .common import (
     sample_h3_transition,
     split_joint_latents,
 )
-from .weight_sync import H3_LORA_TARGETS
+from .weight_sync import H3_LORA_TARGETS, H3_VEOMNI_LORA_TARGETS
 
 __all__ = ["MiniMaxH3FlowGRPO"]
 
@@ -84,17 +85,25 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
 
         target_modules = model_config.target_modules
         requested = {target_modules} if isinstance(target_modules, str) else set(target_modules or [])
-        unsupported = {
-            target
-            for target in requested
-            if not any(target == supported or target.endswith("." + supported) for supported in H3_LORA_TARGETS)
-        }
-        if not requested or unsupported:
-            raise ValueError(
-                "MiniMax H3 LoRA supports only transformer/refiner attention and MLP projections "
-                f"{sorted(H3_LORA_TARGETS)}, got unsupported targets {sorted(unsupported or requested)}. "
-                "Other targets cannot be synchronized to the rollout model."
+        valid_layout = any(
+            requested
+            and all(
+                any(target == supported or target.endswith("." + supported) for supported in supported_targets)
+                for target in requested
             )
+            for supported_targets in (H3_LORA_TARGETS, H3_VEOMNI_LORA_TARGETS)
+        )
+        if not valid_layout:
+            supported = sorted(H3_LORA_TARGETS | H3_VEOMNI_LORA_TARGETS)
+            raise ValueError(
+                "MiniMax H3 LoRA supports only one complete projection naming layout from "
+                f"{supported}; got {sorted(requested)}. Other targets cannot be synchronized to the rollout model."
+            )
+
+    @classmethod
+    def convert_export_key(cls, name: str) -> str:
+        """Map VeOmni's native H3 wrapper keys to the fused rollout layout."""
+        return veomni.convert_export_key(name)
 
     @classmethod
     def build_scheduler(cls, model_config: DiffusionModelConfig) -> H3SchedulerPair:
@@ -272,7 +281,14 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
         video_update_mask = model_inputs.pop("_h3_video_update_mask")
         audio_update_mask = model_inputs.pop("_h3_audio_update_mask")
         target_only_trajectory = bool(model_inputs.pop("_h3_target_only_trajectory"))
-        video_velocity, audio_velocity = module(**model_inputs)
+        if veomni.is_veomni_module(module):
+            video_velocity, audio_velocity = veomni.predict_veomni(
+                module,
+                model_inputs,
+                use_gradient_checkpointing=model_config.enable_gradient_checkpointing,
+            )
+        else:
+            video_velocity, audio_velocity = module(**model_inputs)
         video = model_inputs["hidden_states"].float()
         audio = model_inputs["audio_hidden_states"].float()
         if target_only_trajectory:

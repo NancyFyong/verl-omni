@@ -40,6 +40,7 @@ from verl.utils.torch_dtypes import PrecisionType
 from verl.workers.engine.base import BaseEngine, BaseEngineCtx, EngineRegistry
 from verl.workers.engine.utils import enable_full_determinism, prepare_micro_batches
 
+from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.pipelines.utils import build_scheduler, forward_and_sample_previous_step, prepare_model_inputs
 from verl_omni.workers.config import (
     DiffusionModelConfig,
@@ -425,8 +426,8 @@ class VeOmniDiffusionEngine(BaseEngine):
         timesteps = micro_batch["all_timesteps"]
         prompt_embeds = micro_batch["prompt_embeds"]
         prompt_embeds_mask = micro_batch["prompt_embeds_mask"]
-        negative_prompt_embeds = micro_batch["negative_prompt_embeds"]
-        negative_prompt_embeds_mask = micro_batch["negative_prompt_embeds_mask"]
+        negative_prompt_embeds = micro_batch.get("negative_prompt_embeds")
+        negative_prompt_embeds_mask = micro_batch.get("negative_prompt_embeds_mask")
         sp_size = self.ulysses_sequence_parallel_size if self.use_ulysses_sp else 1
 
         if prompt_embeds.is_nested:
@@ -729,7 +730,9 @@ class VeOmniDiffusionEngine(BaseEngine):
                 if "lora_" not in name
             }
 
-        return convert_weight_keys(params, peft_model), lora_config.to_peft_dict()
+        if not getattr(peft_model, "_checkpoint_conversion_mapping", None):
+            params = convert_weight_keys(params, peft_model)
+        return params, lora_config.to_peft_dict()
 
     def get_per_tensor_param(self, **kwargs):
         load_model_to_gpu(self.module, get_device_id())
@@ -742,11 +745,18 @@ class VeOmniDiffusionEngine(BaseEngine):
             )
         else:
             params = self.module.state_dict()
-            params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
+            module = getattr(self.module, "_fsdp_wrapped_module", self.module)
+            if not getattr(module, "_checkpoint_conversion_mapping", None):
+                params = convert_weight_keys(params, module)
 
         if self._is_offload_param:
             offload_model_to_cpu(self.module)
 
+        model_config = getattr(self, "model_config", None)
+        model_cls = DiffusionModelBase.peek_class(
+            getattr(model_config, "architecture", None),
+            getattr(model_config, "algorithm", None),
+        )
         device = get_device_id()
         export_dtype = PrecisionType.to_dtype(self.engine_config.model_dtype)
 
@@ -756,7 +766,10 @@ class VeOmniDiffusionEngine(BaseEngine):
                 tensor = tensor.to(device, non_blocking=True)
                 if tensor.is_floating_point() and tensor.dtype != export_dtype:
                     tensor = tensor.to(export_dtype, non_blocking=True)
-                yield f"transformer.{name}", tensor
+                export_name = f"transformer.{name}"
+                if model_cls is not None:
+                    export_name = model_cls.convert_export_key(export_name)
+                yield export_name, tensor
 
         return param_generator(), peft_config_dict
 

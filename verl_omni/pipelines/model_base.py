@@ -119,6 +119,11 @@ class DiffusionModelBase(ABC):
         return
 
     @classmethod
+    def convert_export_key(cls, name: str) -> str:
+        """Convert a training-backend state-dict key to the rollout layout."""
+        return name
+
+    @classmethod
     def prepare_processor_files(cls, model_path: str) -> Optional[str]:
         """Prepare model-specific processor files before ``hf_processor()`` loads them.
 

@@ -54,6 +54,13 @@ _LORA_TARGET_MAPPING = {
     "ff.net.2": ("fc2",),
 }
 H3_LORA_TARGETS = frozenset(_LORA_TARGET_MAPPING)
+H3_VEOMNI_LORA_TARGETS = frozenset({"qkv_proj", "out_proj", "fc1", "fc2"})
+_VEOMNI_LORA_TARGET_MAPPING = {
+    "qkv_proj": ("to_q", "to_k", "to_v"),
+    "out_proj": ("out_proj",),
+    "fc1": ("fc1_0", "fc1_1"),
+    "fc2": ("fc2",),
+}
 
 
 def _diffusers_to_vllm_name(name: str) -> str:
@@ -200,8 +207,17 @@ class MiniMaxH3WeightSyncMixin:
     def install_h3_lora_layout(self) -> None:
         """Expose H3's fused QKV and GEGLU layout to the LoRA manager."""
         transformer = getattr(self, self._h3_weight_component_name(), None)
-        if transformer is not None and not getattr(transformer, "stacked_params_mapping", None):
-            transformer.stacked_params_mapping = list(_LORA_STACKED_PARAMS_MAPPING)
+        if transformer is None:
+            return
+        existing = list(getattr(transformer, "stacked_params_mapping", ()) or ())
+
+        def _leaf_pair(item: tuple) -> tuple[str, str]:
+            return tuple(str(name).strip(".").split(".")[-1] for name in item[:2])
+
+        known = {_leaf_pair(item) for item in existing if len(item) >= 2}
+        transformer.stacked_params_mapping = existing + [
+            item for item in _LORA_STACKED_PARAMS_MAPPING if _leaf_pair(item) not in known
+        ]
 
     def map_lora_update_to_engine(
         self,
@@ -217,15 +233,79 @@ class MiniMaxH3WeightSyncMixin:
         else:
             raise ValueError(f"MiniMax H3 LoRA sync requires explicit target_modules, got {target_modules!r}.")
 
+        component = self._h3_weight_component_name()
+        if requested_targets and all(
+            any(target == supported or target.endswith("." + supported) for supported in H3_VEOMNI_LORA_TARGETS)
+            for target in requested_targets
+        ):
+            transformer = getattr(self, component)
+            heads = transformer.arch.num_attention_heads
+            head_dim = transformer.arch.attention_head_dim
+            ff_half = transformer.arch.ffn_hidden_size
+            mapped = {}
+            for name, tensor in tensors.items():
+                name = name.replace("transformer.base_model.model.dit.", "transformer.", 1)
+                name = name.replace("transformer.dit.", "transformer.", 1)
+                prefix, separator, inner = name.partition(".")
+                if separator and prefix == "transformer":
+                    name = f"{component}.{inner}"
+                is_lora_a = name.endswith(".lora_A.weight")
+                is_lora_b = name.endswith(".lora_B.weight")
+                if not (is_lora_a or is_lora_b):
+                    mapped[name] = tensor
+                    continue
+                suffix = ".lora_A.weight" if is_lora_a else ".lora_B.weight"
+                module = name[: -len(suffix)]
+                if module.endswith(".attn.qkv_proj"):
+                    base = module[: -len("qkv_proj")]
+                    if is_lora_a:
+                        projections = (tensor, tensor, tensor)
+                    else:
+                        expected = heads * 3 * head_dim
+                        if tensor.shape[0] != expected:
+                            raise ValueError(
+                                f"MiniMax H3 qkv_proj LoRA B rows must be {expected}, got {tensor.shape[0]} for {name}."
+                            )
+                        grouped = tensor.view(heads, 3, head_dim, -1)
+                        projections = tuple(grouped[:, index].reshape(heads * head_dim, -1) for index in range(3))
+                    for target, projection in zip(("to_q", "to_k", "to_v"), projections, strict=True):
+                        mapped[f"{base}{target}{suffix}"] = projection.contiguous()
+                    continue
+                if module.endswith(".mlp.fc1"):
+                    base = module[: -len("fc1")]
+                    if is_lora_a:
+                        projections = (tensor, tensor)
+                    else:
+                        if tensor.shape[0] != 2 * ff_half:
+                            raise ValueError(
+                                f"MiniMax H3 fc1 LoRA B rows must be {2 * ff_half}, got {tensor.shape[0]} for {name}."
+                            )
+                        projections = tensor.chunk(2, dim=0)
+                    for target, projection in zip(("fc1_0", "fc1_1"), projections, strict=True):
+                        mapped[f"{base}{target}{suffix}"] = projection.contiguous()
+                    continue
+                mapped[name] = tensor
+            new_config = dict(peft_config)
+            new_config["target_modules"] = sorted(
+                {
+                    mapped_target
+                    for target in requested_targets
+                    for supported in H3_VEOMNI_LORA_TARGETS
+                    if target == supported or target.endswith("." + supported)
+                    for mapped_target in _VEOMNI_LORA_TARGET_MAPPING[supported]
+                }
+            )
+            return mapped, new_config
+
         target_suffixes = {target: _lora_target_suffix(target) for target in requested_targets}
         unsupported = sorted(target for target, suffix in target_suffixes.items() if suffix is None)
         if not requested_targets or unsupported:
+            supported = sorted(H3_LORA_TARGETS | H3_VEOMNI_LORA_TARGETS)
             raise ValueError(
-                "MiniMax H3 LoRA sync supports only attention Q/K/V/output and GEGLU projections; "
+                f"MiniMax H3 LoRA sync supports only {supported}; "
                 f"unsupported targets: {unsupported or sorted(requested_targets)}."
             )
 
-        component = self._h3_weight_component_name()
         ff_half = getattr(self, component).arch.ffn_hidden_size
         mapped: dict[str, torch.Tensor] = {}
         for name, tensor in tensors.items():
@@ -279,5 +359,15 @@ class MiniMaxH3WeightSyncMixin:
         )
         return mapped, new_config
 
+    @staticmethod
+    def _validate_diffusion_lora_binding(*, lora_model, bound_lora_names) -> None:
+        """Reject partial or no-op adapter binding in the rollout engine."""
+        unbound = set(lora_model.loras) - set(bound_lora_names)
+        if unbound:
+            raise ValueError(
+                f"MiniMax H3 LoRA has {len(unbound)} unbound modules; refusing a partial or no-op sync. "
+                f"First unbound names: {sorted(unbound)[:5]}"
+            )
 
-__all__ = ["H3_LORA_TARGETS", "MiniMaxH3WeightSyncMixin"]
+
+__all__ = ["H3_LORA_TARGETS", "H3_VEOMNI_LORA_TARGETS", "MiniMaxH3WeightSyncMixin"]

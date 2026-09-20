@@ -1,12 +1,13 @@
 # MiniMax H3 T2VA, FL2VA, and Ref2VA FlowGRPO
 
-Last updated: 09/14/2026
+Last updated: 09/20/2026
 
 These recipes train `MiniMaxAI/MiniMax-H3` LoRA adapters with FlowGRPO for
 text-to-audio-video (T2VA), first-frame image-to-audio-video (FL2VA), and
-reference-to-audio-video (Ref2VA) generation. The launchers configure a
-Diffusers H3 Actor and vLLM-Omni rollout for joint video and audio generation,
-with CLAP and ImageBind as the default rewards.
+reference-to-audio-video (Ref2VA) generation. The default launchers configure
+a Diffusers H3 Actor and vLLM-Omni rollout for joint video and audio generation,
+with CLAP and ImageBind as the default rewards. T2VA also provides a VeOmni
+Actor launcher.
 
 T2VA supports NVIDIA GPUs and Ascend NPUs. The FL2VA and full multimodal
 Ref2VA paths target NVIDIA GPUs.
@@ -197,6 +198,26 @@ bash examples/flowgrpo_trainer/minimax_h3/run_minimax_h3_t2va_lora.sh \
   actor_rollout_ref.model.attn_backend=native \
   actor_rollout_ref.rollout.rollout_attn_backend=TORCH_SDPA
 ```
+
+### NVIDIA GPU (VeOmni Actor, T2VA)
+
+This path requires VeOmni 0.1.12 or later and trains the native fused H3 DiT
+while retaining vLLM-Omni rollout:
+
+```bash
+uv pip install veomni==0.1.12 --no-deps
+
+MODEL_PATH="$MODEL_ROOT/FL2VA" \
+DATA_DIR="$HOME/data/vid_prompt/verl_omni" \
+IMAGEBIND_MODEL_PATH=/path/to/imagebind_huge.pth \
+bash examples/flowgrpo_trainer/minimax_h3/run_minimax_h3_t2va_lora_veomni.sh
+```
+
+Unlike the Diffusers Actor, the VeOmni Actor reads the fused checkpoint from
+`$MODEL_PATH/transformer` and trains `qkv_proj`, `out_proj`, `fc1`, and `fc2`.
+The sync adapter expands these into vLLM-Omni's logical Q/K/V and GEGLU slices
+and rejects any partially bound update. VeOmni sequence parallelism is not yet
+supported by this engine integration, so the launcher keeps Ulysses SP at 1.
 
 ### NVIDIA GPU (FL2VA)
 
