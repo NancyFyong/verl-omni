@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -23,7 +24,11 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
 
 import verl_omni
-from verl_omni.trainer.diffusion.ray_diffusion_trainer import DistributionMatchingRayTrainer
+from verl_omni.trainer.diffusion.ray_diffusion_trainer import (
+    DistributionMatchingRayTrainer,
+    publish_directory_atomically,
+    write_latest_iteration,
+)
 from verl_omni.trainer.main_diffusion import _get_trainer_cls
 
 CONFIG_DIR = str(Path(verl_omni.__file__).parent / "trainer" / "config")
@@ -174,6 +179,40 @@ class TestDMDCycles:
 
 
 class TestDMDCheckpoint:
+    def test_publication_failure_cleans_staging(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(os, "replace", MagicMock(side_effect=OSError("rename failed")))
+        with pytest.raises(OSError, match="rename failed"):
+            with publish_directory_atomically(tmp_path, "global_step_1") as staging:
+                (staging / "complete").touch()
+        assert not list(tmp_path.iterdir())
+
+    def test_tracker_failure_keeps_previous_value_and_cleans_temp(self, tmp_path, monkeypatch):
+        tracker = tmp_path / "latest_checkpointed_iteration.txt"
+        tracker.write_text("1")
+        monkeypatch.setattr(os, "replace", MagicMock(side_effect=OSError("rename failed")))
+        with pytest.raises(OSError, match="rename failed"):
+            write_latest_iteration(tmp_path, 2)
+        assert tracker.read_text() == "1"
+        assert list(tmp_path.iterdir()) == [tracker]
+
+    def test_publication_preserves_existing_checkpoint(self, tmp_path):
+        destination = tmp_path / "global_step_1"
+        destination.mkdir()
+        (destination / "complete").write_text("old")
+        with pytest.raises(FileExistsError):
+            with publish_directory_atomically(tmp_path, destination.name):
+                pytest.fail("An existing checkpoint must not be opened for replacement.")
+        assert (destination / "complete").read_text() == "old"
+
+    def test_checkpoint_and_tracker_publish_only_after_success(self, tmp_path):
+        with publish_directory_atomically(tmp_path, "global_step_2") as staging:
+            (staging / "complete").write_text("new")
+            assert not (tmp_path / "global_step_2").exists()
+        write_latest_iteration(tmp_path, 2)
+        assert (tmp_path / "global_step_2" / "complete").read_text() == "new"
+        assert (tmp_path / "latest_checkpointed_iteration.txt").read_text() == "2"
+        assert not list(tmp_path.glob(".*"))
+
     def test_counter_mismatch_rejected_before_worker_load(self, tmp_path):
         trainer = make_trainer([1] * 9)
         trainer.config.trainer.n_gpus_per_node = 1

@@ -28,7 +28,6 @@ import time
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from contextlib import contextmanager
 from pathlib import Path
 from pprint import pprint
 from typing import Any, Literal, Optional
@@ -78,8 +77,10 @@ from verl_omni.trainer.diffusion.diffusion_trainer_utils import (
     NoOpCheckpointManager,
     _to_diffusion_worker_tensordict,
     old_policy_decay,
+    publish_directory_atomically,
     validate_distillation_config,
     worker_group_port_ranges,
+    write_latest_iteration,
 )
 from verl_omni.trainer.diffusion.rollout_correction import (
     apply_bypass_mode_to_diffusion_batch,
@@ -1499,33 +1500,6 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
-
-
-@contextmanager
-def publish_directory_atomically(root: Path, name: str):
-    """Stage a directory in a sibling temp path and publish it as ``root/name``.
-
-    The published directory never appears in a partial state: the staged content
-    is only moved into place after the body succeeds, and any failure removes the
-    staging directory without creating the target.
-    """
-    target = root / name
-    if target.exists():
-        raise FileExistsError(f"Refusing to overwrite checkpoint {target}.")
-    staging = Path(tempfile.mkdtemp(prefix=f".{name}_", dir=root))
-    try:
-        yield staging
-    except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
-    os.replace(staging, target)
-
-
-def write_latest_iteration(root: Path, step: int) -> None:
-    """Atomically update the ``latest_checkpointed_iteration.txt`` tracker file."""
-    tracker = root / f".latest_{uuid.uuid4().hex}"
-    tracker.write_text(str(step))
-    os.replace(tracker, root / "latest_checkpointed_iteration.txt")
 
 
 class DistributionMatchingRayTrainer(BaseRayDiffusionTrainer):
