@@ -71,18 +71,18 @@ def test_conflicting_typed_and_legacy_etp_fails(monkeypatch):
 
 @pytest.mark.parametrize("as_object", [False, True])
 def test_explicit_parallel_config_keeps_etp_and_other_fields(monkeypatch, as_object):
-    parallel = {"tensor_parallel_size": 4, "text_encoder_tp_size": 4, "ring_degree": 2}
+    parallel = {"tensor_parallel_size": 4, "text_encoder_tp_size": 4, "vae_patch_parallel_size": 4}
     if as_object:
         parallel = DiffusionParallelConfig.from_dict(parallel)
     engine_args = _prepare(monkeypatch, parallel=parallel)
     stages = AsyncOmniEngine._create_default_diffusion_stage_cfg(engine_args)
     od_config = OmniDiffusionConfig(parallel_config=stages[0]["engine_args"]["parallel_config"])
     assert od_config.parallel_config.text_encoder_tp_size == 4
-    assert od_config.parallel_config.ring_degree == 2
+    assert od_config.parallel_config.vae_patch_parallel_size == 4
 
 
 def test_missing_nested_etp_is_filled_without_mutating_input(monkeypatch):
-    parallel = {"tensor_parallel_size": 4, "ring_degree": 2}
+    parallel = {"tensor_parallel_size": 4, "vae_patch_parallel_size": 4}
     engine_args = _prepare(monkeypatch, typed=4, parallel=parallel)
     stages = AsyncOmniEngine._create_default_diffusion_stage_cfg(engine_args)
     assert stages[0]["engine_args"]["parallel_config"].text_encoder_tp_size == 4
@@ -103,7 +103,12 @@ async def test_run_server_preserves_etp_at_engine_boundary(monkeypatch, algorith
     monkeypatch.setattr(server_module, "get_non_ephemeral_free_port", lambda *_: 12345)
     monkeypatch.setattr(os, "environ", dict(os.environ))
     server = SimpleNamespace(
-        config=DiffusionRolloutConfig(tensor_model_parallel_size=4, text_encoder_tp_size=typed),
+        config=DiffusionRolloutConfig(
+            tensor_model_parallel_size=4,
+            text_encoder_tp_size=typed,
+            vae_patch_parallel_size=4,
+            vae_use_tiling=True,
+        ),
         model_config=SimpleNamespace(architecture="MiniMaxH3Pipeline", algorithm=algorithm),
     )
     server._generate_strategy = strategy_module.DiffusionStrategy(server)
@@ -122,6 +127,11 @@ async def test_run_server_preserves_etp_at_engine_boundary(monkeypatch, algorith
             server, Namespace(tensor_parallel_size=4, text_encoder_tp_size=cli)
         )
     stages = AsyncOmniEngine._create_default_diffusion_stage_cfg(captured)
-    od_config = OmniDiffusionConfig(parallel_config=stages[0]["engine_args"]["parallel_config"])
+    od_config = OmniDiffusionConfig(
+        parallel_config=stages[0]["engine_args"]["parallel_config"],
+        vae_use_tiling=stages[0]["engine_args"]["vae_use_tiling"],
+    )
     assert od_config.parallel_config.tensor_parallel_size == 4
     assert od_config.parallel_config.text_encoder_tp_size == 4
+    assert od_config.parallel_config.vae_patch_parallel_size == 4
+    assert od_config.vae_use_tiling is True
