@@ -28,6 +28,7 @@ import time
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 from pprint import pprint
 from typing import Any, Literal, Optional
@@ -1102,7 +1103,7 @@ class BaseRayDiffusionTrainer(ABC):
             actor_output["perf/mfu/actor"] = actor_mfu
         return DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
 
-    def _start_profiling(self, do_profile: bool, profile_step: Optional[int] = None) -> None:
+    def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
         if not do_profile:
             return
@@ -1116,9 +1117,7 @@ class BaseRayDiffusionTrainer(ABC):
                 self._controller_nsys_profile_active = True
                 controller_profile_started = True
 
-            self.actor_rollout_wg.start_profile(
-                role="e2e", profile_step=self.global_steps if profile_step is None else profile_step
-            )
+            self.actor_rollout_wg.start_profile(role="e2e", profile_step=self.global_steps)
             if self.use_reference_policy and not self.ref_in_actor:
                 self.ref_policy_wg.start_profile(profile_step=self.global_steps)
             if self.use_teacher_policy and Role.TeacherModel in self.role_worker_mapping:
@@ -1502,8 +1501,40 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                     self.train_dataset.on_batch_end(batch=batch)
 
 
+@contextmanager
+def publish_directory_atomically(root: Path, name: str):
+    """Stage a directory in a sibling temp path and publish it as ``root/name``.
+
+    The published directory never appears in a partial state: the staged content
+    is only moved into place after the body succeeds, and any failure removes the
+    staging directory without creating the target.
+    """
+    target = root / name
+    if target.exists():
+        raise FileExistsError(f"Refusing to overwrite checkpoint {target}.")
+    staging = Path(tempfile.mkdtemp(prefix=f".{name}_", dir=root))
+    try:
+        yield staging
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    os.replace(staging, target)
+
+
+def write_latest_iteration(root: Path, step: int) -> None:
+    """Atomically update the ``latest_checkpointed_iteration.txt`` tracker file."""
+    tracker = root / f".latest_{uuid.uuid4().hex}"
+    tracker.write_text(str(step))
+    os.replace(tracker, root / "latest_checkpointed_iteration.txt")
+
+
 class DistributionMatchingRayTrainer(BaseRayDiffusionTrainer):
-    """Offline DMD2: one student attempt followed by K fake-score attempts."""
+    """Offline distribution-matching distillation trainer.
+
+    Each cycle runs one student update followed by ``K`` fake-score updates. The
+    loop is agnostic to the concrete distribution-matching objective; DMD2 is the
+    currently supported instance, selected through the top-level ``dmd`` config.
+    """
 
     def __init__(self, config, *args, **kwargs):
         self.validate_config(config)
@@ -1633,14 +1664,10 @@ class DistributionMatchingRayTrainer(BaseRayDiffusionTrainer):
         """Publish actor shards, both clocks, dataloader and RNG as one complete cycle."""
         root = Path(self.config.trainer.default_local_dir)
         root.mkdir(parents=True, exist_ok=True)
-        target = root / f"global_step_{self.global_steps}"
-        if target.exists():
-            raise FileExistsError(f"Refusing to overwrite checkpoint {target}.")
-        temporary = Path(tempfile.mkdtemp(prefix=f".global_step_{self.global_steps}_", dir=root))
-        try:
-            self.actor_rollout_wg.save_checkpoint(str(temporary / "actor"), global_step=self.global_steps)
-            self.validate_actor_checkpoint(temporary, self.global_steps, self.optimizer_steps)
-            torch.save(self.train_dataloader.state_dict(), temporary / "data.pt")
+        with publish_directory_atomically(root, f"global_step_{self.global_steps}") as staging:
+            self.actor_rollout_wg.save_checkpoint(str(staging / "actor"), global_step=self.global_steps)
+            self.validate_actor_checkpoint(staging, self.global_steps, self.optimizer_steps)
+            torch.save(self.train_dataloader.state_dict(), staging / "data.pt")
             torch.save(
                 {
                     "version": 1,
@@ -1654,16 +1681,9 @@ class DistributionMatchingRayTrainer(BaseRayDiffusionTrainer):
                         "python": random.getstate(),
                     },
                 },
-                temporary / "trainer.pt",
+                staging / "trainer.pt",
             )
-            os.replace(temporary, target)
-            tracker = root / f".latest_{uuid.uuid4().hex}"
-            tracker.write_text(str(self.global_steps))
-            os.replace(tracker, root / "latest_checkpointed_iteration.txt")
-        except Exception:
-            if temporary.exists():
-                shutil.rmtree(temporary)
-            raise
+        write_latest_iteration(root, self.global_steps)
         keep = self.config.trainer.get("max_actor_ckpt_to_keep")
         if keep is not None and keep > 0:
             checkpoints = sorted(
@@ -1792,7 +1812,7 @@ class DistributionMatchingRayTrainer(BaseRayDiffusionTrainer):
             while self.global_steps < self.total_training_steps:
                 cycle = self.global_steps + 1
                 if cycle in profile_steps and not profiling:
-                    self._start_profiling(True, profile_step=cycle)
+                    self._start_profiling(True)
                     profiling = True
                 start = time.perf_counter()
                 metrics = self.update_stage("student", 0)

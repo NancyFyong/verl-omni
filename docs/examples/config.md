@@ -60,8 +60,8 @@ algorithm:
   rollout_correction: { ... }   # mirrors upstream RolloutCorrectionConfig
 ```
 
-- `algorithm.trainer_type`: Trainer loop. `policy_gradient` (FlowGRPO, MixGRPO, Flow-DPPO, …), `direct_preference` (DPO, DiffusionNFT, AWM), or `distribution_matching` (DMD2).
-- `algorithm.sample_source`: `online` uses rollout and reward engines. `offline` selects actor-only execution; DMD2 uses it for fresh differentiable samples inside the training engine rather than pregenerated images.
+- `algorithm.trainer_type`: Trainer loop. `policy_gradient` (FlowGRPO, MixGRPO, Flow-DPPO, …), `direct_preference` (DPO, DiffusionNFT, AWM), or `distribution_matching`.
+- `algorithm.sample_source`: `online` uses rollout and reward engines. `offline` selects actor-only execution, used by distribution-matching for engine-local sampling.
 - `algorithm.adv_estimator`: Advantage estimator name; defaults to `actor_rollout_ref.model.algorithm` (e.g. `flow_grpo`).
 - `algorithm.norm_adv_by_std_in_grpo`: Normalize advantages by within-group std (GRPO-style).
 - `algorithm.global_std`: Use a global (cross-group) std for advantage normalization.
