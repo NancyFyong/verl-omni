@@ -666,10 +666,8 @@ class VeOmniDiffusionEngine(BaseEngine):
         if self._is_offload_optimizer:
             offload_optimizer(self.optimizer)
 
-    def _lora_per_tensor_param(self, base_sync_done: bool, adapter_name: str | None):
-        """Export adapter (or base) weights for a rollout LoRA sync, in PEFT on-disk key format."""
+    def _get_lora_model_and_config(self, adapter_name: str | None):
         from veomni.lora import is_veomni_lora_model
-        from veomni.lora.state_dict import get_lora_state_dict
 
         peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
         if not is_veomni_lora_model(peft_model):
@@ -687,6 +685,20 @@ class VeOmniDiffusionEngine(BaseEngine):
                 "actor_rollout_ref.actor.strategy=fsdp2."
             )
 
+        return peft_model, peft_model.get_lora_config(requested_adapter)
+
+    def get_lora_peft_config(self, adapter_name: str = "default") -> dict | None:
+        """Return collective-free LoRA metadata for colocated and checkpoint-engine sync."""
+        if not self._is_lora:
+            return None
+        _, config = self._get_lora_model_and_config(adapter_name)
+        return config.to_peft_dict()
+
+    def _lora_per_tensor_param(self, base_sync_done: bool, adapter_name: str | None):
+        """Export adapter (or base) weights for a rollout LoRA sync, in PEFT on-disk key format."""
+        from veomni.lora.state_dict import get_lora_state_dict
+
+        peft_model, lora_config = self._get_lora_model_and_config(adapter_name)
         # A second base sync with no adapter sync in between leaves the rollout on base weights.
         if not base_sync_done:
             if getattr(self, "_lora_base_synced", False) and not getattr(self, "_lora_adapter_synced", False):
@@ -700,7 +712,6 @@ class VeOmniDiffusionEngine(BaseEngine):
         else:
             self._lora_adapter_synced = True
 
-        lora_config = peft_model.get_lora_config(adapter_name)
         if base_sync_done:
             params = get_lora_state_dict(peft_model, adapter_name=adapter_name or "default", config=lora_config)
             # vLLM only strips base_model.model at the start of a key; keeping it binds no layers.

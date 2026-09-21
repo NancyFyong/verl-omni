@@ -13,8 +13,10 @@
 # limitations under the License.
 """CPU checks for LoRA support in the VeOmni diffusion engine."""
 
+import asyncio
 import builtins
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
@@ -80,6 +82,7 @@ def _lora_module(target_modules=("to_q", "to_k")):
 def test_lora_config_is_empty_without_lora():
     engine = _make_engine()
     assert engine._build_veomni_lora_config() == {}
+    assert engine.get_lora_peft_config() is None
 
 
 def test_lora_config_maps_verl_omni_fields_to_veomni_names():
@@ -179,6 +182,71 @@ def test_adapter_sync_keys_resolve_in_actual_diffusion_lora_manager(monkeypatch)
         assert manager._get_lora_weights(loaded, runtime_name) is not None, (
             f"Exported LoRA cannot bind to {runtime_name}; loaded names: {list(loaded.loras)}"
         )
+
+
+def test_worker_reads_veomni_lora_metadata_and_checksum_without_export():
+    from verl_omni.workers.engine_workers import ActorRolloutRefWorker
+
+    engine = _make_engine(_lora_module(), lora_rank=4)
+    engine.get_per_tensor_param = MagicMock(side_effect=AssertionError("metadata must not gather weights"))
+    worker = object.__new__(ActorRolloutRefWorker)
+    worker.role = "actor"
+    worker.peft_merge = False
+    worker.actor = SimpleNamespace(engine=engine)
+
+    config = worker.get_lora_peft_config()
+    assert config is not None
+    assert config["r"] == 4
+    assert config["lora_alpha"] == 8
+    checksum = worker.get_lora_weight_checksum()
+    assert checksum["num_lora_tensors"] == 4
+    engine.get_per_tensor_param.assert_not_called()
+    worker.peft_merge = True
+    assert worker.get_lora_peft_config() is None
+    assert worker.get_lora_weight_checksum() is None
+
+
+def test_non_naive_worker_sends_veomni_adapters_on_every_update(monkeypatch):
+    from verl_omni.workers.engine_workers import ActorRolloutRefWorker
+
+    engine = _make_engine(_lora_module(), lora_rank=4)
+    monkeypatch.setattr(veomni_impl, "load_model_to_gpu", MagicMock())
+    monkeypatch.setattr(veomni_impl, "get_device_id", lambda: torch.device("cpu"))
+    worker = object.__new__(ActorRolloutRefWorker)
+    worker.actor = SimpleNamespace(engine=engine)
+    worker.config = SimpleNamespace(rollout=SimpleNamespace(checkpoint_engine=SimpleNamespace(backend="nccl")))
+    worker.peft_merge = False
+    worker.rollout_adapter = "default"
+    worker._rank = 0
+    sent = []
+
+    async def capture(params, global_steps):
+        sent.append((global_steps, dict(params)))
+
+    worker.checkpoint_engine = SimpleNamespace(send_weights=AsyncMock(side_effect=capture))
+    for step in (1, 2):
+        asyncio.run(worker.update_weights(global_steps=step))
+    assert [step for step, _ in sent] == [1, 2]
+    for _, params in sent:
+        assert len(params) == 4
+        assert all(".lora_" in name for name in params)
+
+
+def test_colocated_worker_uses_veomni_lora_fast_path(monkeypatch):
+    from tests.workers.test_omni_lora_weight_sync_on_cpu import _fast_path_worker, _run_update
+
+    worker = _fast_path_worker()
+    engine = _make_engine(_lora_module(), lora_rank=4)
+    monkeypatch.setattr(veomni_impl, "load_model_to_gpu", MagicMock())
+    monkeypatch.setattr(veomni_impl, "get_device_id", lambda: torch.device("cpu"))
+    worker.actor = SimpleNamespace(engine=engine)
+    sender = _run_update(worker, global_steps=2)
+    sender.async_send_weights.assert_awaited_once()
+    exported = dict(sender.async_send_weights.call_args.args[0])
+    assert len(exported) == 4
+    assert all(".lora_" in name for name in exported)
+    assert worker.rollout._execute_method.call_args.kwargs["kwargs"]["peft_config"]["r"] == 4
+    worker.rollout.update_weights.assert_not_called()
 
 
 def test_base_sync_exports_plain_transformer_keys(monkeypatch):
