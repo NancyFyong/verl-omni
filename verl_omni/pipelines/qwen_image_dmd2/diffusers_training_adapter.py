@@ -81,6 +81,48 @@ class QwenImageDMD2(QwenImage):
         )
 
     @classmethod
+    def sample_student(cls, *, noise, sigmas, exit_index, predict, grad_enabled):
+        """Euler-sample packed ``[B, N, D]`` latents to an engine-selected exit.
+
+        ``predict(latents, sigma, grad_enabled=...)`` owns model/adapter access.
+        Only the exit forward retains a graph; this hook performs no random
+        draws or collectives and returns fp32 x0 rather than a trajectory.
+        """
+        from verl_omni.trainer.diffusion.distillation.utils import ode_euler_step
+
+        sample = noise
+        for index in range(exit_index):
+            prediction = predict(sample, sigmas[index], grad_enabled=False)
+            sample = ode_euler_step(sample, prediction, sigmas[index], sigmas[index + 1])
+        prediction = predict(sample, sigmas[exit_index], grad_enabled=grad_enabled)
+        return cls.prediction_to_x0(sample, prediction, sigmas[exit_index])
+
+    @staticmethod
+    def prepare_score_inputs(generated, scheduler, dmd_config, *, sigma_generator, noise_generator):
+        """Return detached fp32 ``(noisy_latents, noise, sigma)`` for packed latents.
+
+        Discrete timesteps are sampled on the half-open training grid, shifted
+        once, then clamped. Continuous sigmas are uniform in the configured
+        interval without shifting. Both random streams are owned by the engine.
+        """
+        from verl_omni.trainer.diffusion.distillation.utils import timestep_shift
+
+        if dmd_config.score_discrete_steps:
+            total = scheduler.config.num_train_timesteps
+            if dmd_config.score_discrete_steps != total:
+                raise ValueError("score_discrete_steps must equal the model scheduler's num_train_timesteps.")
+            timestep = torch.randint(total, (generated.shape[0],), device=generated.device, generator=sigma_generator)
+            sigma = timestep_shift(timestep, total, dmd_config.score_timestep_shift) / total
+            sigma = sigma.clamp(dmd_config.score_sigma_min, dmd_config.score_sigma_max)
+        else:
+            sigma = torch.rand(generated.shape[0], device=generated.device, generator=sigma_generator)
+            sigma = dmd_config.score_sigma_min + (dmd_config.score_sigma_max - dmd_config.score_sigma_min) * sigma
+        noise = torch.randn(generated.shape, dtype=torch.float32, device=generated.device, generator=noise_generator)
+        expanded = sigma.reshape(-1, 1, 1)
+        noisy = (1 - expanded) * generated.detach().float() + expanded * noise
+        return noisy, noise, sigma
+
+    @classmethod
     def configure_train_mode(cls, module):
         """Keep sampling and checkpoint recomputation in evaluation mode with autograd enabled."""
         module.eval()

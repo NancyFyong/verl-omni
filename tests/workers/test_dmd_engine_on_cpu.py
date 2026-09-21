@@ -30,6 +30,7 @@ import verl_omni.workers.engine_workers as engine_workers
 from verl_omni.workers.config import DiffusionDMDConfig
 from verl_omni.workers.engine.fsdp import diffusers_impl
 from verl_omni.workers.engine.fsdp.diffusers_impl import DMDDiffusersFSDPEngine
+from verl_omni.workers.engine.lora_adapter_mixin import LoRAAdapterMixin
 from verl_omni.workers.engine_workers import DMDTrainingWorker, TrainingWorker
 
 
@@ -184,6 +185,22 @@ class TestDMDOptimizer:
 
 
 class TestDMDAdapterContext:
+    def test_mixin_keeps_default_restore_behavior(self):
+        engine = engine_shell()
+        engine.select_stage("fake_score")
+        with pytest.raises(RuntimeError, match="boom"):
+            with LoRAAdapterMixin.use_adapter(engine, "student_ema"):
+                raise RuntimeError("boom")
+        assert engine.module.active_adapter == "default"
+
+    def test_mixin_supports_explicit_restore_target(self):
+        engine = engine_shell()
+        engine.select_stage("fake_score")
+        with pytest.raises(RuntimeError, match="boom"):
+            with LoRAAdapterMixin.use_adapter(engine, "student_ema", restore_adapter="fake_score"):
+                raise RuntimeError("boom")
+        assert engine.module.active_adapter == "fake_score"
+
     def test_nested_and_exception_contexts_restore_the_active_dmd_role(self):
         engine = engine_shell()
         engine.select_stage("fake_score")
@@ -194,6 +211,24 @@ class TestDMDAdapterContext:
                     raise RuntimeError("boom")
             assert engine.module.active_adapter == "student_ema"
         assert engine.module.active_adapter == "fake_score"
+
+    @pytest.mark.parametrize("stage", ["student", "fake_score"])
+    def test_role_graph_survives_no_grad_score_switches(self, stage):
+        engine = engine_shell()
+        engine.select_stage(stage)
+        parameter = engine.role_parameters[stage][0]
+        loss = parameter.square().sum()
+        with torch.no_grad():
+            with engine.use_adapter("student_ema"):
+                engine.module.adapters["student_ema"].sum()
+            with engine.use_adapter("reference"):
+                assert not engine.module.adapters_enabled
+        loss.backward()
+        torch.testing.assert_close(parameter.grad, 2 * parameter.detach())
+        other = "student" if stage == "fake_score" else "fake_score"
+        assert engine.role_parameters[other][0].grad is None
+        assert engine.module.adapters["student_ema"].grad is None
+        assert engine.module.active_adapter == engine.adapter_names[stage]
 
     def test_reference_context_restores_the_active_dmd_role(self):
         engine = engine_shell()
@@ -222,6 +257,104 @@ class TestDMDExport:
         metadata = json.loads((destination / "adapter_config.json").read_text())
         assert metadata["r"] == 4
         engine.get_per_tensor_param.assert_called_once_with(base_sync_done=True, adapter_name="student_ema")
+
+
+def choose_last_exit(tensor, src):
+    assert src == 0
+    tensor.fill_(3)
+
+
+def sampling_engine():
+    engine = engine_shell()
+    engine.engine_config = SimpleNamespace(seed=7)
+    engine.model_config = SimpleNamespace(pipeline=SimpleNamespace(num_inference_steps=4))
+    engine.scheduler = SimpleNamespace(config=SimpleNamespace(num_train_timesteps=1000))
+    engine.get_data_parallel_rank = MagicMock(return_value=1)
+    engine.generators = {}
+    engine.pending_generator_states = {}
+    return engine
+
+
+class TestDMDSamplingDispatch:
+    @pytest.mark.parametrize("missing", [None, "sample_student", "prepare_score_inputs"])
+    def test_adapter_hooks_are_validated_before_model_initialization(self, monkeypatch, missing):
+        hooks = (
+            "build_conditioning_provider",
+            "latent_geometry",
+            "pack_latents",
+            "prepare_dmd_inputs",
+            "prediction_to_x0",
+            "sampling_sigmas",
+            "sample_student",
+            "prepare_score_inputs",
+        )
+        adapter = SimpleNamespace(**{name: MagicMock() for name in hooks if name != missing})
+        monkeypatch.setattr(diffusers_impl.DiffusionModelBase, "get_class", MagicMock(return_value=adapter))
+        parent_init = MagicMock()
+        monkeypatch.setattr(diffusers_impl.DiffusersFSDPEngine, "__init__", parent_init)
+        model = SimpleNamespace(lora_rank=2, policy_state_adapters=("default",))
+        engine_config = SimpleNamespace(strategy="fsdp2", forward_only=False)
+        if missing:
+            with pytest.raises(TypeError, match=missing):
+                DMDDiffusersFSDPEngine(model, engine_config, None, None, dmd_config=DiffusionDMDConfig())
+            parent_init.assert_not_called()
+        else:
+            DMDDiffusersFSDPEngine(model, engine_config, None, None, dmd_config=DiffusionDMDConfig())
+            assert parent_init.call_args.args[0].policy_state_adapters == ("default", "fake_score", "student_ema")
+        assert model.policy_state_adapters == ("default",)
+
+    def test_student_sampling_delegates_after_rank_synchronized_exit(self, monkeypatch):
+        broadcast = MagicMock(side_effect=choose_last_exit)
+        monkeypatch.setattr(torch.distributed, "broadcast", broadcast)
+        engine = sampling_engine()
+        noise = torch.ones(2, 3, 4)
+        sigmas = torch.tensor([1.0, 0.9, 0.75, 0.5, 0.0])
+        generated = noise * 2
+        engine.model_adapter = SimpleNamespace(
+            sampling_sigmas=MagicMock(return_value=sigmas), sample_student=MagicMock(return_value=generated)
+        )
+        engine.predict = MagicMock()
+        condition, geometry = {"condition": "test"}, {"shape": "test"}
+
+        output, exit_index = engine.student_sample(noise, condition, geometry, grad_enabled=True)
+
+        assert output is generated and exit_index == 3
+        broadcast.assert_called_once()
+        call = engine.model_adapter.sample_student.call_args
+        assert call.kwargs["noise"] is noise and call.kwargs["sigmas"] is sigmas
+        assert call.kwargs["exit_index"] == 3 and call.kwargs["grad_enabled"] is True
+        call.kwargs["predict"](noise, sigmas[0], grad_enabled=False)
+        engine.predict.assert_called_once_with(
+            "student", noise, sigmas[0], condition=condition, geometry=geometry, grad_enabled=False
+        )
+
+    def test_score_inputs_pass_checkpointed_streams_to_the_adapter(self):
+        engine = sampling_engine()
+        generated = torch.ones(2, 3, 4, requires_grad=True)
+        expected = (generated.detach(), torch.zeros_like(generated), torch.ones(2))
+        engine.model_adapter = SimpleNamespace(prepare_score_inputs=MagicMock(return_value=expected))
+
+        assert engine.score_inputs(generated) is expected
+
+        call = engine.model_adapter.prepare_score_inputs.call_args
+        assert call.args == (generated, engine.scheduler, engine.dmd_config)
+        assert call.kwargs["sigma_generator"] is engine.generators["score_sigma"]
+        assert call.kwargs["noise_generator"] is engine.generators["score_noise"]
+        assert set(engine.generators) == {"score_sigma", "score_noise"}
+
+    def test_named_stream_restore_preserves_next_draws(self):
+        engine = sampling_engine()
+        streams = ("rollout_decision", "score_sigma", "score_noise")
+        for stream in streams:
+            torch.rand(7, generator=engine.generator(stream, "cpu"))
+        saved = {name: generator.get_state().clone() for name, generator in engine.generators.items()}
+        expected = {name: torch.rand(4, generator=engine.generator(name, "cpu")) for name in streams}
+        restored = sampling_engine()
+        restored.pending_generator_states = saved
+        for name in streams:
+            actual = torch.rand(4, generator=restored.generator(name, "cpu"))
+            torch.testing.assert_close(actual, expected[name], rtol=0, atol=0)
+        assert not restored.pending_generator_states
 
 
 class TestDMDAccumulation:

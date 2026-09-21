@@ -21,8 +21,9 @@ import os
 import time
 import warnings
 from abc import ABC, abstractmethod
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from copy import deepcopy
+from functools import partial
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -73,7 +74,7 @@ from verl_omni.pipelines.utils import (
     prepare_model_inputs,
     prepare_noisy_latents,
 )
-from verl_omni.trainer.diffusion.distillation.utils import ode_euler_step, standard_cfg, timestep_shift
+from verl_omni.trainer.diffusion.distillation.utils import standard_cfg
 from verl_omni.utils.fsdp_utils import collect_lora_params
 from verl_omni.workers.config import DiffusionModelConfig
 from verl_omni.workers.engine.lora_adapter_mixin import LoRAAdapterMixin
@@ -1495,25 +1496,9 @@ class DMDDiffusersFSDPEngine(DiffusersFSDPEngine):
             raise ValueError(f"DMD2 expects exactly one active adapter, got {active!r}.")
         return active[0]
 
-    @contextmanager
     def use_adapter(self, name):
-        """Temporarily select a DMD role, restoring the role active on entry.
-
-        This intentionally differs from ``LoRAAdapterMixin.use_adapter``, which
-        restores ``"default"``. A fake-score phase switches to the student
-        adapter for the no-grad rollout and must return to ``fake_score`` (not
-        ``default``) before backward, so the restore target is the caller's role.
-        """
-        if name == "reference":
-            with self.disable_adapter():
-                yield
-            return
-        previous = self.active_adapter_name()
-        self._set_adapter(name)
-        try:
-            yield
-        finally:
-            self._set_adapter(previous)
+        """Reuse the shared context while restoring the caller's active DMD role."""
+        return super().use_adapter(name, restore_adapter=self.active_adapter_name())
 
     def __init__(self, model_config, engine_config, optimizer_config, checkpoint_config, *, dmd_config):
         if model_config.lora_rank <= 0:
@@ -1551,6 +1536,8 @@ class DMDDiffusersFSDPEngine(DiffusersFSDPEngine):
             "prepare_dmd_inputs",
             "prediction_to_x0",
             "sampling_sigmas",
+            "sample_student",
+            "prepare_score_inputs",
         ):
             if not callable(getattr(self.model_adapter, method, None)):
                 raise TypeError(f"The selected DMD2 model adapter must implement {method}.")
@@ -1659,7 +1646,7 @@ class DMDDiffusersFSDPEngine(DiffusersFSDPEngine):
             return prediction
 
     def student_sample(self, noise, condition, geometry, *, grad_enabled):
-        """Backward-simulate to a rank-synchronized exit, retaining only its graph."""
+        """Synchronize the exit index before delegating sampling to the pipeline."""
         steps = self.model_config.pipeline.num_inference_steps
         if not isinstance(steps, int) or isinstance(steps, bool) or steps <= 0:
             raise ValueError("num_inference_steps must be a positive integer.")
@@ -1669,41 +1656,24 @@ class DMDDiffusersFSDPEngine(DiffusersFSDPEngine):
         )
         torch.distributed.broadcast(exit_step, src=0)
         exit_index = int(exit_step.item())
-        sample = noise
-        for index in range(exit_index + 1):
-            prediction = self.predict(
-                "student", sample, sigmas[index], condition, geometry, grad_enabled=grad_enabled and index == exit_index
-            )
-            if index == exit_index:
-                return self.model_adapter.prediction_to_x0(
-                    sample, prediction, self.expand_sigma(sigmas[index], sample)
-                ), exit_index
-            sample = ode_euler_step(sample, prediction, sigmas[index], sigmas[index + 1])
-        raise RuntimeError("Student sampling reached no exit prediction.")
+        generated = self.model_adapter.sample_student(
+            noise=noise,
+            sigmas=sigmas,
+            exit_index=exit_index,
+            predict=partial(self.predict, "student", condition=condition, geometry=geometry),
+            grad_enabled=grad_enabled,
+        )
+        return generated, exit_index
 
     def score_inputs(self, generated):
-        """Construct detached flow corruption with discrete or continuous sigma sampling."""
-        cfg = self.dmd_config
-        if cfg.score_discrete_steps:
-            total = self.scheduler.config.num_train_timesteps
-            if cfg.score_discrete_steps != total:
-                raise ValueError("score_discrete_steps must equal the model scheduler's num_train_timesteps.")
-            timestep = torch.randint(
-                total,
-                (generated.shape[0],),
-                device=generated.device,
-                generator=self.generator("score_sigma", generated.device),
-            )
-            sigma = timestep_shift(timestep, total, cfg.score_timestep_shift) / total
-            sigma = sigma.clamp(cfg.score_sigma_min, cfg.score_sigma_max)
-        else:
-            sigma = torch.rand(
-                generated.shape[0], device=generated.device, generator=self.generator("score_sigma", generated.device)
-            )
-            sigma = cfg.score_sigma_min + (cfg.score_sigma_max - cfg.score_sigma_min) * sigma
-        noise = self.noise(generated.shape, generated.device, "score_noise")
-        expanded = self.expand_sigma(sigma, generated)
-        return (1 - expanded) * generated.detach().float() + expanded * noise, noise, sigma
+        """Delegate score corruption using the engine's checkpointed random streams."""
+        return self.model_adapter.prepare_score_inputs(
+            generated,
+            self.scheduler,
+            self.dmd_config,
+            sigma_generator=self.generator("score_sigma", generated.device),
+            noise_generator=self.generator("score_noise", generated.device),
+        )
 
     def prepare_model_inputs(self, micro_batch, step=None):
         """Delegate geometry and frozen conditioning to the registered architecture."""

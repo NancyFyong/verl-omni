@@ -1,6 +1,6 @@
 # Diffusion Distribution Matching: DMD2 Runtime
 
-Last updated: 09/18/2026.
+Last updated: 09/21/2026.
 
 ## Scope
 
@@ -109,8 +109,8 @@ main_diffusion.TaskRunner
 |---|---|
 | `DistributionMatchingRayTrainer` | Reuse offline worker/data/resource setup; run the explicit 1:K cycle; publish complete checkpoints and one student artifact |
 | `DMDTrainingWorker` | Reuse distributed initialization and mini/microbatch handling; constrain each call to one optimizer attempt |
-| `DMDDiffusersFSDPEngine` | Differentiable sampling, score calls, optimizer selection, independent RNG streams, rank-agreed skips, EMA and DMD checkpoint state |
-| Registered model adapter | Conditioning, latent geometry, latent packing, transformer inputs, prediction-to-x0 conversion and sampling sigmas |
+| `DMDDiffusersFSDPEngine` | Model/adapter access, synchronized rollout exits, independent RNG streams, optimizers, rank-agreed skips, EMA and DMD checkpoint state |
+| Registered model adapter | Conditioning, latent geometry and packing, transformer inputs, x0 conversion, student sampling and score corruption |
 | `DMDLoss` and `trainer/diffusion/distillation/utils.py` | Registered objective dispatch and pure tensor equations |
 
 The DMD2 trainer remains a thin algorithm-specific subclass because one cycle
@@ -135,6 +135,12 @@ selected `(architecture, dmd2)` pair and requires these methods:
 | `forward(...)` | Return a prediction with the same shape as the packed latent |
 | `prediction_to_x0(noisy, prediction, sigma)` | Convert architecture-native prediction into canonical fp32 x0 |
 | `sampling_sigmas(model_config, dmd_config, device)` | Return a descending `num_inference_steps + 1` Euler sigma grid |
+| `sample_student(*, noise, sigmas, exit_index, predict, grad_enabled)` | Run the student sampling loop; keep a graph only at the engine-selected exit; return fp32 x0 |
+| `prepare_score_inputs(generated, scheduler, dmd_config, *, sigma_generator, noise_generator)` | Return detached fp32 `(noisy_latents, noise, sigma)` using the supplied RNG streams |
+
+The engine broadcasts the exit index before sampling and checkpoints the named
+RNG streams. The sampling hook calls `predict(latents, sigma, grad_enabled=...)`
+for model access; it does not own adapters, optimizers or distributed collectives.
 
 Training adapters remain stateless classmethod/staticmethod registry classes.
 Condition encoders and caches are per-run objects returned by the provider hook,
