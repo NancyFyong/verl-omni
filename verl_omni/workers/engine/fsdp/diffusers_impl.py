@@ -1487,28 +1487,28 @@ class DMDDiffusersFSDPEngine(DiffusersFSDPEngine):
     }
     stream_offsets = {"initial_noise": 0, "rollout_decision": 1, "score_sigma": 3, "score_noise": 4}
 
-    def selected_adapter(self):
-        """Return the single active adapter so DMD contexts can restore their own role."""
+    def active_adapter_name(self):
+        """Return the single active PEFT adapter for the current DMD role."""
         module = getattr(self.module, "_fsdp_wrapped_module", self.module)
-        active = getattr(module, "active_adapters", None)
-        if callable(active):
-            active = active()
-        if active is None:
-            active = getattr(module, "active_adapter", None)
-        if isinstance(active, list | tuple):
-            if len(active) != 1:
-                raise ValueError(f"DMD2 requires one active adapter, got {active!r}.")
-            active = active[0]
-        return active or "default"
+        active = module.active_adapters
+        if len(active) != 1:
+            raise ValueError(f"DMD2 expects exactly one active adapter, got {active!r}.")
+        return active[0]
 
     @contextmanager
     def use_adapter(self, name):
-        """Switch one DMD role and restore the previously active role on exit."""
-        previous = self.selected_adapter()
+        """Temporarily select a DMD role, restoring the role active on entry.
+
+        This intentionally differs from ``LoRAAdapterMixin.use_adapter``, which
+        restores ``"default"``. A fake-score phase switches to the student
+        adapter for the no-grad rollout and must return to ``fake_score`` (not
+        ``default``) before backward, so the restore target is the caller's role.
+        """
         if name == "reference":
             with self.disable_adapter():
                 yield
             return
+        previous = self.active_adapter_name()
         self._set_adapter(name)
         try:
             yield
@@ -1533,11 +1533,14 @@ class DMDDiffusersFSDPEngine(DiffusersFSDPEngine):
         self.pending_generator_states = {}
         self.last_step_succeeded = False
         self.forward_finite = True
+        # Copy first so overriding the managed adapters never mutates the caller's config.
         model_config = deepcopy(model_config)
-        allowed = {"default", "fake_score", "student_ema", "reference"}
-        if not set(model_config.policy_state_adapters).issubset(allowed):
+        supported_adapters = {"default", "fake_score", "student_ema", "reference"}
+        unsupported = set(model_config.policy_state_adapters) - supported_adapters
+        if unsupported:
             raise ValueError(
-                "DMD2 manages default, fake_score and student_ema adapters; other policy states are unsupported."
+                "DMD2 manages the default, fake_score and student_ema adapters; "
+                f"unsupported policy states: {sorted(unsupported)}."
             )
         object.__setattr__(model_config, "policy_state_adapters", ("default", "fake_score", "student_ema"))
         self.model_adapter = DiffusionModelBase.get_class(model_config)
