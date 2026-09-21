@@ -26,6 +26,26 @@ NUM_GPUS=2 BACKEND=veomni bash tests/special_e2e/run_flowgrpo_qwen_image_veomni_
 NUM_GPUS=2 BACKEND=fsdp2 bash tests/special_e2e/run_flowgrpo_qwen_image_veomni_lora.sh
 ```
 
+## Regional compilation
+
+For FSDP2 with `ulysses_sequence_parallel_size=1`, regional compilation can
+compile the repeated Qwen-Image transformer blocks to improve training
+performance. The benchmark recipe enables the configuration validated with
+FA3:
+
+```bash
+bash examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_fsdp2_benchmark.sh
+```
+
+Set `actor_rollout_ref.model.use_regional_compile=true` to enable the feature.
+The benchmark uses `fullgraph=false` because the current FA3 path requires a
+graph break, and `dynamic=true` for prompt-dependent input shapes. Append
+`actor_rollout_ref.model.use_regional_compile=false` to the benchmark command
+to compare against eager execution. Other compiler options can be customized
+through `actor_rollout_ref.model.regional_compile_options`; see the
+[configuration reference](../../../docs/examples/config.md#actor_rollout_refmodel--diffusionmodelconfig)
+for all defaults and current constraints.
+
 ## Optional timestep input staging
 
 For Qwen-Image (`QwenImagePipeline`) FlowGRPO or DiffusionNFT with FSDP/FSDP2 on
