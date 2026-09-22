@@ -44,13 +44,13 @@ from verl_omni.pipelines.request_batch import (
 from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 
-from .common import QwenImageTokenIdPromptMixin, apply_true_cfg, build_img_shapes, coalesce_not_none
+from .common import QwenImageLoRAMixin, QwenImageTokenIdPromptMixin, apply_true_cfg, build_img_shapes, coalesce_not_none
 
 __all__ = ["QwenImagePipelineWithLogProb"]
 
 
 @VllmOmniPipelineBase.register("QwenImagePipeline", algorithm="flow_grpo")
-class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipeline):
+class QwenImagePipelineWithLogProb(QwenImageLoRAMixin, QwenImageTokenIdPromptMixin, QwenImagePipeline):
     """Rollout pipeline for Qwen-Image that captures per-step log-probabilities.
 
     Extends :class:`~vllm_omni.diffusion.models.qwen_image.QwenImagePipeline`
@@ -80,36 +80,6 @@ class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipelin
             subfolder="scheduler",
             local_files_only=local_files_only,
         )
-
-    @staticmethod
-    def map_lora_update_to_engine(lora_tensors: dict, peft_config: dict) -> tuple[dict, dict]:
-        """Map diffusers output-projection LoRA names to the vLLM layout."""
-        tensors = {}
-        for name, tensor in lora_tensors.items():
-            if name.startswith("transformer.base_model.model."):
-                name = "transformer." + name.removeprefix("transformer.base_model.model.")
-            name = name.replace(".to_out.0.", ".to_out.")
-            if name in tensors:
-                raise ValueError(f"Duplicate Qwen-Image LoRA tensor after name mapping: {name}")
-            tensors[name] = tensor
-        config = dict(peft_config)
-        targets = config.get("target_modules")
-        if isinstance(targets, list | tuple | set):
-            config["target_modules"] = [
-                target[:-2] if target == "to_out.0" or target.endswith(".to_out.0") else target for target in targets
-            ]
-        return tensors, config
-
-    @staticmethod
-    def _validate_diffusion_lora_binding(*, lora_model, bound_lora_names):
-        if not lora_model.loras:
-            raise ValueError("Qwen-Image LoRA has no adapter tensors; refusing a no-op sync.")
-        unbound = set(lora_model.loras) - bound_lora_names
-        if unbound:
-            raise ValueError(
-                f"Qwen-Image LoRA has {len(unbound)} unbound modules; refusing a partial or no-op sync. "
-                f"First unbound names: {sorted(unbound)[:5]}"
-            )
 
     def _get_qwen_prompt_embeds(
         self,

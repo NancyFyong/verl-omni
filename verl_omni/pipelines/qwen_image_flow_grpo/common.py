@@ -40,6 +40,40 @@ def apply_true_cfg(
     return comb_pred * (cond_norm / noise_norm)
 
 
+class QwenImageLoRAMixin:
+    """Map and validate live LoRA updates for Qwen-Image and Boogu-Image."""
+
+    @staticmethod
+    def map_lora_update_to_engine(lora_tensors: dict, peft_config: dict) -> tuple[dict, dict]:
+        """Map diffusers output-projection LoRA names to the vLLM layout."""
+        tensors = {}
+        for name, tensor in lora_tensors.items():
+            if name.startswith("transformer.base_model.model."):
+                name = "transformer." + name.removeprefix("transformer.base_model.model.")
+            name = name.replace(".to_out.0.", ".to_out.")
+            if name in tensors:
+                raise ValueError(f"Duplicate Qwen-Image/Boogu-Image LoRA tensor after name mapping: {name}")
+            tensors[name] = tensor
+        config = dict(peft_config)
+        targets = config.get("target_modules")
+        if isinstance(targets, list | tuple | set):
+            config["target_modules"] = [
+                target[:-2] if target == "to_out.0" or target.endswith(".to_out.0") else target for target in targets
+            ]
+        return tensors, config
+
+    @staticmethod
+    def _validate_diffusion_lora_binding(*, lora_model, bound_lora_names):
+        if not lora_model.loras:
+            raise ValueError("Qwen-Image/Boogu-Image LoRA has no adapter tensors; refusing a no-op sync.")
+        unbound = set(lora_model.loras) - bound_lora_names
+        if unbound:
+            raise ValueError(
+                f"Qwen-Image/Boogu-Image LoRA has {len(unbound)} unbound modules; refusing a partial or no-op sync. "
+                f"First unbound names: {sorted(unbound)[:5]}"
+            )
+
+
 class QwenImageTokenIdPromptMixin:
     """Encode pre-tokenized Qwen-Image prompts for rollout adapters."""
 
