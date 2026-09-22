@@ -29,7 +29,11 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from verl_omni.pipelines.diffusion_rollout_output import rollout_output, wrap_rollout_postprocessor
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
-from verl_omni.pipelines.qwen_image_flow_grpo.common import QwenImageTokenIdPromptMixin, coalesce_not_none
+from verl_omni.pipelines.qwen_image_flow_grpo.common import (
+    QwenImageLoRAMixin,
+    QwenImageTokenIdPromptMixin,
+    coalesce_not_none,
+)
 from verl_omni.pipelines.request_batch import (
     collate_prompt_mask as _collate_prompt_mask,
 )
@@ -68,7 +72,7 @@ pipeline_boogu_image.get_boogu_image_post_process_func = get_rollout_post_proces
 
 
 @VllmOmniPipelineBase.register("BooguImagePipeline", algorithm="flow_grpo")
-class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipeline):
+class BooguImagePipelineWithLogProb(QwenImageLoRAMixin, QwenImageTokenIdPromptMixin, BooguImagePipeline):
     """Rollout pipeline for Boogu-Image that captures per-step log-probabilities.
 
     Extends the vllm-omni ``BooguImagePipeline`` with:
