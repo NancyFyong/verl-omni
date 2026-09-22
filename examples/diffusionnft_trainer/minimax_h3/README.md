@@ -194,10 +194,10 @@ For example, add `ROLLOUT_TP=4 VAE_PATCH_PARALLEL_SIZE=4 VAE_USE_TILING=True`
 to reuse a four-rank TP group for tiled VAE decode.
 
 Pure Ulysses uses `ROLLOUT_TP=1 ROLLOUT_USP=4 ROLLOUT_RING=1`, with
-`TEXT_ENCODER_TP=4 VAE_PATCH_PARALLEL_SIZE=4 VAE_USE_TILING=True`. **This requires
-the verl sequence-parallel replica-sizing prerequisite; the current pin fails
-fast rather than allocating the wrong number of replicas.** GPU validation is
-pending. H3 only permits VAE mode `tile`, VAE parallel size `1` or the full DiT
+`TEXT_ENCODER_TP=4 VAE_PATCH_PARALLEL_SIZE=4 VAE_USE_TILING=True`. Local rollout
+subclasses account for SP ranks without patching verl; TP remains the actual
+engine TP degree. GPU validation is pending. H3 only permits VAE mode `tile`,
+VAE parallel size `1` or the full DiT
 group, and no hybrid Ulysses x Ring. Encoder TP must divide 8.
 
 FL2VA/Ref2VA and V1 users can pass the typed Hydra fields directly; their

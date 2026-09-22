@@ -282,12 +282,12 @@ VAE parallelism reuse those ranks; they do not multiply GPU allocation again.
 Resource-bearing degrees must be set through these typed fields, not conflicting
 `engine_kwargs` or nested `parallel_config` overrides.
 
-**Dependency:** the current verl pin does not count sequence-parallel ranks in
-its replica allocator. Ulysses/Ring greater than one therefore fail fast unless
-verl provides `get_rollout_sequence_parallel_size` and uses it in the server
-manager, replica, server adapter and profiler rank mapping. VAE parallelism on
-an existing TP group does not need that allocator change. GPU validation of the
-new SP/VAE path is still pending; parameter routing is not performance evidence.
+The V0/V1 diffusion trainers use a local `LLMServerManager` subclass for SP-aware
+allocation, with matching vLLM-Omni replica, server-adapter and profiler rank
+mapping. No verl patch or TP-field substitution is needed. SP=1 delegates to the
+upstream path; SP>1 is limited to vLLM-Omni diffusion with DP=PP=1 and no
+prefill/decode disaggregation. GPU validation of the new SP/VAE path is still
+pending; CPU resource/routing checks are not performance evidence.
 
 For MiniMax-H3, `vae_parallel_mode` must be `tile`, VAE parallel size must be `1`
 or the complete DiT group, CFG parallelism must be `1`, and hybrid Ulysses x Ring
@@ -305,7 +305,7 @@ actor_rollout_ref.rollout.vae_parallel_mode=tile \
 actor_rollout_ref.rollout.vae_use_tiling=true
 ```
 
-After installing the verl allocator prerequisite, pure Ulysses on four GPUs uses
+Pure Ulysses on four GPUs uses
 `tensor_model_parallel_size=1`, `ulysses_degree=4`, `ring_degree=1`, and encoder
 and VAE parallel sizes of `4`. Do not set both TP and Ulysses to `4` on four GPUs:
 that requests sixteen ranks.

@@ -21,6 +21,7 @@ from typing import Any, Optional
 import ray
 import torch
 import vllm_omni.entrypoints.cli.serve
+from verl.utils.profiler import build_rollout_dist_profiler
 from verl.utils.tracking import RLInsightLogger
 from verl.workers.config import RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, TokenOutput
@@ -39,6 +40,7 @@ from vllm_omni.lora.request import LoRARequest
 
 from verl_omni.utils.net_utils import get_non_ephemeral_free_port
 from verl_omni.workers.config import DiffusionModelConfig, DiffusionRolloutConfig, OmniModelConfig
+from verl_omni.workers.rollout.base import get_rollout_sequence_parallel_size, get_rollout_world_size
 from verl_omni.workers.rollout.replica import DiffusionOutput
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_ar_strategy import ARStrategy
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy
@@ -83,6 +85,15 @@ class vLLMOmniHttpServer(vLLMHttpServer):
 
     def _post_init(self, cuda_visible_devices: str) -> None:
         """Run strategy post-init and preserve the replica device list."""
+        if get_rollout_sequence_parallel_size(self.config) > 1:
+            self.replica_world_size = get_rollout_world_size(self.config)
+            profiler = self.profiler_controller
+            self.profiler_controller = build_rollout_dist_profiler(
+                self.replica_rank,
+                self.replica_world_size,
+                config=self.config.profiler if profiler.config is not None else None,
+                tool_config=profiler.tool_config,
+            )
         if getattr(self.config, "full_determinism", False):
             from verl.workers.engine.utils import enable_full_determinism
 
@@ -535,6 +546,12 @@ class vLLMOmniReplica(vLLMReplica):
         super().__init__(
             replica_rank, config, model_config, gpus_per_node, is_reward_model, is_teacher_model, name_suffix
         )
+        if get_rollout_sequence_parallel_size(self.config) > 1:
+            self.world_size = get_rollout_world_size(self.config)
+            self.gpus_per_replica_node = min(gpus_per_node, self.world_size)
+            if self.world_size % self.gpus_per_replica_node:
+                raise ValueError(f"Replica size {self.world_size} must be divisible by GPUs per node {gpus_per_node}.")
+            self.nnodes = self.world_size // self.gpus_per_replica_node
         self.server_class = ray.remote(vLLMOmniHttpServer)
 
     def _get_server_name_prefix(self) -> str:

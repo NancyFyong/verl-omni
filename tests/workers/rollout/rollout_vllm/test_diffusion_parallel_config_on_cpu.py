@@ -100,10 +100,6 @@ def test_nested_sp_cannot_bypass_resource_allocation(monkeypatch):
 @pytest.mark.parametrize("algorithm", ["flow_grpo", "diffusion_nft"])
 @pytest.mark.parametrize("nested", [False, True])
 def test_pure_ulysses_and_shared_encoder_vae_group(monkeypatch, algorithm, nested):
-    from verl.workers.rollout import utils
-
-    # The routing contract can be tested before the separate verl sizing patch lands.
-    monkeypatch.setattr(utils, "get_rollout_sequence_parallel_size", lambda config: 4, raising=False)
     config = DiffusionRolloutConfig(
         name="vllm_omni",
         tensor_model_parallel_size=1,
@@ -122,9 +118,6 @@ def test_pure_ulysses_and_shared_encoder_vae_group(monkeypatch, algorithm, neste
 
 @pytest.mark.parametrize("key,field", [("usp", "ulysses_degree"), ("ring-degree", "ring_degree")])
 def test_explicit_one_cannot_override_allocated_sp(monkeypatch, key, field):
-    from verl.workers.rollout import utils
-
-    monkeypatch.setattr(utils, "get_rollout_sequence_parallel_size", lambda config: 4, raising=False)
     config = DiffusionRolloutConfig(
         name="vllm_omni",
         tensor_model_parallel_size=1,
@@ -133,14 +126,6 @@ def test_explicit_one_cannot_override_allocated_sp(monkeypatch, key, field):
     )
     with pytest.raises(ValueError, match=field):
         _prepare(monkeypatch, config, **{field: 1})
-
-
-def test_old_verl_pin_fails_before_allocating_sp_replicas(monkeypatch):
-    from verl.workers.rollout import utils
-
-    monkeypatch.delattr(utils, "get_rollout_sequence_parallel_size", raising=False)
-    with pytest.raises(NotImplementedError, match="replica sizing"):
-        DiffusionRolloutConfig(name="vllm_omni", tensor_model_parallel_size=1, ulysses_degree=4)
 
 
 @pytest.mark.parametrize(

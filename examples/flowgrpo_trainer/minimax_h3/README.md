@@ -189,9 +189,9 @@ unchanged. For TP=4 with parallel VAE decode, use
 `ROLLOUT_TP=4 VAE_PATCH_PARALLEL_SIZE=4 VAE_USE_TILING=True`.
 
 Pure Ulysses uses `ROLLOUT_TP=1 ROLLOUT_USP=4 ROLLOUT_RING=1`, with
-`TEXT_ENCODER_TP=4 VAE_PATCH_PARALLEL_SIZE=4 VAE_USE_TILING=True`. **The current
-verl pin lacks SP-aware replica allocation, so this profile fails fast until
-the allocator prerequisite is installed.** GPU validation is pending. H3 requires
+`TEXT_ENCODER_TP=4 VAE_PATCH_PARALLEL_SIZE=4 VAE_USE_TILING=True`. Local rollout
+subclasses account for SP ranks without patching verl; TP remains the actual
+engine TP degree. GPU validation is pending. H3 requires
 VAE mode `tile`, VAE parallel size `1` or the full DiT group, CFG parallel size
 `1`, and no hybrid Ulysses x Ring. Encoder TP must divide 8.
 

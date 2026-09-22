@@ -271,12 +271,12 @@ class DiffusionRolloutConfig(BaseConfig):
                 f"got {self.text_encoder_tp_size}."
             )
         if self.ulysses_degree * self.ring_degree > 1:
-            from verl.workers.rollout import utils as rollout_utils
-
-            if not hasattr(rollout_utils, "get_rollout_sequence_parallel_size"):
-                raise NotImplementedError(
-                    "Rollout Ulysses/Ring requires verl sequence-parallel replica sizing support; "
-                    "the current verl pin only allocates TP * DP * PP GPUs."
-                )
-            if self.name != "vllm_omni" or self.data_parallel_size != 1 or self.pipeline_model_parallel_size != 1:
-                raise ValueError("Rollout sequence parallelism requires vllm_omni with DP=PP=1.")
+            omni_kwargs = (self.engine_kwargs or {}).get("vllm_omni", {}) or {}
+            if (
+                self.name != "vllm_omni"
+                or self.data_parallel_size != 1
+                or self.pipeline_model_parallel_size != 1
+                or omni_kwargs.get("output_mode") == "ar"
+                or (self.disaggregation and self.disaggregation.get("enabled", False))
+            ):
+                raise ValueError("Rollout sequence parallelism requires vllm_omni diffusion with DP=PP=1 and no PD.")
