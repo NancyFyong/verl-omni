@@ -67,7 +67,7 @@ from verl_omni.workers.checkpoint_engine import OmniCheckpointEngineManager
 from verl_omni.workers.config.reward import reward_role_required, streaming_reward_enabled
 from verl_omni.workers.detach_actor_worker import DiffusionDetachActorWorker
 from verl_omni.workers.rollout.diffusion_llm_server import DiffusionWholeSampleRetryLLMServerClient
-from verl_omni.workers.rollout.llm_server import DiffusionLLMServerManager as LLMServerManager
+from verl_omni.workers.rollout.replica import DiffusionLLMServerManager as LLMServerManager
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))

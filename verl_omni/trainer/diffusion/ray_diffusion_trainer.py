@@ -92,7 +92,7 @@ from verl_omni.utils.tracking import (
     wrap_val_samples_for_wandb,
 )
 from verl_omni.workers.config.reward import reward_is_enabled, reward_role_required, streaming_reward_enabled
-from verl_omni.workers.rollout.llm_server import DiffusionLLMServerManager as LLMServerManager
+from verl_omni.workers.rollout.replica import DiffusionLLMServerManager as LLMServerManager
 from verl_omni.workers.utils.padding import embeds_padding_2_no_padding
 
 sys_logger = logging.getLogger(__name__)

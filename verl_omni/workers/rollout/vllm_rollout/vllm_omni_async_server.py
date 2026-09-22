@@ -26,6 +26,7 @@ from verl.utils.tracking import RLInsightLogger
 from verl.workers.config import RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, TokenOutput
 from verl.workers.rollout.utils import run_uvicorn
+from verl.workers.rollout.vllm_rollout import ServerAdapter
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
     VLLM_LORA_NAME,
@@ -530,6 +531,26 @@ class vLLMOmniHttpServer(vLLMHttpServer):
 
         logger.info("Aborted request: %s", request_id)
         return {"aborted": True, "request_id": request_id}
+
+
+class vLLMOmniServerAdapter(ServerAdapter):
+    """Reuse verl's transport with SP-aware replica and IPC rank mapping."""
+
+    def __init__(self, config, model_config, device_mesh, replica_rank: int = -1):
+        super().__init__(config, model_config, device_mesh, replica_rank=replica_rank)
+        if get_rollout_sequence_parallel_size(self.config) == 1:
+            return
+
+        rank = int(os.environ["RANK"])
+        local_world_size = int(os.environ["RAY_LOCAL_WORLD_SIZE"])
+        world_size = get_rollout_world_size(self.config)
+        self.replica_rank = rank // world_size if replica_rank == -1 else replica_rank
+        self.rollout_rank = rank % world_size
+        self.node_rank = self.rollout_rank // local_world_size
+        self._has_server = self.rollout_rank == 0
+        local_rank = self.rollout_rank % local_world_size
+        job_id = ray.get_runtime_context().get_job_id()
+        self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"
 
 
 class vLLMOmniReplica(vLLMReplica):
