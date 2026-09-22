@@ -44,7 +44,7 @@ from .common import (
     sample_h3_transition,
     split_joint_latents,
 )
-from .weight_sync import H3_LORA_TARGETS, H3_VEOMNI_LORA_TARGETS
+from .weight_sync import resolve_h3_lora_target_layout
 
 __all__ = ["MiniMaxH3FlowGRPO"]
 
@@ -83,22 +83,7 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
         if model_config.lora_rank <= 0:
             return
 
-        target_modules = model_config.target_modules
-        requested = {target_modules} if isinstance(target_modules, str) else set(target_modules or [])
-        valid_layout = any(
-            requested
-            and all(
-                any(target == supported or target.endswith("." + supported) for supported in supported_targets)
-                for target in requested
-            )
-            for supported_targets in (H3_LORA_TARGETS, H3_VEOMNI_LORA_TARGETS)
-        )
-        if not valid_layout:
-            supported = sorted(H3_LORA_TARGETS | H3_VEOMNI_LORA_TARGETS)
-            raise ValueError(
-                "MiniMax H3 LoRA supports only one complete projection naming layout from "
-                f"{supported}; got {sorted(requested)}. Other targets cannot be synchronized to the rollout model."
-            )
+        resolve_h3_lora_target_layout(model_config.target_modules)
 
     @classmethod
     def convert_export_key(cls, name: str) -> str:

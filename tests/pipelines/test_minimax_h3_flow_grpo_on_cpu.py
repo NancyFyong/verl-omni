@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 from tensordict import TensorDict
 from vllm_omni.diffusion.data import DiffusionOutput as VllmDiffusionOutput
 from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
@@ -35,7 +36,10 @@ from verl_omni.pipelines.minimax_h3_flow_grpo.common import (
 )
 from verl_omni.pipelines.minimax_h3_flow_grpo.diffusers_training_adapter import MiniMaxH3FlowGRPO
 from verl_omni.pipelines.minimax_h3_flow_grpo.vllm_omni_rollout_adapter import MiniMaxH3PipelineWithLogProb
-from verl_omni.pipelines.minimax_h3_flow_grpo.weight_sync import MiniMaxH3WeightSyncMixin
+from verl_omni.pipelines.minimax_h3_flow_grpo.weight_sync import (
+    MiniMaxH3WeightSyncMixin,
+    resolve_h3_lora_target_layout,
+)
 from verl_omni.pipelines.model_base import DiffusionModelBase, VllmOmniPipelineBase
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_async_server import vLLMOmniHttpServer
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy
@@ -321,6 +325,20 @@ def test_lora_weight_sync_splits_geglu_and_rewrites_targets() -> None:
     torch.testing.assert_close(mapped["transformer.blocks.0.mlp.fc1_0.lora_B.weight"], tensor[4:])
     torch.testing.assert_close(mapped["transformer.blocks.0.mlp.fc1_1.lora_B.weight"], tensor[:4])
     assert mapped_config["target_modules"] == ["fc1_0", "fc1_1", "to_q"]
+
+
+def test_h3_lora_target_layout_is_shared_by_validation_and_sync() -> None:
+    layouts = {
+        "diffusers": ("to_q", "to_k", "to_v", "to_out.0", "ff.net.0.proj", "ff.net.2"),
+        "veomni": ("qkv_proj", "out_proj", "fc1", "fc2"),
+    }
+    for expected_layout, targets in layouts.items():
+        assert resolve_h3_lora_target_layout(targets) == (expected_layout, set(targets))
+        assert resolve_h3_lora_target_layout(OmegaConf.create(targets)) == (expected_layout, set(targets))
+        MiniMaxH3FlowGRPO.validate_lora_config(SimpleNamespace(lora_rank=4, target_modules=targets))
+
+    with pytest.raises(ValueError, match="one complete projection naming layout"):
+        resolve_h3_lora_target_layout(("to_q", "qkv_proj"))
 
 
 def test_ref2va_weight_sync_targets_the_combined_ref_transformer() -> None:
