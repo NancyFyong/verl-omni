@@ -46,6 +46,7 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from verl_omni.pipelines.diffusion_rollout_output import with_rollout_data
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
+    apply_h3_parallel_setup,
     ref2va_reference_image_short_edge,
     serialize_ref_blocks,
     validate_h3_parallel_config,
@@ -100,6 +101,7 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
         validate_h3_parallel_config(od_config.parallel_config)
         self._reference_image_short_edge = validate_ref2va_reference_image_short_edge()
         super().__init__(od_config=od_config, prefix=prefix)
+        apply_h3_parallel_setup(self, od_config)
         self.install_h3_lora_layout()
         self._flow_grpo_noise_level = 0.8
         self._flow_grpo_sde_type = "cps"

@@ -38,6 +38,7 @@ from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 from .common import (
     AUDIO_ROW_WIDTH,
     MiniMaxH3RolloutWeightSyncMixin,
+    apply_h3_parallel_setup,
     pack_video_audio_rows,
     ref2va_reference_image_short_edge,
     serialize_ref_blocks,
@@ -65,6 +66,7 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
         validate_h3_parallel_config(od_config.parallel_config)
         self._reference_image_short_edge = validate_ref2va_reference_image_short_edge()
         super().__init__(od_config=od_config, prefix=prefix)
+        apply_h3_parallel_setup(self, od_config)
         if hasattr(self, "set_progress_bar_config"):
             self.set_progress_bar_config(disable=True)
         self._install_lora_layout()
