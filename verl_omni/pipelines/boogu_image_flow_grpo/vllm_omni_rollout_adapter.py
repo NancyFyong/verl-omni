@@ -29,11 +29,7 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from verl_omni.pipelines.diffusion_rollout_output import rollout_output, wrap_rollout_postprocessor
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
-from verl_omni.pipelines.qwen_image_flow_grpo.common import (
-    QwenImageLoRAMixin,
-    QwenImageTokenIdPromptMixin,
-    coalesce_not_none,
-)
+from verl_omni.pipelines.qwen_image_flow_grpo.common import QwenImageTokenIdPromptMixin, coalesce_not_none
 from verl_omni.pipelines.request_batch import (
     collate_prompt_mask as _collate_prompt_mask,
 )
@@ -72,7 +68,7 @@ pipeline_boogu_image.get_boogu_image_post_process_func = get_rollout_post_proces
 
 
 @VllmOmniPipelineBase.register("BooguImagePipeline", algorithm="flow_grpo")
-class BooguImagePipelineWithLogProb(QwenImageLoRAMixin, QwenImageTokenIdPromptMixin, BooguImagePipeline):
+class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipeline):
     """Rollout pipeline for Boogu-Image that captures per-step log-probabilities.
 
     Extends the vllm-omni ``BooguImagePipeline`` with:
@@ -119,6 +115,23 @@ class BooguImagePipelineWithLogProb(QwenImageLoRAMixin, QwenImageTokenIdPromptMi
             subfolder="scheduler",
             local_files_only=local_files_only,
         )
+
+    # TODO: Remove after upgrading the vllm-omni pin to map live LoRA keys and targets
+    # natively for Boogu-Image (https://github.com/vllm-project/vllm-omni/issues/8001).
+    @staticmethod
+    def map_lora_update_to_engine(lora_tensors: dict, peft_config: dict) -> tuple[dict, dict]:
+        """Rename Boogu-Image output-projection LoRA keys and target modules."""
+        tensors = {
+            name.replace("transformer.base_model.model.", "transformer.", 1).replace(".to_out.0.", ".to_out."): tensor
+            for name, tensor in lora_tensors.items()
+        }
+        config = dict(peft_config)
+        targets = config.get("target_modules")
+        if isinstance(targets, list | tuple | set):
+            config["target_modules"] = [
+                target[:-2] if target == "to_out.0" or target.endswith(".to_out.0") else target for target in targets
+            ]
+        return tensors, config
 
     # ------------------------------------------------------------------
     # Prompt encoding from pre-tokenised IDs
