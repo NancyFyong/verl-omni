@@ -31,10 +31,10 @@ from .common import (
     keyframe_indices_to_anchors,
     pack_video_audio_rows,
     prepare_h3_processor_files,
+    run_h3_transformer,
     split_dual_velocity,
     unpack_video_audio_rows,
     validate_lora_target_modules,
-    validate_standard_ulysses_sequence_length,
 )
 
 __all__ = ["MiniMaxH3DiffusionNFT"]
@@ -179,7 +179,6 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
             position_ids, token_tags, video_indices, audio_indices, text_indices, num_cond_video, num_cond_audio = (
                 layout
             )
-            validate_standard_ulysses_sequence_length(position_ids.shape[0], sp_size)
             sample_video_condition = condition_video_rows[index]
             if condition_video_row_count is not None:
                 sample_video_condition = sample_video_condition[: int(condition_video_row_count[index].reshape(-1)[0])]
@@ -210,18 +209,22 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
                 condition_video_timestep=max(video_t, 0.999),
                 condition_audio_timestep=1.0 if ref_block_meta is not None else video_t,
             )
-            result = module(
-                hidden_states=full_video_rows,
-                audio_hidden_states=full_audio_rows,
-                encoder_hidden_states=encoder_hidden_states[index : index + 1, :num_text_tokens],
-                timestep=unique_timesteps.to(device),
-                timestep_indices=timestep_indices.to(device),
-                token_tags=token_tags.to(device),
-                position_ids=position_ids.to(device),
-                video_indices=video_indices.to(device),
-                audio_indices=audio_indices.to(device),
-                text_indices=text_indices.to(device),
-                return_dict=False,
+            result = run_h3_transformer(
+                module,
+                {
+                    "hidden_states": full_video_rows,
+                    "audio_hidden_states": full_audio_rows,
+                    "encoder_hidden_states": encoder_hidden_states[index : index + 1, :num_text_tokens],
+                    "timestep": unique_timesteps.to(device),
+                    "timestep_indices": timestep_indices.to(device),
+                    "token_tags": token_tags.to(device),
+                    "position_ids": position_ids.to(device),
+                    "video_indices": video_indices.to(device),
+                    "audio_indices": audio_indices.to(device),
+                    "text_indices": text_indices.to(device),
+                    "return_dict": False,
+                },
+                sp_size,
             )
             v_video, v_audio = split_dual_velocity(result)
             v_video = v_video[:, num_cond_video:]

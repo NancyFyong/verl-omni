@@ -31,7 +31,7 @@ from vllm_omni.diffusion.models.minimax_h3.denoise_loop import (
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     build_ref2va_layout_from_meta,
     prepare_h3_processor_files,
-    validate_standard_ulysses_sequence_length,
+    run_h3_transformer,
 )
 from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
@@ -216,10 +216,6 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
             ).bool()
             audio_update_mask = torch.ones(audio_rows, dtype=torch.bool)
 
-        validate_standard_ulysses_sequence_length(
-            seq_len,
-            tu.get_non_tensor_data(micro_batch, "sp_size", default=1),
-        )
         original_step = _shared_int(micro_batch["h3_step_indices"][:, step], "scheduler step")
         step_timesteps = torch.stack((timesteps[:, step], micro_batch["h3_audio_timesteps"][:, step]), dim=-1)
         if step_timesteps.shape[0] > 1 and not torch.all(step_timesteps == step_timesteps[0]):
@@ -255,6 +251,7 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
                 "_h3_video_update_mask": video_update_mask_device,
                 "_h3_audio_update_mask": audio_update_mask_device,
                 "_h3_target_only_trajectory": is_ref2va,
+                "_h3_sp_size": tu.get_non_tensor_data(micro_batch, "sp_size", default=1),
             },
             None,
         )
@@ -278,7 +275,8 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
         video_update_mask = model_inputs.pop("_h3_video_update_mask")
         audio_update_mask = model_inputs.pop("_h3_audio_update_mask")
         target_only_trajectory = bool(model_inputs.pop("_h3_target_only_trajectory"))
-        video_velocity, audio_velocity = module(**model_inputs)
+        sp_size = model_inputs.pop("_h3_sp_size", 1)
+        video_velocity, audio_velocity = run_h3_transformer(module, model_inputs, sp_size)
         video = model_inputs["hidden_states"].float()
         audio = model_inputs["audio_hidden_states"].float()
         if target_only_trajectory:

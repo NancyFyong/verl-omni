@@ -338,10 +338,10 @@ def _diffusers_ulysses_fwd_bwd(sp_size: int, dp_size: int, backend: str):
 # =============================================================================
 
 
-def _minimax_h3_inputs(task: str, device: str) -> dict[str, torch.Tensor | bool]:
-    """Build a standard-Ulysses-compatible joint layout for each H3 task."""
+def _minimax_h3_inputs(task: str, device: str, aligned: bool) -> dict[str, torch.Tensor | bool]:
+    """Build an H3 joint layout of length 8 (aligned) or 7 (requires SP padding) for each task."""
     generator = torch.Generator(device=device).manual_seed({"t2va": 11, "fl2va": 12, "ref2va": 13}[task])
-    text_rows = {"t2va": 4, "fl2va": 3, "ref2va": 2}[task]
+    text_rows = {"t2va": 4, "fl2va": 3, "ref2va": 2}[task] - (0 if aligned else 1)
     condition_video_rows = 0 if task == "t2va" else 1
     condition_audio_rows = 1 if task == "ref2va" else 0
     video_rows = condition_video_rows + 2
@@ -370,7 +370,7 @@ def _minimax_h3_inputs(task: str, device: str) -> dict[str, torch.Tensor | bool]
         "timestep": timesteps,
         "timestep_indices": timestep_indices,
         "token_tags": token_tags,
-        "position_ids": torch.zeros(seq_len, 3, device=device),
+        "position_ids": torch.randn(seq_len, 3, generator=generator, device=device),
         "video_indices": video_indices,
         "audio_indices": audio_indices,
         "text_indices": text_indices,
@@ -378,10 +378,11 @@ def _minimax_h3_inputs(task: str, device: str) -> dict[str, torch.Tensor | bool]
     }
 
 
+@pytest.mark.parametrize("aligned", [True, False])
 @pytest.mark.parametrize("sp_size", [2, 4])
 @pytest.mark.parametrize("backend", _ulysses_backends)
-def test_minimax_h3_standard_ulysses_all_tasks_fwd_bwd(sp_size, backend):
-    """H3 standard Ulysses must match serial execution for divisible task layouts."""
+def test_minimax_h3_standard_ulysses_all_tasks_fwd_bwd(sp_size, backend, aligned):
+    """H3 standard Ulysses with masked SP padding must match serial unpadded execution."""
     if not torch.distributed.is_initialized():
         initialize_global_process_group()
 
@@ -392,6 +393,8 @@ def test_minimax_h3_standard_ulysses_all_tasks_fwd_bwd(sp_size, backend):
     device = get_device_name()
 
     from diffusers import ContextParallelConfig, MiniMaxH3Transformer3DModel
+
+    from verl_omni.pipelines.minimax_h3_diffusion_nft.common import run_h3_transformer
 
     ulysses_device_mesh = init_device_mesh(
         device_type=device,
@@ -428,8 +431,8 @@ def test_minimax_h3_standard_ulysses_all_tasks_fwd_bwd(sp_size, backend):
     sp_losses = []
     no_sp_losses = []
     for task in ("t2va", "fl2va", "ref2va"):
-        model_inputs = _minimax_h3_inputs(task, device)
-        output_sp = module_sp(**model_inputs)
+        model_inputs = _minimax_h3_inputs(task, device, aligned)
+        output_sp = run_h3_transformer(module_sp, model_inputs, sp_size)
         output_no_sp = module_no_sp(**model_inputs)
         assert len(output_sp) == len(output_no_sp) == 2
         for actual, expected in zip(output_sp, output_no_sp, strict=True):

@@ -1,6 +1,6 @@
 # MiniMax H3 T2VA, FL2VA, and Ref2VA FlowGRPO
 
-Last updated: 09/21/2026
+Last updated: 09/23/2026
 
 These recipes train `MiniMaxAI/MiniMax-H3` LoRA adapters with FlowGRPO for
 text-to-audio-video (T2VA), first-frame image-to-audio-video (FL2VA), and
@@ -182,7 +182,7 @@ measure fidelity to the supplied references.
 ### Actor FSDP sequence parallelism
 
 The NVIDIA T2VA, FL2VA, and Ref2VA launchers accept `ACTOR_SP` (default `1`).
-Set it to a divisor of the GPU count to shard each Actor's unpadded joint
+Set it to a divisor of the GPU count to shard each Actor's joint
 text/video/audio sequence with Diffusers Ulysses context parallelism:
 
 ```bash
@@ -191,14 +191,14 @@ ACTOR_SP=2 bash examples/flowgrpo_trainer/minimax_h3/run_minimax_h3_t2va_lora.sh
 
 This uses the same standard equal-partition Ulysses path as Qwen-Image and
 changes Actor FSDP data parallelism to `NUM_GPUS / ACTOR_SP`; it does not change
-rollout `ROLLOUT_TP` or text-encoder `TEXT_ENCODER_TP`. Every sample's unpadded
-joint text/video/audio sequence length must divide evenly by `ACTOR_SP`, and the
-SP size must also divide the model's attention-head count (56 for the released
-H3 checkpoint). The adapter fails before the transformer when a packed layout is
-incompatible; it does not add attention-visible padding. Because prompt and
-reference layouts vary, validate the complete dataset before a long run and keep
-`ACTOR_SP=1` when this invariant cannot be guaranteed. Keep timestep staging
-disabled. FlowGRPO micro-batches must still share one packed layout; sequence
+rollout `ROLLOUT_TP` or text-encoder `TEXT_ENCODER_TP`. `ACTOR_SP` must divide
+the model's attention-head count (56 for the released H3 checkpoint). When a
+packed layout's length is not a multiple of `ACTOR_SP`, the adapter appends
+padding rows and masks them as attention keys; real rows attend exactly as
+without padding and padding outputs are discarded, so arbitrary prompt and
+reference lengths are supported. Use an attention backend that accepts key
+masks under context parallelism (`native`, `flash_varlen_hub`, or
+`_flash_3_varlen_hub`). Keep timestep staging disabled. FlowGRPO micro-batches must still share one packed layout; sequence
 parallelism does not relax that replay contract.
 
 ### NVIDIA GPU

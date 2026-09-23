@@ -14,9 +14,53 @@
 """CPU contract tests for MiniMax H3 Diffusers context parallelism."""
 
 import pytest
+import torch
 
 from tests.special_e2e.run_flowgrpo_minimax_h3_tiny import _hydra_overrides, _validate_actor_sp
-from verl_omni.pipelines.minimax_h3_diffusion_nft.common import validate_standard_ulysses_sequence_length
+from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
+    TEXT_TAG,
+    pad_h3_layout_for_ulysses,
+    run_h3_transformer,
+)
+
+_TINY_H3 = dict(
+    in_channels=4,
+    audio_in_channels=4,
+    num_layers=2,
+    num_refiner_layers=1,
+    hidden_size=32,
+    num_attention_heads=2,
+    attention_head_dim=16,
+    ffn_dim=64,
+    text_dim=16,
+    freq_dim=16,
+    time_embed_hidden_dim=32,
+    time_embed_dim=16,
+    rope_freq_dim=1,
+)
+
+
+def _layout_inputs(text_rows: int = 2, video_rows: int = 3, audio_rows: int = 2) -> dict:
+    """Build an H3 packed layout whose joint length is intentionally odd by default."""
+    generator = torch.Generator().manual_seed(3)
+    seq_len = text_rows + video_rows + audio_rows
+    token_tags = torch.tensor([1] * text_rows + [0] * video_rows + [2] * audio_rows)
+    row_timesteps = torch.full((seq_len,), 0.5)
+    row_timesteps[text_rows] = 0.999
+    timestep, timestep_indices = torch.unique(row_timesteps, sorted=True, return_inverse=True)
+    return {
+        "hidden_states": torch.randn(1, video_rows, 16, generator=generator),
+        "audio_hidden_states": torch.randn(1, audio_rows, 4, generator=generator),
+        "encoder_hidden_states": torch.randn(1, text_rows, 16, generator=generator),
+        "timestep": timestep,
+        "timestep_indices": timestep_indices,
+        "token_tags": token_tags,
+        "position_ids": torch.randn(seq_len, 3, generator=generator),
+        "video_indices": torch.arange(text_rows, text_rows + video_rows),
+        "audio_indices": torch.arange(text_rows + video_rows, seq_len),
+        "text_indices": torch.arange(text_rows),
+        "return_dict": False,
+    }
 
 
 def test_minimax_h3_uses_diffusers_standard_ulysses_configuration() -> None:
@@ -29,19 +73,83 @@ def test_minimax_h3_uses_diffusers_standard_ulysses_configuration() -> None:
 
 
 @pytest.mark.parametrize(("sequence_length", "sp_size"), [(7, 1), (8, 2), (8, 4), (12, 4)])
-def test_minimax_h3_accepts_standard_ulysses_compatible_layout(sequence_length, sp_size) -> None:
-    validate_standard_ulysses_sequence_length(sequence_length, sp_size)
+def test_minimax_h3_padding_is_a_no_op_for_aligned_layouts(sequence_length, sp_size) -> None:
+    inputs = _layout_inputs(text_rows=sequence_length - 5)
+
+    assert pad_h3_layout_for_ulysses(inputs, sp_size) is inputs
 
 
-@pytest.mark.parametrize(("sequence_length", "sp_size"), [(7, 2), (9, 4), (10, 4)])
-def test_minimax_h3_rejects_uneven_standard_ulysses_layout(sequence_length, sp_size) -> None:
-    with pytest.raises(ValueError, match=rf"sequence_length={sequence_length} and sp_size={sp_size}"):
-        validate_standard_ulysses_sequence_length(sequence_length, sp_size)
+@pytest.mark.parametrize(("sequence_length", "sp_size", "padded_length"), [(7, 2, 8), (9, 4, 12), (10, 4, 12)])
+def test_minimax_h3_padding_masks_trailing_rows(sequence_length, sp_size, padded_length) -> None:
+    inputs = _layout_inputs(text_rows=sequence_length - 5)
+
+    padded = pad_h3_layout_for_ulysses(inputs, sp_size)
+
+    assert padded["position_ids"].shape == (padded_length, 3)
+    assert padded["token_tags"].shape == padded["timestep_indices"].shape == (padded_length,)
+    assert torch.equal(padded["position_ids"][:sequence_length], inputs["position_ids"])
+    assert torch.all(padded["position_ids"][sequence_length:] == 0)
+    assert torch.all(padded["token_tags"][sequence_length:] == TEXT_TAG)
+    assert torch.all(padded["timestep_indices"][sequence_length:] == 0)
+    assert padded["attention_mask"].shape == (1, 1, 1, padded_length)
+    assert padded["attention_mask"].dtype == torch.bool
+    assert padded["attention_mask"][..., :sequence_length].all()
+    assert not padded["attention_mask"][..., sequence_length:].any()
+    for key in ("video_indices", "audio_indices", "text_indices"):
+        assert padded[key] is inputs[key]
 
 
-def test_minimax_h3_rejects_nonpositive_standard_ulysses_size() -> None:
+def test_minimax_h3_padding_rejects_nonpositive_sp_size() -> None:
     with pytest.raises(ValueError, match="must be positive"):
-        validate_standard_ulysses_sequence_length(sequence_length=8, sp_size=0)
+        pad_h3_layout_for_ulysses(_layout_inputs(), sp_size=0)
+
+
+def test_minimax_h3_padding_rejects_non_h3_modules() -> None:
+    with pytest.raises(TypeError, match="MiniMaxH3Transformer3DModel"):
+        run_h3_transformer(torch.nn.Linear(1, 1), _layout_inputs(), sp_size=2)
+
+
+@pytest.mark.parametrize("gradient_checkpointing", [False, True])
+@pytest.mark.parametrize("sp_size", [2, 4])
+def test_minimax_h3_padded_forward_matches_unpadded_forward(sp_size, gradient_checkpointing) -> None:
+    """Masked padding rows must not change real-row outputs or parameter gradients."""
+    from diffusers import MiniMaxH3Transformer3DModel
+
+    torch.manual_seed(0)
+    reference = MiniMaxH3Transformer3DModel(**_TINY_H3).float()
+    padded_model = MiniMaxH3Transformer3DModel(**_TINY_H3).float()
+    padded_model.load_state_dict(reference.state_dict())
+    for model in (reference, padded_model):
+        model.set_attention_backend("native")
+        if gradient_checkpointing:
+            model.enable_gradient_checkpointing()
+    inputs = _layout_inputs()
+
+    expected = reference(**inputs)
+    actual = run_h3_transformer(padded_model, inputs, sp_size)
+    for got, want in zip(actual, expected, strict=True):
+        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
+
+    sum(output.square().mean() for output in expected).backward()
+    sum(output.square().mean() for output in actual).backward()
+    compared = 0
+    for (name, got), (_, want) in zip(padded_model.named_parameters(), reference.named_parameters(), strict=True):
+        if want.grad is None:
+            assert got.grad is None, name
+            continue
+        torch.testing.assert_close(got.grad, want.grad, rtol=1e-5, atol=1e-6, msg=name)
+        compared += 1
+    assert compared > 0
+
+
+def test_minimax_h3_masked_forward_fails_closed_on_diffusers_signature_drift(monkeypatch) -> None:
+    from diffusers import MiniMaxH3Transformer3DModel
+
+    import verl_omni.pipelines.minimax_h3_diffusion_nft.common as common
+
+    monkeypatch.setattr(common, "_H3_FORWARD_PARAMETERS", ("self", "hidden_states"))
+    with pytest.raises(RuntimeError, match="Revalidate the masked forward"):
+        run_h3_transformer(MiniMaxH3Transformer3DModel(**_TINY_H3), _layout_inputs(), sp_size=2)
 
 
 @pytest.mark.parametrize(("task", "train_batch_size"), [("t2va", 8), ("fl2va", 8), ("ref2va", 4)])
