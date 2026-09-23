@@ -120,9 +120,11 @@ class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipel
     # natively for Boogu-Image (https://github.com/vllm-project/vllm-omni/issues/8001).
     @staticmethod
     def map_lora_update_to_engine(lora_tensors: dict, peft_config: dict) -> tuple[dict, dict]:
-        """Rename Boogu-Image output-projection LoRA keys and target modules."""
+        """Map diffusers output/joint-attention LoRA names to the native layout."""
         tensors = {
-            name.replace("transformer.base_model.model.", "transformer.", 1).replace(".to_out.0.", ".to_out."): tensor
+            name.replace("transformer.base_model.model.", "transformer.", 1)
+            .replace(".to_out.0.", ".to_out.")
+            .replace(".img_instruct_attn.processor.", ".img_instruct_attn."): tensor
             for name, tensor in lora_tensors.items()
         }
         config = dict(peft_config)
