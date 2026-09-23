@@ -43,11 +43,32 @@ thing, the guide wins and the file links to it.
 | [add-reward-score](skills/add-reward-score/SKILL.md) | a new reward scorer plus the config overrides that select it    |
 | [run-cpu-tests](skills/run-cpu-tests/SKILL.md)       | what the CPU job does that `testing_guide.md`'s local commands don't |
 | [self-review](skills/code-review/SKILL.md)           | report-only review: purpose, code quality, goal completeness, and validation/accountability; severity separate from category |
+| [pr-review](skills/pr-review/SKILL.md)               | review someone's PR, or address review on your own: exact head state, all feedback threads, routing to the area skills below |
 | [profile](skills/profile/SKILL.md)                  | select a profiler and capture the relevant processes/workload |
 | [train-infer-consistency](skills/train-infer-consistency/SKILL.md) | rollout / actor consistency collection and analysis using MindStudio skills |
 
 `commit-and-pr` holds the authoritative module list; other files link to it rather
 than duplicating it.
+
+### Review area skills
+
+Loaded from the `pr-review` routing table or from `self-review`. Each covers one
+system boundary with the past PRs that broke it and the evidence that settles it.
+
+| Skill | Boundary |
+| --- | --- |
+| [review-new-architecture](skills/review-new-architecture/SKILL.md) | both registries, checklist gaps, shared-path leakage, past misses |
+| [review-refactor](skills/review-refactor/SKILL.md) | behavior preservation, deleted tests, every consumer, leftovers, slicing |
+| [review-rollout-contract](skills/review-rollout-contract/SKILL.md) | request payload and `rollout_output()` fields reaching training |
+| [review-media-contract](skills/review-media-contract/SKILL.md) | declared media kind, layouts, sample rates, reward inputs |
+| [review-weight-sync](skills/review-weight-sync/SKILL.md) | full-weight export, name mapping, LoRA binding |
+| [review-train-rollout-consistency](skills/review-train-rollout-consistency/SKILL.md) | step math, conditioning and numerics that must match on both sides |
+| [review-distributed-memory](skills/review-distributed-memory/SKILL.md) | parallel sizes, FSDP paths, gradient sync, colocated memory, NPU |
+| [review-async-state](skills/review-async-state/SKILL.md) | TransferQueue, background threads, sleep/wake, checkpoint resume |
+| [review-config-recipe](skills/review-config-recipe/SKILL.md) | config surfaces, checkpoint layout, the recipe behind the evidence |
+| [review-dependencies](skills/review-dependencies/SKILL.md) | pins, pin bumps, upstream patches, compatibility code |
+| [review-omni-ar](skills/review-omni-ar/SKILL.md) | omni and AR adapters, stage topology, processors on workers |
+| [review-tests-ci](skills/review-tests-ci/SKILL.md) | every PR: tests that can fail, CI selection, the evidence ladder |
 
 ## Other agent tools
 

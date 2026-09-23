@@ -73,17 +73,10 @@ category. Missing critical validation can block; a naming preference usually
 cannot. Do not invent findings to avoid saying the code is sound, or impose
 source-line limits, blanket bans on framework hooks, or formatter-only nits.
 
-Project-specific checks:
+Project-specific checks live in the `review-*` area skills. Pick them from the
+routing table in [pr-review](../pr-review/SKILL.md#3-classify-the-change-and-load-the-area-skills) and work
+each one against your diff. Also check:
 
-- **Wire compatibility:** for protocol-preserving refactors, keep valid
-  `prompt_token_ids`, `multi_modal_data` and `extra_fields` intact end to end.
-  Unsupported or conflicting fields must not disappear silently.
-- **Media contracts:** use `DiffusionIOSpec` / `media_kind` rather than guessing
-  modality from `ndim` or a dimension equal to three.
-- **Distributed paths:** verify actual replica/rank allocation, sample ordering
-  and loss normalization, not just a parsed config or a printed parallel degree.
-- **Weight sync:** trace export, name/shape/scaling conversion, binding and use.
-  A tensor count or active adapter ID alone cannot prove value-correct binding.
 - **Surgical scope:** flag unrelated cleanup and orphaned code caused by this
   change; do not demand refactoring pre-existing debt unrelated to the goal.
 
@@ -109,9 +102,9 @@ performance and convergence are different claims, not interchangeable badges.
   Keep unchecked items as coverage gaps, not confirmed defects.
 - Give the exact command and result, or **not run**. Associate test logs with the
   tested SHA/config; a previous head's green check is not current-head evidence.
-- Check `.github/*_pin.txt` and the interpreter/worker source binding before
-  attributing an import or runtime failure to the patch. Compare with the base
-  when needed; a dependency mismatch is not automatically a code regression.
+- Match the pins ([review-dependencies](../review-dependencies/SKILL.md#reproduce-at-the-pins))
+  and the interpreter/worker source binding before attributing an import or
+  runtime failure to the patch. Compare with the base when needed.
 - Read the automated gates' actual scope. CPU selection does not replace the
   config-doc, generated-config, device-API, DataProto or other sanity checks.
 - "Engine initialized" is not a completed GPU e2e. For timing claims identify

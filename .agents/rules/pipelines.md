@@ -23,8 +23,13 @@ imports an adapter by name, so:
 - `architecture` is auto-detected from `model_index.json`'s `_class_name`;
   `algorithm` comes from `DiffusionModelConfig.algorithm`. Neither is passed
   explicitly at the call site.
-- A miss raises `NotImplementedError` listing every registered key. Read that list
-  before assuming the adapter is broken — usually it is just not registered.
+- A training-side miss (`get_class_by_name`) raises `NotImplementedError` listing
+  every registered key. Read that list before assuming the adapter is broken —
+  usually it is just not registered.
+- A rollout-side miss does not raise: `VllmOmniPipelineBase.get_class` returns
+  `None`, and the engine runs the stock vllm-omni pipeline without the log-prob
+  adapter. Check both keys resolve
+  ([review-new-architecture](../skills/review-new-architecture/SKILL.md)).
 - Out-of-tree adapters register through `DiffusionModelConfig.external_lib`; adding
   one needs no fork.
 
