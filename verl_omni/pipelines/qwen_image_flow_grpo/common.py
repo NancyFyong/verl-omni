@@ -41,19 +41,17 @@ def apply_true_cfg(
 
 
 class QwenImageLoRAMixin:
-    """Map and validate live LoRA updates for Qwen-Image and Boogu-Image."""
+    """Map Qwen-Image live LoRA names to the rollout layout."""
 
+    # TODO: Remove after upgrading the vllm-omni pin to map live LoRA keys and targets
+    # natively for Qwen-Image (https://github.com/vllm-project/vllm-omni/issues/8001).
     @staticmethod
     def map_lora_update_to_engine(lora_tensors: dict, peft_config: dict) -> tuple[dict, dict]:
-        """Map diffusers output-projection LoRA names to the vLLM layout."""
-        tensors = {}
-        for name, tensor in lora_tensors.items():
-            if name.startswith("transformer.base_model.model."):
-                name = "transformer." + name.removeprefix("transformer.base_model.model.")
-            name = name.replace(".to_out.0.", ".to_out.")
-            if name in tensors:
-                raise ValueError(f"Duplicate Qwen-Image/Boogu-Image LoRA tensor after name mapping: {name}")
-            tensors[name] = tensor
+        """Rename diffusers output-projection LoRA keys and target modules."""
+        tensors = {
+            name.replace("transformer.base_model.model.", "transformer.", 1).replace(".to_out.0.", ".to_out."): tensor
+            for name, tensor in lora_tensors.items()
+        }
         config = dict(peft_config)
         targets = config.get("target_modules")
         if isinstance(targets, list | tuple | set):
@@ -61,17 +59,6 @@ class QwenImageLoRAMixin:
                 target[:-2] if target == "to_out.0" or target.endswith(".to_out.0") else target for target in targets
             ]
         return tensors, config
-
-    @staticmethod
-    def _validate_diffusion_lora_binding(*, lora_model, bound_lora_names):
-        if not lora_model.loras:
-            raise ValueError("Qwen-Image/Boogu-Image LoRA has no adapter tensors; refusing a no-op sync.")
-        unbound = set(lora_model.loras) - bound_lora_names
-        if unbound:
-            raise ValueError(
-                f"Qwen-Image/Boogu-Image LoRA has {len(unbound)} unbound modules; refusing a partial or no-op sync. "
-                f"First unbound names: {sorted(unbound)[:5]}"
-            )
 
 
 class QwenImageTokenIdPromptMixin:
