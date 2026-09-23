@@ -108,6 +108,8 @@ def runtime_manager(monkeypatch):
     from verl_omni.pipelines.qwen_image_flow_grpo.vllm_omni_rollout_adapter import QwenImagePipelineWithLogProb
     from verl_omni.utils.vllm_omni.utils import VLLMOmniHijack
 
+    # Match CPU-only CI even when the local host supports pinned-memory copies.
+    monkeypatch.setattr("vllm.lora.lora_model.PIN_MEMORY", False)
     monkeypatch.setattr(parallel_state, "_TP", SimpleNamespace(rank_in_group=0, world_size=1))
     monkeypatch.setattr(qwen, "Attention", lambda **_: torch.nn.Identity())
     monkeypatch.setattr(VLLMOmniHijack, "_patched", False)
@@ -145,6 +147,10 @@ def test_export_load_bind_activate_contract(runtime_manager, monkeypatch, case):
     elif case == "output_only":
         params = {name: tensor for name, tensor in params.items() if ".to_out.0." in name}
         config = {**config, "target_modules": ["to_out.0"]}
+    # The loader may scale B in place when CPU tensors share storage.
+    mapped, _ = manager.pipeline.map_lora_update_to_engine(
+        {name: tensor.clone() for name, tensor in params.items()}, config
+    )
     manager.set_active_adapter(
         OmniTensorLoRARequest(
             lora_name="actor", lora_int_id=1, lora_path="in-memory", lora_tensors=params, peft_config=config
@@ -159,7 +165,6 @@ def test_export_load_bind_activate_contract(runtime_manager, monkeypatch, case):
             assert all(torch.count_nonzero(t) == 0 for t in (*output.lora_a_stacked, *output.lora_b_stacked))
         return
 
-    mapped, _ = manager.pipeline.map_lora_update_to_engine(params, config)
     assert any(name.endswith(".to_out") for name in manager._lora_modules)
     bound = 0
     for name, layer in manager._lora_modules.items():
