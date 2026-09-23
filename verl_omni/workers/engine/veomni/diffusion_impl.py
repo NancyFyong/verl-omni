@@ -113,6 +113,64 @@ def _reject_veomni_moe_expert_lora(model: torch.nn.Module) -> None:
         )
 
 
+# TODO: Qwen-Image attention compatibility shim. Remove this block together with its two call
+# sites (_build_ops_config and _build_model_optimizer) and
+# tests/workers/test_veomni_diffusion_attention_on_cpu.py once verl-omni requires a VeOmni release
+# that contains both:
+#   - https://github.com/ByteDance-Seed/VeOmni/pull/1214 (Hub attention names; merged after 0.1.12)
+#   - https://github.com/ByteDance-Seed/VeOmni/pull/1236 (Qwen-Image honors attn_implementation)
+# Until then, with VeOmni 0.1.12:
+#   - Hub names (flash_attention_*_hub) are rejected at model build;
+#   - Qwen-Image drops attn_implementation, so every value silently runs diffusers' native SDPA.
+# The shim builds with eager and selects the kernel through diffusers instead. Only the Hub
+# varlen backends are mapped: in diffusers>=0.40 they pack keys by the mask's nonzero indices,
+# while flash_varlen and _flash_varlen_3 keep a key prefix and mishandle Qwen-Image's
+# mid-sequence text padding.
+_QWEN_IMAGE_DIFFUSERS_ATTENTION_BACKENDS = {
+    "eager": "native",
+    "flash_attention_2_hub": "flash_varlen_hub",
+    "flash_attention_3_hub": "_flash_3_varlen_hub",
+}
+
+
+def _veomni_attn_implementation(attn_implementation: str) -> str:
+    """Build with eager when the installed VeOmni cannot parse Hub attention names."""
+    from veomni.arguments import OpsImplementationConfig
+
+    if attn_implementation.endswith("_hub") and not hasattr(OpsImplementationConfig, "normalize_hub_attention_backend"):
+        return "eager"  # Qwen-Image gets the Hub kernel in _apply_qwen_image_attention_backend
+    return attn_implementation
+
+
+def _apply_qwen_image_attention_backend(model: torch.nn.Module, attn_implementation: str) -> None:
+    """Honor ``veomni_config.attn_implementation`` for VeOmni's Qwen-Image transformer."""
+    from veomni.models.diffusers.qwen_image.qwen_image_transformer.modeling_qwen_image_transformer import (
+        QwenImageSPAttnProcessor,
+    )
+
+    if not any(isinstance(getattr(m, "processor", None), QwenImageSPAttnProcessor) for m in model.modules()):
+        # e.g. Wan / MiniMax H3 / LTX select attention inside VeOmni.
+        if _veomni_attn_implementation(attn_implementation) != attn_implementation:
+            raise ValueError(
+                f"veomni_config.attn_implementation={attn_implementation!r} requires a VeOmni release "
+                "with Hub attention support; the installed VeOmni only gets it for Qwen-Image via verl-omni."
+            )
+        return
+    backend = _QWEN_IMAGE_DIFFUSERS_ATTENTION_BACKENDS.get(attn_implementation)
+    if backend is None:
+        raise ValueError(
+            f"veomni_config.attn_implementation={attn_implementation!r} is not supported for Qwen-Image; "
+            f"use one of {sorted(_QWEN_IMAGE_DIFFUSERS_ATTENTION_BACKENDS)}. Local flash_attention_2/3 "
+            "map to diffusers varlen kernels that mishandle Qwen-Image's text padding."
+        )
+    from diffusers.models.attention_dispatch import _AttentionBackendRegistry
+
+    # set_attention_backend also switches diffusers' process-wide default; keep it for other models.
+    active_backend = _AttentionBackendRegistry._active_backend
+    model.set_attention_backend(backend)
+    _AttentionBackendRegistry.set_active_backend(active_backend)
+
+
 @EngineRegistry.register(model_type="diffusion_model", backend=["veomni"], device=["cuda"])
 class VeOmniDiffusionEngine(BaseEngine):
     """VeOmni-backed diffusion training engine for verl-omni RL loops."""
@@ -198,6 +256,7 @@ class VeOmniDiffusionEngine(BaseEngine):
         ops_kwargs = {
             name: getattr(self.engine_config, name) for name in ops_fields if hasattr(self.engine_config, name)
         }
+        ops_kwargs["attn_implementation"] = _veomni_attn_implementation(self.engine_config.attn_implementation)
         return OpsImplementationConfig(**ops_kwargs)
 
     def _get_veomni_model_paths(self) -> tuple[str, str]:
@@ -354,6 +413,7 @@ class VeOmniDiffusionEngine(BaseEngine):
         self.veomni_trainer = self._build_veomni_dit_trainer()
         veomni_base = self.veomni_trainer.base
         BaseTrainer._build_model(veomni_base)
+        _apply_qwen_image_attention_backend(veomni_base.model, self.engine_config.attn_implementation)
         if self._is_lora:
             # Wrap the model before parallelization; otherwise no adapter is injected.
             BaseTrainer._freeze_model_module(veomni_base)
