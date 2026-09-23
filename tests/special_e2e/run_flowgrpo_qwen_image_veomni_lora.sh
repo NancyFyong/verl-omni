@@ -64,6 +64,7 @@ python3 tests/special_e2e/create_dummy_diffusion_data.py \
     --data_sources jpeg_compressibility
 
 python3 -m verl_omni.trainer.main_diffusion \
+    trainer.use_v1=false \
     "${engine_args[@]}" \
     algorithm.adv_estimator=flow_grpo \
     data.train_files=${dummy_train_path} \

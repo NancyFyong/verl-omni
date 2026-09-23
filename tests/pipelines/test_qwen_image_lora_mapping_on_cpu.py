@@ -86,8 +86,7 @@ def _export_qwen_actor(monkeypatch, backend):
     )
     if backend == "veomni":
         lora = pytest.importorskip("veomni.lora")
-        from tests.workers.test_veomni_diffusion_lora_on_cpu import _export
-        from tests.workers.test_veomni_diffusion_lora_on_cpu import _make_engine as _make_veomni_engine
+        from tests.workers.veomni_lora_helpers import export_veomni_params, make_veomni_engine
 
         model = lora.VeOmniLoraModel(model, lora.VeOmniLoraConfig(r=4, lora_alpha=8, target_modules=_QWEN_TARGETS))
     else:
@@ -97,8 +96,8 @@ def _export_qwen_actor(monkeypatch, backend):
             if ".lora_" in name:
                 param.fill_((index + 1) / 128)
     if backend == "veomni":
-        engine = _make_veomni_engine(model, lora_rank=4)
-        params, config = _export(engine, monkeypatch, base_sync_done=True)
+        engine = make_veomni_engine(model, lora_rank=4)
+        params, config = export_veomni_params(engine, monkeypatch, base_sync_done=True)
     else:
         _patch_sync_helpers(monkeypatch)
         engine = _make_engine(model, lora_config={})

@@ -1,13 +1,14 @@
 # Qwen-Image FlowGRPO
 
-Last updated: 09/21/2026
+Last updated: 09/23/2026
 
 See the [FlowGRPO trainer guide](../../../docs/examples/flowgrpo_trainer.md) for installation, OCR data and
 reward-model setup.
 
 ## VeOmni LoRA
 
-VeOmni 0.1.12 or newer is required for native LoRA injection and adapter-to-rollout synchronization:
+VeOmni 0.1.12 or newer is required for native LoRA injection and adapter-to-rollout synchronization. Install it
+as described in [Installing VeOmni alongside vLLM 0.28.0](../../../docs/start/install.md#installing-veomni-alongside-vllm-0280):
 
 ```bash
 bash examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_lora_veomni.sh
@@ -15,12 +16,11 @@ bash examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_lora_veomni.sh
 
 The recipe mirrors `run_qwen_image_ocr_lora.sh` and replaces the actor and reference backends with VeOmni.
 It keeps vLLM-Omni for rollout and uses explicit LoRA target modules because VeOmni does not support the
-`all-linear` shorthand.
+`all-linear` shorthand. It runs the legacy (v0) trainer; VeOmni LoRA has not been validated with the V1 trainer.
 
-The tiny LoRA smoke is standalone until the CI image installs VeOmni 0.1.12:
+The tiny LoRA smoke is a standalone script and is not part of the GPU smoke CI:
 
 ```bash
-uv pip install veomni==0.1.12 --no-deps
 NUM_GPUS=2 BACKEND=veomni bash tests/special_e2e/run_flowgrpo_qwen_image_veomni_lora.sh
 # Check the existing FSDP2 export/binding path with the same smoke:
 NUM_GPUS=2 BACKEND=fsdp2 bash tests/special_e2e/run_flowgrpo_qwen_image_veomni_lora.sh
