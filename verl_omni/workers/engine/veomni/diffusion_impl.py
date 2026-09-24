@@ -113,19 +113,9 @@ def _reject_veomni_moe_expert_lora(model: torch.nn.Module) -> None:
         )
 
 
-# TODO: Qwen-Image attention compatibility shim. Remove this block together with its two call
-# sites (_build_ops_config and _build_model_optimizer) and
-# tests/workers/test_veomni_diffusion_attention_on_cpu.py once verl-omni requires a VeOmni release
-# that contains both:
-#   - https://github.com/ByteDance-Seed/VeOmni/pull/1214 (Hub attention names; merged after 0.1.12)
-#   - https://github.com/ByteDance-Seed/VeOmni/pull/1236 (Qwen-Image honors attn_implementation)
-# Until then, with VeOmni 0.1.12:
-#   - Hub names (flash_attention_*_hub) are rejected at model build;
-#   - Qwen-Image drops attn_implementation, so every value silently runs diffusers' native SDPA.
-# The shim builds with eager and selects the kernel through diffusers instead. Only the Hub
-# varlen backends are mapped: in diffusers>=0.40 they pack keys by the mask's nonzero indices,
-# while flash_varlen and _flash_varlen_3 keep a key prefix and mishandle Qwen-Image's
-# mid-sequence text padding.
+# TODO: Remove this shim, its call sites and tests once the required VeOmni includes
+# ByteDance-Seed/VeOmni#1214 and #1236. VeOmni 0.1.12 rejects Hub attention names and Qwen-Image
+# ignores attn_implementation. Only Hub varlen backends handle Qwen-Image's text padding correctly.
 _QWEN_IMAGE_DIFFUSERS_ATTENTION_BACKENDS = {
     "eager": "native",
     "flash_attention_2_hub": "flash_varlen_hub",
