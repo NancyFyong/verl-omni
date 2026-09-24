@@ -19,8 +19,8 @@ import torch
 from tests.special_e2e.run_flowgrpo_minimax_h3_tiny import _hydra_overrides, _validate_actor_sp
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     TEXT_TAG,
+    h3_ulysses_forward,
     pad_h3_layout_for_ulysses,
-    run_h3_transformer,
 )
 
 _TINY_H3 = dict(
@@ -106,7 +106,7 @@ def test_minimax_h3_padding_rejects_nonpositive_sp_size() -> None:
 
 def test_minimax_h3_padding_rejects_non_h3_modules() -> None:
     with pytest.raises(TypeError, match="MiniMaxH3Transformer3DModel"):
-        run_h3_transformer(torch.nn.Linear(1, 1), _layout_inputs(), sp_size=2)
+        h3_ulysses_forward(torch.nn.Linear(1, 1), _layout_inputs(), sp_size=2)
 
 
 @pytest.mark.parametrize("gradient_checkpointing", [False, True])
@@ -126,7 +126,7 @@ def test_minimax_h3_padded_forward_matches_unpadded_forward(sp_size, gradient_ch
     inputs = _layout_inputs()
 
     expected = reference(**inputs)
-    actual = run_h3_transformer(padded_model, inputs, sp_size)
+    actual = h3_ulysses_forward(padded_model, inputs, sp_size)
     for got, want in zip(actual, expected, strict=True):
         torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
 
@@ -149,7 +149,7 @@ def test_minimax_h3_masked_forward_fails_closed_on_diffusers_signature_drift(mon
 
     monkeypatch.setattr(common, "_H3_FORWARD_PARAMETERS", ("self", "hidden_states"))
     with pytest.raises(RuntimeError, match="Revalidate the masked forward"):
-        run_h3_transformer(MiniMaxH3Transformer3DModel(**_TINY_H3), _layout_inputs(), sp_size=2)
+        h3_ulysses_forward(MiniMaxH3Transformer3DModel(**_TINY_H3), _layout_inputs(), sp_size=2)
 
 
 @pytest.mark.parametrize(("task", "train_batch_size"), [("t2va", 8), ("fl2va", 8), ("ref2va", 4)])

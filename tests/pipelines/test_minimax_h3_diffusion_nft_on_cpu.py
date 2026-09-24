@@ -290,7 +290,7 @@ class TestMiniMaxH3Forward:
             calls.append((model_inputs["position_ids"].shape[0], sp_size))
             return module(**model_inputs)
 
-        monkeypatch.setattr(adapter, "run_h3_transformer", _runner)
+        monkeypatch.setattr(adapter, "h3_ulysses_forward", _runner)
         video_rows, audio_rows = _rows()
         mask = torch.zeros(_BATCH, _TEXT_LEN, dtype=torch.int32)
         mask[:, :5] = 1

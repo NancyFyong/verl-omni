@@ -59,7 +59,7 @@ __all__ = [
     "ref2va_reference_image_short_edge",
     "validate_ref2va_reference_image_short_edge",
     "pad_h3_layout_for_ulysses",
-    "run_h3_transformer",
+    "h3_ulysses_forward",
     "keyframe_indices_to_anchors",
     "serialize_ref_blocks",
     "build_packed_sequence",
@@ -118,7 +118,7 @@ def pad_h3_layout_for_ulysses(model_inputs: dict[str, Any], sp_size: int | None)
     return padded
 
 
-def _h3_forward_with_attention_mask(
+def _h3_masked_forward(
     self,
     hidden_states: torch.Tensor,
     audio_hidden_states: torch.Tensor,
@@ -195,12 +195,18 @@ def _install_h3_attention_mask_forward(module: torch.nn.Module) -> None:
             "MiniMax H3 SP padding was validated against the Diffusers 0.40 transformer forward; "
             f"found forward={forward_params} and block={block_params}. Revalidate the masked forward."
         )
-    module.forward = types.MethodType(apply_lora_scale("attention_kwargs")(_h3_forward_with_attention_mask), module)
+    module.forward = types.MethodType(apply_lora_scale("attention_kwargs")(_h3_masked_forward), module)
     module._verl_omni_h3_attention_mask_forward = True
 
 
-def run_h3_transformer(module: torch.nn.Module, model_inputs: dict[str, Any], sp_size: int | None = 1):
-    """Run the H3 transformer, padding the packed layout when Actor Ulysses SP needs it."""
+def h3_ulysses_forward(module: torch.nn.Module, model_inputs: dict[str, Any], sp_size: int | None = 1):
+    """Run the H3 transformer, padding the packed layout when Actor Ulysses SP needs it.
+
+    Standard Ulysses shards the packed sequence equally, so non-divisible layouts are
+    padded here and the padding rows are masked as attention keys. Variable-length
+    (Ulysses Anything) training is not supported yet because Diffusers lacks its
+    backward; see https://github.com/huggingface/diffusers/pull/14834.
+    """
     model_inputs = pad_h3_layout_for_ulysses(model_inputs, sp_size)
     if "attention_mask" in model_inputs:
         _install_h3_attention_mask_forward(module)

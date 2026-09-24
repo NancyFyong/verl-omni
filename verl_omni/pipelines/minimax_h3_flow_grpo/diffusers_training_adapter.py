@@ -30,8 +30,8 @@ from vllm_omni.diffusion.models.minimax_h3.denoise_loop import (
 
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     build_ref2va_layout_from_meta,
+    h3_ulysses_forward,
     prepare_h3_processor_files,
-    run_h3_transformer,
 )
 from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
@@ -276,7 +276,7 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
         audio_update_mask = model_inputs.pop("_h3_audio_update_mask")
         target_only_trajectory = bool(model_inputs.pop("_h3_target_only_trajectory"))
         sp_size = model_inputs.pop("_h3_sp_size", 1)
-        video_velocity, audio_velocity = run_h3_transformer(module, model_inputs, sp_size)
+        video_velocity, audio_velocity = h3_ulysses_forward(module, model_inputs, sp_size)
         video = model_inputs["hidden_states"].float()
         audio = model_inputs["audio_hidden_states"].float()
         if target_only_trajectory:

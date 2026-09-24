@@ -27,11 +27,11 @@ from .common import (
     build_ref2va_layout_from_meta,
     build_row_timesteps,
     h3_dit_timestep,
+    h3_ulysses_forward,
     h3_velocity_to_flow_match,
     keyframe_indices_to_anchors,
     pack_video_audio_rows,
     prepare_h3_processor_files,
-    run_h3_transformer,
     split_dual_velocity,
     unpack_video_audio_rows,
     validate_lora_target_modules,
@@ -209,7 +209,7 @@ class MiniMaxH3DiffusionNFT(DiffusionModelBase):
                 condition_video_timestep=max(video_t, 0.999),
                 condition_audio_timestep=1.0 if ref_block_meta is not None else video_t,
             )
-            result = run_h3_transformer(
+            result = h3_ulysses_forward(
                 module,
                 {
                     "hidden_states": full_video_rows,

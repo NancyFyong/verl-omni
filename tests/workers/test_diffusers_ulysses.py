@@ -394,7 +394,7 @@ def test_minimax_h3_standard_ulysses_all_tasks_fwd_bwd(sp_size, backend, aligned
 
     from diffusers import ContextParallelConfig, MiniMaxH3Transformer3DModel
 
-    from verl_omni.pipelines.minimax_h3_diffusion_nft.common import run_h3_transformer
+    from verl_omni.pipelines.minimax_h3_diffusion_nft.common import h3_ulysses_forward
 
     ulysses_device_mesh = init_device_mesh(
         device_type=device,
@@ -432,7 +432,7 @@ def test_minimax_h3_standard_ulysses_all_tasks_fwd_bwd(sp_size, backend, aligned
     no_sp_losses = []
     for task in ("t2va", "fl2va", "ref2va"):
         model_inputs = _minimax_h3_inputs(task, device, aligned)
-        output_sp = run_h3_transformer(module_sp, model_inputs, sp_size)
+        output_sp = h3_ulysses_forward(module_sp, model_inputs, sp_size)
         output_no_sp = module_no_sp(**model_inputs)
         assert len(output_sp) == len(output_no_sp) == 2
         for actual, expected in zip(output_sp, output_no_sp, strict=True):
