@@ -1,29 +1,47 @@
 #!/usr/bin/env bash
-# DEPRECATED (v0): superseded by run_minimax_h3_t2va_lora_v1.sh (V1 sync, the default since v0.3.0).
-# MiniMax H3 T2VA LoRA FlowGRPO with CLAP and ImageBind rewards.
+# MiniMax H3 Ref2VA LoRA FlowGRPO (V1 trainer: TransferQueue + ReplayBuffer + sync mode).
+#
+# This is the V1 sync counterpart of run_minimax_h3_ref2va_lora.sh. It uses
+# `verl_omni.trainer.main_diffusion_v1` with `trainer.use_v1=true` and
+# `trainer.v1.trainer_mode=sync`. Training hyperparameters (batch 32 x n=8,
+# TP=2, 256x384x121, micro 1, SDE [0,8] size 3, noise 0.8) are aligned with
+# run_minimax_h3_fl2va_lora_v1.sh; Ref2VA-specific knobs (dual-DiT actor under
+# transformer_ref, reference-image short edge, 12288-token media budget,
+# video_flow_shift) follow the V0 Ref2VA recipe.
 set -x
 
 export WANDB_MODE=${WANDB_MODE:-online}
+export RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
-WORKSPACE=${WORKSPACE:-$HOME}
-MODEL_PATH=${MODEL_PATH:-$WORKSPACE/models/MiniMax-H3/FL2VA}
-DATA_DIR=${DATA_DIR:-$WORKSPACE/data/vid_prompt/verl_omni}
-CLAP_MODEL_PATH=${CLAP_MODEL_PATH:-laion/larger_clap_general}
-IMAGEBIND_MODEL_PATH=${IMAGEBIND_MODEL_PATH:-.checkpoints/imagebind_huge.pth}
-ACTOR_CONFIG_PATH=${ACTOR_CONFIG_PATH:-$(dirname "$MODEL_PATH")/transformer}
+: "${DATA_DIR:?Set DATA_DIR to the parquet directory produced by prepare_ref2va_data.py}"
+if [[ -z "${MODEL_PATH:-}" || ! -d "$MODEL_PATH/Ref2VA" || ! -d "$MODEL_PATH/transformer_ref" ]]; then
+    echo "MODEL_PATH must contain Ref2VA/ rollout weights and transformer_ref/ Actor weights (got: '${MODEL_PATH:-<unset>}')" >&2
+    exit 1
+fi
+
 NUM_GPUS=${NUM_GPUS:-8}
 ROLLOUT_TP=${ROLLOUT_TP:-2}
+if ((ROLLOUT_TP <= 0 || NUM_GPUS % ROLLOUT_TP != 0)); then
+  echo "NUM_GPUS ($NUM_GPUS) must be a positive multiple of ROLLOUT_TP ($ROLLOUT_TP)." >&2
+  exit 1
+fi
 TEXT_ENCODER_TP=${TEXT_ENCODER_TP:-$ROLLOUT_TP}
+CLAP_MODEL_PATH=${CLAP_MODEL_PATH:-laion/larger_clap_general}
+IMAGEBIND_MODEL_PATH=${IMAGEBIND_MODEL_PATH:-.checkpoints/imagebind_huge.pth}
 REWARD_DEVICE=${REWARD_DEVICE:-cuda}
 REWARD_NUM_WORKERS=${REWARD_NUM_WORKERS:-1}
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-100}
-ASPECT_RATIO=${ASPECT_RATIO:-16:9}
 HEIGHT=${HEIGHT:-256}
 WIDTH=${WIDTH:-384}
 NUM_FRAMES=${NUM_FRAMES:-121}
 INFER_STEPS=${INFER_STEPS:-10}
 VAL_HEIGHT=${VAL_HEIGHT:-512}
 VAL_WIDTH=${VAL_WIDTH:-768}
+MAX_PROMPT_EMBEDS=${MAX_PROMPT_EMBEDS:-12288}
+REF_IMAGE_SHORT_EDGE=${REF_IMAGE_SHORT_EDGE:-512}
+VAL_REF_IMAGE_SHORT_EDGE=${VAL_REF_IMAGE_SHORT_EDGE:-768}
+export REF_IMAGE_SHORT_EDGE
 
 train_path=$DATA_DIR/train.parquet
 test_path=$DATA_DIR/test.parquet
@@ -48,8 +66,7 @@ exec > >(tee -a "$log_file") 2>&1
 
 h3_lora_targets="['to_q','to_k','to_v','to_out.0','ff.net.0.proj','ff.net.2']"
 
-python3 -m verl_omni.trainer.main_diffusion \
-    trainer.use_v1=false \
+python3 -m verl_omni.trainer.main_diffusion_v1 \
     data.train_files=$train_path \
     data.val_files=$test_path \
     data.train_batch_size=32 \
@@ -59,10 +76,12 @@ python3 -m verl_omni.trainer.main_diffusion \
     data.seed=42 \
     algorithm.adv_estimator=flow_grpo \
     algorithm.global_std=True \
-    actor_rollout_ref.model.path=$MODEL_PATH \
-    actor_rollout_ref.model.config_path=$ACTOR_CONFIG_PATH \
+    actor_rollout_ref.model.path="$MODEL_PATH/Ref2VA" \
+    actor_rollout_ref.model.tokenizer_path="$MODEL_PATH/Ref2VA/tokenizer" \
+    actor_rollout_ref.model.config_path="$MODEL_PATH/transformer_ref" \
+    +actor_rollout_ref.model.architecture=MiniMaxH3Pipeline \
+    actor_rollout_ref.model.external_lib=verl_omni.pipelines.minimax_h3_flow_grpo \
     actor_rollout_ref.model.algorithm=flow_grpo \
-    actor_rollout_ref.model.transformer_subfolder=transformer \
     actor_rollout_ref.model.attn_backend=_flash_3_varlen_hub \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.model.lora_rank=64 \
@@ -81,22 +100,27 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.rollout.name=vllm_omni \
     actor_rollout_ref.rollout.rollout_attn_backend=FLASH_ATTN_3_HUB \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP \
-    actor_rollout_ref.rollout.text_encoder_tp_size=$TEXT_ENCODER_TP \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.text_encoder_tp_size=$TEXT_ENCODER_TP \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.enable_cpu_offload=True \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.stage_init_timeout=1800 \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.init_timeout=3600 \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.seed=42 \
     actor_rollout_ref.rollout.agent.num_workers=$((NUM_GPUS / ROLLOUT_TP)) \
     actor_rollout_ref.rollout.agent.default_agent_loop=minimax_h3_diffusion_single_turn_agent \
-    actor_rollout_ref.rollout.max_prompt_embed_length=1024 \
+    actor_rollout_ref.rollout.max_prompt_embed_length=$MAX_PROMPT_EMBEDS \
     actor_rollout_ref.rollout.load_format=safetensors \
     actor_rollout_ref.rollout.calculate_log_probs=True \
+    actor_rollout_ref.rollout.pipeline.task=ref2va \
     actor_rollout_ref.rollout.pipeline.height=$HEIGHT \
     actor_rollout_ref.rollout.pipeline.width=$WIDTH \
-    actor_rollout_ref.rollout.pipeline.aspect_ratio=${ASPECT_RATIO} \
     actor_rollout_ref.rollout.pipeline.num_frames=$NUM_FRAMES \
     actor_rollout_ref.rollout.pipeline.frame_rate=24 \
     actor_rollout_ref.rollout.pipeline.num_inference_steps=$INFER_STEPS \
     actor_rollout_ref.rollout.pipeline.true_cfg_scale=1.0 \
-    actor_rollout_ref.rollout.pipeline.max_sequence_length=1024 \
+    actor_rollout_ref.rollout.pipeline.max_sequence_length=$MAX_PROMPT_EMBEDS \
+    actor_rollout_ref.rollout.pipeline.reference_image_short_edge=$REF_IMAGE_SHORT_EDGE \
+    actor_rollout_ref.rollout.pipeline.video_flow_shift=12.0 \
     +actor_rollout_ref.rollout.pipeline.output_type=np \
     actor_rollout_ref.rollout.val_kwargs.pipeline.height=$VAL_HEIGHT \
     actor_rollout_ref.rollout.val_kwargs.pipeline.width=$VAL_WIDTH \
@@ -104,7 +128,10 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.rollout.val_kwargs.pipeline.frame_rate=24.0 \
     actor_rollout_ref.rollout.val_kwargs.pipeline.num_inference_steps=40 \
     actor_rollout_ref.rollout.val_kwargs.pipeline.true_cfg_scale=1.0 \
+    actor_rollout_ref.rollout.val_kwargs.pipeline.max_sequence_length=$MAX_PROMPT_EMBEDS \
+    actor_rollout_ref.rollout.val_kwargs.pipeline.reference_image_short_edge=$VAL_REF_IMAGE_SHORT_EDGE \
     +actor_rollout_ref.rollout.val_kwargs.pipeline.output_type=pt \
+    actor_rollout_ref.rollout.val_kwargs.algo.noise_level=0.0 \
     actor_rollout_ref.rollout.algo.noise_level=0.8 \
     actor_rollout_ref.rollout.algo.sde_type=cps \
     actor_rollout_ref.rollout.algo.sde_window_range='[0,8]' \
@@ -133,11 +160,12 @@ python3 -m verl_omni.trainer.main_diffusion \
     reward.aggregation=weighted_sum \
     trainer.logger='["console","wandb"]' \
     trainer.project_name=flow_grpo \
-    trainer.experiment_name=minimax_h3_t2va_lora_gpu \
+    trainer.experiment_name=minimax_h3_ref2va_lora_v1_gpu \
     trainer.default_local_dir=$checkpoint_dir \
     trainer.validation_data_dir=$output_dir/validation_data \
     trainer.rollout_data_dir=$output_dir/rollout_data \
     trainer.rollout_data_save_freq=10 \
+    trainer.rollout_data_max_samples=8 \
     trainer.log_val_generations=8 \
     trainer.video_fps=24 \
     trainer.val_before_train=True \
@@ -147,4 +175,6 @@ python3 -m verl_omni.trainer.main_diffusion \
     trainer.max_actor_ckpt_to_keep=1 \
     trainer.test_freq=10 \
     trainer.total_epochs=15 \
-    trainer.total_training_steps=$TOTAL_TRAINING_STEPS "$@"
+    trainer.total_training_steps=$TOTAL_TRAINING_STEPS \
+    trainer.use_v1=true \
+    trainer.v1.trainer_mode=sync "$@"
