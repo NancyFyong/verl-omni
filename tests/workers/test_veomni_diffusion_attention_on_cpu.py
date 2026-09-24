@@ -64,22 +64,24 @@ def test_qwen_image_uses_the_requested_backend(no_kernel_download, monkeypatch, 
 
     monkeypatch.setattr(_AttentionBackendRegistry, "_active_backend", AttentionBackendName.NATIVE)
     model = _tiny_qwen_image()
-    veomni_patch._apply_qwen_image_attention_backend(model, attn_implementation)
+    veomni_patch._apply_attention_backend(model, attn_implementation)
     assert _backend(model) == backend
     # Only this model switches: diffusers' process-wide default stays as it was.
     assert _AttentionBackendRegistry._active_backend == AttentionBackendName.NATIVE
 
 
 @pytest.mark.parametrize("attn_implementation", ["sdpa", "flash_attention_2", "flash_attention_3", "flex_attention"])
-def test_qwen_image_rejects_backends_that_would_be_dropped_or_mask_unsafe(attn_implementation):
-    with pytest.raises(ValueError, match="not supported for Qwen-Image"):
-        veomni_patch._apply_qwen_image_attention_backend(_tiny_qwen_image(), attn_implementation)
+@pytest.mark.parametrize("make_model", [_tiny_qwen_image, lambda: torch.nn.Linear(4, 4)], ids=["qwen_image", "other"])
+def test_names_outside_the_allowlist_are_rejected_for_every_model(make_model, attn_implementation):
+    with pytest.raises(ValueError, match="not supported by the VeOmni diffusion engine"):
+        veomni_patch._apply_attention_backend(make_model(), attn_implementation)
 
 
-def test_other_dits_keep_veomni_attention_selection():
-    """Wan / MiniMax H3 / LTX read attn_implementation inside VeOmni; the engine must not touch them."""
-    model = torch.nn.Sequential(torch.nn.Linear(4, 4))
-    veomni_patch._apply_qwen_image_attention_backend(model, "flash_attention_2")
+@pytest.mark.parametrize("attn_implementation", ["eager", "flash_attention_2_hub", "flash_attention_3_hub"])
+def test_other_dits_keep_veomni_attention_selection(monkeypatch, attn_implementation):
+    """Wan / MiniMax H3 / LTX read allowlisted names inside VeOmni; the engine must not touch them."""
+    _set_veomni_hub_support(monkeypatch, True)
+    veomni_patch._apply_attention_backend(torch.nn.Linear(4, 4), attn_implementation)
 
 
 def _set_veomni_hub_support(monkeypatch, supported: bool):
@@ -120,4 +122,4 @@ def test_other_dits_reject_hub_names_the_installed_veomni_cannot_parse(monkeypat
     """Without this, Wan & co. would silently train with eager attention."""
     _set_veomni_hub_support(monkeypatch, False)
     with pytest.raises(ValueError, match="requires a VeOmni release with Hub attention support"):
-        veomni_patch._apply_qwen_image_attention_backend(torch.nn.Linear(4, 4), "flash_attention_3_hub")
+        veomni_patch._apply_attention_backend(torch.nn.Linear(4, 4), "flash_attention_3_hub")

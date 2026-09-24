@@ -47,7 +47,7 @@ from verl_omni.workers.config import (
     VeOmniDiffusionOptimizerConfig,
 )
 from verl_omni.workers.engine.veomni.lora_utils import _reject_veomni_moe_expert_lora, _validate_veomni_lora_support
-from verl_omni.workers.engine.veomni.patch import _apply_qwen_image_attention_backend, _veomni_attn_implementation
+from verl_omni.workers.engine.veomni.patch import _apply_attention_backend, _veomni_attn_implementation
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -296,7 +296,7 @@ class VeOmniDiffusionEngine(BaseEngine):
         self.veomni_trainer = self._build_veomni_dit_trainer()
         veomni_base = self.veomni_trainer.base
         BaseTrainer._build_model(veomni_base)
-        _apply_qwen_image_attention_backend(veomni_base.model, self.engine_config.attn_implementation)
+        _apply_attention_backend(veomni_base.model, self.engine_config.attn_implementation)
         if self._is_lora:
             # Wrap the model before parallelization; otherwise no adapter is injected.
             BaseTrainer._freeze_model_module(veomni_base)

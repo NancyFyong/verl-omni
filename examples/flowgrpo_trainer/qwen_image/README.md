@@ -18,8 +18,9 @@ The recipe mirrors `run_qwen_image_ocr_lora.sh` and replaces the actor and refer
 It keeps vLLM-Omni for rollout and uses explicit LoRA target modules because VeOmni does not support the
 `all-linear` shorthand. It runs the legacy (v0) trainer; VeOmni LoRA has not been validated with the V1 trainer.
 With VeOmni, actor and reference attention come from `veomni_config.attn_implementation`, not
-`model.attn_backend`. Qwen-Image accepts `eager`, `flash_attention_2_hub`, and
-`flash_attention_3_hub` (the recipe default, matching the rollout's `FLASH_ATTN_3_HUB`).
+`model.attn_backend`. The VeOmni engine accepts `eager`, `flash_attention_2_hub`, and
+`flash_attention_3_hub` for every model (the recipe uses `flash_attention_3_hub`, matching the rollout's
+`FLASH_ATTN_3_HUB`).
 
 The tiny LoRA smoke is a standalone script and is not part of the GPU smoke CI:
 
