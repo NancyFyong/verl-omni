@@ -22,6 +22,7 @@ import pytest
 import torch
 
 import verl_omni.workers.engine.veomni.diffusion_impl as veomni_impl
+import verl_omni.workers.engine.veomni.lora_utils as veomni_lora_utils
 from tests.workers.veomni_lora_helpers import export_veomni_params, make_veomni_engine
 from verl_omni.workers.config.diffusion import DiffusionModelConfig
 
@@ -321,49 +322,49 @@ def _model_config(**overrides):
 
 
 def test_validation_accepts_the_supported_lora_setup():
-    veomni_impl._validate_veomni_lora_support(_model_config())
+    veomni_lora_utils._validate_veomni_lora_support(_model_config())
 
 
 @pytest.mark.parametrize("value", [True, "true", "True", "kaiming"])
 def test_validation_accepts_every_spelling_of_kaiming_init(value):
-    veomni_impl._validate_veomni_lora_support(_model_config(lora_init_weights=value))
+    veomni_lora_utils._validate_veomni_lora_support(_model_config(lora_init_weights=value))
 
 
 def test_validation_rejects_merge():
     with pytest.raises(NotImplementedError, match="merge=True"):
-        veomni_impl._validate_veomni_lora_support(_model_config(lora={"merge": True}))
+        veomni_lora_utils._validate_veomni_lora_support(_model_config(lora={"merge": True}))
 
 
 def test_validation_rejects_named_policy_state_adapters():
     """VeOmniLoraModel is single-adapter, so old/EMA policy states cannot exist."""
     with pytest.raises(NotImplementedError, match="policy_state_adapters"):
-        veomni_impl._validate_veomni_lora_support(_model_config(policy_state_adapters=("default", "old")))
+        veomni_lora_utils._validate_veomni_lora_support(_model_config(policy_state_adapters=("default", "old")))
 
 
 def test_validation_accepts_the_logical_reference_policy_state():
     """``reference`` is served by disable_adapter, not by a second adapter."""
-    veomni_impl._validate_veomni_lora_support(_model_config(policy_state_adapters=("default", "reference")))
+    veomni_lora_utils._validate_veomni_lora_support(_model_config(policy_state_adapters=("default", "reference")))
 
 
 def test_validation_rejects_lora_dtype():
     with pytest.raises(NotImplementedError, match="lora_dtype"):
-        veomni_impl._validate_veomni_lora_support(_model_config(lora_dtype="float32"))
+        veomni_lora_utils._validate_veomni_lora_support(_model_config(lora_dtype="float32"))
 
 
 def test_validation_rejects_target_parameters():
     with pytest.raises(NotImplementedError, match="target_parameters"):
-        veomni_impl._validate_veomni_lora_support(_model_config(target_parameters=["experts.gate_up_proj"]))
+        veomni_lora_utils._validate_veomni_lora_support(_model_config(target_parameters=["experts.gate_up_proj"]))
 
 
 def test_validation_rejects_gaussian_init():
     """The verl-omni default; VeOmni would silently Kaiming-init instead."""
     with pytest.raises(NotImplementedError, match="lora_init_weights"):
-        veomni_impl._validate_veomni_lora_support(_model_config(lora_init_weights="gaussian"))
+        veomni_lora_utils._validate_veomni_lora_support(_model_config(lora_init_weights="gaussian"))
 
 
 def test_validation_ignores_init_when_loading_an_adapter():
     """Loaded adapter weights replace the initialization, including the gaussian default."""
-    veomni_impl._validate_veomni_lora_support(
+    veomni_lora_utils._validate_veomni_lora_support(
         _model_config(lora_init_weights="gaussian", lora_adapter_path="/tmp/adapter")
     )
 
@@ -379,11 +380,11 @@ def test_build_rejects_moe_expert_lora():
     model = _lora_module()
     model.get_base_model().experts = _Experts()
     with pytest.raises(NotImplementedError, match="MoE expert LoRA"):
-        veomni_impl._reject_veomni_moe_expert_lora(model)
+        veomni_lora_utils._reject_veomni_moe_expert_lora(model)
 
 
 def test_build_accepts_dense_lora():
-    veomni_impl._reject_veomni_moe_expert_lora(_lora_module())
+    veomni_lora_utils._reject_veomni_moe_expert_lora(_lora_module())
 
 
 def test_veomni_really_only_implements_kaiming_init():
