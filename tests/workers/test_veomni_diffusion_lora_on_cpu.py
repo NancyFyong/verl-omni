@@ -21,6 +21,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import torch
 
+# The engine imports veomni, which the CPU CI does not install.
+pytest.importorskip("veomni")
 import verl_omni.workers.engine.veomni.diffusion_impl as veomni_impl
 import verl_omni.workers.engine.veomni.lora_utils as veomni_lora_utils
 from tests.workers.veomni_lora_helpers import export_veomni_params, make_veomni_engine

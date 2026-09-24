@@ -18,6 +18,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+# The engine imports veomni, which the CPU CI does not install.
+pytest.importorskip("veomni")
 import verl_omni.workers.engine.veomni.patch as veomni_patch
 from tests.workers.veomni_lora_helpers import make_veomni_engine
 
