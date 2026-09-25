@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # MiniMax H3 T2VA LoRA FlowGRPO with the VeOmni actor engine.
-set -euo pipefail
+set -euxo pipefail
 
 export WANDB_MODE=${WANDB_MODE:-online}
 
@@ -59,7 +59,10 @@ fi
 
 output_dir=${OUTPUT_DIR:-$repo_root/outputs/$script_name}
 checkpoint_dir=$output_dir/checkpoints
-mkdir -p "$checkpoint_dir"
+run_timestamp=$(date +"%Y%m%d_%H%M")
+log_file=$output_dir/logs/$run_timestamp/${NODE_RANK:-0}.log
+mkdir -p "$checkpoint_dir" "$(dirname "$log_file")"
+exec > >(tee -a "$log_file") 2>&1
 
 h3_lora_targets="['qkv_proj','out_proj','fc1','fc2']"
 
@@ -168,4 +171,5 @@ python3 -m verl_omni.trainer.main_diffusion \
     trainer.max_actor_ckpt_to_keep=1 \
     trainer.test_freq=10 \
     trainer.total_epochs=15 \
-    trainer.total_training_steps=$TOTAL_TRAINING_STEPS "$@"
+    trainer.total_training_steps=$TOTAL_TRAINING_STEPS \
+    "$@"

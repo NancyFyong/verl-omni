@@ -204,6 +204,8 @@ bash examples/flowgrpo_trainer/minimax_h3/run_minimax_h3_t2va_lora.sh \
 These launchers use VeOmni **0.1.12** and the native fused H3 DiT with
 vLLM-Omni rollout. VeOmni main runtime migration and multi-sample Actor
 packing are separate work; keep Actor micro-batch size and Ulysses SP at 1.
+Each launcher defines its full training command and writes timestamped logs
+under `OUTPUT_DIR/logs`.
 
 ```bash
 uv pip install veomni==0.1.12 --no-deps
@@ -229,8 +231,8 @@ config location. LoRA targets are `qkv_proj`, `out_proj`, `fc1`, and `fc2`;
 the sync adapter expands them into vLLM-Omni's logical Q/K/V and GEGLU slices
 and rejects partially bound updates.
 
-FL2VA fixes frame zero in both training and validation. Ref2VA retains its
-2048-pixel reference short edge, 12288-token embedding budget and video flow
+FL2VA fixes frame zero in both training and validation. Ref2VA uses a
+512-pixel reference short edge, 12288-token embedding budget and video flow
 shift of 12; its `MODEL_PATH` is the repository root. All three scripts use
 `NUM_GPUS`; Ref2VA defaults to rollout/text-encoder TP 4, the others to TP 2.
 Trailing Hydra overrides take precedence over recipe defaults.
@@ -243,7 +245,7 @@ not change global attention selection or fall back silently when a kernel
 is unavailable. `MINIMAX_H3_ATTENTION_IMPLEMENTATION` does not select the
 patched Actor backend; use `veomni_config.attn_implementation` instead.
 
-The bridge has a removal TODO tied to
+The bridge in `verl_omni/workers/engine/veomni/patch.py` has a removal TODO tied to
 [VeOmni #1239](https://github.com/ByteDance-Seed/VeOmni/pull/1239): remove it
 once the required VeOmni dependency includes that fix and this integration
 uses the native attention setup. The separate Qwen/Hub compatibility shim
@@ -403,7 +405,7 @@ Common environment overrides are:
 | `ROLLOUT_TP` | vLLM-Omni DiT tensor parallel size |
 | `TEXT_ENCODER_TP` | H3 text-encoder tensor parallel size |
 | `MAX_PROMPT_EMBEDS` | Prompt/reference-row padding cap; defaults to 12288 |
-| `REF_IMAGE_SHORT_EDGE` | Ref2VA training image short edge; defaults to 2048 |
+| `REF_IMAGE_SHORT_EDGE` | Ref2VA training image short edge; defaults to 512 for VeOmni, 2048 for FSDP |
 | `VAL_REF_IMAGE_SHORT_EDGE` | Ref2VA validation image short edge; defaults to the training value |
 | `REWARD_NUM_WORKERS` | Number of reward workers |
 | `REWARD_DEVICE` | Reward device type, such as `cuda` or `npu` |

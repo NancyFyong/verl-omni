@@ -78,6 +78,11 @@ def test_veomni_launchers_preserve_paths_task_overrides_and_exit_status(recipe_e
     argv = json.loads(Path(recipe_env["ARGV_FILE"]).read_text())
     assert argv[:2] == ["-m", "verl_omni.trainer.main_diffusion"]
     assert argv[-1] == override
+    recipe_keys = [arg.lstrip("+").split("=", 1)[0] for arg in argv[2:-1]]
+    assert len(recipe_keys) == len(set(recipe_keys))
+    logs = list(Path(recipe_env["OUTPUT_DIR"]).glob("logs/*/*.log"))
+    assert len(logs) == 1
+    assert "verl_omni.trainer.main_diffusion" in logs[0].read_text()
     options = dict(arg.lstrip("+").split("=", 1) for arg in argv[2:])
     partition = "Ref2VA" if task == "ref2va" else "FL2VA"
     model = f"{recipe_env['MODEL_ROOT']}/{partition}"
@@ -107,12 +112,26 @@ def test_veomni_launchers_preserve_paths_task_overrides_and_exit_status(recipe_e
             if task == "fl2va":
                 assert options[f"actor_rollout_ref.rollout.{phase}.frame_indices"] == "[0]"
             else:
-                assert options[f"actor_rollout_ref.rollout.{phase}.reference_image_short_edge"] == "2048"
+                assert options[f"actor_rollout_ref.rollout.{phase}.reference_image_short_edge"] == "512"
                 assert options[f"actor_rollout_ref.rollout.{phase}.max_sequence_length"] == "12288"
         if task == "ref2va":
             assert options["actor_rollout_ref.rollout.max_prompt_embed_length"] == "12288"
             assert options["actor_rollout_ref.rollout.pipeline.video_flow_shift"] == "12.0"
             assert options["actor_rollout_ref.rollout.pipeline.num_frames"] == "96"
+
+
+@pytest.mark.parametrize("val_edge", [None, "1024"])
+def test_ref2va_launcher_preserves_reference_size_overrides(recipe_env, val_edge):
+    recipe_env["REF_IMAGE_SHORT_EDGE"] = "768"
+    recipe_env.pop("VAL_REF_IMAGE_SHORT_EDGE", None)
+    if val_edge is not None:
+        recipe_env["VAL_REF_IMAGE_SHORT_EDGE"] = val_edge
+    result = _run("ref2va", recipe_env)
+    assert result.returncode == 0, result.stderr
+    argv = json.loads(Path(recipe_env["ARGV_FILE"]).read_text())
+    options = dict(arg.lstrip("+").split("=", 1) for arg in argv[2:])
+    assert options["actor_rollout_ref.rollout.pipeline.reference_image_short_edge"] == "768"
+    assert options["actor_rollout_ref.rollout.val_kwargs.pipeline.reference_image_short_edge"] == (val_edge or "768")
 
 
 @pytest.mark.parametrize("task", ["t2va", "fl2va", "ref2va"])
