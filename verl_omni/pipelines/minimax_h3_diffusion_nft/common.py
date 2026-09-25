@@ -24,6 +24,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from verl_omni.pipelines.rollout_request import prompt_ids_from_payload
+
 VIDEO_ROW_WIDTH = 96
 AUDIO_ROW_WIDTH = 32
 LATENT_META_WIDTH = 6
@@ -553,7 +555,7 @@ def prepare_h3_token_id_prompt(request: Any) -> torch.Tensor | None:
     if not isinstance(custom_prompt, dict):
         return None
 
-    token_ids = custom_prompt.get("prompt_token_ids")
+    token_ids = prompt_ids_from_payload(custom_prompt)
     if token_ids is None:
         return None
     extra_args = getattr(getattr(request, "sampling_params", None), "extra_args", None) or {}
@@ -566,7 +568,7 @@ def prepare_h3_token_id_prompt(request: Any) -> torch.Tensor | None:
 
     prompt_ids = torch.as_tensor(token_ids, dtype=torch.long).detach().cpu().reshape(-1)
     if prompt_ids.numel() == 0:
-        raise ValueError("MiniMax H3 requires non-empty prompt_token_ids.")
+        raise ValueError("MiniMax H3 requires non-empty prompt_ids.")
     custom_prompt["prompt"] = "[pretokenized]"
     return prompt_ids
 

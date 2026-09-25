@@ -47,57 +47,12 @@ from verl_omni.workers.config import (
     VeOmniDiffusionEngineConfig,
     VeOmniDiffusionOptimizerConfig,
 )
+from verl_omni.workers.engine.veomni.lora_utils import _reject_veomni_moe_expert_lora, _validate_veomni_lora_support
+from verl_omni.workers.engine.veomni.patch import _apply_attention_backend, _veomni_attn_implementation
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
-
-
-# veomni.lora implements Kaiming-uniform A / zero B only; other PEFT spellings are ignored.
-_VEOMNI_SUPPORTED_LORA_INIT = ("true", "kaiming")
-
-
-def _validate_veomni_lora_support(model_config: DiffusionModelConfig) -> None:
-    """Reject LoRA settings that ``veomni.lora`` would silently ignore."""
-    if model_config.lora.get("merge", False):
-        raise NotImplementedError(
-            "VeOmni diffusion backend does not support model.lora.merge=True yet; "
-            "use adapter-only sync (model.lora.merge=False)."
-        )
-
-    policy_state_adapters = tuple(model_config.policy_state_adapters or ())
-    if policy_state_adapters not in ((), ("default",)):
-        raise NotImplementedError(
-            f"VeOmni diffusion backend supports the 'default' adapter only "
-            f"(veomni.lora.VeOmniLoraModel has no add_adapter/set_adapter); got "
-            f"policy_state_adapters={policy_state_adapters}. Old/EMA-policy algorithms "
-            "(e.g. diffusion_nft with rollout.rollout_adapter=old) require "
-            "actor_rollout_ref.actor.strategy=fsdp2."
-        )
-
-    if model_config.lora_dtype is not None:
-        raise NotImplementedError(
-            f"VeOmni diffusion backend does not support model.lora_dtype "
-            f"(got {model_config.lora_dtype!r}); veomni.lora creates adapters in the "
-            "base-weight dtype. Drop lora_dtype or use actor_rollout_ref.actor.strategy=fsdp2."
-        )
-
-    if model_config.target_parameters:
-        raise NotImplementedError(
-            f"VeOmni diffusion backend does not support model.target_parameters "
-            f"(got {model_config.target_parameters!r}); those adapters would be silently "
-            "omitted. Use actor_rollout_ref.actor.strategy=fsdp2 for nn.Parameter LoRA."
-        )
-
-    init_weights = model_config.lora_init_weights
-    if str(init_weights).strip().lower() not in _VEOMNI_SUPPORTED_LORA_INIT:
-        raise NotImplementedError(
-            "VeOmni diffusion backend initializes LoRA with Kaiming-uniform A and zero B; "
-            f"model.lora_init_weights={init_weights!r} cannot be honored and would be "
-            "silently ignored. Set actor_rollout_ref.model.lora_init_weights=true to "
-            "acknowledge Kaiming initialization, or use "
-            f"actor_rollout_ref.actor.strategy=fsdp2 for PEFT's {init_weights!r}."
-        )
 
 
 @EngineRegistry.register(model_type="diffusion_model", backend=["veomni"], device=["cuda"])
@@ -132,8 +87,6 @@ class VeOmniDiffusionEngine(BaseEngine):
         self._is_offload_param = self.engine_config.param_offload
         self._is_offload_optimizer = self.engine_config.optimizer_offload
         self._is_lora = is_lora
-        self._lora_base_synced = False
-        self._lora_adapter_synced = False
 
     @property
     def is_param_offload_enabled(self) -> bool:
@@ -187,6 +140,7 @@ class VeOmniDiffusionEngine(BaseEngine):
         ops_kwargs = {
             name: getattr(self.engine_config, name) for name in ops_fields if hasattr(self.engine_config, name)
         }
+        ops_kwargs["attn_implementation"] = _veomni_attn_implementation(self.engine_config.attn_implementation)
         return OpsImplementationConfig(**ops_kwargs)
 
     def _get_veomni_model_paths(self) -> tuple[str, str]:
@@ -211,7 +165,12 @@ class VeOmniDiffusionEngine(BaseEngine):
 
         target_modules = self.model_config.target_modules
         # VeOmni has no "all-linear" shorthand and otherwise injects zero adapters.
-        if isinstance(target_modules, str) and target_modules == "all-linear":
+        # A loaded adapter rebuilds its targets from adapter_config.json instead.
+        if (
+            self.model_config.lora_adapter_path is None
+            and isinstance(target_modules, str)
+            and target_modules == "all-linear"
+        ):
             raise ValueError(
                 "VeOmni diffusion backend does not support target_modules='all-linear'; "
                 "list the modules explicitly, e.g. "
@@ -338,9 +297,11 @@ class VeOmniDiffusionEngine(BaseEngine):
         self.veomni_trainer = self._build_veomni_dit_trainer()
         veomni_base = self.veomni_trainer.base
         BaseTrainer._build_model(veomni_base)
+        _apply_attention_backend(veomni_base.model, self.engine_config.attn_implementation)
         if self._is_lora:
             # Wrap the model before parallelization; otherwise no adapter is injected.
             BaseTrainer._freeze_model_module(veomni_base)
+            _reject_veomni_moe_expert_lora(veomni_base.model)
         BaseTrainer._build_parallelized_model(veomni_base)
         scheduler = self._build_scheduler()
         if not self.engine_config.forward_only:
@@ -700,19 +661,6 @@ class VeOmniDiffusionEngine(BaseEngine):
         from veomni.lora.state_dict import get_lora_state_dict
 
         peft_model, lora_config = self._get_lora_model_and_config(adapter_name)
-        # A second base sync with no adapter sync in between leaves the rollout on base weights.
-        if not base_sync_done:
-            if getattr(self, "_lora_base_synced", False) and not getattr(self, "_lora_adapter_synced", False):
-                raise RuntimeError(
-                    "VeOmni LoRA was asked for a second base-weight sync without any "
-                    "adapter sync in between; the rollout would keep serving the frozen "
-                    "base policy. Check that the weight-update path recognizes "
-                    "veomni.lora models (VeOmniLoraModel has no peft_config attribute)."
-                )
-            self._lora_base_synced = True
-        else:
-            self._lora_adapter_synced = True
-
         if base_sync_done:
             params = get_lora_state_dict(peft_model, adapter_name=adapter_name or "default", config=lora_config)
             # vLLM only strips base_model.model at the start of a key; keeping it binds no layers.
@@ -781,16 +729,8 @@ class VeOmniDiffusionEngine(BaseEngine):
             return
 
         from veomni.lora.layers import is_lora_linear
-        from veomni.lora.moe_layers import LoraIndependentExperts, LoraSharedExperts
 
-        modules = list(self.module.modules())
-        if any(isinstance(module, LoraIndependentExperts | LoraSharedExperts) for module in modules):
-            raise NotImplementedError(
-                "VeOmni diffusion backend cannot disable MoE expert LoRA; "
-                "the reference policy would reuse the actor's adapter."
-            )
-
-        saved = [(module, module.active_adapter) for module in modules if is_lora_linear(module)]
+        saved = [(module, module.active_adapter) for module in self.module.modules() if is_lora_linear(module)]
         if not saved:
             raise RuntimeError("LoRA is configured but no VeOmni LoRA layers were injected.")
 

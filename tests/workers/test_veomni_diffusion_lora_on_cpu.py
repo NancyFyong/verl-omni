@@ -21,9 +21,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import torch
 
+# The engine imports veomni, which the CPU CI does not install.
+pytest.importorskip("veomni")
 import verl_omni.workers.engine.veomni.diffusion_impl as veomni_impl
+import verl_omni.workers.engine.veomni.lora_utils as veomni_lora_utils
+from tests.workers.veomni_lora_helpers import export_veomni_params, make_veomni_engine
 from verl_omni.workers.config.diffusion import DiffusionModelConfig
-from verl_omni.workers.engine.veomni.diffusion_impl import VeOmniDiffusionEngine
 
 veomni_lora = pytest.importorskip("veomni.lora")
 
@@ -42,33 +45,6 @@ class _ToyTransformer(torch.nn.Module):
         self.proj_out = torch.nn.Linear(8, 8, bias=False)
 
 
-def _make_engine(
-    module=None,
-    *,
-    lora_rank: int = 0,
-    lora_alpha: int = 64,
-    target_modules=None,
-    lora_adapter_path=None,
-    lora: dict | None = None,
-) -> VeOmniDiffusionEngine:
-    """Build an engine without running ``__init__`` (which needs torch.distributed)."""
-    engine = object.__new__(VeOmniDiffusionEngine)
-    engine.module = module
-    engine._is_offload_param = False
-    engine._is_lora = lora_rank > 0 or lora_adapter_path is not None
-    # DiffusionModelConfig.__post_init__ does I/O; set the fields under test directly.
-    model_config = object.__new__(DiffusionModelConfig)
-    object.__setattr__(model_config, "lora_rank", lora_rank)
-    object.__setattr__(model_config, "lora_alpha", lora_alpha)
-    object.__setattr__(model_config, "target_modules", target_modules)
-    object.__setattr__(model_config, "exclude_modules", None)
-    object.__setattr__(model_config, "lora_adapter_path", lora_adapter_path)
-    object.__setattr__(model_config, "lora", lora if lora is not None else {})
-    engine.model_config = model_config
-    engine.engine_config = MagicMock(model_dtype="bf16")
-    return engine
-
-
 def _lora_module(target_modules=("to_q", "to_k")):
     config = veomni_lora.VeOmniLoraConfig(r=4, lora_alpha=8, target_modules=list(target_modules))
     return veomni_lora.VeOmniLoraModel(_ToyTransformer(), config)
@@ -80,13 +56,13 @@ def _lora_module(target_modules=("to_q", "to_k")):
 
 
 def test_lora_config_is_empty_without_lora():
-    engine = _make_engine()
+    engine = make_veomni_engine()
     assert engine._build_veomni_lora_config() == {}
     assert engine.get_lora_peft_config() is None
 
 
 def test_lora_config_maps_verl_omni_fields_to_veomni_names():
-    engine = _make_engine(lora_rank=64, lora_alpha=128, target_modules=["to_q", "to_k"])
+    engine = make_veomni_engine(lora_rank=64, lora_alpha=128, target_modules=["to_q", "to_k"])
 
     config = engine._build_veomni_lora_config()
 
@@ -98,7 +74,7 @@ def test_lora_config_maps_verl_omni_fields_to_veomni_names():
 
 
 def test_lora_config_requires_veomni_0_1_12(monkeypatch):
-    engine = _make_engine(lora_rank=64, target_modules=["to_q"])
+    engine = make_veomni_engine(lora_rank=64, target_modules=["to_q"])
     real_import = builtins.__import__
 
     def import_without_veomni_lora(name, *args, **kwargs):
@@ -112,13 +88,19 @@ def test_lora_config_requires_veomni_0_1_12(monkeypatch):
 
 
 def test_lora_config_forwards_the_adapter_path_for_resume():
-    engine = _make_engine(lora_rank=64, target_modules=["to_q"], lora_adapter_path="/tmp/adapter")
+    engine = make_veomni_engine(lora_rank=64, target_modules=["to_q"], lora_adapter_path="/tmp/adapter")
+    assert engine._build_veomni_lora_config()["lora_adapter"] == "/tmp/adapter"
+
+
+def test_lora_config_allows_all_linear_when_loading_an_adapter():
+    """VeOmni rebuilds the targets from adapter_config.json, so the default target list is unused."""
+    engine = make_veomni_engine(target_modules="all-linear", lora_adapter_path="/tmp/adapter")
     assert engine._build_veomni_lora_config()["lora_adapter"] == "/tmp/adapter"
 
 
 def test_lora_config_rejects_all_linear():
     """VeOmni has no ``all-linear`` shorthand and would inject zero adapters."""
-    engine = _make_engine(lora_rank=64, target_modules="all-linear")
+    engine = make_veomni_engine(lora_rank=64, target_modules="all-linear")
 
     with pytest.raises(ValueError, match="all-linear"):
         engine._build_veomni_lora_config()
@@ -137,19 +119,10 @@ def test_veomni_really_matches_nothing_for_all_linear():
 # --------------------------------------------------------------------------
 
 
-def _export(engine, monkeypatch, **kwargs):
-    monkeypatch.setattr(veomni_impl, "load_model_to_gpu", MagicMock())
-    monkeypatch.setattr(veomni_impl, "offload_model_to_cpu", MagicMock())
-    monkeypatch.setattr(veomni_impl, "get_device_id", lambda: torch.device("cpu"))
-    monkeypatch.setattr(veomni_impl.PrecisionType, "to_dtype", staticmethod(lambda _: torch.float32))
-    generator, peft_config = engine.get_per_tensor_param(**kwargs)
-    return dict(generator), peft_config
-
-
 def test_adapter_sync_exports_peft_formatted_lora_tensors(monkeypatch):
-    engine = _make_engine(_lora_module(), lora_rank=4, target_modules=["to_q", "to_k"])
+    engine = make_veomni_engine(_lora_module(), lora_rank=4, target_modules=["to_q", "to_k"])
 
-    params, peft_config = _export(engine, monkeypatch, base_sync_done=True)
+    params, peft_config = export_veomni_params(engine, monkeypatch, base_sync_done=True)
 
     assert peft_config["peft_type"] == "LORA"
     assert peft_config["r"] == 4
@@ -167,8 +140,8 @@ def test_adapter_sync_keys_resolve_in_actual_diffusion_lora_manager(monkeypatch)
     from vllm.lora.peft_helper import PEFTHelper
     from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 
-    engine = _make_engine(_lora_module(), lora_rank=4, target_modules=["to_q", "to_k"])
-    params, config = _export(engine, monkeypatch, base_sync_done=True)
+    engine = make_veomni_engine(_lora_module(), lora_rank=4, target_modules=["to_q", "to_k"])
+    params, config = export_veomni_params(engine, monkeypatch, base_sync_done=True)
     loaded = LoRAModel.from_lora_tensors(
         lora_model_id=1,
         tensors=params,
@@ -187,7 +160,7 @@ def test_adapter_sync_keys_resolve_in_actual_diffusion_lora_manager(monkeypatch)
 def test_worker_reads_veomni_lora_metadata_and_checksum_without_export():
     from verl_omni.workers.engine_workers import ActorRolloutRefWorker
 
-    engine = _make_engine(_lora_module(), lora_rank=4)
+    engine = make_veomni_engine(_lora_module(), lora_rank=4)
     engine.get_per_tensor_param = MagicMock(side_effect=AssertionError("metadata must not gather weights"))
     worker = object.__new__(ActorRolloutRefWorker)
     worker.role = "actor"
@@ -209,7 +182,7 @@ def test_worker_reads_veomni_lora_metadata_and_checksum_without_export():
 def test_non_naive_worker_sends_veomni_adapters_on_every_update(monkeypatch):
     from verl_omni.workers.engine_workers import ActorRolloutRefWorker
 
-    engine = _make_engine(_lora_module(), lora_rank=4)
+    engine = make_veomni_engine(_lora_module(), lora_rank=4)
     monkeypatch.setattr(veomni_impl, "load_model_to_gpu", MagicMock())
     monkeypatch.setattr(veomni_impl, "get_device_id", lambda: torch.device("cpu"))
     worker = object.__new__(ActorRolloutRefWorker)
@@ -236,7 +209,7 @@ def test_colocated_worker_uses_veomni_lora_fast_path(monkeypatch):
     from tests.workers.test_omni_lora_weight_sync_on_cpu import _fast_path_worker, _run_update
 
     worker = _fast_path_worker()
-    engine = _make_engine(_lora_module(), lora_rank=4)
+    engine = make_veomni_engine(_lora_module(), lora_rank=4)
     monkeypatch.setattr(veomni_impl, "load_model_to_gpu", MagicMock())
     monkeypatch.setattr(veomni_impl, "get_device_id", lambda: torch.device("cpu"))
     worker.actor = SimpleNamespace(engine=engine)
@@ -251,9 +224,9 @@ def test_colocated_worker_uses_veomni_lora_fast_path(monkeypatch):
 
 def test_base_sync_exports_plain_transformer_keys(monkeypatch):
     """The first sync must not leak the LoRA wrapper prefix or ``base_layer``."""
-    engine = _make_engine(_lora_module(), lora_rank=4, target_modules=["to_q", "to_k"])
+    engine = make_veomni_engine(_lora_module(), lora_rank=4, target_modules=["to_q", "to_k"])
 
-    params, peft_config = _export(engine, monkeypatch, base_sync_done=False)
+    params, peft_config = export_veomni_params(engine, monkeypatch, base_sync_done=False)
 
     expected = {f"transformer.{name}" for name in _ToyTransformer().state_dict()}
     assert set(params) == expected
@@ -263,16 +236,16 @@ def test_base_sync_exports_plain_transformer_keys(monkeypatch):
 
 def test_export_fails_closed_when_the_adapter_was_never_injected(monkeypatch):
     """A plain module with LoRA configured means the sync would ship base weights."""
-    engine = _make_engine(_ToyTransformer(), lora_rank=4, target_modules=["to_q"])
+    engine = make_veomni_engine(_ToyTransformer(), lora_rank=4, target_modules=["to_q"])
 
     with pytest.raises(RuntimeError, match="not a LoRA model"):
-        _export(engine, monkeypatch, base_sync_done=True)
+        export_veomni_params(engine, monkeypatch, base_sync_done=True)
 
 
 def test_export_without_lora_keeps_the_full_state_dict(monkeypatch):
-    engine = _make_engine(_ToyTransformer())
+    engine = make_veomni_engine(_ToyTransformer())
 
-    params, peft_config = _export(engine, monkeypatch)
+    params, peft_config = export_veomni_params(engine, monkeypatch)
 
     assert peft_config is None
     assert set(params) == {f"transformer.{name}" for name in _ToyTransformer().state_dict()}
@@ -285,7 +258,7 @@ def test_export_without_lora_keeps_the_full_state_dict(monkeypatch):
 
 def test_disable_adapter_bypasses_the_lora_delta():
     module = _lora_module()
-    engine = _make_engine(module, lora_rank=4, target_modules=["to_q", "to_k"])
+    engine = make_veomni_engine(module, lora_rank=4, target_modules=["to_q", "to_k"])
     linear = module.get_base_model().transformer_blocks[0].to_q
     with torch.no_grad():
         linear.lora_A["default"].weight.fill_(0.3)
@@ -306,7 +279,7 @@ def test_disable_adapter_bypasses_the_lora_delta():
 
 def test_disable_adapter_restores_the_adapter_on_error():
     module = _lora_module()
-    engine = _make_engine(module, lora_rank=4, target_modules=["to_q"])
+    engine = make_veomni_engine(module, lora_rank=4, target_modules=["to_q"])
     linear = module.get_base_model().transformer_blocks[0].to_q
     active = linear.active_adapter
 
@@ -317,14 +290,14 @@ def test_disable_adapter_restores_the_adapter_on_error():
 
 
 def test_disable_adapter_fails_when_lora_was_not_injected():
-    engine = _make_engine(_ToyTransformer(), lora_rank=4, target_modules=["to_q"])
+    engine = make_veomni_engine(_ToyTransformer(), lora_rank=4, target_modules=["to_q"])
     with pytest.raises(RuntimeError, match="no VeOmni LoRA layers"):
         with engine.disable_adapter():
             pass
 
 
 def test_disable_adapter_is_a_no_op_without_lora():
-    engine = _make_engine(_ToyTransformer())
+    engine = make_veomni_engine(_ToyTransformer())
     with engine.disable_adapter():
         pass
 
@@ -343,6 +316,7 @@ def _model_config(**overrides):
         "lora_dtype": None,
         "target_parameters": None,
         "lora_init_weights": "true",
+        "lora_adapter_path": None,
     }
     for name, value in {**defaults, **overrides}.items():
         object.__setattr__(config, name, value)
@@ -350,39 +324,69 @@ def _model_config(**overrides):
 
 
 def test_validation_accepts_the_supported_lora_setup():
-    veomni_impl._validate_veomni_lora_support(_model_config())
+    veomni_lora_utils._validate_veomni_lora_support(_model_config())
 
 
 @pytest.mark.parametrize("value", [True, "true", "True", "kaiming"])
 def test_validation_accepts_every_spelling_of_kaiming_init(value):
-    veomni_impl._validate_veomni_lora_support(_model_config(lora_init_weights=value))
+    veomni_lora_utils._validate_veomni_lora_support(_model_config(lora_init_weights=value))
 
 
 def test_validation_rejects_merge():
     with pytest.raises(NotImplementedError, match="merge=True"):
-        veomni_impl._validate_veomni_lora_support(_model_config(lora={"merge": True}))
+        veomni_lora_utils._validate_veomni_lora_support(_model_config(lora={"merge": True}))
 
 
 def test_validation_rejects_named_policy_state_adapters():
     """VeOmniLoraModel is single-adapter, so old/EMA policy states cannot exist."""
     with pytest.raises(NotImplementedError, match="policy_state_adapters"):
-        veomni_impl._validate_veomni_lora_support(_model_config(policy_state_adapters=("default", "old")))
+        veomni_lora_utils._validate_veomni_lora_support(_model_config(policy_state_adapters=("default", "old")))
+
+
+def test_validation_accepts_the_logical_reference_policy_state():
+    """``reference`` is served by disable_adapter, not by a second adapter."""
+    veomni_lora_utils._validate_veomni_lora_support(_model_config(policy_state_adapters=("default", "reference")))
 
 
 def test_validation_rejects_lora_dtype():
     with pytest.raises(NotImplementedError, match="lora_dtype"):
-        veomni_impl._validate_veomni_lora_support(_model_config(lora_dtype="float32"))
+        veomni_lora_utils._validate_veomni_lora_support(_model_config(lora_dtype="float32"))
 
 
 def test_validation_rejects_target_parameters():
     with pytest.raises(NotImplementedError, match="target_parameters"):
-        veomni_impl._validate_veomni_lora_support(_model_config(target_parameters=["experts.gate_up_proj"]))
+        veomni_lora_utils._validate_veomni_lora_support(_model_config(target_parameters=["experts.gate_up_proj"]))
 
 
 def test_validation_rejects_gaussian_init():
     """The verl-omni default; VeOmni would silently Kaiming-init instead."""
     with pytest.raises(NotImplementedError, match="lora_init_weights"):
-        veomni_impl._validate_veomni_lora_support(_model_config(lora_init_weights="gaussian"))
+        veomni_lora_utils._validate_veomni_lora_support(_model_config(lora_init_weights="gaussian"))
+
+
+def test_validation_ignores_init_when_loading_an_adapter():
+    """Loaded adapter weights replace the initialization, including the gaussian default."""
+    veomni_lora_utils._validate_veomni_lora_support(
+        _model_config(lora_init_weights="gaussian", lora_adapter_path="/tmp/adapter")
+    )
+
+
+def test_build_rejects_moe_expert_lora():
+    """disable_adapter only bypasses dense LoRA layers, so expert LoRA must fail at startup."""
+    from veomni.lora.moe_layers import LoraIndependentExperts
+
+    class _Experts(LoraIndependentExperts):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+
+    model = _lora_module()
+    model.get_base_model().experts = _Experts()
+    with pytest.raises(NotImplementedError, match="MoE expert LoRA"):
+        veomni_lora_utils._reject_veomni_moe_expert_lora(model)
+
+
+def test_build_accepts_dense_lora():
+    veomni_lora_utils._reject_veomni_moe_expert_lora(_lora_module())
 
 
 def test_veomni_really_only_implements_kaiming_init():
@@ -409,26 +413,17 @@ def test_gaussian_default_would_have_reached_the_engine_unnoticed():
 
 def test_export_rejects_a_named_rollout_adapter(monkeypatch):
     """``rollout_adapter=old`` would otherwise raise a bare KeyError mid-training."""
-    engine = _make_engine(_lora_module(), lora_rank=4, target_modules=["to_q", "to_k"])
+    engine = make_veomni_engine(_lora_module(), lora_rank=4, target_modules=["to_q", "to_k"])
 
     with pytest.raises(NotImplementedError, match="'default' adapter only"):
-        _export(engine, monkeypatch, base_sync_done=True, adapter_name="old")
-
-
-def test_export_rejects_a_second_base_sync_without_an_adapter_sync(monkeypatch):
-    """Callers gating on ``peft_config`` never advance past base sync; fail loudly."""
-    engine = _make_engine(_lora_module(), lora_rank=4, target_modules=["to_q", "to_k"])
-
-    _export(engine, monkeypatch, base_sync_done=False)
-    with pytest.raises(RuntimeError, match="second base-weight sync"):
-        _export(engine, monkeypatch, base_sync_done=False)
+        export_veomni_params(engine, monkeypatch, base_sync_done=True, adapter_name="old")
 
 
 def test_export_allows_repeated_adapter_syncs(monkeypatch):
     """The steady-state path: base once, then adapter every step."""
-    engine = _make_engine(_lora_module(), lora_rank=4, target_modules=["to_q", "to_k"])
+    engine = make_veomni_engine(_lora_module(), lora_rank=4, target_modules=["to_q", "to_k"])
 
-    _export(engine, monkeypatch, base_sync_done=False)
+    export_veomni_params(engine, monkeypatch, base_sync_done=False)
     for _ in range(3):
-        params, _ = _export(engine, monkeypatch, base_sync_done=True)
+        params, _ = export_veomni_params(engine, monkeypatch, base_sync_done=True)
         assert params
