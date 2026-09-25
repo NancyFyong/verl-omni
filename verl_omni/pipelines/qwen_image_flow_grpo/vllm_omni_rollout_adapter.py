@@ -53,7 +53,7 @@ from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 from verl_omni.pipelines.rollout_request import prompt_ids_from_payload
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 
-from .common import QwenImageTokenIdPromptMixin, apply_true_cfg, build_img_shapes, coalesce_not_none
+from .common import QwenImageLoRAMixin, QwenImageTokenIdPromptMixin, apply_true_cfg, build_img_shapes, coalesce_not_none
 
 __all__ = ["QwenImagePipelineWithLogProb"]
 
@@ -69,7 +69,7 @@ pipeline_qwen_image.get_qwen_image_post_process_func = get_rollout_post_process_
 
 
 @VllmOmniPipelineBase.register("QwenImagePipeline", algorithm="flow_grpo")
-class QwenImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImagePipeline):
+class QwenImagePipelineWithLogProb(QwenImageLoRAMixin, QwenImageTokenIdPromptMixin, QwenImagePipeline):
     """Rollout pipeline for Qwen-Image that captures per-step log-probabilities.
 
     Extends :class:`~vllm_omni.diffusion.models.qwen_image.QwenImagePipeline`

@@ -32,6 +32,7 @@ from verl_omni.pipelines.diffusion_rollout_output import (
 )
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.qwen_image_flow_grpo.common import (
+    QwenImageLoRAMixin,
     QwenImageTokenIdPromptMixin,
     build_img_shapes,
     coalesce_not_none,
@@ -43,7 +44,7 @@ __all__ = ["QwenImageDiffusionNFTPipeline"]
 
 
 @VllmOmniPipelineBase.register("QwenImagePipeline", algorithm="diffusion_nft")
-class QwenImageDiffusionNFTPipeline(QwenImageTokenIdPromptMixin, QwenImagePipeline):
+class QwenImageDiffusionNFTPipeline(QwenImageLoRAMixin, QwenImageTokenIdPromptMixin, QwenImagePipeline):
     """Rollout pipeline for Qwen-Image used by DiffusionNFT.
 
     DiffusionNFT trains from the final clean latent with a forward-process

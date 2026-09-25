@@ -32,7 +32,7 @@ from verl_omni.pipelines.diffusion_rollout_output import (
     with_visual_artifacts,
 )
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
-from verl_omni.pipelines.qwen_image_flow_grpo.common import apply_true_cfg, build_img_shapes
+from verl_omni.pipelines.qwen_image_flow_grpo.common import QwenImageLoRAMixin, apply_true_cfg, build_img_shapes
 from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 from verl_omni.pipelines.rollout_request import prompt_ids_from_payload
 
@@ -44,7 +44,7 @@ def _coalesce_not_none(value, default):
 
 
 @VllmOmniPipelineBase.register("QwenImagePipeline", algorithm="dpo")
-class QwenImageDPOPipeline(QwenImagePipeline):
+class QwenImageDPOPipeline(QwenImageLoRAMixin, QwenImagePipeline):
     """Rollout pipeline that returns DPO training tensors with generated images."""
 
     #: Declares the primary rollout media stream so downstream consumers read

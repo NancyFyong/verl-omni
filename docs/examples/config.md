@@ -1,6 +1,6 @@
 # Config Explanation
 
-Last updated: 09/14/2026
+Last updated: 09/17/2026
 
 VeRL-Omni builds on [verl](https://github.com/verl-project/verl) and reuses the
 same Hydra config surface for shared RL trainer fields (`data`, FSDP actor /
@@ -75,8 +75,9 @@ algorithm:
 
 ### `actor_rollout_ref.separate` — synchronous resource separation
 
-`actor_rollout_ref.separate` defaults to `false`. When enabled, the legacy synchronous
-diffusion trainer (`trainer.use_v1=false`) places pure Actor workers on the trainer
+`actor_rollout_ref.separate` defaults to `false`. When enabled, the deprecated
+legacy synchronous diffusion trainer (`trainer.use_v1=false`) places pure Actor
+workers on the trainer
 resources and launches rollout/checkpoint workers on a separate Ray resource pool.
 The mode is limited to online policy-gradient training and publishes actor weights once
 before training and once after every logical-batch update.
@@ -110,9 +111,9 @@ standalone rollout GPUs from the Ray cluster.
 `actor_rollout_ref.rollout.agent.num_workers` controls CPU request concurrency; it
 does not allocate rollout GPUs and does not need to match `rollout.n_gpus_per_node`.
 
-This topology is v0-only (`trainer.use_v1=false`). The default CUDA DanceGRPO
-recipe is now the V1 sync launcher (`run_wan22_5b_t2v_hpsv3_v1.sh`); use the
-**deprecated** v0 auto-detect script below when you need
+This topology is v0-only (`trainer.use_v1=false`, deprecated). The default CUDA
+DanceGRPO recipe is now the V1 sync launcher (`run_wan22_5b_t2v_hpsv3_v1.sh`);
+use the **deprecated** v0 auto-detect script below when you need
 `actor_rollout_ref.separate`.
 
 On a CUDA Ray cluster, that v0 recipe forwards trailing Hydra overrides, so the
@@ -145,6 +146,12 @@ actor_rollout_ref:
     transformer_subfolder: transformer
     attn_backend: _flash_3_varlen_hub
     enable_gradient_checkpointing: True
+    use_regional_compile: False
+    regional_compile_options:
+      backend: inductor
+      mode: default
+      fullgraph: False
+      dynamic: True
     lora_rank: 0
     lora_alpha: 64
     lora_init_weights: gaussian
@@ -165,6 +172,8 @@ actor_rollout_ref:
 - `actor_rollout_ref.model.config_path`: Optional transformer config path. If null, backends use `<path>/<transformer_subfolder>`.
 - `actor_rollout_ref.model.transformer_subfolder`: Subfolder with diffusion transformer weights/config (default `transformer`).
 - `actor_rollout_ref.model.attn_backend`: Diffusers attention backend. One of `native`, `_native_npu`, `flash_varlen_hub`, `_flash_3_varlen_hub`. Must stay consistent with `rollout.rollout_attn_backend`.
+- `actor_rollout_ref.model.use_regional_compile`: Compile repeated Diffusers transformer blocks before FSDP2 sharding. This currently requires `actor_rollout_ref.actor.strategy=fsdp2` and `actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=1`.
+- `actor_rollout_ref.model.regional_compile_options`: Keyword arguments forwarded to Diffusers `compile_repeated_blocks` and then to `torch.compile`. By default, `fullgraph=False` permits eager boundaries around code that cannot be compiled, while `dynamic=True` supports input-dependent shapes. Other `torch.compile` keyword arguments can also be supplied after validation for the target workload.
 - `actor_rollout_ref.model.lora_rank`: LoRA rank; `> 0` enables LoRA.
 - `actor_rollout_ref.model.lora_alpha`: LoRA scaling factor.
 - `actor_rollout_ref.model.lora_init_weights`: LoRA init method (default `gaussian`).
@@ -227,7 +236,7 @@ actor_rollout_ref:
 
 Shared PPO / FSDP / optim fields (`ppo_mini_batch_size`, `ppo_epochs`, `optim.lr`, `fsdp_config`, …) follow upstream verl — see the [verl Config Explanation](https://verl.readthedocs.io/en/latest/examples/config.html).
 
-VeOmni engine path (`strategy=veomni`) adds `veomni_config` / VeOmni optimizer fields; see {doc}`../start/install` and the `run_*_veomni.sh` recipes.
+VeOmni engine path (`strategy=veomni`) adds `veomni_config` / VeOmni optimizer fields; see {doc}`../start/engine_backends` and the `run_*_veomni.sh` recipes.
 
 ### `actor_rollout_ref.rollout` — `DiffusionRolloutConfig`
 
@@ -344,8 +353,9 @@ These sit on the diffusion trainer YAML (in addition to shared verl trainer fiel
 - `trainer.video_fps`: FPS for videos written to `rollout_data_dir` / `validation_data_dir` and logged to W&B (image runs ignore this).
 - `trainer.rollout_data_save_freq`: Dump train rollout every N steps (`1` = every step, `<= 0` = never).
 - `trainer.rollout_data_max_samples` / `validation_data_max_samples`: Cap samples dumped per train / val run (`null` = all).
-- `trainer.use_v1`: Use the V1 trainer (TransferQueue + ReplayBuffer). When `false`,
-  the legacy v0 diffusion trainer. Wan2.2 DanceGRPO on CUDA now defaults to V1
+- `trainer.use_v1`: Use the V1 trainer (TransferQueue + ReplayBuffer). Defaults
+  to `true` since v0.3.0; `false` explicitly selects the **deprecated** legacy
+  v0 diffusion trainer for every model. Wan2.2 DanceGRPO on CUDA defaults to V1
   via `run_wan22_5b_t2v_hpsv3_v1.sh`; the v0 auto-detect launcher is deprecated
   for CUDA.
 - `trainer.v1.*`: V1 mode / sampler / async placeholders (`trainer_mode`, `max_off_policy_threshold`, …). See {doc}`../start/diffusion_v1`.

@@ -1,6 +1,6 @@
 # How to Integrate a New Diffusion Model for FlowGRPO Training
 
-Last updated: 09/08/2026.
+Last updated: 09/17/2026.
 
 This guide walks you through everything required to integrate a new diffusion
 model into VeRL-Omni so it can be trained end-to-end with the **FlowGRPO**
@@ -388,6 +388,15 @@ weight sync.  The default is a no-op.  MiniMax H3 overrides it to reject
 ``all-linear`` and keep LoRA on the transformer/refiner blocks its sync path
 can map.
 
+### 3.6 (Optional) `get_fsdp_ignored_module_names`
+
+Override this hook to declare frozen submodule name components to leave
+unsharded under FSDP2; the default is `[]`. Declare a tower whose forward is
+skipped for some micro-batches — an unsharded forward emits no collectives,
+so the skip cannot desync the ranks. Ignored parameters must stay frozen
+(FSDP2 does not synchronize their gradients), and a non-empty list requires
+`strategy=fsdp2`; the engine raises otherwise.
+
 ---
 
 ## Step 4 — Write `vllm_omni_rollout_adapter.py`
@@ -613,7 +622,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     ...  # everything else identical to your diffusers/FSDP2 recipe
 ```
 
-See [`examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_veomni.sh`](../../examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_veomni.sh) for a complete VeOmni recipe that mirrors [`run_qwen_image_ocr.sh`](../../examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr.sh) line-for-line — the diff is only the engine-selection fields. Install instructions for VeOmni alongside vLLM 0.20.2 are in [`docs/start/install.md`](../start/install.md#optional-engine-backends).
+See [`examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_veomni.sh`](../../examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr_veomni.sh) for a complete VeOmni recipe that mirrors [`run_qwen_image_ocr.sh`](../../examples/flowgrpo_trainer/qwen_image/run_qwen_image_ocr.sh) line-for-line — the diff is only the engine-selection fields. Install instructions for VeOmni alongside vLLM 0.28.0 are in [`docs/start/engine_backends.md`](../start/engine_backends.md).
 
 
 #### Mixing override schemas — don't

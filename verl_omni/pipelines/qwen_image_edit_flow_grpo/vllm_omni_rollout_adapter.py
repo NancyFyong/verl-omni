@@ -36,6 +36,7 @@ from verl_omni.pipelines.diffusion_rollout_output import (
 )
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.qwen_image_flow_grpo.common import (
+    QwenImageLoRAMixin,
     QwenImageTokenIdPromptMixin,
     apply_true_cfg,
     coalesce_not_none,
@@ -126,7 +127,7 @@ def _condition_images_for_prompt_encoding(custom_prompt: dict) -> list[Any]:
 
 
 @VllmOmniPipelineBase.register("QwenImageEditPlusPipeline", algorithm="flow_grpo")
-class QwenImageEditPlusPipelineWithLogProb(QwenImageTokenIdPromptMixin, QwenImageEditPlusPipeline):
+class QwenImageEditPlusPipelineWithLogProb(QwenImageLoRAMixin, QwenImageTokenIdPromptMixin, QwenImageEditPlusPipeline):
     """Qwen-Image-Edit-Plus rollout pipeline for FlowGRPO."""
 
     #: Declares the primary rollout media stream so downstream consumers read

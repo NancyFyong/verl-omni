@@ -28,6 +28,7 @@ import ray
 import torch
 import transfer_queue as tq
 from omegaconf import OmegaConf, open_dict
+from packaging.version import InvalidVersion, Version
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 from transfer_queue import KVBatchMeta
@@ -113,6 +114,19 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
+def _tq_supports_checkpoint() -> bool:
+    """Return whether TransferQueue supports saving and loading checkpoints."""
+    try:
+        version_supported = Version(getattr(tq, "__version__", "")) >= Version("0.1.9")
+    except InvalidVersion:
+        return False
+    return (
+        version_supported
+        and callable(getattr(tq, "save_checkpoint", None))
+        and callable(getattr(tq, "load_checkpoint", None))
+    )
+
+
 DIFFUSION_TRAINER_REGISTRY: dict[str, type] = {}
 
 
@@ -166,8 +180,8 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         if self._is_direct_preference:
             if config.algorithm.get("sample_source", "online") == "offline":
                 raise NotImplementedError(
-                    "Diffusion offline DPO stays on the v0 trainer. Use "
-                    "`python -m verl_omni.trainer.main_diffusion` with trainer.use_v1=false."
+                    "Diffusion offline DPO stays on the v0 trainer by design. Use "
+                    "`python -m verl_omni.trainer.main_diffusion` (the legacy v0 entrypoint)."
                 )
             self._loss_fn = get_diffusion_loss_fn(loss_mode)
             self._has_old_adapter = "old" in tuple(
@@ -260,6 +274,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
         self.global_steps += 1
         SkipManager.set_step(self.global_steps)
+        self._reissue_inflight_prompts()
         self.on_train_begin()
         last_val_metrics = None
         while current_epoch < self.config.trainer.total_epochs and self.global_steps <= self.total_training_steps:
@@ -485,6 +500,11 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
         with marked_timer("adv", timing_raw, color="brown"):
             data = self._compute_advantage(data)
+
+        # Zero advantages of rows appended by _balance_batch so the unmasked
+        # FlowGRPO loss mean is not corrupted by duplicated real advantages.
+        # _compute_advantage recomputes advantages, so this must run after it.
+        data = self._zero_pad_row_advantages(data)
 
         with marked_timer("update_actor", timing_raw, color="red"):
             actor_output = self._update_actor(data)
@@ -1213,7 +1233,29 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
         batch_multiple = math.lcm(dp_size, actor_global_mini_batch_size)
         if len(data) % batch_multiple != 0:
-            data, _ = pad_dataproto_to_divisor(data, size_divisor=batch_multiple)
+            # pad_dataproto_to_divisor pads by duplicating real rows, which would
+            # carry real advantages into the unmasked FlowGRPO loss mean and bias
+            # the gradient. Mark the duplicated tail so its advantages can be zeroed
+            # before the actor update (see _zero_pad_row_advantages).
+            data, pad_size = pad_dataproto_to_divisor(data, size_divisor=batch_multiple)
+            is_pad = np.zeros(len(data), dtype=bool)
+            is_pad[-pad_size:] = True
+            data.non_tensor_batch["_balance_is_pad"] = is_pad
+        return data
+
+    def _zero_pad_row_advantages(self, data: DataProto) -> DataProto:
+        """Zero advantages of rows appended by ``_balance_batch``.
+
+        ``_compute_advantage`` recomputes advantages, so this must run after it.
+        Pad rows then contribute nothing to the unmasked ``torch.mean`` loss.
+        No-op when no padding occurred.
+        """
+        is_pad = data.non_tensor_batch.pop("_balance_is_pad", None)
+        if is_pad is None or not is_pad.any():
+            return data
+        advantages = data.batch["advantages"]
+        is_pad = torch.from_numpy(is_pad).to(advantages.device)
+        advantages[is_pad] = 0.0
         return data
 
     def _compute_old_log_prob(self, data: DataProto) -> DataProto:
@@ -1739,6 +1781,12 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         local_mkdir_safe(local_global_step_folder)
         torch.save(self.train_dataloader.state_dict(), os.path.join(local_global_step_folder, "data.pt"))
 
+        if self.trainer_mode != "sync" and _tq_supports_checkpoint():
+            tq.save_checkpoint(
+                os.path.join(local_global_step_folder, "transfer_queue"),
+                metadata={"global_steps": self.global_steps},
+            )
+
         latest = os.path.join(self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt")
         with open(latest, "w") as f:
             f.write(str(self.global_steps))
@@ -1777,3 +1825,63 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             self.train_dataloader.load_state_dict(torch.load(dataloader_path, weights_only=False))
         else:
             logger.warning(f"No dataloader state at {dataloader_path}, starting from scratch")
+
+        if self.trainer_mode != "sync":
+            tq_checkpoint = os.path.join(global_step_folder, "transfer_queue")
+            if not _tq_supports_checkpoint():
+                logger.warning(
+                    "TransferQueue checkpoint recovery is unavailable; async queue state will start empty. "
+                    "TransferQueue >= 0.1.9 with save_checkpoint/load_checkpoint is required."
+                )
+            elif os.path.exists(tq_checkpoint):
+                logger.info(f"Loading TransferQueue state from {tq_checkpoint}")
+                tq.load_checkpoint(tq_checkpoint)
+            else:
+                logger.warning(f"No TransferQueue state at {tq_checkpoint}; async queue state will start empty")
+
+    def _reissue_inflight_prompts(self, partition_id: str = "train") -> int:
+        """Restart checkpointed pending and running prompt groups."""
+        if self.trainer_mode == "sync" or not _tq_supports_checkpoint():
+            return 0
+
+        data = tq.kv_list(partition_id)
+        if not data:
+            return 0
+        items = data.get(partition_id, {})
+        inflight_uids = [
+            key
+            for key, tag in items.items()
+            if tag.get("is_prompt", False) and tag.get("status") in ("pending", "running")
+        ]
+        if not inflight_uids:
+            return 0
+
+        batch = tq.kv_batch_get(keys=inflight_uids, partition_id=partition_id)
+        inflight_uid_set = set(inflight_uids)
+        partial_trajectory_keys = [
+            key
+            for key, tag in items.items()
+            if not tag.get("is_prompt", False) and self._trajectory_uid(key) in inflight_uid_set
+        ]
+        if partial_trajectory_keys:
+            tq.kv_clear(keys=partial_trajectory_keys, partition_id=partition_id)
+
+        tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
+        tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in inflight_uids]
+        from tensordict.tensorclass import NonTensorData
+
+        tq.kv_batch_put(
+            keys=inflight_uids,
+            partition_id=partition_id,
+            tags=tags,
+            fields=batch.select(*[key for key in batch.keys() if not isinstance(batch.get(key), NonTensorData)]),
+        )
+        self.agent_loop_manager.generate_sequences(batch)
+
+        logger.info(
+            "Re-issued %d in-flight prompts for step %d; cleared %d partial trajectories",
+            len(inflight_uids),
+            self.global_steps,
+            len(partial_trajectory_keys),
+        )
+        return len(inflight_uids)
