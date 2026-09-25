@@ -72,6 +72,9 @@ async def check(args):
         external_lib=None,
         enable_prompt_embed_cache=False,
         prompt_embed_cache_size=16,
+        # The checker drives one in-process engine without tensor parallelism.
+        tensor_model_parallel_size=1,
+        text_encoder_tp_size=1,
         step_execution=args.step_execution,
     )
     server = SimpleNamespace(
@@ -157,6 +160,7 @@ async def check(args):
                 _export_video(
                     preview,
                     str(output_dir / f"{index}.mp4"),
+                    fps=preview.spec.fps,
                     audio=result.extra_fields.get("audio"),
                     audio_sample_rate=result.extra_fields.get("audio_sample_rate"),
                 )
