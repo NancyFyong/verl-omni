@@ -1,6 +1,6 @@
 # Config Explanation
 
-Last updated: 09/21/2026
+Last updated: 09/25/2026
 
 VeRL-Omni builds on [verl](https://github.com/verl-project/verl) and reuses the
 same Hydra config surface for shared RL trainer fields (`data`, FSDP actor /
@@ -289,6 +289,14 @@ mapping. No verl patch or TP-field substitution is needed. SP=1 delegates to the
 upstream path; SP>1 is limited to vLLM-Omni diffusion with DP=PP=1 and no
 prefill/decode disaggregation. GPU validation of the new SP/VAE path is still
 pending; CPU resource/routing checks are not performance evidence.
+
+vLLM-Omni's custom-pipeline loader skips its post-construction VAE/SP setup, so
+every registered rollout pipeline applies it after construction. Ulysses/Ring
+requires every declared DiT to define `_sp_plan`, and VAE parallelism requires a
+distributed VAE; unsupported combinations fail at startup instead of being
+ignored. At the pinned vLLM-Omni, Qwen-Image, Wan2.2, LTX-2 and MiniMax-H3 support
+both, Qwen-Image-Edit-Plus supports SP only, SD3 and Bagel support VAE parallelism
+only, and FLUX and Boogu-Image support neither.
 
 For MiniMax-H3, `vae_parallel_mode` must be `tile`, VAE parallel size must be `1`
 or the complete DiT group, CFG parallelism must be `1`, and hybrid Ulysses x Ring

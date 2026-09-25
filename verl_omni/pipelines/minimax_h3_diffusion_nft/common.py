@@ -59,7 +59,6 @@ __all__ = [
     "ref2va_reference_image_short_edge",
     "validate_ref2va_reference_image_short_edge",
     "validate_h3_parallel_config",
-    "apply_h3_parallel_setup",
     "keyframe_indices_to_anchors",
     "serialize_ref_blocks",
     "build_packed_sequence",
@@ -87,26 +86,6 @@ def validate_h3_parallel_config(parallel_config: Any) -> None:
         raise ValueError(f"MiniMax-H3 vae_patch_parallel_size must be 1 or the full DiT group size ({dit_world_size}).")
     if p.text_encoder_tp_size not in (1, dit_world_size) or 8 % p.text_encoder_tp_size:
         raise ValueError("MiniMax-H3 text_encoder_tp_size must be 1 or the full DiT group size and divide 8.")
-
-
-def apply_h3_parallel_setup(pipeline: Any, od_config: Any) -> None:
-    """Apply the VAE and DiT sequence-parallel setup that custom pipeline loading skips."""
-    # TODO: drop once vLLM-Omni's custom_pipeline loader runs initialize_model's post-construction setup.
-    from vllm_omni.diffusion.registry import _apply_sequence_parallel_if_enabled
-
-    parallel_config = od_config.parallel_config
-    if parallel_config.vae_patch_parallel_size > 1:
-        od_config.vae_use_tiling = True
-        pipeline.vae.set_parallel_size(parallel_config.vae_patch_parallel_size, mode=parallel_config.vae_parallel_mode)
-    if od_config.vae_use_tiling:
-        pipeline.vae.use_tiling = True  # H3 tiles by default; only honor an explicit request.
-
-    if parallel_config.sequence_parallel_size <= 1:
-        return
-    _apply_sequence_parallel_if_enabled(pipeline, od_config)
-    for name in pipeline._dit_modules:
-        if getattr(getattr(pipeline, name).sp_prepare, "_hook_registry", None) is None:
-            raise RuntimeError(f"MiniMax-H3 sequence parallelism hooks were not applied to {name}.")
 
 
 def validate_ref2va_reference_image_short_edge(value: int | str | None = None) -> int:

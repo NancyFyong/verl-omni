@@ -23,6 +23,7 @@ from unittest.mock import Mock
 import pytest
 import torch.nn as nn
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
@@ -302,30 +303,37 @@ class _SPDiT(nn.Module):
         self.sp_prepare = nn.Identity()
 
 
+class _ParallelVAE(DistributedVaeMixin):
+    def __init__(self):
+        self.use_tiling = False
+        self.set_parallel_size = Mock()
+
+
 class _SPPipeline(nn.Module):
-    _dit_modules = ["transformer", "transformers_ref"]
+    _dit_modules = ["transformer", "transformer_2", "transformers_ref"]
 
     def __init__(self):
         super().__init__()
         self.transformer = _SPDiT()
+        self.transformer_2 = None
         self.transformers_ref = _SPDiT()
-        self.vae = SimpleNamespace(use_tiling=True, set_parallel_size=Mock())
+        self.vae = _ParallelVAE()
 
 
-def _h3_parallel_setup(pipeline, **parallel):
+def _parallel_setup(pipeline, **parallel):
     from vllm_omni.diffusion.forward_context import get_forward_context, set_forward_context
 
-    from verl_omni.pipelines.minimax_h3_diffusion_nft.common import apply_h3_parallel_setup
+    from verl_omni.pipelines.model_base import apply_rollout_parallel_setup
 
     od_config = OmniDiffusionConfig(parallel_config=DiffusionParallelConfig(**parallel))
     with set_forward_context(omni_diffusion_config=od_config):
-        apply_h3_parallel_setup(pipeline, od_config)
+        apply_rollout_parallel_setup(pipeline, od_config)
         return od_config, get_forward_context().sp_plan_hooks_applied
 
 
-def test_h3_parallel_setup_installs_sp_hooks_and_vae_parallel():
+def test_parallel_setup_installs_sp_hooks_and_vae_parallel():
     pipeline = _SPPipeline()
-    od_config, hooks_applied = _h3_parallel_setup(pipeline, ulysses_degree=2, vae_patch_parallel_size=2)
+    od_config, hooks_applied = _parallel_setup(pipeline, ulysses_degree=2, vae_patch_parallel_size=2)
     assert hooks_applied is True
     for dit in (pipeline.transformer, pipeline.transformers_ref):
         assert dit.sp_prepare._hook_registry.get_hook("sp_input---sp_prepare") is not None
@@ -333,48 +341,91 @@ def test_h3_parallel_setup_installs_sp_hooks_and_vae_parallel():
     assert od_config.vae_use_tiling is True and pipeline.vae.use_tiling is True
 
 
-def test_h3_parallel_setup_keeps_defaults_unchanged():
+def test_parallel_setup_keeps_defaults_unchanged():
     pipeline = _SPPipeline()
-    _, hooks_applied = _h3_parallel_setup(pipeline, tensor_parallel_size=2)
+    _, hooks_applied = _parallel_setup(pipeline, tensor_parallel_size=2)
     assert hooks_applied is False
     assert getattr(pipeline.transformer.sp_prepare, "_hook_registry", None) is None
     pipeline.vae.set_parallel_size.assert_not_called()
-    assert pipeline.vae.use_tiling is True
+    assert pipeline.vae.use_tiling is False
 
 
-def test_h3_parallel_setup_fails_closed_without_sp_hooks(monkeypatch):
+@pytest.mark.parametrize(
+    ("component", "replacement", "parallel", "error"),
+    [
+        ("transformers_ref", nn.Linear(1, 1), {"ulysses_degree": 2}, "sequence parallelism"),
+        ("vae", SimpleNamespace(use_tiling=False), {"vae_patch_parallel_size": 2}, "vae_patch_parallel_size"),
+    ],
+)
+def test_parallel_setup_rejects_unsupported_components(component, replacement, parallel, error):
+    pipeline = _SPPipeline()
+    setattr(pipeline, component, replacement)
+    with pytest.raises(ValueError, match=error):
+        _parallel_setup(pipeline, **parallel)
+    assert getattr(pipeline.transformer.sp_prepare, "_hook_registry", None) is None
+
+
+def test_parallel_setup_fails_closed_without_sp_hooks(monkeypatch):
     from vllm_omni.diffusion import registry
 
     monkeypatch.setattr(registry, "_apply_sequence_parallel_if_enabled", lambda *_: None)
-    with pytest.raises(RuntimeError, match="hooks were not applied to transformer"):
-        _h3_parallel_setup(_SPPipeline(), ulysses_degree=2)
+    with pytest.raises(RuntimeError, match="hooks were not applied to _SPPipeline.transformer"):
+        _parallel_setup(_SPPipeline(), ulysses_degree=2)
+
+
+def test_registered_pipelines_apply_parallel_setup_once_after_construction(monkeypatch):
+    import verl_omni.pipelines  # noqa: F401
+    from verl_omni.pipelines import model_base
+
+    assert all(
+        "__wrapped__" in vars(vars(cls)["__init__"]) for cls in model_base.VllmOmniPipelineBase._registry.values()
+    )
+    monkeypatch.setattr(model_base.VllmOmniPipelineBase, "_registry", {})
+    events = []
+    monkeypatch.setattr(model_base, "apply_rollout_parallel_setup", lambda pipeline, _: events.append("setup"))
+
+    @model_base.VllmOmniPipelineBase.register("Toy", algorithm="flow_grpo")
+    class Parent:
+        def __init__(self, *, od_config):
+            events.append("parent")
+
+    @model_base.VllmOmniPipelineBase.register("Toy", algorithm="dual_grpo")
+    class Child(Parent):
+        def __init__(self, *, od_config):
+            super().__init__(od_config=od_config)
+            events.append("child")
+
+    Parent(od_config=None)
+    assert events == ["parent", "setup"]
+    events.clear()
+    Child(od_config=None)
+    assert events == ["parent", "child", "setup"]
 
 
 @pytest.mark.parametrize("algorithm", ["flow_grpo", "diffusion_nft"])
-def test_h3_adapters_apply_parallel_setup_after_construction(monkeypatch, algorithm):
-    import sys
-
+def test_h3_adapters_receive_parallel_setup(monkeypatch, algorithm):
+    from vllm_omni.diffusion.forward_context import set_forward_context
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 
     import verl_omni.pipelines  # noqa: F401
 
-    events = []
-
     def fake_init(self, **_):
         nn.Module.__init__(self)
-        events.append("init")
+        self._dit_modules = ["transformer"]
+        self.transformer = _SPDiT()
+        self.vae = _ParallelVAE()
 
     monkeypatch.setattr(MiniMaxH3Pipeline, "__init__", fake_init)
     pipeline_cls = strategy_module.VllmOmniPipelineBase.get_class("MiniMaxH3Pipeline", algorithm)
     for method in ("_install_lora_layout", "install_h3_lora_layout"):
         if hasattr(pipeline_cls, method):
             monkeypatch.setattr(pipeline_cls, method, lambda self: None)
-    setup = Mock(side_effect=lambda *_: events.append("setup"))
-    monkeypatch.setattr(sys.modules[pipeline_cls.__module__], "apply_h3_parallel_setup", setup)
-    od_config = SimpleNamespace(parallel_config=DiffusionParallelConfig(ulysses_degree=2))
-    pipeline = pipeline_cls(od_config=od_config)
-    setup.assert_called_once_with(pipeline, od_config)
-    assert events == ["init", "setup"]
+    parallel = DiffusionParallelConfig(ulysses_degree=2, vae_patch_parallel_size=2)
+    od_config = OmniDiffusionConfig(parallel_config=parallel)
+    with set_forward_context(omni_diffusion_config=od_config):
+        pipeline = pipeline_cls(od_config=od_config)
+    assert pipeline.transformer.sp_prepare._hook_registry.get_hook("sp_input---sp_prepare") is not None
+    pipeline.vae.set_parallel_size.assert_called_once_with(2, mode="tile")
 
 
 def test_hydra_exposes_parallel_fields_without_plus():
