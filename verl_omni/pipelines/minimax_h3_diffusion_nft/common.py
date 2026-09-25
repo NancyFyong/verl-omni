@@ -120,6 +120,8 @@ def pad_h3_layout_for_ulysses(model_inputs: dict[str, Any], sp_size: int | None)
     return padded
 
 
+# TODO(NancyFyong): Remove this copied forward and its installer when
+# https://github.com/huggingface/diffusers/pull/14868 ships in the pinned Diffusers version.
 def _h3_masked_forward(
     self,
     hidden_states: torch.Tensor,
