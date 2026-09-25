@@ -1,6 +1,6 @@
 # Diffusion Distribution Matching: DMD2 Runtime
 
-Last updated: 09/21/2026.
+Last updated: 09/25/2026.
 
 ## Scope
 
@@ -8,7 +8,7 @@ This page documents the reusable runtime for **distribution-only DMD2**. The
 runtime trains a few-step flow-matching student against a frozen real-score
 teacher and a trainable fake-score model. It supplies differentiable student
 sampling, an explicit student-to-fake-score update cycle, named-LoRA ownership,
-EMA, numerical-skip handling, complete checkpoints and semantic student export.
+EMA, numerical-skip handling and complete resumable FSDP checkpoints.
 
 This runtime slice does not register a concrete model architecture. A model
 integration must provide the conditioning, latent geometry, model-input,
@@ -107,7 +107,7 @@ main_diffusion.TaskRunner
 
 | Component | Responsibility |
 |---|---|
-| `DistributionMatchingRayTrainer` | Reuse offline worker/data/resource setup; run the explicit 1:K cycle; publish complete checkpoints and one student artifact |
+| `DistributionMatchingRayTrainer` | Reuse offline worker/data/resource setup; run the explicit 1:K cycle; publish complete checkpoints |
 | `DMDTrainingWorker` | Reuse distributed initialization and mini/microbatch handling; constrain each call to one optimizer attempt |
 | `DMDDiffusersFSDPEngine` | Model/adapter access, synchronized rollout exits, independent RNG streams, optimizers, rank-agreed skips, EMA and DMD checkpoint state |
 | Registered model adapter | Conditioning, latent geometry and packing, transformer inputs, x0 conversion, student sampling and score corruption |
@@ -180,8 +180,8 @@ most one optimizer update.
   gradients, advances neither scheduler nor EMA, and is not retried.
 - A successful student update applies EMA once the successful student-update
   count reaches `ema_start_step`.
-- An all-skipped cycle consumes the finite cycle budget. Training refuses to
-  export if either role had no successful update by the end.
+- An all-skipped cycle consumes the finite cycle budget. Training ends with an
+  error if either role had no successful update by the end.
 - Unexpected exceptions make the trainer terminal. Counters cannot undo an
   already applied optimizer step; restart from the last complete checkpoint.
 
@@ -226,11 +226,11 @@ checkpoints. FSDP1 additionally requires `use_orig_params=true`.
 | `score_timestep_shift` | `3.0` | Discrete score-sampling shift |
 | `ema_decay` | `0.999` | Student EMA decay |
 | `ema_start_step` | `0` | Successful student-update threshold for EMA |
-| `export_role` | `student` | Export `student` or explicit `student_ema` |
+| `export_role` | `student` | Deprecated and ignored; retained for existing configuration fingerprints |
 
-## Checkpoint and Export
+## Checkpoint and Resume
 
-A resumable checkpoint and an inference adapter are distinct artifacts:
+The only saved training artifact is the complete FSDP checkpoint:
 
 ```text
 OUTPUT_DIR/
@@ -243,10 +243,6 @@ OUTPUT_DIR/
     data.pt
     trainer.pt
   latest_checkpointed_iteration.txt
-  inference/
-    adapter_model.safetensors
-    adapter_config.json
-    inference_manifest.json
 ```
 
 Standard FSDP shards contain the physical model and student optimizer state.
@@ -263,20 +259,24 @@ or legacy prototype formats are rejected before model mutation. Positive
 output root. Resume restores exact saved state, but native mixed-precision
 execution is not promised to produce bitwise-identical future updates.
 
-After the finite cycle budget, the trainer exports one finite complete
-base-dependent PEFT adapter selected by `dmd.export_role`. Fake-score and teacher
-weights are never inference artifacts. The manifest records optimizer counts,
-base provenance, transformer-config hash and artifact checksum. A concrete model
-integration owns decoded-generation instructions and validates that the exported
-adapter reloads into its architecture.
+With `trainer.save_freq > 0`, checkpoints are saved at that interval and after
+the final completed cycle; nonpositive values disable checkpoint saving. No
+separate `inference/` directory, PEFT adapter or inference manifest is generated.
+Student, fake-score and EMA parameters remain in the model shards for resume.
+
+The deprecated `dmd.export_role` field no longer selects an output. Its value is
+retained in configuration fingerprints so existing runtime checkpoints can still
+be resumed with their original configuration. Existing checkpoints and previously
+exported files are not modified. These FSDP shards are training state, not a
+standalone Diffusers pipeline or directly loadable inference adapter.
 
 ## Limitations
 
 This runtime does not include a production architecture, automatic
 validation-replica synchronization, vLLM-Omni serving, request batching,
 standalone score transport, full finetuning or NPU validation. Concrete model
-integrations supply their own conditioning, packing, export/reload and
-real-model validation.
+integrations supply their own conditioning, packing and real-model validation.
+Inference conversion and serving are outside this checkpoint-only runtime.
 
 ## References
 

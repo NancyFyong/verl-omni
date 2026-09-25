@@ -96,7 +96,6 @@ def make_trainer(outcomes):
     trainer.total_training_steps = 3
     trainer.actor_rollout_wg = FakeDMDWorker(outcomes)
     trainer.next_batch = empty_batch
-    trainer.export_student = MagicMock()
     return trainer
 
 
@@ -120,6 +119,7 @@ class TestDMDConfiguration:
             "data.train_batch_size=7",
             "actor_rollout_ref.model.model_type=diffusion_model",
             "actor_rollout_ref.actor.checkpoint.load_contents=[model]",
+            "trainer.val_only=true",
         ],
     )
     def test_unsupported_modes_fail_before_workers(self, override):
@@ -137,10 +137,11 @@ class TestDMDConfiguration:
 
 
 class TestDMDCycles:
-    def test_normal_and_skipped_cycles_keep_separate_success_counts(self, monkeypatch):
+    def test_normal_and_skipped_cycles_keep_separate_success_counts(self, monkeypatch, tmp_path):
         monkeypatch.setattr("verl.utils.tracking.Tracking", FakeTracking)
         FakeTracking.records = []
         trainer = make_trainer([1, 1, 1, 0, 1, 0, 1, 0, 1])
+        trainer.config.trainer.default_local_dir = str(tmp_path)
         trainer.fit()
         assert trainer.global_steps == 3
         assert trainer.optimizer_steps == {"student": 2, "fake_score": 4}
@@ -148,7 +149,42 @@ class TestDMDCycles:
         assert [step for step, _ in FakeTracking.records] == [1, 2, 3]
         assert "fake_score/0/loss" in FakeTracking.records[0][1]
         assert "fake_score/1/loss" in FakeTracking.records[0][1]
-        trainer.export_student.assert_called_once()
+        assert not list(tmp_path.iterdir())
+
+    @pytest.mark.parametrize("save_freq,expected_saves", [(-1, 0), (2, 2), (10, 1)])
+    @pytest.mark.parametrize("legacy_export_role", ["student", "student_ema"])
+    def test_finished_training_only_uses_checkpoint_schedule(
+        self, monkeypatch, tmp_path, save_freq, expected_saves, legacy_export_role
+    ):
+        monkeypatch.setattr("verl.utils.tracking.Tracking", FakeTracking)
+        trainer = make_trainer([1] * 9)
+        trainer.config.trainer.default_local_dir = str(tmp_path)
+        trainer.config.trainer.save_freq = save_freq
+        trainer.config.dmd.export_role = legacy_export_role
+        trainer.dmd_config = omega_conf_to_dataclass(trainer.config.dmd)
+        fingerprint = trainer.configuration_fingerprint()
+        trainer._save_checkpoint = MagicMock()
+        trainer.fit()
+        assert trainer._save_checkpoint.call_count == expected_saves
+        assert trainer.optimizer_steps == {"student": 3, "fake_score": 6}
+        assert trainer.configuration_fingerprint() == fingerprint
+        assert trainer.config.dmd.export_role == legacy_export_role
+        assert not (tmp_path / "inference").exists()
+        assert not hasattr(DistributionMatchingRayTrainer, "export_student")
+
+    def test_completed_run_does_not_rewrite_existing_inference_files(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("verl.utils.tracking.Tracking", FakeTracking)
+        trainer = make_trainer([])
+        trainer.config.trainer.default_local_dir = str(tmp_path)
+        trainer.global_steps = 3
+        trainer.optimizer_steps = {"student": 3, "fake_score": 6}
+        artifact = tmp_path / "inference" / "adapter_model.safetensors"
+        artifact.parent.mkdir()
+        artifact.write_bytes(b"previous artifact")
+        trainer.fit()
+        assert not trainer.actor_rollout_wg.stages
+        assert artifact.read_bytes() == b"previous artifact"
+        assert list(artifact.parent.iterdir()) == [artifact]
 
     def test_all_skipped_budget_terminates_without_claiming_training_success(self, monkeypatch):
         monkeypatch.setattr("verl.utils.tracking.Tracking", FakeTracking)
@@ -157,7 +193,6 @@ class TestDMDCycles:
             trainer.fit()
         assert trainer.global_steps == 3
         assert trainer.optimizer_steps == {"student": 0, "fake_score": 0}
-        trainer.export_student.assert_not_called()
 
     def test_partial_exception_is_not_a_numerical_retry(self, monkeypatch):
         monkeypatch.setattr("verl.utils.tracking.Tracking", FakeTracking)
@@ -167,7 +202,6 @@ class TestDMDCycles:
         assert trainer.global_steps == 0
         assert trainer.optimizer_steps["student"] == 1  # This cannot roll back a real optimizer update.
         assert trainer.actor_rollout_wg.stages == ["student", "fake_score"]
-        trainer.export_student.assert_not_called()
         with pytest.raises(RuntimeError, match="must be reconstructed"):
             trainer.fit()
         assert trainer.actor_rollout_wg.stages == ["student", "fake_score"]

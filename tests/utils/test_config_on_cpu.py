@@ -48,3 +48,29 @@ def test_validate_config_timestep_staging(enabled, sp_size, as_dict):
             validate_config(config)
     else:
         validate_config(config)
+
+
+@pytest.mark.parametrize("strategy", ["fsdp", "fsdp2", "veomni", "megatron"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_validate_config_no_sync_gradient_accumulation(strategy, enabled):
+    config = _config()
+    config.actor_rollout_ref = {"actor": {"strategy": strategy, "use_no_sync_for_gradient_accumulation": enabled}}
+    if enabled and strategy not in ("fsdp", "fsdp2"):
+        with pytest.raises(ValueError, match="fsdp or fsdp2"):
+            validate_config(config)
+    else:
+        validate_config(config)
+
+
+def test_dynamic_resource_scheduling_default_off_is_admitted():
+    validate_config(_config())
+    config = _config()
+    config.async_training = {"use_dynamic_resource_scheduling": False}
+    validate_config(config)
+
+
+def test_dynamic_resource_scheduling_raises_on_v1_entrypoints():
+    config = _config()
+    config.async_training = {"use_dynamic_resource_scheduling": True}
+    with pytest.raises(ValueError, match="hybrid_rollout.enable_switch"):
+        validate_config(config)

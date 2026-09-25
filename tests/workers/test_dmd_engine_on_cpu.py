@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import hashlib
-import json
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -239,24 +237,53 @@ class TestDMDAdapterContext:
         assert engine.module.active_adapter == "fake_score"
 
 
-class TestDMDExport:
-    def test_ema_export_uses_its_role_specific_peft_config(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(diffusers_impl, "get_device_id", cpu_device)
-        engine = engine_shell()
-        engine.module.peft_config["student_ema"] = LoraConfig(r=4)
-        engine.engine_config = SimpleNamespace(strategy="fsdp2")
-        engine.rank = 0
-        engine.get_per_tensor_param = MagicMock(
-            return_value=(iter([("transformer.adapter.weight", torch.ones(2))]), {"r": 2})
-        )
+class TestDMDCheckpointState:
+    def test_extra_state_roundtrip_reuses_parent_checkpoint(self, monkeypatch, tmp_path):
+        parent_save = MagicMock()
+        parent_load = MagicMock()
+        monkeypatch.setattr(diffusers_impl.DiffusersFSDPEngine, "save_checkpoint", parent_save)
+        monkeypatch.setattr(diffusers_impl.DiffusersFSDPEngine, "load_checkpoint", parent_load)
+        monkeypatch.setattr(torch.distributed, "get_world_size", MagicMock(return_value=1))
         monkeypatch.setattr(torch.distributed, "barrier", MagicMock())
+        engine = engine_shell()
+        engine.rank = 0
+        engine.optimizer_steps = {"student": 2, "fake_score": 4}
+        engine.skipped_steps = {"student": 1, "fake_score": 2}
+        engine.generators = {"initial_noise": torch.Generator().manual_seed(7)}
+        engine.pending_generator_states = {"score_noise": torch.Generator().manual_seed(8).get_state()}
+        saved_rng = engine.generators["initial_noise"].get_state().clone()
+        saved_pending_rng = engine.pending_generator_states["score_noise"].clone()
+        saved_scheduler = deepcopy(engine.schedulers["fake_score"].state_dict())
+        engine.select_stage("fake_score")
 
-        destination = tmp_path / "ema"
-        engine.export_student(destination, role="student_ema")
+        engine.save_checkpoint(str(tmp_path), global_step=3)
 
-        metadata = json.loads((destination / "adapter_config.json").read_text())
-        assert metadata["r"] == 4
-        engine.get_per_tensor_param.assert_called_once_with(base_sync_done=True, adapter_name="student_ema")
+        parent_save.assert_called_once_with(str(tmp_path), global_step=3)
+        assert engine.active_stage == "fake_score"
+        assert [path.name for path in tmp_path.iterdir()] == ["dmd_state_rank_0.pt"]
+        state = torch.load(tmp_path / "dmd_state_rank_0.pt", weights_only=False)
+        assert state["version"] == 1 and state["world_size"] == 1
+        assert state["fake_optimizer"] == engine.optimizers["fake_score"].state_dict()
+        engine.optimizers["fake_score"].param_groups[0]["lr"] = 0.8
+        engine.schedulers["fake_score"].last_epoch = 10
+        engine.optimizer_steps = {"student": 0, "fake_score": 0}
+        engine.skipped_steps = {"student": 0, "fake_score": 0}
+        torch.rand(2, generator=engine.generators["initial_noise"])
+
+        assert engine.load_checkpoint(str(tmp_path)) == {"student": 2, "fake_score": 4}
+
+        parent_load.assert_called_once_with(str(tmp_path), del_local_after_load=False)
+        assert engine.optimizers["fake_score"].param_groups[0]["lr"] == 0.1
+        assert engine.schedulers["fake_score"].state_dict() == saved_scheduler
+        assert engine.skipped_steps == {"student": 1, "fake_score": 2}
+        assert engine.active_stage == "student" and not engine.generators
+        torch.testing.assert_close(engine.pending_generator_states["initial_noise"], saved_rng, rtol=0, atol=0)
+        torch.testing.assert_close(engine.pending_generator_states["score_noise"], saved_pending_rng, rtol=0, atol=0)
+
+    def test_no_separate_inference_export_api(self):
+        assert not hasattr(DMDDiffusersFSDPEngine, "export_student")
+        assert not hasattr(DMDTrainingWorker, "export_student")
+        assert not hasattr(DMDTrainingWorker, "get_model_provenance")
 
 
 def choose_last_exit(tensor, src):
@@ -423,25 +450,6 @@ class TestDMDWorker:
 
         assert worker.config.model_type == "diffusion_dmd_model"
         assert worker.received_dmd_config is dmd_config
-
-    @pytest.mark.parametrize("source", ["snapshot", "download", "local"])
-    def test_export_provenance_is_computed_inside_the_dmd_worker(self, tmp_path, source):
-        revision = "a" * 40
-        root = tmp_path / "snapshots" / revision if source == "snapshot" else tmp_path
-        (root / "transformer").mkdir(parents=True)
-        config = b'{"in_channels": 64}'
-        (root / "transformer/config.json").write_bytes(config)
-        if source == "download":
-            metadata = root / ".cache/huggingface/download/model_index.json.metadata"
-            metadata.parent.mkdir(parents=True)
-            metadata.write_text(revision + "\netag\n0\n")
-        worker = object.__new__(DMDTrainingWorker)
-        worker.engine = SimpleNamespace(model_config=SimpleNamespace(local_path=str(root)))
-
-        value = worker.get_model_provenance()
-
-        assert value["base_model_revision"] == (None if source == "local" else revision)
-        assert value["base_transformer_config_sha256"] == hashlib.sha256(config).hexdigest()
 
     def test_reuses_one_minibatch_and_selects_before_context(self, monkeypatch):
         result = tu.get_tensordict({}, {"metrics": {"loss": [1.0]}})

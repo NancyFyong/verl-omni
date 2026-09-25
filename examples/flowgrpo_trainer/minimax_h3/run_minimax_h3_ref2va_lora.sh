@@ -61,6 +61,7 @@ exec > >(tee -a "$log_file") 2>&1
 h3_lora_targets='["to_q","to_k","to_v","to_out.0","ff.net.0.proj","ff.net.2"]'
 
 python3 -m verl_omni.trainer.main_diffusion \
+    trainer.use_v1=false \
     algorithm.trainer_type=policy_gradient \
     algorithm.sample_source=online \
     algorithm.adv_estimator=flow_grpo \
@@ -100,7 +101,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.rollout.max_num_seqs=1 \
     actor_rollout_ref.rollout.rollout_attn_backend="$ROLLOUT_ATTN_BACKEND" \
     actor_rollout_ref.rollout.tensor_model_parallel_size="$ROLLOUT_TP" \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.text_encoder_tp_size="$TEXT_ENCODER_TP" \
+    actor_rollout_ref.rollout.text_encoder_tp_size="$TEXT_ENCODER_TP" \
     +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.enable_layerwise_offload=True \
     actor_rollout_ref.rollout.n="$ROLLOUT_N" \
     actor_rollout_ref.rollout.seed=42 \

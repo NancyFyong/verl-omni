@@ -13,7 +13,6 @@
 # limitations under the License.
 import asyncio
 import functools
-import hashlib
 import logging
 import os
 import time
@@ -22,7 +21,6 @@ from copy import deepcopy
 from dataclasses import replace
 from functools import partial
 from itertools import chain
-from pathlib import Path
 from typing import Optional
 
 import torch
@@ -36,7 +34,7 @@ from verl.single_controller.base.decorator import Dispatch, make_nd_compute_data
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_device_name, is_npu_available, set_expandable_segments
+from verl.utils.device import get_device_name, get_torch_device, is_npu_available, set_expandable_segments
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.import_utils import import_external_libs
@@ -77,6 +75,17 @@ from verl_omni.workers.utils.losses import diffusion_loss, omni_loss
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _get_engine_lora_config(engine, adapter_name: str = "default") -> dict | None:
+    """Read adapter metadata without gathering weights, including non-PEFT engines."""
+    get_config = getattr(engine, "get_lora_peft_config", None)
+    if callable(get_config):
+        return get_config(adapter_name=adapter_name)
+    module = getattr(engine, "module", None)
+    module = getattr(module, "_fsdp_wrapped_module", module)
+    config = getattr(module, "peft_config", {}).get(adapter_name)
+    return config.to_dict() if config is not None else None
 
 
 async def _timed_await(name: str, timings: dict, coro):
@@ -625,26 +634,6 @@ class DMDTrainingWorker(TrainingWorker):
         finally:
             self.engine.select_stage(previous)
 
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def get_model_provenance(self):
-        """Read the base identity needed only by the DMD2 inference export."""
-        root = Path(self.engine.model_config.local_path)
-        revision = root.name if root.parent.name == "snapshots" else None
-        metadata = root / ".cache/huggingface/download/model_index.json.metadata"
-        if metadata.is_file():
-            with metadata.open() as file:
-                revision = file.readline().strip()
-        if not revision or len(revision) != 40 or any(char not in "0123456789abcdef" for char in revision):
-            revision = None
-        with (root / "transformer/config.json").open("rb") as file:
-            config_hash = hashlib.file_digest(file, "sha256").hexdigest()
-        return {"base_model_revision": revision, "base_transformer_config_sha256": config_hash}
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def export_student(self, directory, role="student"):
-        """Export the selected student adapter without exposing score-model weights."""
-        self.engine.export_student(directory, role)
-
 
 class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     """Hybrid worker that includes actor model, rollout and optional ref model.
@@ -989,6 +978,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
         tu.assign_non_tensor(data, enable_timestep_staging=self.config.actor.get("enable_timestep_staging", False))
+        tu.assign_non_tensor(
+            data,
+            use_no_sync_for_gradient_accumulation=self.config.actor.get("use_no_sync_for_gradient_accumulation", False),
+        )
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 
@@ -1008,12 +1001,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self.peft_merge:
             return None
         engine = getattr(self.actor, "engine", None)
-        module = getattr(engine, "module", None) if engine is not None else None
-        peft_model = getattr(module, "_fsdp_wrapped_module", module) if module is not None else None
-        if peft_model is None or not hasattr(peft_model, "peft_config"):
-            return None
-        peft_config = peft_model.peft_config.get("default", None)
-        result = peft_config.to_dict() if peft_config is not None else None
+        result = _get_engine_lora_config(engine)
         logger.debug("get_lora_peft_config role=%s -> %s", self.role, "LoRA" if result else "none")
         return result
 
@@ -1035,9 +1023,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         engine = getattr(self.actor, "engine", None)
         module = getattr(engine, "module", None) if engine is not None else None
         peft_model = getattr(module, "_fsdp_wrapped_module", module) if module is not None else None
-        if peft_model is None or not hasattr(peft_model, "peft_config"):
-            return None
-        if peft_model.peft_config.get("default", None) is None:
+        if _get_engine_lora_config(engine) is None:
             return None
 
         total_sum = 0.0
@@ -1090,7 +1076,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         start = time.perf_counter()
         if self.actor.engine.is_param_offload_enabled:
             self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
-        aggressive_empty_cache(force_sync=True)
+        get_torch_device().synchronize()
+        get_torch_device().empty_cache()
         if timings is not None:
             timings["offload_actor_to_cpu"] = time.perf_counter() - start
 
@@ -1153,9 +1140,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if effective_mode != "naive":
-            actor_module = getattr(self.actor.engine, "module", None)
-            peft_module = getattr(actor_module, "_fsdp_wrapped_module", actor_module)
-            actor_has_lora = peft_module is not None and hasattr(peft_module, "peft_config")
+            actor_has_lora = _get_engine_lora_config(self.actor.engine, self.rollout_adapter) is not None
 
             if actor_has_lora and not self.peft_merge:
                 logger.debug(
@@ -1193,12 +1178,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 _timed_await("resume_weights", timings, self.rollout.resume(tags=["weights"]))
             )
 
-        # 2. Detect the actor's adapter setup *without* triggering the heavy param
-        #    gather (which runs collectives), so the right path can be chosen up
-        #    front. ``actor_has_lora`` is a cheap attribute check.
-        actor_module = getattr(self.actor.engine, "module", None)
-        peft_module = getattr(actor_module, "_fsdp_wrapped_module", actor_module)
-        actor_has_lora = peft_module is not None and hasattr(peft_module, "peft_config")
+        # 2. Read adapter metadata without triggering a collective parameter gather.
+        actor_has_lora = _get_engine_lora_config(self.actor.engine, self.rollout_adapter) is not None
         # Steady-state LoRA (base already synced) can overlap the *entire* gather +
         # actor offload with resume; the first base sync still needs the slow path.
         use_lora_fast_path = actor_has_lora and not self.peft_merge and self.base_sync_done
@@ -1307,6 +1288,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             await offload_task
         elif not offloaded:
             self._offload_actor_and_empty_cache(timings)
+        log_gpu_memory_usage("After offload model to cpu", logger=logger)
 
         # 5. resume kv_cache
         if self.config.rollout.free_cache_engine:
