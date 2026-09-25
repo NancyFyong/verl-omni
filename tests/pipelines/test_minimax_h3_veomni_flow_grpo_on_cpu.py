@@ -14,6 +14,7 @@
 
 """CPU parity checks for the VeOmni-native MiniMax H3 FlowGRPO actor."""
 
+from importlib import import_module
 from types import SimpleNamespace
 
 import pytest
@@ -30,9 +31,10 @@ from verl_omni.pipelines.minimax_h3_flow_grpo.veomni_training_adapter import (
     predict_veomni,
 )
 from verl_omni.pipelines.minimax_h3_flow_grpo.weight_sync import MiniMaxH3WeightSyncMixin
-from verl_omni.workers.engine.veomni.diffusion_impl import VeOmniDiffusionEngine
 
 veomni_lora = pytest.importorskip("veomni.lora")
+VeOmniDiffusionEngine = import_module("verl_omni.workers.engine.veomni.diffusion_impl").VeOmniDiffusionEngine
+
 veomni_h3_config = pytest.importorskip(
     "veomni.models.diffusers.minimax_h3.minimax_h3_transformer.configuration_minimax_h3_transformer"
 )
@@ -266,6 +268,104 @@ def test_native_h3_forward_rejects_multi_sample_micro_batches():
     _, native_model = _build_models()
     with pytest.raises(ValueError, match="micro-batch size 1"):
         predict_veomni(native_model, _logical_inputs(batch_size=2), use_gradient_checkpointing=False)
+
+
+@pytest.mark.parametrize(
+    "implementation,backend",
+    [
+        ("eager", "native"),
+        ("flash_attention_2", "flash"),
+        ("flash_attention_3", "_flash_3"),
+        ("flash_attention_2_hub", "flash_hub"),
+        ("flash_attention_3_hub", "_flash_3_hub"),
+    ],
+)
+def test_h3_attention_honors_config_without_changing_other_models(monkeypatch, implementation, backend):
+    import diffusers.models.attention_dispatch as dispatch
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core import core
+
+    from verl_omni.workers.engine.veomni.patch import _apply_attention_backend
+
+    monkeypatch.setattr(core, "ATTENTION_IMPLEMENTATION", "torch")
+    checked, loaded, calls = [], [], []
+    monkeypatch.setattr(dispatch, "_check_attention_backend_requirements", checked.append)
+    monkeypatch.setattr(dispatch, "_maybe_download_kernel_for_backend", loaded.append)
+    dispatch_fn = dispatch.dispatch_attention_fn
+
+    def record(query, key, value, **kwargs):
+        calls.append(kwargs.pop("backend").value)
+        return dispatch_fn(query, key, value, backend=dispatch.AttentionBackendName.NATIVE, **kwargs)
+
+    monkeypatch.setattr(dispatch, "dispatch_attention_fn", record)
+    torch.manual_seed(19)
+    reference, native = _build_models()
+    untouched = _build_models()[1]
+    original_forward = untouched.dit.blocks[0].attn.forward.__func__
+    state_keys = set(native.state_dict())
+    global_backend = dispatch._AttentionBackendRegistry._active_backend
+    _apply_attention_backend(native, implementation)
+    logical = _logical_inputs()
+    expected = reference(**{key: value for key, value in logical.items() if not key.startswith("_h3_")})
+    actual = predict_veomni(native, logical, use_gradient_checkpointing=True)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    sum(x.square().mean() for x in actual).backward()
+    assert native.dit.blocks[0].attn.qkv_proj.weight.grad.isfinite().all()
+    assert calls and set(calls) == {backend}
+    assert [x.value for x in checked] == [backend]
+    assert [x.value for x in loaded] == [backend]
+    assert core.ATTENTION_IMPLEMENTATION == "torch"
+    assert dispatch._AttentionBackendRegistry._active_backend == global_backend
+    assert untouched.dit.blocks[0].attn.forward.__func__ is original_forward
+    assert set(native.state_dict()) == state_keys
+
+
+def test_h3_attention_kernel_load_failure_does_not_install_partial_patch(monkeypatch):
+    import diffusers.models.attention_dispatch as dispatch
+
+    from verl_omni.workers.engine.veomni.patch import _apply_attention_backend
+
+    _, native = _build_models()
+    original_forward = native.dit.blocks[0].attn.forward.__func__
+    monkeypatch.setattr(dispatch, "_check_attention_backend_requirements", lambda _: None)
+
+    def fail(_):
+        raise RuntimeError("kernel unavailable")
+
+    monkeypatch.setattr(dispatch, "_maybe_download_kernel_for_backend", fail)
+    with pytest.raises(RuntimeError, match="kernel unavailable"):
+        _apply_attention_backend(native, "flash_attention_3_hub")
+    assert native.dit.blocks[0].attn.forward.__func__ is original_forward
+
+
+@pytest.mark.parametrize("implementation", ["sdpa", "flex_attention", "invalid"])
+def test_h3_attention_rejects_unsupported_backends(implementation):
+    from verl_omni.workers.engine.veomni.patch import _apply_attention_backend
+
+    _, native = _build_models()
+    with pytest.raises(ValueError, match="Unsupported H3 VeOmni attention"):
+        _apply_attention_backend(native, implementation)
+
+
+@pytest.mark.parametrize("cu_seqlens,use_ulysses", [((0, 2, 8), False), ((0, 8), True)])
+def test_h3_attention_bridge_rejects_packing_and_sp(cu_seqlens, use_ulysses):
+    from verl_omni.workers.engine.veomni.patch import _apply_attention_backend
+
+    _, native = _build_models()
+    _apply_attention_backend(native, "eager")
+    with pytest.raises(ValueError, match="one sample and Ulysses SP=1"):
+        native.dit.blocks[0].attn(
+            torch.randn(8, _HIDDEN), rope_cos=None, rope_sin=None, cu_seqlens=cu_seqlens, use_ulysses=use_ulysses
+        )
+
+
+def test_h3_attention_uses_upstream_fix_when_available():
+    from verl_omni.workers.engine.veomni.patch import _apply_attention_backend
+
+    _, native = _build_models()
+    native._load_attention_kernel = lambda: None
+    original_forward = native.dit.blocks[0].attn.forward.__func__
+    _apply_attention_backend(native, "flash_attention_3")
+    assert native.dit.blocks[0].attn.forward.__func__ is original_forward
 
 
 def test_h3_lora_validation_accepts_one_naming_layout_and_rejects_mixed():

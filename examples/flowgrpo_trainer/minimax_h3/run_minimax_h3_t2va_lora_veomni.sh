@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # MiniMax H3 T2VA LoRA FlowGRPO with the VeOmni actor engine.
-set -x
+set -euo pipefail
 
 export WANDB_MODE=${WANDB_MODE:-online}
-export MINIMAX_H3_ATTENTION_IMPLEMENTATION=${MINIMAX_H3_ATTENTION_IMPLEMENTATION:-flash_attention_3}
 
 WORKSPACE=${WORKSPACE:-$HOME}
 MODEL_PATH=${MODEL_PATH:-$WORKSPACE/models/MiniMax-H3/FL2VA}
@@ -25,7 +24,13 @@ INFER_STEPS=${INFER_STEPS:-10}
 VAL_HEIGHT=${VAL_HEIGHT:-512}
 VAL_WIDTH=${VAL_WIDTH:-768}
 
-if ((NUM_GPUS <= 0 || ROLLOUT_TP <= 0 || NUM_GPUS % ROLLOUT_TP != 0)); then
+for name in NUM_GPUS ROLLOUT_TP TEXT_ENCODER_TP; do
+    if [[ ! ${!name} =~ ^[1-9][0-9]*$ ]]; then
+        echo "$name must be a positive decimal integer without leading zeros." >&2
+        exit 1
+    fi
+done
+if ((NUM_GPUS % ROLLOUT_TP != 0)); then
     echo "NUM_GPUS must be a positive multiple of ROLLOUT_TP." >&2
     exit 1
 fi
@@ -34,7 +39,7 @@ if ((TEXT_ENCODER_TP != 1 && TEXT_ENCODER_TP != ROLLOUT_TP)); then
     exit 1
 fi
 if [[ ! -d "$MODEL_PATH/transformer" ]]; then
-    echo "MODEL_PATH must point to the fused FL2VA checkpoint containing transformer/." >&2
+    echo "MODEL_PATH must point to the fused rollout checkpoint containing transformer/." >&2
     exit 1
 fi
 
@@ -60,8 +65,8 @@ h3_lora_targets="['qkv_proj','out_proj','fc1','fc2']"
 
 python3 -m verl_omni.trainer.main_diffusion \
     diffusion/model_engine=veomni_diffusion \
-    data.train_files=$train_path \
-    data.val_files=$test_path \
+    "data.train_files=$train_path" \
+    "data.val_files=$test_path" \
     data.train_batch_size=32 \
     data.val_max_samples=128 \
     data.max_prompt_length=1024 \
@@ -69,8 +74,8 @@ python3 -m verl_omni.trainer.main_diffusion \
     data.seed=42 \
     algorithm.adv_estimator=flow_grpo \
     algorithm.global_std=True \
-    actor_rollout_ref.model.path=$MODEL_PATH \
-    actor_rollout_ref.model.config_path=$ACTOR_CONFIG_PATH \
+    "actor_rollout_ref.model.path=$MODEL_PATH" \
+    "actor_rollout_ref.model.config_path=$ACTOR_CONFIG_PATH" \
     actor_rollout_ref.model.algorithm=flow_grpo \
     actor_rollout_ref.model.transformer_subfolder=transformer \
     actor_rollout_ref.model.attn_backend=native \
@@ -88,11 +93,11 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.veomni_config.strategy=veomni \
     actor_rollout_ref.actor.veomni_config.ulysses_parallel_size=1 \
-    actor_rollout_ref.actor.veomni_config.attn_implementation=flash_attention_3 \
+    actor_rollout_ref.actor.veomni_config.attn_implementation=flash_attention_3_hub \
     actor_rollout_ref.actor.veomni_config.param_offload=True \
     actor_rollout_ref.actor.veomni_config.optimizer_offload=True \
     actor_rollout_ref.ref.veomni_config.strategy=veomni \
-    actor_rollout_ref.ref.veomni_config.attn_implementation=flash_attention_3 \
+    actor_rollout_ref.ref.veomni_config.attn_implementation=flash_attention_3_hub \
     actor_rollout_ref.ref.veomni_config.ulysses_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm_omni \
     actor_rollout_ref.rollout.rollout_attn_backend=FLASH_ATTN_3_HUB \
@@ -149,10 +154,10 @@ python3 -m verl_omni.trainer.main_diffusion \
     reward.aggregation=weighted_sum \
     trainer.logger='["console","wandb"]' \
     trainer.project_name=flow_grpo \
-    trainer.experiment_name=minimax_h3_t2va_lora_gpu \
-    trainer.default_local_dir=$checkpoint_dir \
-    trainer.validation_data_dir=$output_dir/validation_data \
-    trainer.rollout_data_dir=$output_dir/rollout_data \
+    trainer.experiment_name=minimax_h3_t2va_lora_veomni \
+    "trainer.default_local_dir=$checkpoint_dir" \
+    "trainer.validation_data_dir=$output_dir/validation_data" \
+    "trainer.rollout_data_dir=$output_dir/rollout_data" \
     trainer.rollout_data_save_freq=10 \
     trainer.log_val_generations=8 \
     trainer.video_fps=24 \

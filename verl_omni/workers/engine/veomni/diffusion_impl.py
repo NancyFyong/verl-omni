@@ -383,6 +383,8 @@ class VeOmniDiffusionEngine(BaseEngine):
         return embeds, mask
 
     def prepare_model_inputs(self, micro_batch: TensorDict, step: int):
+        from verl_omni.workers.engine.fsdp.diffusers_impl import DiffusersFSDPEngine
+
         latents = micro_batch["all_latents"]
         timesteps = micro_batch["all_timesteps"]
         prompt_embeds = micro_batch["prompt_embeds"]
@@ -407,6 +409,7 @@ class VeOmniDiffusionEngine(BaseEngine):
                 negative_prompt_embeds, negative_prompt_embeds_mask, sp_size
             )
 
+        DiffusersFSDPEngine._unpad_condition_rows(self, micro_batch)
         return prepare_model_inputs(
             module=self.module,
             model_config=self.model_config,

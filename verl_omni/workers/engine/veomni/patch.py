@@ -17,7 +17,7 @@ import torch
 # TODO: Remove this shim, its call sites and tests once the required VeOmni includes
 # ByteDance-Seed/VeOmni#1214 and #1236. VeOmni 0.1.12 rejects Hub attention names and Qwen-Image
 # ignores attn_implementation. Only Hub varlen backends handle Qwen-Image's text padding correctly,
-# so this table is the allowlist for every model; the diffusers backend is applied to Qwen-Image only.
+# so this table is the allowlist except for H3's instance-local attention bridge.
 _DIFFUSERS_ATTENTION_BACKENDS = {
     "eager": "native",
     "flash_attention_2_hub": "flash_varlen_hub",
@@ -30,12 +30,17 @@ def _veomni_attn_implementation(attn_implementation: str) -> str:
     from veomni.arguments import OpsImplementationConfig
 
     if attn_implementation.endswith("_hub") and not hasattr(OpsImplementationConfig, "normalize_hub_attention_backend"):
-        return "eager"  # Qwen-Image gets the Hub kernel in _apply_attention_backend
+        return "eager"  # Qwen-Image and H3 get the Hub kernel in _apply_attention_backend
     return attn_implementation
 
 
 def _apply_attention_backend(model: torch.nn.Module, attn_implementation: str) -> None:
-    """Check ``veomni_config.attn_implementation`` for any model; apply it to VeOmni's Qwen-Image transformer."""
+    """Apply model-specific attention compatibility while retaining backend validation."""
+    if getattr(getattr(model, "config", None), "model_type", None) == "MiniMaxH3DiTModel":
+        from verl_omni.pipelines.minimax_h3_flow_grpo.attention import configure_veomni_attention
+
+        configure_veomni_attention(model, attn_implementation)
+        return
     from veomni.models.diffusers.qwen_image.qwen_image_transformer.modeling_qwen_image_transformer import (
         QwenImageSPAttnProcessor,
     )
@@ -48,11 +53,11 @@ def _apply_attention_backend(model: torch.nn.Module, attn_implementation: str) -
             "map to diffusers varlen kernels that mishandle Qwen-Image's text padding."
         )
     if not any(isinstance(getattr(m, "processor", None), QwenImageSPAttnProcessor) for m in model.modules()):
-        # e.g. Wan / MiniMax H3 / LTX select attention inside VeOmni.
+        # e.g. Wan / LTX select attention inside VeOmni.
         if _veomni_attn_implementation(attn_implementation) != attn_implementation:
             raise ValueError(
                 f"veomni_config.attn_implementation={attn_implementation!r} requires a VeOmni release "
-                "with Hub attention support; the installed VeOmni only gets it for Qwen-Image via verl-omni."
+                "with Hub attention support; verl-omni only supplies it for Qwen-Image and MiniMax H3."
             )
         return
     from diffusers.models.attention_dispatch import _AttentionBackendRegistry

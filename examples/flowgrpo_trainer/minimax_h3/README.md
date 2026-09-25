@@ -199,25 +199,63 @@ bash examples/flowgrpo_trainer/minimax_h3/run_minimax_h3_t2va_lora.sh \
   actor_rollout_ref.rollout.rollout_attn_backend=TORCH_SDPA
 ```
 
-### NVIDIA GPU (VeOmni Actor, T2VA)
+### NVIDIA GPU (VeOmni Actor, T2VA / FL2VA / Ref2VA)
 
-This path requires VeOmni 0.1.12 or later and trains the native fused H3 DiT
-while retaining vLLM-Omni rollout:
+These launchers use VeOmni **0.1.12** and the native fused H3 DiT with
+vLLM-Omni rollout. VeOmni main runtime migration and multi-sample Actor
+packing are separate work; keep Actor micro-batch size and Ulysses SP at 1.
 
 ```bash
 uv pip install veomni==0.1.12 --no-deps
+export IMAGEBIND_MODEL_PATH=/path/to/imagebind_huge.pth
 
 MODEL_PATH="$MODEL_ROOT/FL2VA" \
 DATA_DIR="$HOME/data/vid_prompt/verl_omni" \
-IMAGEBIND_MODEL_PATH=/path/to/imagebind_huge.pth \
 bash examples/flowgrpo_trainer/minimax_h3/run_minimax_h3_t2va_lora_veomni.sh
+
+MODEL_PATH="$MODEL_ROOT/FL2VA" \
+DATA_DIR="$HOME/data/fl2va/verl_omni" \
+bash examples/flowgrpo_trainer/minimax_h3/run_minimax_h3_fl2va_lora_veomni.sh
+
+MODEL_PATH="$MODEL_ROOT" \
+DATA_DIR="$HOME/data/minimax_h3_ref2va" \
+bash examples/flowgrpo_trainer/minimax_h3/run_minimax_h3_ref2va_lora_veomni.sh
 ```
 
-Unlike the Diffusers Actor, the VeOmni Actor reads the fused checkpoint from
-`$MODEL_PATH/transformer` and trains `qkv_proj`, `out_proj`, `fc1`, and `fc2`.
-The sync adapter expands these into vLLM-Omni's logical Q/K/V and GEGLU slices
-and rejects any partially bound update. VeOmni sequence parallelism is not yet
-supported by this engine integration, so the launcher keeps Ulysses SP at 1.
+The Actor reads fused weights/config from `FL2VA/transformer` or
+`Ref2VA/transformer`, **not** the Diffusers `transformer` / `transformer_ref`
+directories at the repository root. `ACTOR_CONFIG_PATH` can override the
+config location. LoRA targets are `qkv_proj`, `out_proj`, `fc1`, and `fc2`;
+the sync adapter expands them into vLLM-Omni's logical Q/K/V and GEGLU slices
+and rejects partially bound updates.
+
+FL2VA fixes frame zero in both training and validation. Ref2VA retains its
+2048-pixel reference short edge, 12288-token embedding budget and video flow
+shift of 12; its `MODEL_PATH` is the repository root. All three scripts use
+`NUM_GPUS`; Ref2VA defaults to rollout/text-encoder TP 4, the others to TP 2.
+Trailing Hydra overrides take precedence over recipe defaults.
+
+The Actor defaults to `flash_attention_3_hub`, matching rollout's
+`FLASH_ATTN_3_HUB`, without a local flash-attn installation. VeOmni 0.1.12
+ignores the configured H3 backend, so an instance-local attention bridge
+selects the requested kernel for both DiT and token-refiner blocks. It does
+not change global attention selection or fall back silently when a kernel
+is unavailable. `MINIMAX_H3_ATTENTION_IMPLEMENTATION` does not select the
+patched Actor backend; use `veomni_config.attn_implementation` instead.
+
+The bridge has a removal TODO tied to
+[VeOmni #1239](https://github.com/ByteDance-Seed/VeOmni/pull/1239): remove it
+once the required VeOmni dependency includes that fix and this integration
+uses the native attention setup. The separate Qwen/Hub compatibility shim
+has its own upstream dependencies.
+
+For hardware without FA3, append these overrides to any VeOmni launcher:
+
+```bash
+actor_rollout_ref.actor.veomni_config.attn_implementation=eager \
+actor_rollout_ref.ref.veomni_config.attn_implementation=eager \
+actor_rollout_ref.rollout.rollout_attn_backend=TORCH_SDPA
+```
 
 ### NVIDIA GPU (FL2VA)
 
