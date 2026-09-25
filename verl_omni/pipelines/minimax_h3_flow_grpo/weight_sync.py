@@ -197,11 +197,10 @@ class MiniMaxH3WeightSyncMixin:
             ff_half = transformer.arch.ffn_hidden_size
             mapped = {}
             for name, tensor in tensors.items():
-                name = name.replace("transformer.base_model.model.dit.", "transformer.", 1)
-                name = name.replace("transformer.dit.", "transformer.", 1)
                 prefix, separator, inner = name.partition(".")
                 if separator and prefix == "transformer":
-                    name = f"{component}.{inner}"
+                    inner = inner.removeprefix("base_model.model.")
+                    name = f"{component}.{diffusers_to_vllm_name(inner)}"
                 lora_weight = _split_lora_weight_name(name)
                 if lora_weight is None:
                     mapped[name] = tensor

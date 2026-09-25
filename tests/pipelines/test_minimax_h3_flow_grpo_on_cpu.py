@@ -314,6 +314,33 @@ def test_full_weight_sync_uses_fused_loaders_and_returns_model_parameter_names()
     }
 
 
+@pytest.mark.parametrize("prefix", ["", "dit."])
+@pytest.mark.parametrize("combined", [False, True])
+def test_native_full_weight_sync_normalizes_wrapper_at_rollout(prefix, combined) -> None:
+    pipeline = _SyncPipeline()
+    if combined:
+        pipeline.partition = "combined"
+        pipeline.transformers_ref = _Component({})
+    component = "transformers_ref" if combined else "transformer"
+    names = [
+        "condition_proj.weight",
+        "token_refiner.blocks.0.attn.qkv_proj.weight",
+        "blocks.0.attn.qkv_proj.weight",
+        "blocks.0.mlp.fc1.weight",
+    ]
+    weights = {f"transformer.{prefix}{name}": torch.randn(4, 4) for name in names}
+    weights["vae.dit.weight"] = torch.ones(1)
+
+    loaded = pipeline.load_weights(weights.items())
+
+    expected = {f"{component}.{name}" for name in names} | {"vae.dit.weight"}
+    assert loaded == expected
+    assert {name for name, _ in pipeline.forwarded} == expected
+    assert all(actual is original for (_, actual), original in zip(pipeline.forwarded, weights.values(), strict=True))
+    pipeline.qkv.weight_loader.assert_not_called()
+    pipeline.fc1.weight_loader.assert_not_called()
+
+
 def test_lora_weight_sync_splits_geglu_and_rewrites_targets() -> None:
     pipeline = _SyncPipeline()
     tensor = torch.arange(32, dtype=torch.float32).reshape(8, 4)
@@ -325,6 +352,25 @@ def test_lora_weight_sync_splits_geglu_and_rewrites_targets() -> None:
     torch.testing.assert_close(mapped["transformer.blocks.0.mlp.fc1_0.lora_B.weight"], tensor[4:])
     torch.testing.assert_close(mapped["transformer.blocks.0.mlp.fc1_1.lora_B.weight"], tensor[:4])
     assert mapped_config["target_modules"] == ["fc1_0", "fc1_1", "to_q"]
+
+
+@pytest.mark.parametrize("prefix", ["", "dit.", "base_model.model.dit."])
+@pytest.mark.parametrize("combined", [False, True])
+def test_native_lora_weight_sync_normalizes_wrapper_at_rollout(prefix, combined) -> None:
+    pipeline = _SyncPipeline()
+    pipeline.transformer.arch = SimpleNamespace(ffn_hidden_size=4, num_attention_heads=2, attention_head_dim=4)
+    if combined:
+        pipeline.partition = "combined"
+        pipeline.transformers_ref = pipeline.transformer
+    component = "transformers_ref" if combined else "transformer"
+    tensor = torch.ones(4, 4)
+    mapped, _ = pipeline.map_lora_update_to_engine(
+        {f"transformer.{prefix}blocks.0.attn.out_proj.lora_A.weight": tensor},
+        {"r": 4, "target_modules": ["out_proj"]},
+    )
+    expected = f"{component}.blocks.0.attn.out_proj.lora_A.weight"
+    assert set(mapped) == {expected}
+    assert mapped[expected] is tensor
 
 
 def test_h3_lora_target_layout_is_shared_by_validation_and_sync() -> None:

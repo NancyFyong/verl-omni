@@ -18,19 +18,13 @@ from __future__ import annotations
 
 import torch
 
-__all__ = ["convert_export_key", "is_veomni_module", "predict_veomni"]
+__all__ = ["is_veomni_module", "predict_veomni"]
 
 
 def is_veomni_module(module: torch.nn.Module) -> bool:
     """Return whether ``module`` wraps VeOmni's native fused H3 DiT."""
     config = getattr(module, "config", None)
     return getattr(config, "model_type", None) == "MiniMaxH3DiTModel"
-
-
-def convert_export_key(name: str) -> str:
-    """Remove VeOmni's HF wrapper prefix from a rollout-sync key."""
-    prefix = "transformer.dit."
-    return f"transformer.{name[len(prefix) :]}" if name.startswith(prefix) else name
 
 
 def _native_forward_inputs(model_inputs: dict[str, torch.Tensor], use_gradient_checkpointing: bool) -> dict:

@@ -40,7 +40,6 @@ from verl.utils.torch_dtypes import PrecisionType
 from verl.workers.engine.base import BaseEngine, BaseEngineCtx, EngineRegistry
 from verl.workers.engine.utils import enable_full_determinism, prepare_micro_batches
 
-from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.pipelines.utils import build_scheduler, forward_and_sample_previous_step, prepare_model_inputs
 from verl_omni.workers.config import (
     DiffusionModelConfig,
@@ -703,11 +702,6 @@ class VeOmniDiffusionEngine(BaseEngine):
         if self._is_offload_param:
             offload_model_to_cpu(self.module)
 
-        model_config = getattr(self, "model_config", None)
-        model_cls = DiffusionModelBase.peek_class(
-            getattr(model_config, "architecture", None),
-            getattr(model_config, "algorithm", None),
-        )
         device = get_device_id()
         export_dtype = PrecisionType.to_dtype(self.engine_config.model_dtype)
 
@@ -717,10 +711,7 @@ class VeOmniDiffusionEngine(BaseEngine):
                 tensor = tensor.to(device, non_blocking=True)
                 if tensor.is_floating_point() and tensor.dtype != export_dtype:
                     tensor = tensor.to(export_dtype, non_blocking=True)
-                export_name = f"transformer.{name}"
-                if model_cls is not None:
-                    export_name = model_cls.convert_export_key(export_name)
-                yield export_name, tensor
+                yield f"transformer.{name}", tensor
 
         return param_generator(), peft_config_dict
 

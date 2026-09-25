@@ -86,11 +86,6 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
         resolve_h3_lora_target_layout(model_config.target_modules)
 
     @classmethod
-    def convert_export_key(cls, name: str) -> str:
-        """Map VeOmni's native H3 wrapper keys to the fused rollout layout."""
-        return veomni.convert_export_key(name)
-
-    @classmethod
     def build_scheduler(cls, model_config: DiffusionModelConfig) -> H3SchedulerPair:
         # H3 uses different sigma schedules for video and audio latents.
         schedulers = (FlowMatchSDEDiscreteScheduler(), FlowMatchSDEDiscreteScheduler())

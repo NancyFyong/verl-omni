@@ -423,11 +423,29 @@ def test_native_h3_lora_export_binds_to_fused_rollout_modules(monkeypatch):
 
     base_generator, _ = engine.get_per_tensor_param(base_sync_done=False, adapter_name="default")
     base = dict(base_generator)
-    assert "transformer.condition_proj.weight" in base
-    assert not any(".dit." in name or "conon_proj" in name for name in base)
+    assert "transformer.dit.condition_proj.weight" in base
+    assert not any("conon_proj" in name for name in base)
+
+    class _RolloutLoader:
+        def load_weights(self, weights):
+            params = dict(weights)
+            self.transformer.load_state_dict(
+                {name.removeprefix("transformer."): tensor for name, tensor in params.items()}, strict=True
+            )
+            return set(params)
+
+    class _RolloutPipeline(MiniMaxH3WeightSyncMixin, _RolloutLoader):
+        pass
+
+    rollout = _RolloutPipeline()
+    rollout.transformer = _build_models()[1].dit
+    loaded_base = rollout.load_weights(base.items())
+    assert loaded_base == {name.replace("transformer.dit.", "transformer.", 1) for name in base}
+    torch.testing.assert_close(rollout.transformer.condition_proj.weight, base["transformer.dit.condition_proj.weight"])
 
     adapter_generator, config = engine.get_per_tensor_param(base_sync_done=True, adapter_name="default")
     adapter = dict(adapter_generator)
+    assert all(name.startswith("transformer.dit.") for name in adapter)
     mapper = object.__new__(MiniMaxH3WeightSyncMixin)
     mapper.transformer = SimpleNamespace(
         arch=SimpleNamespace(

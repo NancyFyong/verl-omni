@@ -472,7 +472,9 @@ _TOPLEVEL_RENAMES = (
 
 
 def diffusers_to_vllm_name(name: str) -> str:
-    """Rename a Diffusers H3 parameter to its fused vLLM-Omni counterpart."""
+    """Rename a Diffusers or VeOmni H3 parameter to its fused vLLM-Omni counterpart."""
+    if name.startswith("dit."):
+        return name.removeprefix("dit.")
     name = name.replace("token_refiner.refiner_blocks.", "token_refiner.blocks.")
     name = name.replace("transformer_blocks.", "blocks.")
     name = name.replace(".attn.norm_q.", ".attn.q_norm.")
