@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -29,39 +28,11 @@ from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.pipelines.qwen_image_flow_grpo.common import QwenImageTokenIdPromptMixin
 from verl_omni.pipelines.qwen_image_flow_grpo.diffusers_training_adapter import QwenImage
 
-__all__ = ["QwenImageDMD2", "load_qwen_dmd2_adapter", "qwen_dmd2_base_provenance"]
-
-
-def qwen_dmd2_base_provenance(local_path):
-    """Read the base identity required to validate a Qwen DMD2 LoRA artifact."""
-    root = Path(local_path)
-    revision = root.name if root.parent.name == "snapshots" else None
-    metadata = root / ".cache/huggingface/download/model_index.json.metadata"
-    if metadata.is_file():
-        with metadata.open() as file:
-            revision = file.readline().strip()
-    if not revision or len(revision) != 40 or any(char not in "0123456789abcdef" for char in revision):
-        revision = None
-    with (root / "transformer/config.json").open("rb") as file:
-        config_hash = hashlib.file_digest(file, "sha256").hexdigest()
-    return {"base_model_revision": revision, "base_transformer_config_sha256": config_hash}
-
-
-def load_qwen_dmd2_adapter(module, path, adapter_name="default"):
-    """Load the PEFT artifact emitted by the DMD2 engine into Qwen-Image."""
-    from safetensors.torch import load_file
-
-    path = Path(path)
-    weights = {
-        key.removeprefix("base_model.model.").removeprefix("transformer."): value
-        for key, value in load_file(path / "adapter_model.safetensors").items()
-    }
-    metadata = json.loads((path / "adapter_config.json").read_text())
-    module.load_lora_adapter(weights, adapter_name=adapter_name, prefix=None, metadata=metadata)
+__all__ = ["QwenImageDMD2"]
 
 
 def build_qwen_dmd_sigmas(num_inference_steps, shift, device):
-    """Build the fixed, once-shifted Euler grid shared by training and inference."""
+    """Build Qwen's fixed, once-shifted Euler training grid."""
     from verl_omni.trainer.diffusion.distillation.utils import timestep_shift
 
     if isinstance(num_inference_steps, bool) or not isinstance(num_inference_steps, int) or num_inference_steps <= 0:

@@ -1,6 +1,6 @@
 # Qwen-Image DMD2 distribution-only
 
-Last updated: 09/11/2026.
+Last updated: 09/25/2026.
 
 See the [algorithm and runtime contract](../../../docs/algo/diffusion_distillation.md)
 for the objectives, role ownership, configuration and checkpoint semantics.
@@ -84,9 +84,7 @@ One frozen base holds independently optimized `default` (student) and
 `fake_score` adapters, a non-optimized `student_ema`, and adapter-disabled teacher
 scoring. This MVP requires LoRA; independent full modules and external teachers
 are deferred, not mathematical requirements of DMD2. FSDP1 requires
-`use_orig_params=true`; FSDP2 is the default. The example's attention LoRA targets
-are fully covered by layer-wise export; custom targets must also be covered by
-`model.fsdp_layer_prefixes`, otherwise export fails closed.
+`use_orig_params=true`; FSDP2 is the default.
 
 ## Batching and diagnostics
 
@@ -116,10 +114,9 @@ Use the existing `global_profiler.steps` and
 `actor_rollout_ref.actor.profiler` settings for Torch traces. No new profiler or
 inference server is required for training.
 
-## Resume and inference
+## Checkpoint and resume
 
-The two user-facing outputs are a complete training checkpoint and one selected
-inference artifact:
+The only saved training artifact is the complete FSDP checkpoint:
 
 ```text
 OUTPUT_DIR/
@@ -129,14 +126,12 @@ OUTPUT_DIR/
     data.pt
     trainer.pt      # completed cycle, driver RNG and configuration fingerprint
   latest_checkpointed_iteration.txt
-  inference/
-    adapter_model.safetensors
-    adapter_config.json
-    inference_manifest.json
 ```
 
-Saving is synchronous and atomic on a shared local filesystem. All ranks and
-role clocks are checked before publication and restore. `max_actor_ckpt_to_keep`
+The launcher saves every `SAVE_FREQ` cycles (default 100) and after the final
+completed cycle. `SAVE_FREQ=-1` disables saving; no separate artifact is then
+written at the end. Saving is synchronous and atomic on a shared local filesystem.
+All ranks and role clocks are checked before publication and restore. `max_actor_ckpt_to_keep`
 controls retention of this run's complete checkpoints. Restore requires model,
 optimizer and extra state. Legacy generic-distillation checkpoints are rejected;
 there is no implicit format/counter migration. Mathematical/data/optimizer
@@ -152,27 +147,16 @@ keep the same data/model/training configuration and use a fresh output directory
 # trainer.resume_from_path=/path/to/global_step_N
 ```
 
-Export defaults to **student**. EMA remains resumable smoothing state;
-`dmd.export_role=student_ema` explicitly selects it instead. The inference artifact
-is a base-dependent PEFT LoRA, not a merged self-contained pipeline. Its manifest
-records role, step, resolved base revision, transformer-config hash, sampler,
-resolution and weight checksum. Unversioned local bases record a null revision;
-use an immutable matching base rather than treating the config hash as a weight
-checksum. Generation
-reuses Qwen input preparation and the exact fp32 training Euler grid:
+Student, fake-score and EMA adapters remain in the resumable model state. No
+separate student/EMA LoRA, `inference/` directory or generation tool is produced.
+`dmd.export_role` is deprecated and ignored; retain its original value when
+resuming an existing checkpoint because it remains part of the configuration
+fingerprint. Existing checkpoints and inference files are left untouched.
 
-```bash
-python examples/dmd2_trainer/qwen_image/generate.py \
-  --artifact outputs/qwen_dmd2/inference \
-  --prompt 'A red apple on a wooden table' \
-  --seed 42 --output outputs/apple.png
-```
-
-Use `--base-model` if the matching base checkpoint moved. Stock pipeline defaults
-must not silently replace the recorded fixed-shift/conditional-only schedule.
-Automatic CheckpointEngine validation replicas, vLLM request batching and new
-transports are deliberately deferred. A completed smoke or decoded image proves
-execution, not generation-quality improvement.
+FSDP checkpoints are not directly loadable with `QwenImagePipeline.from_pretrained`.
+Inference conversion, CheckpointEngine validation replicas, vLLM request batching
+and new transports are outside this training integration. A completed training
+smoke does not establish generation-quality improvement.
 
 ## Validation commands
 
@@ -180,7 +164,7 @@ execution, not generation-quality improvement.
 # CPU suite (includes existing OPD regressions)
 python -m pytest -o 'python_files=*_on_cpu.py' --asyncio-mode=auto tests/
 
-# Real two-rank FSDP1/FSDP2 tiny-model updates, EMA, resume and adapter reload
+# Real two-rank FSDP1/FSDP2 tiny-model updates, EMA and checkpoint resume
 QWEN_IMAGE_MODEL_PATH=/path/to/tiny-random/Qwen-Image \
 torchrun --standalone --nproc_per_node=2 -m pytest -q tests/workers/test_dmd_fsdp.py
 

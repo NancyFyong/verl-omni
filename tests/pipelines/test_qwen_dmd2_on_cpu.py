@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import hashlib
 import json
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -26,8 +25,6 @@ from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.pipelines.qwen_image_dmd2.diffusers_training_adapter import (
     QwenImageConditionProvider,
     QwenImageDMD2,
-    load_qwen_dmd2_adapter,
-    qwen_dmd2_base_provenance,
 )
 from verl_omni.workers.config import DiffusionDMDConfig
 
@@ -166,39 +163,6 @@ class TestQwenDMDSampling:
 
 
 class TestQwenDMD2:
-    def test_base_provenance_is_owned_by_the_qwen_integration(self, tmp_path):
-        revision = "a" * 40
-        root = tmp_path / "snapshots" / revision
-        (root / "transformer").mkdir(parents=True)
-        config = b'{"in_channels": 64}'
-        (root / "transformer/config.json").write_bytes(config)
-
-        value = qwen_dmd2_base_provenance(root)
-
-        assert value == {
-            "base_model_revision": revision,
-            "base_transformer_config_sha256": hashlib.sha256(config).hexdigest(),
-        }
-
-    def test_peft_export_loader_is_owned_by_the_qwen_integration(self, tmp_path):
-        from safetensors.torch import save_file
-
-        save_file(
-            {"base_model.model.transformer.block.lora_A.weight": torch.ones(2)}, tmp_path / "adapter_model.safetensors"
-        )
-        (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 2}))
-        module = SimpleNamespace(load_lora_adapter=Mock())
-
-        load_qwen_dmd2_adapter(module, tmp_path, "student")
-
-        (weights,) = module.load_lora_adapter.call_args.args
-        assert set(weights) == {"block.lora_A.weight"}
-        assert module.load_lora_adapter.call_args.kwargs == {
-            "adapter_name": "student",
-            "prefix": None,
-            "metadata": {"r": 2},
-        }
-
     def test_registry_does_not_claim_original_dmd_or_edit_support(self):
         assert DiffusionModelBase.get_class_by_name("QwenImagePipeline", "dmd2") is QwenImageDMD2
         with pytest.raises(NotImplementedError):

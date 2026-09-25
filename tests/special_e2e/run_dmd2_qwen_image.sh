@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Multi-GPU DMD2 production smoke, including atomic checkpoints and student export.
+# Multi-GPU DMD2 production smoke with complete resumable FSDP checkpoints.
 set -euo pipefail
 
 export NUM_GPUS=${NUM_GPUS:-2}
@@ -29,6 +29,14 @@ bash examples/dmd2_trainer/qwen_image/run_qwen_image_dmd2_lora.sh \
     trainer.logger=console \
     "$@"
 
-test -f "${OUTPUT_DIR}/inference/adapter_model.safetensors"
-test -f "${OUTPUT_DIR}/global_step_${TOTAL_TRAIN_STEPS}/trainer.pt"
-echo 'DMD2 training, checkpoint and student export completed.'
+CHECKPOINT="${OUTPUT_DIR}/global_step_${TOTAL_TRAIN_STEPS}"
+test -f "${CHECKPOINT}/trainer.pt"
+test -f "${CHECKPOINT}/data.pt"
+for ((rank = 0; rank < NUM_GPUS; rank++)); do
+    for kind in model optim extra_state; do
+        test -f "${CHECKPOINT}/actor/${kind}_world_size_${NUM_GPUS}_rank_${rank}.pt"
+    done
+    test -f "${CHECKPOINT}/actor/dmd_state_rank_${rank}.pt"
+done
+test "$(cat "${OUTPUT_DIR}/latest_checkpointed_iteration.txt")" = "${TOTAL_TRAIN_STEPS}"
+echo 'DMD2 training and resumable FSDP checkpoint completed.'

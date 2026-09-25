@@ -17,6 +17,7 @@ import gc
 import os
 import shutil
 import tempfile
+from copy import deepcopy
 from datetime import timedelta
 from functools import partial
 from pathlib import Path
@@ -29,7 +30,6 @@ from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig
 
-from verl_omni.pipelines.qwen_image_dmd2.diffusers_training_adapter import load_qwen_dmd2_adapter
 from verl_omni.workers.config import (
     DiffusionActorConfig,
     DiffusionDMDConfig,
@@ -107,7 +107,7 @@ def train_stage(engine, stage, batch):
 
 
 @pytest.mark.parametrize("strategy", ["fsdp", "fsdp2"])
-def test_qwen_dmd2_engine_update_resume_export(strategy, process_group):
+def test_qwen_dmd2_engine_update_resume(strategy, process_group):
     model_path = os.environ.get("QWEN_IMAGE_MODEL_PATH", os.path.expanduser("~/models/tiny-random/Qwen-Image"))
     if not Path(model_path, "model_index.json").is_file():
         pytest.skip(f"Tiny Qwen checkpoint not found: {model_path}")
@@ -134,11 +134,18 @@ def test_qwen_dmd2_engine_update_resume_export(strategy, process_group):
         saved = {role: adapter_values(engine, role) for role in ("student", "fake_score", "student_ema")}
         for role, values in initial.items():
             assert any(torch.count_nonzero(saved[role][key] - value) > 0 for key, value in values.items())
+        saved_schedulers = {role: deepcopy(scheduler.state_dict()) for role, scheduler in engine.schedulers.items()}
         engine.save_checkpoint(str(directory / "actor"), global_step=3)
+        for prefix in ("model", "optim", "extra_state"):
+            filename = f"{prefix}_world_size_{dist.get_world_size()}_rank_{dist.get_rank()}.pt"
+            assert (directory / "actor" / filename).is_file()
+        assert (directory / "actor" / f"dmd_state_rank_{dist.get_rank()}.pt").is_file()
         replay = train_stage(engine, "student", batch)
         expected = adapter_values(engine, "student")
+        train_stage(engine, "fake_score", batch)
         restored = engine.load_checkpoint(str(directory / "actor"), del_local_after_load=False)
         assert restored == {"student": 3, "fake_score": 6}
+        assert {role: scheduler.state_dict() for role, scheduler in engine.schedulers.items()} == saved_schedulers
         for role, parameters in saved.items():
             for key, value in adapter_values(engine, role).items():
                 torch.testing.assert_close(value, parameters[key], rtol=0, atol=0)
@@ -146,21 +153,6 @@ def test_qwen_dmd2_engine_update_resume_export(strategy, process_group):
         assert repeated["loss"] == pytest.approx(replay["loss"], rel=1e-6, abs=1e-8)
         for key, value in adapter_values(engine, "student").items():
             torch.testing.assert_close(value, expected[key], rtol=0, atol=0)
-        engine.export_student(str(directory / "inference"), role="student")
-        assert (directory / "inference" / "adapter_model.safetensors").is_file()
-        from diffusers import QwenImageTransformer2DModel
-        from peft import get_peft_model_state_dict
-        from safetensors.torch import load_file
-
-        reloaded = QwenImageTransformer2DModel.from_pretrained(
-            model_path, subfolder="transformer", torch_dtype=torch.bfloat16
-        )
-        load_qwen_dmd2_adapter(reloaded, directory / "inference", "reloaded")
-        state = get_peft_model_state_dict(reloaded, adapter_name="reloaded")
-        exported = load_file(directory / "inference" / "adapter_model.safetensors")
-        assert state.keys() == exported.keys()
-        for key, value in state.items():
-            torch.testing.assert_close(value, exported[key], rtol=0, atol=0, check_dtype=False)
         before = dict(engine.optimizer_steps)
         scheduler_step = engine.lr_scheduler.last_epoch
         engine.forward_finite = dist.get_rank() != 0

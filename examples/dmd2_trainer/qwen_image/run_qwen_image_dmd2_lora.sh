@@ -34,7 +34,6 @@ python3 -m verl_omni.trainer.main_diffusion \
     dmd.fake_update_ratio=2 \
     dmd.student_micro_batch_size_per_gpu="${STUDENT_MICRO_BATCH_SIZE:-1}" \
     dmd.fake_score_micro_batch_size_per_gpu="${FAKE_MICRO_BATCH_SIZE:-1}" \
-    dmd.export_role=student \
     trainer.logger='[console,tensorboard]' \
     trainer.project_name=qwen-image-dmd2 \
     trainer.experiment_name="${EXPERIMENT_NAME:-distribution-only}" \
