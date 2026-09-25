@@ -13,11 +13,16 @@
 # limitations under the License.
 """Shared helpers for diffusion Ray trainers."""
 
+import os
+import tempfile
 from collections.abc import Sequence
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Optional
 
 from verl import DataProto
 from verl.trainer.distillation import is_distillation_enabled
+from verl.utils.checkpoint.checkpoint_manager import get_checkpoint_tracker_filename
 
 
 def _to_diffusion_worker_tensordict(batch: DataProto):
@@ -107,6 +112,29 @@ def validate_distillation_config(config) -> None:
                 "the teacher pipeline consumes one batch of generation lead at start-up, and with less lead every "
                 "sample waits on its own batch's generation."
             )
+
+
+@contextmanager
+def publish_directory_atomically(root: Path, name: str):
+    """Publish a staged checkpoint directory, cleaning staging even if rename fails."""
+    target = root / name
+    if target.exists():
+        raise FileExistsError(f"Refusing to overwrite checkpoint {target}.")
+    with tempfile.TemporaryDirectory(prefix=f".{name}_", dir=root) as directory:
+        staging = Path(directory)
+        yield staging
+        os.replace(staging, target)
+
+
+def write_latest_iteration(root: Path, step: int) -> None:
+    """Atomically update verl's checkpoint tracker without leaving temporary files."""
+    descriptor, temporary = tempfile.mkstemp(prefix=".latest_", dir=root)
+    try:
+        with os.fdopen(descriptor, "w") as file:
+            file.write(str(step))
+        os.replace(temporary, get_checkpoint_tracker_filename(str(root)))
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 class NoOpCheckpointManager:

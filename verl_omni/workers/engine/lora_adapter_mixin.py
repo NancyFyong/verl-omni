@@ -111,11 +111,13 @@ class LoRAAdapterMixin:
         module.set_adapter(name)
 
     @contextmanager
-    def use_adapter(self, name: str):
+    def use_adapter(self, name: str, *, restore_adapter: str = "default"):
         """Temporarily select a named PEFT adapter.
 
         ``"reference"`` is a logical policy state (see ``policy_state_adapters``)
         that runs with all LoRA adapters disabled, not a registered PEFT adapter.
+        Named adapters restore to ``restore_adapter`` on exit; existing callers
+        keep the default policy unless they explicitly select another target.
         """
         if name == "reference":
             with self.disable_adapter():
@@ -125,7 +127,7 @@ class LoRAAdapterMixin:
             try:
                 yield
             finally:
-                self._set_adapter("default")
+                self._set_adapter(restore_adapter)
 
     def _active_adapter_trainable_params(self, adapter_name: str) -> list[torch.nn.Parameter]:
         peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)

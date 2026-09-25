@@ -58,7 +58,7 @@ class DiffusionDMDConfig(BaseConfig):
     ema_decay: float = 0.999
     # Successful student update count at which EMA starts.
     ema_start_step: int = 0
-    # Default inference artifact; EMA is an explicit alternative.
+    # Deprecated, ignored; retained for existing configs and checkpoint fingerprints.
     export_role: str = "student"
 
     def __post_init__(self):

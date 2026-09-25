@@ -55,5 +55,5 @@ ema_decay: 0.999
 # Successful student steps before EMA starts.
 ema_start_step: 0
 
-# Default inference artifact.
+# Deprecated, ignored; retained for existing configs and checkpoint fingerprints.
 export_role: student
