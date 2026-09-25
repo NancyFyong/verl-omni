@@ -10,10 +10,10 @@ teacher and a trainable fake-score model. It supplies differentiable student
 sampling, an explicit student-to-fake-score update cycle, named-LoRA ownership,
 EMA, numerical-skip handling and complete resumable FSDP checkpoints.
 
-This runtime slice does not register a concrete model architecture. A model
-integration must provide the conditioning, latent geometry, model-input,
-prediction-to-x0, student-sampling and score-corruption hooks described below. Architecture
-packages, recipes and real-model acceptance tests belong in dependent PRs.
+The parent runtime slice intentionally registers no concrete architecture. This
+integration supplies the `(QwenImagePipeline, dmd2)` adapter, frozen condition
+provider, recipe and Qwen-specific validation while leaving the
+trainer, worker and engine unchanged.
 
 The current contract is intentionally bounded to shape-preserving,
 single-latent flow-matching models sampled with deterministic Euler transitions.
@@ -228,6 +228,69 @@ checkpoints. FSDP1 additionally requires `use_orig_params=true`.
 | `ema_start_step` | `0` | Successful student-update threshold for EMA |
 | `export_role` | `student` | Deprecated and ignored; retained for existing configuration fingerprints |
 
+## Qwen-Image integration
+
+`QwenImageDMD2` is a stateless `DiffusionModelBase` adapter in
+`pipelines/qwen_image_dmd2/diffusers_training_adapter.py`. It reuses the existing
+Qwen-Image training adapter for transformer invocation and implements only the
+DMD2 hooks required by the parent runtime:
+
+| Hook | Qwen behavior |
+|---|---|
+| conditioning | Apply the checkpoint's fixed prompt template and prefix removal, or validate detached precomputed embeddings |
+| latent geometry | Derive VAE channel/scale metadata from the checkpoint and require homogeneous image dimensions within a physical batch |
+| packing | Use the native Qwen 2x spatial packing from normalized VAE latents to `[B,N,D]` |
+| model inputs | Reuse Qwen timestep normalization, RoPE lengths and packed transformer kwargs |
+| prediction conversion | Convert packed `noise - clean` velocity to fp32 x0 |
+| sampling sigmas | Use a fixed once-shifted Euler training grid |
+
+The teacher applies positive/negative CFG in packed velocity space before x0
+conversion. Student and fake-score forwards are conditional-only. For four steps
+and `rollout_timestep_shift=3`, the sigma grid is `[1, 0.9, 0.75, 0.5, 0]`.
+This intentionally differs from the stock Qwen pipeline's
+resolution-dependent shift.
+
+### Prompt and batching contract
+
+Prompt parquet uses the existing `RLHFDataset` chat schema, for example:
+
+```python
+{"prompt": [{"role": "user", "content": "A red apple on a wooden table"}]}
+```
+
+Raw input accepts a string or one text-only user message. The provider rejects
+custom system/assistant or multi-message chats rather than applying a different
+template. A custom dataset may instead provide detached `[B,L,D]` embeddings and
+matching masks. Negative conditioning is required only for student teacher-score
+calls; fake-score attempts do not encode it.
+
+Physical batches may contain more than one sample when all image dimensions
+match. Different geometries fail before model execution. Microbatch tails use the
+parent runtime's TensorDict splitting and sample-weighted reduction. Validated
+distributed coverage is SP=1; this integration does not claim sequence-parallel
+training support.
+
+### Train and resume
+
+Use the {doc}`Qwen-Image DMD2 example <../examples/qwen_image/dmd2_trainer>`.
+The launcher selects 1024x1024, four steps, max sequence length 1024, LoRA
+rank/alpha 32, student LR `1e-4`, fake-score LR `2e-5`, teacher CFG 4 with
+`layer_norm`, and FSDP2/BF16 by default:
+
+```bash
+MODEL_PATH=/path/to/Qwen-Image \
+TRAIN_FILES=/path/to/train.parquet \
+VAL_FILES=/path/to/test.parquet \
+OUTPUT_DIR=outputs/qwen_dmd2 \
+NUM_GPUS=8 TOTAL_TRAIN_STEPS=1000 \
+bash examples/dmd2_trainer/qwen_image/run_qwen_image_dmd2_lora.sh
+```
+
+The validation parquet is required by shared dataloader construction, but the
+launcher disables validation generation. To resume, pass the same model,
+optimizer, DMD and data settings plus `trainer.resume_mode=resume_path` and
+`trainer.resume_from_path=<checkpoint>`.
+
 ## Checkpoint and Resume
 
 The only saved training artifact is the complete FSDP checkpoint:
@@ -272,11 +335,11 @@ standalone Diffusers pipeline or directly loadable inference adapter.
 
 ## Limitations
 
-This runtime does not include a production architecture, automatic
-validation-replica synchronization, vLLM-Omni serving, request batching,
-standalone score transport, full finetuning or NPU validation. Concrete model
-integrations supply their own conditioning, packing and real-model validation.
-Inference conversion and serving are outside this checkpoint-only runtime.
+The Qwen-Image integration is limited to base text-to-image generation with
+LoRA and SP=1. It does not include automatic validation-replica synchronization,
+vLLM-Omni serving, request batching, standalone score transport, full finetuning
+or NPU validation. Inference conversion and serving are outside this
+checkpoint-only integration.
 
 ## References
 
