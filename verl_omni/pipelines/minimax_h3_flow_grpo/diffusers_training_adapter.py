@@ -21,6 +21,7 @@ from typing import Optional
 import torch
 from diffusers import ModelMixin
 from tensordict import TensorDict
+from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_name
 from vllm_omni.diffusion.models.minimax_h3.denoise_loop import (
     MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
@@ -29,6 +30,7 @@ from vllm_omni.diffusion.models.minimax_h3.denoise_loop import (
 
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     build_ref2va_layout_from_meta,
+    h3_ulysses_forward,
     prepare_h3_processor_files,
 )
 from verl_omni.pipelines.model_base import DiffusionModelBase
@@ -238,6 +240,7 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
                 "_h3_video_update_mask": video_update_mask_device,
                 "_h3_audio_update_mask": audio_update_mask_device,
                 "_h3_target_only_trajectory": is_ref2va,
+                "_h3_sp_size": tu.get_non_tensor_data(micro_batch, "sp_size", default=1),
             },
             None,
         )
@@ -261,6 +264,7 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
         video_update_mask = model_inputs.pop("_h3_video_update_mask")
         audio_update_mask = model_inputs.pop("_h3_audio_update_mask")
         target_only_trajectory = bool(model_inputs.pop("_h3_target_only_trajectory"))
+        sp_size = model_inputs.pop("_h3_sp_size", 1)
         if veomni.is_veomni_module(module):
             video_velocity, audio_velocity = veomni.predict_veomni(
                 module,
@@ -268,7 +272,7 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
                 use_gradient_checkpointing=model_config.enable_gradient_checkpointing,
             )
         else:
-            video_velocity, audio_velocity = module(**model_inputs)
+            video_velocity, audio_velocity = h3_ulysses_forward(module, model_inputs, sp_size)
         video = model_inputs["hidden_states"].float()
         audio = model_inputs["audio_hidden_states"].float()
         if target_only_trajectory:

@@ -28,7 +28,7 @@ checkpoint config instead of its production-only 5120-wide constant.
 
 Usage:
     python tests/special_e2e/run_flowgrpo_minimax_h3_tiny.py \
-        --task all --actor-backend fsdp2 --num-gpus 2 --total-steps 2
+        --task all --actor-backend fsdp2 --num-gpus 2 --actor-sp 2 --total-steps 2
 
     python tests/special_e2e/run_flowgrpo_minimax_h3_tiny.py \
         --task t2va --actor-backend veomni --num-gpus 2 --total-steps 2
@@ -39,6 +39,7 @@ time budget; FL2VA and Ref2VA remain available for targeted manual validation.
 Env overrides:
     MODEL_PATH  Tiny H3 checkpoint (default ``~/models/tiny-random/minimax-h3``)
     DATA_DIR    Dummy task parquet root (default ``~/data/dummy_h3_flowgrpo``)
+    ACTOR_SP    Actor Ulysses sequence-parallel size (default ``1``)
 """
 
 from __future__ import annotations
@@ -79,6 +80,11 @@ def _require_minimax_h3_diffusers() -> None:
             "MiniMax H3 FlowGRPO requires Diffusers >=0.40.0 with "
             f"MiniMaxH3Transformer3DModel; found {diffusers.__version__}."
         )
+
+
+def _validate_actor_sp(num_gpus: int, actor_sp: int) -> None:
+    if actor_sp <= 0 or num_gpus % actor_sp:
+        raise ValueError(f"num_gpus={num_gpus} must be divisible by actor_sp={actor_sp}.")
 
 
 def _fixup_ld_library_path() -> None:
@@ -134,6 +140,7 @@ def _hydra_overrides(
     task: str,
     actor_backend: str,
     num_gpus: int,
+    actor_sp: int,
     rollout_tp: int,
     text_encoder_tp: int,
     total_training_steps: int,
@@ -144,6 +151,9 @@ def _hydra_overrides(
     num_inference_steps: int,
 ) -> list[str]:
     """Build a minimal task-specific MiniMax H3 FlowGRPO Hydra invocation."""
+    _validate_actor_sp(num_gpus, actor_sp)
+    if actor_backend == "veomni" and actor_sp != 1:
+        raise ValueError("The VeOmni MiniMax H3 actor supports Ulysses SP=1 only; use --actor-backend fsdp2.")
     micro_bsz_per_gpu = 1
     # The Ref2VA rollout path requires exactly one output per request, while
     # T2VA and FL2VA use two responses to exercise grouped advantages.
@@ -221,7 +231,7 @@ def _hydra_overrides(
                 "actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16",
                 "actor_rollout_ref.actor.fsdp_config.param_offload=True",
                 "actor_rollout_ref.actor.fsdp_config.optimizer_offload=True",
-                "actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=1",
+                f"actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size={actor_sp}",
             ]
         ),
         # rollout
@@ -321,6 +331,7 @@ def run_smoke(
     data_dir: str,
     output_dir: str,
     num_gpus: int,
+    actor_sp: int,
     rollout_tp: int,
     text_encoder_tp: int,
     total_training_steps: int,
@@ -343,6 +354,7 @@ def run_smoke(
     print(f"[1/3] ensuring tiny MiniMax-H3 checkpoint at {tiny_model_dir}", flush=True)
     ensure_tiny_minimax_h3_checkpoint(tiny_model_dir, skip_if_exists=not force_rebuild)
 
+    _validate_actor_sp(num_gpus, actor_sp)
     micro_bsz_per_gpu = 1
     # Match the rollout n in ``_hydra_overrides``: Ref2VA supports one output per
     # request, while T2VA and FL2VA sample two responses per prompt.
@@ -391,6 +403,7 @@ def run_smoke(
         task=task,
         actor_backend=actor_backend,
         num_gpus=num_gpus,
+        actor_sp=actor_sp,
         rollout_tp=rollout_tp,
         text_encoder_tp=text_encoder_tp,
         total_training_steps=total_training_steps,
@@ -406,7 +419,8 @@ def run_smoke(
         child_env.setdefault("MINIMAX_H3_ATTENTION_IMPLEMENTATION", "torch")
     print(
         f"[3/3] launching FlowGRPO {task.upper()} main_diffusion (backend={actor_backend}, "
-        f"num_gpus={num_gpus}, tp={rollout_tp}, te_tp={text_encoder_tp}, steps={total_training_steps})",
+        f"num_gpus={num_gpus}, actor_sp={actor_sp}, tp={rollout_tp}, te_tp={text_encoder_tp}, "
+        f"steps={total_training_steps})",
         flush=True,
     )
     print("  cmd:", " ".join(cmd), flush=True)
@@ -431,6 +445,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--actor-backend", choices=("fsdp2", "veomni"), default="fsdp2")
     parser.add_argument("--num-gpus", type=int, default=int(os.environ.get("NUM_GPUS", 2)))
+    parser.add_argument("--actor-sp", type=int, default=int(os.environ.get("ACTOR_SP", 1)))
     parser.add_argument("--rollout-tp", type=int, default=int(os.environ.get("ROLLOUT_TP", 1)))
     parser.add_argument("--text-encoder-tp", type=int, default=1)
     parser.add_argument("--total-steps", type=int, default=int(os.environ.get("TOTAL_TRAINING_STEPS", 2)))
@@ -457,6 +472,7 @@ def main() -> None:
             data_dir=os.path.join(args.data_dir, task),
             output_dir=os.path.join(args.output_dir, task),
             num_gpus=args.num_gpus,
+            actor_sp=args.actor_sp,
             rollout_tp=args.rollout_tp,
             text_encoder_tp=args.text_encoder_tp,
             total_training_steps=args.total_steps,
