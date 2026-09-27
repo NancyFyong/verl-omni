@@ -18,11 +18,12 @@ from typing import Any
 
 import torch
 
-from verl_omni.pipelines.minimax_h3_shared.common import MINIMAX_H3_TOKEN_ID_NATIVE_KEY, _PromptTokenOverride
-from verl_omni.pipelines.minimax_h3_shared.weight_sync import (
+from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     _LORA_TARGET_MAPPING,
     H3_LORA_TARGETS,
+    MINIMAX_H3_TOKEN_ID_NATIVE_KEY,
     MiniMaxH3WeightSyncBase,
+    _PromptTokenOverride,
     map_lora_tensors,
 )
 from verl_omni.pipelines.rollout_request import prompt_ids_from_payload

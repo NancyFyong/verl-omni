@@ -28,7 +28,7 @@ from vllm_omni.diffusion.models.minimax_h3.denoise_loop import (
     MINIMAX_H3_IMGVID_COND_TIMESTEP,
 )
 
-from verl_omni.pipelines.minimax_h3_shared.common import (
+from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     build_ref2va_layout_from_meta,
     h3_ulysses_forward,
     prepare_h3_processor_files,

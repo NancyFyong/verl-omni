@@ -21,7 +21,7 @@ from typing import Literal
 import torch
 from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
 
-from verl_omni.pipelines.minimax_h3_shared.common import (
+from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     AUDIO_ROW_WIDTH,
     VIDEO_ROW_WIDTH,
     pack_video_audio_rows,

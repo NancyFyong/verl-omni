@@ -29,15 +29,15 @@ from vllm.model_executor.layers import linear
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3DiTModel, MiniMaxH3Rope
 from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 
+from verl_omni.pipelines.minimax_h3_diffusion_nft import common as nft_common
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     MiniMaxH3RolloutWeightSyncMixin,
+    MiniMaxH3WeightSyncBase,
     pack_video_audio_rows,
     unpack_video_audio_rows,
 )
 from verl_omni.pipelines.minimax_h3_flow_grpo.common import flatten_joint_latents, split_joint_latents
 from verl_omni.pipelines.minimax_h3_flow_grpo.weight_sync import MiniMaxH3WeightSyncMixin
-from verl_omni.pipelines.minimax_h3_shared import common as shared_common
-from verl_omni.pipelines.minimax_h3_shared.weight_sync import MiniMaxH3WeightSyncBase
 
 
 class _WeightOnlyDiT(nn.Module):
@@ -342,12 +342,12 @@ def test_both_algorithms_use_the_same_weight_loader_and_layout_helpers():
     assert MiniMaxH3RolloutWeightSyncMixin.load_weights is MiniMaxH3WeightSyncBase.load_weights
     assert MiniMaxH3WeightSyncMixin.load_weights is MiniMaxH3WeightSyncBase.load_weights
     for actor in (nft_actor, flow_actor):
-        assert actor.build_ref2va_layout_from_meta is shared_common.build_ref2va_layout_from_meta
-        assert actor.h3_ulysses_forward is shared_common.h3_ulysses_forward
-        assert actor.prepare_h3_processor_files is shared_common.prepare_h3_processor_files
+        assert actor.build_ref2va_layout_from_meta is nft_common.build_ref2va_layout_from_meta
+        assert actor.h3_ulysses_forward is nft_common.h3_ulysses_forward
+        assert actor.prepare_h3_processor_files is nft_common.prepare_h3_processor_files
     for rollout in (nft_rollout, flow_rollout):
-        assert rollout.serialize_ref_blocks is shared_common.serialize_ref_blocks
-        assert rollout.ref2va_reference_image_short_edge is shared_common.ref2va_reference_image_short_edge
+        assert rollout.serialize_ref_blocks is nft_common.serialize_ref_blocks
+        assert rollout.ref2va_reference_image_short_edge is nft_common.ref2va_reference_image_short_edge
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])

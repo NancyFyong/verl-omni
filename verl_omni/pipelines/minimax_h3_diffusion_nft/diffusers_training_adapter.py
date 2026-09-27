@@ -19,7 +19,7 @@ import torch
 from tensordict import TensorDict
 from verl.utils import tensordict_utils as tu
 
-from verl_omni.pipelines.minimax_h3_shared.common import (
+from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     build_layout_from_meta,
     build_ref2va_layout_from_meta,
     build_row_timesteps,
@@ -31,8 +31,8 @@ from verl_omni.pipelines.minimax_h3_shared.common import (
     prepare_h3_processor_files,
     split_dual_velocity,
     unpack_video_audio_rows,
+    validate_lora_target_modules,
 )
-from verl_omni.pipelines.minimax_h3_shared.weight_sync import validate_lora_target_modules
 from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.workers.config import DiffusionModelConfig
 

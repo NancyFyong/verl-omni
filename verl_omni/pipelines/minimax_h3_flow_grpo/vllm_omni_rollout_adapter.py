@@ -45,7 +45,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from verl_omni.pipelines.diffusion_rollout_output import with_rollout_data
-from verl_omni.pipelines.minimax_h3_shared.common import (
+from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     ref2va_reference_image_short_edge,
     serialize_ref_blocks,
     validate_h3_parallel_config,
