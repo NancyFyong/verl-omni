@@ -21,6 +21,12 @@ from typing import Literal
 import torch
 from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
 
+from verl_omni.pipelines.minimax_h3_shared.common import (
+    AUDIO_ROW_WIDTH,
+    VIDEO_ROW_WIDTH,
+    pack_video_audio_rows,
+    unpack_video_audio_rows,
+)
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 
 H3_VIDEO_SHIFT = 12.0
@@ -28,8 +34,8 @@ H3_AUDIO_SHIFT = 3.0
 H3_VIDEO_LOG_PROB_WEIGHT = 0.5
 H3_AUDIO_LOG_PROB_WEIGHT = 0.5
 
-H3_VIDEO_WIDTH = 96
-H3_AUDIO_WIDTH = 32
+H3_VIDEO_WIDTH = VIDEO_ROW_WIDTH
+H3_AUDIO_WIDTH = AUDIO_ROW_WIDTH
 
 
 def h3_sigma_schedules(
@@ -103,7 +109,7 @@ def flatten_joint_latents(video: torch.Tensor, audio: torch.Tensor) -> torch.Ten
     """Encode unequal H3 row widths as one Engine-compatible row."""
     if video.shape[0] != audio.shape[0]:
         raise ValueError("MiniMax H3 video and audio batch sizes must match.")
-    return torch.cat([video.flatten(1), audio.flatten(1)], dim=1).unsqueeze(1)
+    return pack_video_audio_rows(video.flatten(1).unsqueeze(1), audio.flatten(1).unsqueeze(1)).unsqueeze(1)
 
 
 def split_joint_latents(
@@ -123,7 +129,4 @@ def split_joint_latents(
             f"MiniMax H3 joint width {joint.shape[-1]} does not match video/audio metadata "
             f"({video_numel} + {audio_numel})."
         )
-    return (
-        joint[:, :video_numel].reshape(joint.shape[0], video_rows, H3_VIDEO_WIDTH),
-        joint[:, video_numel:].reshape(joint.shape[0], audio_rows, H3_AUDIO_WIDTH),
-    )
+    return unpack_video_audio_rows(joint, video_rows, audio_rows)

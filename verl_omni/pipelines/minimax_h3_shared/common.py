@@ -1,0 +1,625 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Algorithm-independent MiniMax H3 latent-layout, processor and SP helpers."""
+
+import inspect
+import json
+import os
+import threading
+import types
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+
+VIDEO_ROW_WIDTH = 96
+AUDIO_ROW_WIDTH = 32
+LATENT_META_WIDTH = 6
+REF_BLOCK_META_WIDTH = 5
+MAX_REF_BLOCKS = 12
+VIDEO_TAG, TEXT_TAG, AUDIO_TAG = 0, 1, 2
+
+_REF_BLOCK_KIND_TO_ID = {"image": 1, "audio": 2, "video": 3, "video_audio": 4}
+_REF_BLOCK_ID_TO_KIND = {value: key for key, value in _REF_BLOCK_KIND_TO_ID.items()}
+
+_ROPE_FRAME_RESCALE = 5.0 / 3.0
+_ROPE_FRAMES_PER_LATENT = (1, 4, 4, 4, 4)
+_ROPE_SPATIAL_SCALE = 32
+_REF_IMAGE_SHAPE_LOCK = threading.RLock()
+
+__all__ = [
+    "VIDEO_ROW_WIDTH",
+    "AUDIO_ROW_WIDTH",
+    "LATENT_META_WIDTH",
+    "REF_BLOCK_META_WIDTH",
+    "MAX_REF_BLOCKS",
+    "VIDEO_TAG",
+    "TEXT_TAG",
+    "AUDIO_TAG",
+    "pack_video_audio_rows",
+    "unpack_video_audio_rows",
+    "split_dual_velocity",
+    "h3_dit_timestep",
+    "h3_velocity_to_flow_match",
+    "prepare_h3_processor_files",
+    "ref2va_reference_image_short_edge",
+    "validate_ref2va_reference_image_short_edge",
+    "pad_h3_layout_for_ulysses",
+    "h3_ulysses_forward",
+    "keyframe_indices_to_anchors",
+    "serialize_ref_blocks",
+    "build_packed_sequence",
+    "build_layout_from_meta",
+    "build_ref2va_layout_from_meta",
+    "build_row_timesteps",
+    "MINIMAX_H3_TOKEN_ID_NATIVE_KEY",
+    "messages_to_text",
+]
+
+
+MINIMAX_H3_TOKEN_ID_NATIVE_KEY = "minimax_h3_token_id_native"
+
+
+_H3_FORWARD_PARAMETERS = (
+    "self",
+    "hidden_states",
+    "audio_hidden_states",
+    "encoder_hidden_states",
+    "timestep",
+    "timestep_indices",
+    "token_tags",
+    "position_ids",
+    "video_indices",
+    "audio_indices",
+    "text_indices",
+    "attention_kwargs",
+    "return_dict",
+)
+_H3_BLOCK_FORWARD_PARAMETERS = ("self", "hidden_states", "temb", "adaln_indices", "rotary_emb", "attention_mask")
+
+
+def pad_h3_layout_for_ulysses(model_inputs: dict[str, Any], sp_size: int | None) -> dict[str, Any]:
+    """Pad H3's packed layout to a multiple of ``sp_size`` and mask the padding keys.
+
+    Padding rows are appended after every real row, are absent from the modality
+    index tensors, and are excluded as attention keys, so real rows see exactly
+    the unpadded attention and padding outputs are never selected.
+    """
+    if sp_size is None or sp_size == 1:
+        return model_inputs
+    if sp_size <= 0:
+        raise ValueError(f"MiniMax H3 Actor SP size must be positive, got {sp_size}.")
+    position_ids = model_inputs["position_ids"]
+    seq_len = int(position_ids.shape[0])
+    pad = -seq_len % sp_size
+    if pad == 0:
+        return model_inputs
+    padded = dict(model_inputs)
+    padded["position_ids"] = torch.nn.functional.pad(position_ids, (0, 0, 0, pad))
+    padded["token_tags"] = torch.nn.functional.pad(model_inputs["token_tags"], (0, pad), value=TEXT_TAG)
+    padded["timestep_indices"] = torch.nn.functional.pad(model_inputs["timestep_indices"], (0, pad))
+    # [1, 1, 1, S] is consumed as-is by native SDPA and normalized to key padding by varlen FA backends.
+    attention_mask = torch.zeros((1, 1, 1, seq_len + pad), dtype=torch.bool, device=position_ids.device)
+    attention_mask[..., :seq_len] = True
+    padded["attention_mask"] = attention_mask
+    return padded
+
+
+# TODO: Remove this copied forward and its installer when
+# https://github.com/huggingface/diffusers/pull/14868 ships in the pinned Diffusers version.
+def _h3_masked_forward(
+    self,
+    hidden_states: torch.Tensor,
+    audio_hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    timestep: torch.Tensor,
+    timestep_indices: torch.Tensor,
+    token_tags: torch.Tensor,
+    position_ids: torch.Tensor,
+    video_indices: torch.Tensor,
+    audio_indices: torch.Tensor,
+    text_indices: torch.Tensor,
+    attention_kwargs: dict[str, Any] | None = None,
+    return_dict: bool = True,
+    attention_mask: torch.Tensor | None = None,
+):
+    """Diffusers 0.40 ``MiniMaxH3Transformer3DModel.forward`` plus a block attention mask."""
+    from diffusers.models.modeling_utils import get_parameter_dtype
+    from diffusers.models.transformers.transformer_minimax_h3 import (
+        MINIMAX_H3_MODALITY_NUM,
+        MiniMaxH3TransformerOutput,
+    )
+
+    sequence_length = position_ids.shape[0]
+    if token_tags.shape != (sequence_length,) or timestep_indices.shape != (sequence_length,):
+        raise ValueError("MiniMax H3 token_tags and timestep_indices must match position_ids.")
+    rotary_emb = self.rope(position_ids)
+
+    video_embeds = self.proj_in(hidden_states.to(get_parameter_dtype(self.proj_in)))
+    audio_embeds = self.audio_proj_in(audio_hidden_states.to(get_parameter_dtype(self.audio_proj_in)))
+    text_embeds = self.context_embedder(encoder_hidden_states.to(get_parameter_dtype(self.context_embedder)))
+    text_embeds = self.token_refiner(text_embeds)
+
+    hidden_states = text_embeds.new_zeros((text_embeds.shape[0], sequence_length, text_embeds.shape[-1]))
+    hidden_states = hidden_states.index_copy(1, text_indices, text_embeds)
+    hidden_states = hidden_states.index_copy(1, video_indices, video_embeds.to(text_embeds.dtype))
+    hidden_states = hidden_states.index_copy(1, audio_indices, audio_embeds.to(text_embeds.dtype))
+
+    temb = self.time_proj(timestep)
+    temb = self.time_embedder(temb.to(get_parameter_dtype(self.time_embedder)))
+    adaln_indices = timestep_indices * MINIMAX_H3_MODALITY_NUM + token_tags
+
+    for block in self.transformer_blocks:
+        if torch.is_grad_enabled() and self.gradient_checkpointing:
+            hidden_states = self._gradient_checkpointing_func(
+                block, hidden_states, temb, adaln_indices, rotary_emb, attention_mask
+            )
+        else:
+            hidden_states = block(hidden_states, temb, adaln_indices, rotary_emb, attention_mask)
+
+    hidden_states = self.norm_out(hidden_states, temb, timestep_indices).to(get_parameter_dtype(self.proj_out))
+    video_output = self.proj_out(hidden_states).index_select(1, video_indices)
+    audio_output = self.audio_proj_out(hidden_states).index_select(1, audio_indices)
+    if not return_dict:
+        return (video_output, audio_output)
+    return MiniMaxH3TransformerOutput(sample=video_output, audio_sample=audio_output)
+
+
+def _install_h3_attention_mask_forward(module: torch.nn.Module) -> None:
+    """Let the root H3 call carry a block attention mask, failing closed on Diffusers drift."""
+    if getattr(module, "_verl_omni_h3_attention_mask_forward", False):
+        return
+    from diffusers.models.transformers.transformer_minimax_h3 import (
+        MiniMaxH3Transformer3DModel,
+        MiniMaxH3TransformerBlock,
+    )
+    from diffusers.utils.peft_utils import apply_lora_scale
+
+    if not isinstance(module, MiniMaxH3Transformer3DModel):
+        raise TypeError(f"MiniMax H3 SP padding requires MiniMaxH3Transformer3DModel, got {type(module).__name__}.")
+    forward_params = tuple(inspect.signature(MiniMaxH3Transformer3DModel.forward).parameters)
+    block_params = tuple(inspect.signature(MiniMaxH3TransformerBlock.forward).parameters)
+    if forward_params != _H3_FORWARD_PARAMETERS or block_params != _H3_BLOCK_FORWARD_PARAMETERS:
+        raise RuntimeError(
+            "MiniMax H3 SP padding was validated against the Diffusers 0.40 transformer forward; "
+            f"found forward={forward_params} and block={block_params}. Revalidate the masked forward."
+        )
+    module.forward = types.MethodType(apply_lora_scale("attention_kwargs")(_h3_masked_forward), module)
+    module._verl_omni_h3_attention_mask_forward = True
+
+
+def h3_ulysses_forward(module: torch.nn.Module, model_inputs: dict[str, Any], sp_size: int | None = 1):
+    """Run the H3 transformer, padding the packed layout when Actor Ulysses SP needs it.
+
+    Standard Ulysses shards the packed sequence equally, so non-divisible layouts are
+    padded here and the padding rows are masked as attention keys. Variable-length
+    (Ulysses Anything) training is not supported yet because Diffusers lacks its
+    backward; see https://github.com/huggingface/diffusers/pull/14834.
+    """
+    model_inputs = pad_h3_layout_for_ulysses(model_inputs, sp_size)
+    if "attention_mask" in model_inputs:
+        _install_h3_attention_mask_forward(module)
+    return module(**model_inputs)
+
+
+def validate_ref2va_reference_image_short_edge(value: int | str | None = None) -> int:
+    """Validate the configured Ref2VA reference-image size."""
+    raw_value = os.environ.get("REF_IMAGE_SHORT_EDGE", "2048") if value is None else value
+    try:
+        short_edge = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"REF_IMAGE_SHORT_EDGE must be an integer, got {raw_value!r}.") from exc
+    if not 256 <= short_edge <= 2048 or short_edge % 32 != 0:
+        raise ValueError("REF_IMAGE_SHORT_EDGE must be a multiple of 32 between 256 and 2048.")
+    return short_edge
+
+
+@contextmanager
+def ref2va_reference_image_short_edge(value: int | str | None = None) -> Iterator[int]:
+    """Temporarily apply the Ref2VA image size while serializing concurrent requests."""
+    short_edge = validate_ref2va_reference_image_short_edge(value)
+
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _reference_image_shape
+
+    resize_globals = _reference_image_shape.__globals__
+    constant = "MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE"
+    if constant not in resize_globals:
+        raise RuntimeError("vLLM-Omni no longer exposes the MiniMax H3 reference image size constant.")
+    with _REF_IMAGE_SHAPE_LOCK:
+        original = resize_globals[constant]
+        resize_globals[constant] = short_edge
+        try:
+            yield short_edge
+        finally:
+            resize_globals[constant] = original
+
+
+def messages_to_text(messages: Any) -> str:
+    """Extract plain text items from chat messages without rendering a template."""
+    if isinstance(messages, str):
+        return messages
+    if isinstance(messages, dict):
+        messages = [messages]
+
+    parts: list[str] = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content", "")
+        if isinstance(content, str):
+            parts.append(content)
+            continue
+        for item in content or []:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text", "")))
+    return "\n".join(part for part in parts if part).strip()
+
+
+def h3_dit_timestep(timesteps: torch.Tensor) -> torch.Tensor:
+    """Convert ``sigma * 1000`` to H3's data-fraction timestep."""
+    return 1.0 - timesteps / 1000.0
+
+
+def h3_velocity_to_flow_match(velocity: torch.Tensor) -> torch.Tensor:
+    """Convert H3 velocity to the diffusers flow-match sign."""
+    return -velocity
+
+
+def prepare_h3_processor_files(model_path: str) -> str:
+    """Add the model type omitted from the official H3 processor directory."""
+    processor_dir = Path(model_path) / "processor"
+    if not processor_dir.is_dir():
+        raise FileNotFoundError(f"MiniMax H3 processor directory not found: {processor_dir}")
+    config_path = processor_dir / "config.json"
+    if not config_path.is_file():
+        config_path.write_text(json.dumps({"model_type": "qwen3_vl"}), encoding="utf-8")
+    return str(processor_dir)
+
+
+def keyframe_indices_to_anchors(frame_indices: Sequence[int]) -> tuple[str, ...]:
+    """Map vLLM-Omni's FL2VA frame-index signatures to Actor anchors."""
+    signature = tuple(int(index) for index in frame_indices)
+    mapping = {
+        (): (),
+        (0,): ("first",),
+        (-1,): ("last",),
+        (0, -1): ("first", "last"),
+    }
+    if signature not in mapping:
+        raise ValueError(f"MiniMax H3 FL2VA frame_indices must be [0], [-1], or [0, -1], got {list(signature)}.")
+    return mapping[signature]
+
+
+def serialize_ref_blocks(ref_blocks: Sequence[Mapping[str, Any]]) -> tuple[torch.Tensor, int]:
+    """Encode ordered Ref2VA blocks into a fixed-size tensor plus a valid-block count.
+
+    A fixed ``MAX_REF_BLOCKS`` rows keeps the metadata shape uniform so rollout
+    workers with different reference layouts can be batched without ragged tensors.
+    """
+    count = len(ref_blocks)
+    if count <= 0 or count > MAX_REF_BLOCKS:
+        raise ValueError(f"MiniMax H3 Ref2VA requires 1-{MAX_REF_BLOCKS} reference blocks, got {count}.")
+    metadata = torch.zeros(MAX_REF_BLOCKS, REF_BLOCK_META_WIDTH, dtype=torch.long)
+    for index, block in enumerate(ref_blocks):
+        kind = str(block.get("kind", block.get("type", "")))
+        if kind not in _REF_BLOCK_KIND_TO_ID:
+            raise ValueError(f"Unsupported Ref2VA block kind at index {index}: {kind!r}.")
+        metadata[index] = torch.tensor(
+            [
+                _REF_BLOCK_KIND_TO_ID[kind],
+                int(block.get("ref_audio_t", 0)),
+                int(block.get("latent_t", 0)),
+                int(block.get("latent_h", 0)),
+                int(block.get("latent_w", 0)),
+            ],
+            dtype=torch.long,
+        )
+    return metadata, count
+
+
+def _deserialize_ref_blocks(metadata: torch.Tensor, count: int) -> list[dict[str, int | str]]:
+    """Decode compact Ref2VA block metadata for the upstream layout helper."""
+    rows = metadata.reshape(-1, REF_BLOCK_META_WIDTH)
+    if count <= 0 or count > min(rows.shape[0], MAX_REF_BLOCKS):
+        raise ValueError(f"Ref2VA block count {count} is incompatible with {rows.shape[0]} metadata rows.")
+    blocks: list[dict[str, int | str]] = []
+    for index, row in enumerate(rows[:count].tolist()):
+        kind = _REF_BLOCK_ID_TO_KIND.get(int(row[0]))
+        if kind is None:
+            raise ValueError(f"Unsupported Ref2VA block kind id at index {index}: {int(row[0])}.")
+        ref_audio_t, latent_t, latent_h, latent_w = (int(value) for value in row[1:])
+        if kind == "image":
+            block = {"kind": kind, "latent_h": latent_h, "latent_w": latent_w}
+        elif kind == "audio":
+            block = {"kind": kind, "ref_audio_t": ref_audio_t}
+        else:
+            block = {
+                "kind": kind,
+                "ref_audio_t": ref_audio_t,
+                "latent_t": latent_t,
+                "latent_h": latent_h,
+                "latent_w": latent_w,
+            }
+        blocks.append(block)
+    return blocks
+
+
+def pack_video_audio_rows(video_rows: torch.Tensor, audio_rows: torch.Tensor) -> torch.Tensor:
+    """Flatten and concatenate video and audio rows."""
+    if video_rows.ndim == 2:
+        video_rows = video_rows.unsqueeze(0)
+    if audio_rows.ndim == 2:
+        audio_rows = audio_rows.unsqueeze(0)
+    batch = video_rows.shape[0]
+    return torch.cat([video_rows.reshape(batch, -1), audio_rows.reshape(batch, -1)], dim=1)
+
+
+def unpack_video_audio_rows(
+    packed: torch.Tensor,
+    num_video_rows: int,
+    num_audio_rows: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Unpack flattened video and audio rows."""
+    batch = packed.shape[0]
+    split = num_video_rows * VIDEO_ROW_WIDTH
+    video_rows = packed[:, :split].reshape(batch, num_video_rows, VIDEO_ROW_WIDTH)
+    audio_rows = packed[:, split:].reshape(batch, num_audio_rows, AUDIO_ROW_WIDTH)
+    return video_rows, audio_rows
+
+
+def split_dual_velocity(result) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split a transformer output into video and audio velocity rows."""
+    if isinstance(result, tuple | list):
+        return result[0], result[1]
+    if hasattr(result, "sample") and hasattr(result, "audio_sample"):
+        return result.sample, result.audio_sample
+    raise TypeError(f"Unexpected MiniMax H3 transformer output type: {type(result).__name__}")
+
+
+def _spatial_position_grid(dim: int, patch: int, sqrt_area: float) -> torch.Tensor:
+    """Build one aspect-normalized spatial rotary axis."""
+    ratio = dim / sqrt_area
+    left = (1.0 - ratio) / 2.0
+    grid = np.linspace(left, left + ratio, dim // patch, endpoint=False) * _ROPE_SPATIAL_SCALE
+    return torch.from_numpy(grid).to(torch.float64)
+
+
+def _temporal_position_grid(num_latent_frames: int, origin: float) -> torch.Tensor:
+    """Rotary time of every latent frame, starting at ``origin``. Spacing is ``5/3 * (1, 4, 4, 4, 4)``."""
+    spans = torch.tensor(
+        [
+            _ROPE_FRAME_RESCALE * _ROPE_FRAMES_PER_LATENT[index % len(_ROPE_FRAMES_PER_LATENT)]
+            for index in range(num_latent_frames)
+        ],
+        dtype=torch.float64,
+    )
+    return origin + torch.cat([torch.zeros(1, dtype=torch.float64), spans[:-1].cumsum(0)])
+
+
+def _frame_position_grid(
+    latent_height: int, latent_width: int, patch_h: int, patch_w: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The ``(h, w)`` rotary coordinates of one latent frame, and the width axis they were built from."""
+    sqrt_area = np.sqrt(latent_height * latent_width)
+    height_grid = _spatial_position_grid(latent_height, patch_h, sqrt_area)
+    width_grid = _spatial_position_grid(latent_width, patch_w, sqrt_area)
+    grids = torch.meshgrid(height_grid, width_grid, indexing="ij")
+    return torch.stack([grid.reshape(-1) for grid in grids], dim=-1), width_grid
+
+
+def build_packed_sequence(
+    text_token_tags: torch.Tensor,
+    num_latent_frames: int,
+    latent_height: int,
+    latent_width: int,
+    num_audio_latents: int,
+    patch_size: tuple[int, int, int],
+    audio_channels: int,
+    audio_tag: int = AUDIO_TAG,
+    video_tag: int = VIDEO_TAG,
+    keyframe_anchors: tuple[str, ...] = (),
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Build the packed H3 text, condition, audio, and video layout."""
+    _, patch_h, patch_w = patch_size
+    rows_per_frame = (latent_height // patch_h) * (latent_width // patch_w)
+    num_text_tokens = text_token_tags.shape[0]
+    num_condition_rows = len(keyframe_anchors) * rows_per_frame
+    num_audio_rows = num_audio_latents * audio_channels
+    num_video_rows = num_latent_frames * rows_per_frame
+    sequence_length = num_text_tokens + num_condition_rows + num_audio_rows + num_video_rows
+
+    condition_start = num_text_tokens
+    audio_start = condition_start + num_condition_rows
+    video_start = audio_start + num_audio_rows
+
+    position_ids = torch.zeros(sequence_length, 3, dtype=torch.float64)
+    position_ids[:num_text_tokens, 0] = torch.arange(num_text_tokens, dtype=torch.float64)
+
+    frame_grid, width_grid = _frame_position_grid(latent_height, latent_width, patch_h, patch_w)
+
+    for index, anchor in enumerate(keyframe_anchors):
+        if anchor == "first":
+            anchor_time = float(num_text_tokens)
+        elif anchor == "last":
+            spans = np.ones(num_latent_frames, dtype=np.float64) * _ROPE_FRAME_RESCALE
+            for offset in range(len(_ROPE_FRAMES_PER_LATENT)):
+                spans[offset :: len(_ROPE_FRAMES_PER_LATENT)] *= _ROPE_FRAMES_PER_LATENT[offset]
+            anchor_time = float(num_text_tokens) + float(spans.sum()) - _ROPE_FRAME_RESCALE
+        else:
+            raise ValueError(f"A keyframe anchor must be 'first' or 'last', got {anchor!r}.")
+        rows = slice(condition_start + index * rows_per_frame, condition_start + (index + 1) * rows_per_frame)
+        position_ids[rows, 0] = anchor_time
+        position_ids[rows, 1:] = frame_grid
+
+    audio_time = float(num_text_tokens) + torch.arange(num_audio_latents, dtype=torch.float64)
+    position_ids[audio_start:video_start, 0] = audio_time.repeat(audio_channels)
+    position_ids[audio_start:video_start, 2] = torch.cat(
+        [
+            torch.full((num_audio_latents,), float(width_grid[0]), dtype=torch.float64),
+            torch.full((num_audio_rows - num_audio_latents,), float(width_grid[-1]), dtype=torch.float64),
+        ]
+    )
+
+    video_position_ids = torch.empty(num_latent_frames, rows_per_frame, 3, dtype=torch.float64)
+    video_position_ids[:, :, 0] = _temporal_position_grid(num_latent_frames, float(num_text_tokens))[:, None]
+    video_position_ids[:, :, 1:] = frame_grid[None]
+    position_ids[video_start:] = video_position_ids.reshape(-1, 3)
+
+    video_indices = torch.cat([torch.arange(condition_start, audio_start), torch.arange(video_start, sequence_length)])
+    audio_indices = torch.arange(audio_start, video_start)
+    text_indices = torch.arange(num_text_tokens)
+
+    token_tags = torch.empty(sequence_length, dtype=torch.long)
+    token_tags[text_indices] = text_token_tags.to(torch.long)
+    token_tags[audio_indices] = audio_tag
+    token_tags[video_indices] = video_tag
+
+    return position_ids, token_tags, video_indices, audio_indices, text_indices, num_condition_rows, 0
+
+
+def build_layout_from_meta(
+    meta: Sequence[int],
+    num_text_tokens: int,
+    patch_size: tuple[int, int, int] = (1, 2, 2),
+    keyframe_anchors: tuple[str, ...] = (),
+    text_token_tags: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Build an H3 layout from target metadata and optional FL2VA anchors."""
+    num_video_rows, num_audio_rows = int(meta[0]), int(meta[1])
+    num_latent_frames, latent_height, latent_width = int(meta[2]), int(meta[3]), int(meta[4])
+    num_audio_latents = int(meta[5])
+    if num_audio_latents <= 0:
+        raise ValueError(f"latent_meta audio_t must be positive, got {num_audio_latents}.")
+    audio_channels = num_audio_rows // num_audio_latents
+    if text_token_tags is None:
+        text_token_tags = torch.full((num_text_tokens,), TEXT_TAG, dtype=torch.long)
+    else:
+        text_token_tags = text_token_tags.reshape(-1)[:num_text_tokens].to(dtype=torch.long, device="cpu")
+        if text_token_tags.numel() != num_text_tokens:
+            raise ValueError(f"Expected {num_text_tokens} MiniMax H3 text token tags, got {text_token_tags.numel()}.")
+
+    layout = build_packed_sequence(
+        text_token_tags=text_token_tags,
+        num_latent_frames=num_latent_frames,
+        latent_height=latent_height,
+        latent_width=latent_width,
+        num_audio_latents=num_audio_latents,
+        patch_size=patch_size,
+        audio_channels=audio_channels,
+        keyframe_anchors=keyframe_anchors,
+    )
+    _, _, video_indices, audio_indices, _, num_condition_rows, _ = layout
+    if audio_indices.shape[0] != num_audio_rows:
+        raise ValueError(f"Derived {audio_indices.shape[0]} audio rows, latent_meta says {num_audio_rows}.")
+    derived_target_rows = video_indices.shape[0] - num_condition_rows
+    if derived_target_rows != num_video_rows:
+        raise ValueError(f"Derived {derived_target_rows} target video rows, latent_meta says {num_video_rows}.")
+    return layout
+
+
+def build_ref2va_layout_from_meta(
+    meta: Sequence[int],
+    num_text_tokens: int,
+    ref_block_meta: torch.Tensor,
+    ref_block_count: int,
+    text_token_tags: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Build the Actor layout from compact Ref2VA reference metadata."""
+    from vllm_omni.diffusion.models.minimax_h3.packed_sequence import minimax_h3_packed_sequence_ref2va_blocks
+
+    num_video_rows, num_audio_rows = int(meta[0]), int(meta[1])
+    latent_t, latent_h, latent_w, audio_t = (int(value) for value in meta[2:6])
+    blocks = _deserialize_ref_blocks(ref_block_meta, ref_block_count)
+    packed = minimax_h3_packed_sequence_ref2va_blocks(
+        text_len=num_text_tokens,
+        latent_t=latent_t,
+        latent_h=latent_h,
+        latent_w=latent_w,
+        audio_t=audio_t,
+        ref_blocks=blocks,
+    )
+    used = int(packed["cu_seqlens"][1])
+    token_tags = packed["token_tags"][:used].clone()
+    if text_token_tags is not None:
+        text_token_tags = text_token_tags.reshape(-1)[:num_text_tokens].to(dtype=torch.long, device="cpu")
+        if text_token_tags.numel() != num_text_tokens:
+            raise ValueError(f"Expected {num_text_tokens} MiniMax H3 text token tags, got {text_token_tags.numel()}.")
+        token_tags[packed["text_pos"]] = text_token_tags
+
+    video_indices = packed["img_pos"]
+    audio_indices = packed["audio_pos"]
+    num_condition_video_rows = int((~packed["update_mask"]).sum())
+    num_condition_audio_rows = int((~packed["audio_update_mask"]).sum())
+    target_video_rows = int(packed["update_mask"].sum())
+    target_audio_rows = int(packed["audio_update_mask"].sum())
+    if target_video_rows != num_video_rows:
+        raise ValueError(f"Ref2VA layout has {target_video_rows} target video rows, latent_meta says {num_video_rows}.")
+    if target_audio_rows != num_audio_rows:
+        raise ValueError(f"Ref2VA layout has {target_audio_rows} target audio rows, latent_meta says {num_audio_rows}.")
+    return (
+        packed["img_position_ids"][:used],
+        token_tags,
+        video_indices,
+        audio_indices,
+        packed["text_pos"],
+        num_condition_video_rows,
+        num_condition_audio_rows,
+    )
+
+
+def build_row_timesteps(
+    video_indices: torch.Tensor,
+    audio_indices: torch.Tensor,
+    num_condition_video_rows: int,
+    num_condition_audio_rows: int,
+    num_text_tokens: int,
+    video_timestep: float,
+    audio_timestep: float,
+    condition_video_timestep: float,
+    condition_audio_timestep: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build distinct H3 timesteps and per-row indices."""
+    sequence_length = int(video_indices.numel() + audio_indices.numel() + num_text_tokens)
+    row_timesteps = torch.full((sequence_length,), video_timestep, dtype=torch.float32)
+    row_timesteps[video_indices[:num_condition_video_rows]] = condition_video_timestep
+    row_timesteps[audio_indices[num_condition_audio_rows:]] = audio_timestep
+    row_timesteps[audio_indices[:num_condition_audio_rows]] = condition_audio_timestep
+    return torch.unique(row_timesteps, sorted=True, return_inverse=True)
+
+
+class _PromptTokenOverride:
+    """Return the Agent Loop token IDs when the upstream pipeline tokenizes the prompt.
+
+    Ref2VA prompts mix images, videos and standalone audio, so the upstream pipeline
+    builds every vision/audio span. Wrapping the tokenizer keeps the exact Agent Loop
+    text token IDs while letting that native path run unchanged.
+    """
+
+    def __init__(self, tokenizer: Any, prompt: str, prompt_ids: torch.Tensor) -> None:
+        self._tokenizer = tokenizer
+        self._prompt = prompt
+        self._prompt_ids = prompt_ids.detach().cpu().reshape(-1).tolist()
+
+    def __call__(self, text: str, *args, **kwargs):
+        if text == self._prompt:
+            return {"input_ids": list(self._prompt_ids)}
+        return self._tokenizer(text, *args, **kwargs)
+
+    def __getattr__(self, name: str):
+        return getattr(self._tokenizer, name)
