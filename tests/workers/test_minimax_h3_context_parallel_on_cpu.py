@@ -145,7 +145,7 @@ def test_minimax_h3_padded_forward_matches_unpadded_forward(sp_size, gradient_ch
 def test_minimax_h3_masked_forward_fails_closed_on_diffusers_signature_drift(monkeypatch) -> None:
     from diffusers import MiniMaxH3Transformer3DModel
 
-    import verl_omni.pipelines.minimax_h3_shared.common as common
+    import verl_omni.pipelines.minimax_h3_diffusion_nft.common as common
 
     monkeypatch.setattr(common, "_H3_FORWARD_PARAMETERS", ("self", "hidden_states"))
     with pytest.raises(RuntimeError, match="Revalidate the masked forward"):
