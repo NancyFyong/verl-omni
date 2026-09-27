@@ -32,18 +32,18 @@ from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3P
 from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
 
 from verl_omni.pipelines.diffusion_rollout_output import with_rollout_data
-from verl_omni.pipelines.model_base import VllmOmniPipelineBase
-from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
-
-from .common import (
+from verl_omni.pipelines.minimax_h3_shared.common import (
     AUDIO_ROW_WIDTH,
-    MiniMaxH3RolloutWeightSyncMixin,
     pack_video_audio_rows,
     ref2va_reference_image_short_edge,
     serialize_ref_blocks,
     validate_h3_parallel_config,
     validate_ref2va_reference_image_short_edge,
 )
+from verl_omni.pipelines.model_base import VllmOmniPipelineBase
+from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
+
+from .common import MiniMaxH3RolloutWeightSyncMixin
 
 __all__ = ["MiniMaxH3DiffusionNFTPipeline"]
 
