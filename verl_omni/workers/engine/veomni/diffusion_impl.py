@@ -47,7 +47,13 @@ from verl_omni.workers.config import (
     VeOmniDiffusionOptimizerConfig,
 )
 from verl_omni.workers.engine.veomni.lora_utils import _reject_veomni_moe_expert_lora, _validate_veomni_lora_support
-from verl_omni.workers.engine.veomni.patch import _apply_attention_backend, _veomni_attn_implementation
+from verl_omni.workers.engine.veomni.patch import (
+    _apply_attention_backend,
+    _minimax_h3_export_dtype,
+    _minimax_h3_fsdp_precision,
+    _prepare_minimax_h3_precision,
+    _veomni_attn_implementation,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -297,11 +303,13 @@ class VeOmniDiffusionEngine(BaseEngine):
         veomni_base = self.veomni_trainer.base
         BaseTrainer._build_model(veomni_base)
         _apply_attention_backend(veomni_base.model, self.engine_config.attn_implementation)
+        _prepare_minimax_h3_precision(veomni_base.model)
         if self._is_lora:
             # Wrap the model before parallelization; otherwise no adapter is injected.
             BaseTrainer._freeze_model_module(veomni_base)
             _reject_veomni_moe_expert_lora(veomni_base.model)
-        BaseTrainer._build_parallelized_model(veomni_base)
+        with _minimax_h3_fsdp_precision(veomni_base.model):
+            BaseTrainer._build_parallelized_model(veomni_base)
         scheduler = self._build_scheduler()
         if not self.engine_config.forward_only:
             BaseTrainer._build_optimizer(veomni_base)
@@ -709,8 +717,9 @@ class VeOmniDiffusionEngine(BaseEngine):
             for name, param in params.items():
                 tensor = param.full_tensor() if isinstance(param, DTensor) else param
                 tensor = tensor.to(device, non_blocking=True)
-                if tensor.is_floating_point() and tensor.dtype != export_dtype:
-                    tensor = tensor.to(export_dtype, non_blocking=True)
+                target_dtype = _minimax_h3_export_dtype(self.module, name, export_dtype)
+                if tensor.is_floating_point() and tensor.dtype != target_dtype:
+                    tensor = tensor.to(target_dtype, non_blocking=True)
                 yield f"transformer.{name}", tensor
 
         return param_generator(), peft_config_dict
