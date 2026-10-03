@@ -53,11 +53,16 @@ class _NativePipeline(torch.nn.Module):
         self.transformer = MiniMaxH3DiTModel(config).to(device)
         self.transformers_ref = MiniMaxH3DiTModel(config).to(device)
         self.video_vae = self.audio_vae = None
+        # Newer vLLM-Omni's load_weights reads these; None means no FastH3 adapter or checkpoint.
+        self._fasth3 = self._fasth3_checkpoint = None
         with torch.no_grad():
             for parameter in self.parameters():
                 parameter.fill_(-1)
             self.transformer.rope.inv_freq.fill_(0.25)
             self.transformers_ref.rope.inv_freq.fill_(0.25)
+
+    def _finish_adaln_sidecar(self, component):
+        """This fixture configures no AdaLN sidecar; newer vLLM-Omni's load_weights still calls this."""
 
 
 class _NFTPipeline(MiniMaxH3RolloutWeightSyncMixin, _NativePipeline):

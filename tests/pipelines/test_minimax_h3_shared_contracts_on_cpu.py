@@ -74,6 +74,11 @@ class _NativePipeline:
         self.transformer = _WeightOnlyDiT()
         self.transformers_ref = _WeightOnlyDiT()
         self.video_vae = self.audio_vae = None
+        # Newer vLLM-Omni's load_weights reads these; None means no FastH3 adapter or checkpoint.
+        self._fasth3 = self._fasth3_checkpoint = None
+
+    def _finish_adaln_sidecar(self, component):
+        """This fixture configures no AdaLN sidecar; newer vLLM-Omni's load_weights still calls this."""
 
 
 class _NFTPipeline(MiniMaxH3RolloutWeightSyncMixin, _NativePipeline):
