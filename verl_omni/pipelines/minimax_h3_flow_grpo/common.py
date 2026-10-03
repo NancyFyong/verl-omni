@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Literal
 
 import torch
@@ -44,10 +45,36 @@ def h3_sigma_schedules(
     audio_shift: float = H3_AUDIO_SHIFT,
 ) -> tuple[list[float], list[float]]:
     """Call vLLM-Omni's H3 time-shift function for the video and audio schedules."""
-    return (
-        minimax_h3_time_shift_sigmas(num_steps=num_steps, shift_scale=video_shift),
-        minimax_h3_time_shift_sigmas(num_steps=num_steps, shift_scale=audio_shift),
-    )
+    video_sigmas = minimax_h3_time_shift_sigmas(num_steps=num_steps, shift_scale=video_shift)
+    audio_sigmas = minimax_h3_time_shift_sigmas(num_steps=num_steps, shift_scale=audio_shift)
+    h3_transition_count(video_sigmas, audio_sigmas)
+    return video_sigmas, audio_sigmas
+
+
+def h3_transition_count(video_sigmas: Sequence[float], audio_sigmas: Sequence[float]) -> int:
+    """Return the number of denoiser transitions in a sigma schedule, validating its shape.
+
+    The count is always taken from the schedule itself (``len - 1``) rather than from
+    ``num_inference_steps``: whether a schedule holds ``num_steps`` or ``num_steps + 1``
+    boundaries is an upstream convention that has changed between vLLM-Omni releases.
+    Rollout and Actor replay must walk the same grid down to sigma 0, otherwise the sample
+    is left partly noisy.
+    """
+    if len(video_sigmas) != len(audio_sigmas):
+        raise RuntimeError(
+            f"MiniMax H3 video/audio sigma schedules differ in length: {len(video_sigmas)} vs {len(audio_sigmas)}."
+        )
+    if len(video_sigmas) < 2:
+        raise RuntimeError("MiniMax H3 sigma schedule needs at least two boundaries.")
+    for name, sigmas in (("video", video_sigmas), ("audio", audio_sigmas)):
+        values = [float(value) for value in sigmas]
+        if abs(values[0] - 1.0) > 1e-6 or abs(values[-1]) > 1e-6:
+            raise RuntimeError(
+                f"MiniMax H3 {name} sigma schedule must run from 1.0 to 0.0, got {values[0]} -> {values[-1]}."
+            )
+        if any(nxt >= cur for cur, nxt in zip(values, values[1:], strict=False)):
+            raise RuntimeError(f"MiniMax H3 {name} sigma schedule must be strictly decreasing.")
+    return len(video_sigmas) - 1
 
 
 def configure_flow_scheduler(
