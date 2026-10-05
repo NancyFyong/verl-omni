@@ -44,8 +44,7 @@ from vllm_omni.diffusion.models.minimax_h3.packed_tokens import (
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
-from verl_omni.pipelines.diffusion_rollout_output import with_rollout_data
-from verl_omni.pipelines.minimax_h3_diffusion_nft.artifacts import with_h3_artifacts
+from verl_omni.pipelines.diffusion_rollout_output import with_batched_media_artifacts, with_rollout_data
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     ref2va_reference_image_short_edge,
     serialize_ref_blocks,
@@ -572,12 +571,28 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
         video_latent, audio_latent = self._flow_grpo_final_latents
         self._flow_grpo_final_latents = None
         video, audio = output.output
-        return with_h3_artifacts(
+        sampling = req.sampling_params
+        extra_args = sampling.extra_args or {}
+        output_type = extra_args.get("output_type", sampling.output_type)
+        return with_batched_media_artifacts(
             result,
-            video=video,
-            audio=audio,
-            video_latent=video_latent,
-            audio_latent=audio_latent,
-            sampling=req.sampling_params,
+            data={
+                "video_preview": video,
+                "audio": audio,
+                "video_latent": video_latent,
+                "audio_latent": audio_latent.unsqueeze(0),
+            },
+            specs={
+                "video_preview": MediaSpec(
+                    "video", "decoded", "THWC", fps=24 if sampling.frame_rate is None else sampling.frame_rate
+                ),
+                "audio": MediaSpec("audio", "decoded", "CT", sample_rate=32000),
+                "video_latent": MediaSpec("video", "latent", "CTHW"),
+                "audio_latent": MediaSpec("audio", "latent", "CLT"),
+            },
+            primary="video_latent" if output_type == "latent" else "video_preview",
+            preview="video_preview",
+            audio="audio",
             context=f"pipeline={type(self).__name__}, request_id={req.request_id}",
+            requested=extra_args.get("requested_outputs"),
         )

@@ -31,11 +31,10 @@ from vllm_omni.diffusion.models.minimax_h3.packed_tokens import (
 from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
 
-from verl_omni.pipelines.diffusion_rollout_output import with_rollout_data
+from verl_omni.pipelines.diffusion_rollout_output import with_batched_media_artifacts, with_rollout_data
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 
-from .artifacts import with_h3_artifacts
 from .common import (
     AUDIO_ROW_WIDTH,
     MiniMaxH3RolloutWeightSyncMixin,
@@ -235,14 +234,30 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
             to_cpu=True,
         )
         video, audio = output.output
-        return with_h3_artifacts(
+        sampling = request.sampling_params
+        extra_args = sampling.extra_args or {}
+        output_type = extra_args.get("output_type", sampling.output_type)
+        return with_batched_media_artifacts(
             result,
-            video=video,
-            audio=audio,
-            video_latent=capture["video_latent"],
-            audio_latent=capture["audio_latent"],
-            sampling=request.sampling_params,
+            data={
+                "video_preview": video,
+                "audio": audio,
+                "video_latent": capture["video_latent"],
+                "audio_latent": capture["audio_latent"].unsqueeze(0),
+            },
+            specs={
+                "video_preview": MediaSpec(
+                    "video", "decoded", "THWC", fps=24 if sampling.frame_rate is None else sampling.frame_rate
+                ),
+                "audio": MediaSpec("audio", "decoded", "CT", sample_rate=32000),
+                "video_latent": MediaSpec("video", "latent", "CTHW"),
+                "audio_latent": MediaSpec("audio", "latent", "CLT"),
+            },
+            primary="video_latent" if output_type == "latent" else "video_preview",
+            preview="video_preview",
+            audio="audio",
             context=f"pipeline={type(self).__name__}, request_id={request.request_id}",
+            requested=extra_args.get("requested_outputs"),
         )
 
     @staticmethod
