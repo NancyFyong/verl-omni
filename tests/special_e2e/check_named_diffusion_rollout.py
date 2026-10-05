@@ -37,6 +37,7 @@ from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.rollout_request import OmniRolloutRequest
 from verl_omni.utils.reward_score.reward_utils import image_tensor_to_pil, visual_reward_frames
 from verl_omni.utils.tracking import _export_video
+from verl_omni.workers.config import DiffusionRolloutConfig
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy
 
 _SYSTEM_PROMPT = (
@@ -68,7 +69,8 @@ def _request(model, architecture, index, tokenizer_path=None):
 
 async def check(args):
     """Exercise production lowering and output parsing against the pinned engine."""
-    config = SimpleNamespace(
+    config = DiffusionRolloutConfig(
+        name="vllm_omni",
         external_lib=None,
         enable_prompt_embed_cache=False,
         prompt_embed_cache_size=16,

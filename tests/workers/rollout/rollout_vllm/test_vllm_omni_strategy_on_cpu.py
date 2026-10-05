@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from argparse import Namespace
+from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -25,6 +26,7 @@ from verl_omni.pipelines.model_base import OmniRolloutPipelineBase
 from verl_omni.pipelines.qwen3_omni.omni_rollout_adapter import Qwen3OmniRolloutAdapter
 from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 from verl_omni.pipelines.rollout_request import OmniRolloutRequest
+from verl_omni.workers.config import DiffusionRolloutConfig
 from verl_omni.workers.rollout.vllm_rollout import vllm_omni_ar_strategy as ar_strategy_module
 from verl_omni.workers.rollout.vllm_rollout import vllm_omni_async_server as server_module
 from verl_omni.workers.rollout.vllm_rollout import vllm_omni_diffusion_strategy as diffusion_strategy_module
@@ -723,7 +725,7 @@ def test_diffusion_strategy_preserves_engine_argument_preparation(monkeypatch):
         staticmethod(lambda **kwargs: pipeline_cls),
     )
     server = SimpleNamespace(
-        config=SimpleNamespace(
+        config=DiffusionRolloutConfig(
             external_lib=["extension"],
             tensor_model_parallel_size=4,
             text_encoder_tp_size=1,
@@ -741,6 +743,15 @@ def test_diffusion_strategy_preserves_engine_argument_preparation(monkeypatch):
     assert imported == [["extension"]]
     assert engine_args == {
         "max_num_seqs": 1,
+        "tensor_parallel_size": 4,
+        "ulysses_degree": 1,
+        "ring_degree": 1,
+        "sequence_parallel_size": 1,
+        "data_parallel_size": 1,
+        "pipeline_parallel_size": 1,
+        "vae_patch_parallel_size": 1,
+        "vae_parallel_mode": "tile",
+        "vae_use_tiling": False,
         "text_encoder_tp_size": 1,
         "enable_dummy_pipeline": True,
         "custom_pipeline_args": {"pipeline_class": "package.Adapter"},
@@ -975,3 +986,47 @@ async def test_strategy_preserves_mode_specific_engine_call(strategy_cls, priori
     assert engine.kwargs["request_id"] == "request-1"
     assert engine.kwargs["sampling_params_list"] == ["params"]
     assert set(engine.kwargs) - {"prompt", "request_id", "sampling_params_list"} == expected_extra_keys
+
+
+@pytest.mark.asyncio
+async def test_named_rollout_checker_prepares_single_device_topology_before_engine_start(monkeypatch):
+    path = Path(__file__).resolve().parents[4] / "tests/special_e2e/check_named_diffusion_rollout.py"
+    spec = spec_from_file_location("named_rollout_checker_under_test", path)
+    checker = module_from_spec(spec)
+    spec.loader.exec_module(checker)
+
+    class EngineStartReached(Exception):
+        pass
+
+    def engine_start(**engine_args):
+        assert engine_args["tensor_parallel_size"] == 1
+        assert engine_args["ulysses_degree"] == engine_args["ring_degree"] == 1
+        assert engine_args["data_parallel_size"] == engine_args["pipeline_parallel_size"] == 1
+        assert engine_args["text_encoder_tp_size"] == engine_args["vae_patch_parallel_size"] == 1
+        assert engine_args["vae_parallel_mode"] == "tile"
+        assert engine_args["vae_use_tiling"] is False
+        raise EngineStartReached
+
+    monkeypatch.setattr(checker, "_request", lambda *args: object())
+    monkeypatch.setattr(checker, "AsyncOmni", engine_start)
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "0")
+    args = SimpleNamespace(
+        architecture="QwenImagePipeline",
+        algorithm="flow_grpo",
+        model="unused",
+        engine_class_name=None,
+        step_execution=False,
+        cpu_offload=False,
+        num_requests=1,
+        require_request_batch=False,
+        deploy_config=None,
+        height=64,
+        width=64,
+        num_frames=5,
+        output_type="latent",
+        extra_json="{}",
+        tokenizer_path=None,
+    )
+    with pytest.raises(EngineStartReached):
+        await checker.check(args)

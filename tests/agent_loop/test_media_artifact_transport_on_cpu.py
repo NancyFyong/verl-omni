@@ -53,10 +53,12 @@ def _internal():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["ordinary", "tq"])
-async def test_named_media_survives_to_preview_and_reward_consumers(monkeypatch, transport):
+@pytest.mark.parametrize("batch_size", [1, 2])
+async def test_named_media_survives_to_preview_and_reward_consumers(monkeypatch, transport, batch_size):
+    internals = [_internal() for _ in range(batch_size)]
     if transport == "ordinary":
         worker = object.__new__(DiffusionAgentLoopWorker)
-        data = worker._postprocess([_internal()])
+        data = worker._postprocess(internals)
     else:
         worker = object.__new__(DiffusionAgentLoopWorkerTQ.__ray_metadata__.modified_class)
         stored = {}
@@ -65,16 +67,18 @@ async def test_named_media_survives_to_preview_and_reward_consumers(monkeypatch,
             stored.update(fields=fields)
 
         monkeypatch.setattr(tq_utils.tq, "async_kv_batch_put", put)
-        await worker._write_trajectory_to_tq(
-            _internal(), uid="sample", session_id=0, trajectory={"step": 1}, validate=False
+        await worker._write_trajectories_to_tq(
+            list(enumerate(internals)), uid="sample", trajectory={"step": 1}, validate=False
         )
         monkeypatch.setattr(tq_utils.tq, "kv_batch_get", lambda **kwargs: stored["fields"])
-        data = tq_utils.diffusion_tq_batch_to_dataproto(SimpleNamespace(keys=["sample_0_0"], partition_id="train"))
+        data = tq_utils.diffusion_tq_batch_to_dataproto(
+            SimpleNamespace(keys=[f"sample_{i}_0" for i in range(batch_size)], partition_id="train")
+        )
 
     assert data.batch["media_artifact__video_latent"].dtype == torch.float16
-    assert data.batch["media_artifact__video_latent"].shape == (1, 16, 2, 2, 2)
+    assert data.batch["media_artifact__video_latent"].shape == (batch_size, 16, 2, 2, 2)
     previews = previews_from_batch(data)
-    assert len(previews) == 1 and previews[0].data.dtype == torch.uint8
+    assert len(previews) == batch_size and previews[0].data.dtype == torch.uint8
     assert previews[0].spec.fps == 12
     extra = _reward_extra_info(data[0])
     assert set(extra["media_artifacts"]) == {"video_preview", "video_latent", "audio"}

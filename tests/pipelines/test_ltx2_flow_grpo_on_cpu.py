@@ -1046,3 +1046,15 @@ def unittest_mock_super_forward(target, return_value):
         return return_value
 
     return patch.object(LTX23PipelineWithLogProb.__bases__[0], "forward", side_effect=forward)
+
+
+def test_ltx2_agent_loop_registered_in_agent_loop_package() -> None:
+    from verl.experimental.agent_loop.agent_loop import _agent_loop_registry
+
+    from verl_omni.agent_loop import LTX2DiffusionSingleTurnAgentLoop
+
+    assert LTX2DiffusionSingleTurnAgentLoop is not None
+    assert "ltx2_diffusion_single_turn_agent" in _agent_loop_registry
+    assert _agent_loop_registry["ltx2_diffusion_single_turn_agent"]["_target_"] == (
+        f"{LTX2DiffusionSingleTurnAgentLoop.__module__}.{LTX2DiffusionSingleTurnAgentLoop.__qualname__}"
+    )
