@@ -185,13 +185,15 @@ def test_rollout_output_reaches_actor_and_replays_joint_transition(monkeypatch) 
     assert set(metadata["prompt_embeddings"]) == {"prompt_embeds", "prompt_embeds_mask"}
     assert "all_next_latents" in metadata["rl"]
 
-    final_res = SimpleNamespace(
+    from vllm_omni.outputs import OmniRequestOutput
+
+    final_res = OmniRequestOutput.from_diffusion(
+        request_id="h3-flow-test",
         images=rollout_output.output["payload"]["video"],
         trajectory_latents=rollout_output.trajectory_latents,
         trajectory_timesteps=rollout_output.trajectory_timesteps,
         trajectory_log_probs=rollout_output.trajectory_log_probs,
         multimodal_output={"metadata": rollout_output.output["metadata"]},
-        request_output=None,
     )
     server = object.__new__(vLLMOmniHttpServer)
     server.global_steps = 1

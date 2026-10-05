@@ -38,7 +38,8 @@ from verl_omni.pipelines.bagel_flow_grpo.common import (
     maybe_to_cpu,
     setup_bagel_sigmas,
 )
-from verl_omni.pipelines.diffusion_rollout_output import rollout_output, with_visual_artifacts
+from verl_omni.pipelines.diffusion_media_output import with_visual_artifacts
+from verl_omni.pipelines.diffusion_rollout_output import rollout_output
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 from verl_omni.pipelines.rollout_request import prompt_ids_from_payload

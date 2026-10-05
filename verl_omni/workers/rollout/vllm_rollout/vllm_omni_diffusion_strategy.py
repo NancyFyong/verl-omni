@@ -22,12 +22,14 @@ import torch
 from verl.utils.import_utils import import_external_libs
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
+from vllm_omni.outputs import OmniRequestOutput
 
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.rollout_artifacts import (
     ARTIFACT_PREFIX,
     ARTIFACT_SPECS,
     PRIMARY_ARTIFACT,
+    MediaArtifact,
     artifacts_from_fields,
     requested_artifact_names,
     select_artifact,
@@ -84,6 +86,86 @@ def _unbatch_training_field(value: Any, *, context: str, name: str) -> Any:
             raise ValueError(f"{context}, field={name!r}: expected one batched item, got {len(value)}")
         return value[0]
     return value
+
+
+def _media_artifact_header(multimodal: Any, *, context: str) -> Mapping[str, Any] | None:
+    """Validate the named header before interpreting any engine payload."""
+    metadata = multimodal.get("metadata", {}) if isinstance(multimodal, Mapping) else {}
+    header = metadata.get("media_artifacts") if isinstance(metadata, Mapping) else None
+    if header is None:
+        if isinstance(multimodal, Mapping) and multimodal.keys() - {"metadata"}:
+            raise ValueError(f"{context}: named media_artifacts declaration required")
+        return None
+    if not isinstance(header, Mapping) or not {"primary", "specs", "preview", "audio"} <= header.keys():
+        raise ValueError(f"{context}: invalid media_artifacts header")
+    if not isinstance(header["specs"], Mapping) or header["primary"] not in header["specs"]:
+        raise ValueError(f"{context}: invalid named artifact declarations/primary")
+    return header
+
+
+def _merge_artifact_sources(sources: list[Mapping[str, Any]], *, context: str) -> dict[str, torch.Tensor]:
+    """Merge complementary engine sources, rejecting non-tensors and conflicting aliases."""
+    payload = {}
+    for source in sources:
+        for name, tensor in source.items():
+            if not isinstance(name, str):
+                raise ValueError(f"{context}: artifact names must be strings, got {name!r}")
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(f"{context}, artifact={name!r}: expected tensor, got {type(tensor).__name__}")
+            if name in payload and (
+                payload[name].dtype != tensor.dtype or not _alias_values_match(payload[name], tensor)
+            ):
+                raise ValueError(f"{context}: conflicting artifact={name!r} in multimodal_output and images")
+            payload[name] = tensor
+    if not payload:
+        raise ValueError(f"{context}: expected one named artifact payload")
+    return payload
+
+
+def _collect_artifact_payload(
+    final_res: OmniRequestOutput, header: Mapping[str, Any], *, context: str
+) -> dict[str, torch.Tensor]:
+    """Read the pinned formatter's named mappings and explicitly labelled images fallback."""
+    sources = []
+    specs = header["specs"]
+    for key, value in final_res.multimodal_output.items():
+        if key in {"metadata", "audio_sample_rate", "fps", "trajectory"}:
+            continue
+        if key in ("image", "video", "audio") and isinstance(value, Mapping | list):
+            if isinstance(value, list):
+                if len(value) != 1:
+                    raise ValueError(f"{context}: expected one named artifact payload")
+                value = value[0]
+            if not isinstance(value, Mapping):
+                raise ValueError(f"{context}: invalid named {key} payload")
+            sources.append(value)
+        elif key in specs:
+            sources.append({key: value})
+        else:
+            raise ValueError(f"{context}: undeclared multimodal output {key!r}")
+    if final_res.images:
+        if len(final_res.images) != 1:
+            raise ValueError(f"{context}: expected one named artifact payload")
+        image_payload = final_res.images[0]
+        if not isinstance(image_payload, Mapping):
+            primary = header["primary"]
+            expected_kind = specs[primary]["modality"]
+            if final_res.final_output_type != expected_kind:
+                raise ValueError(f"{context}: images fallback requires explicit final_output_type={expected_kind}")
+            image_payload = {primary: image_payload}
+        sources.append(image_payload)
+    return _merge_artifact_sources(sources, context=context)
+
+
+def _finish_reason(final_res: OmniRequestOutput | None, *, default: str) -> str:
+    """Read completion state when supplied; pure diffusion outputs may omit it."""
+    if final_res is None:
+        return default
+    if final_res.outputs:
+        return final_res.outputs[0].finish_reason or default
+    if hasattr(final_res, "finish_reason"):
+        return final_res.finish_reason or default
+    return default
 
 
 class DiffusionStrategy(OmniStrategyBase):
@@ -277,221 +359,146 @@ class DiffusionStrategy(OmniStrategyBase):
 
     def _diffusion_io_spec(self) -> Optional[DiffusionIOSpec]:
         """Resolve the adapter's available named artifacts, independent of engine wire layout."""
-        model_config = getattr(self.server, "model_config", None)
+        model_config = self.server.model_config
         if model_config is None:
             return None
         pipeline_cls = VllmOmniPipelineBase.get_class(
             architecture=model_config.architecture,
             algorithm=model_config.algorithm,
         )
-        return getattr(pipeline_cls, "diffusion_io_spec", None)
+        if pipeline_cls is None or not hasattr(pipeline_cls, "diffusion_io_spec"):
+            return None
+        return pipeline_cls.diffusion_io_spec
 
-    def process_output(self, final_res: Any, params: Any, sampling_params: dict[str, Any]) -> DiffusionOutput:
-        output_type = _diffusion_output_type(sampling_params)
-        req_output = getattr(final_res, "request_output", None) or final_res
-        request_id = getattr(req_output, "request_id", getattr(final_res, "request_id", "unknown"))
-        model_config = getattr(self.server, "model_config", None)
-        context = (
-            f"pipeline={getattr(model_config, 'architecture', 'unknown')}/"
-            f"{getattr(model_config, 'algorithm', 'unknown')}, request_id={request_id}"
+    def _parse_media_artifacts(
+        self,
+        final_res: OmniRequestOutput,
+        header: Mapping[str, Any],
+        sampling_params: dict[str, Any],
+        *,
+        context: str,
+    ) -> dict[str, MediaArtifact]:
+        """Validate merged named media against requested outputs and adapter declarations."""
+        payload = _collect_artifact_payload(final_res, header, context=context)
+        primary_name = header["primary"]
+        artifacts = artifacts_from_fields(
+            {
+                ARTIFACT_SPECS: header["specs"],
+                PRIMARY_ARTIFACT: primary_name,
+                **{ARTIFACT_PREFIX + name: tensor for name, tensor in payload.items()},
+            },
+            context=context,
         )
-        multimodal = getattr(final_res, "multimodal_output", None)
-        metadata = multimodal.get("metadata", {}) if isinstance(multimodal, Mapping) else {}
-        artifact_header = metadata.get("media_artifacts") if isinstance(metadata, Mapping) else None
-        artifact_payload = None
-        if artifact_header is not None:
-            if (
-                not isinstance(artifact_header, Mapping)
-                or not {"primary", "specs", "preview", "audio"} <= artifact_header.keys()
-            ):
+        validate_artifacts(
+            artifacts.items(),
+            {name: artifact.spec for name, artifact in artifacts.items()},
+            primary=primary_name,
+            context=context,
+            requested=sampling_params.get(
+                "requested_outputs", (sampling_params.get("extra_args") or {}).get("requested_outputs")
+            ),
+        )
+        preview_name = header["preview"]
+        if preview_name is not None and (
+            preview_name not in artifacts
+            or artifacts[preview_name].spec.representation != "decoded"
+            or artifacts[preview_name].spec.modality not in ("image", "video")
+        ):
+            raise ValueError(f"{context}: preview artifact={preview_name!r} must name decoded visual media")
+        primary = artifacts[primary_name]
+        expected_representation = "latent" if _diffusion_output_type(sampling_params) == "latent" else "decoded"
+        if primary.spec.representation != expected_representation:
+            raise ValueError(
+                f"{context}, artifact={primary_name!r}: expected {expected_representation}, got {primary.spec}"
+            )
+        io_spec = self._diffusion_io_spec()
+        if io_spec is not None:
+            for name, artifact in artifacts.items():
+                expected = io_spec.artifacts.get(name)
+                if expected is None:
+                    raise ValueError(f"{context}: undeclared artifact={name!r}")
+                actual = artifact.spec
+                if (actual.modality, actual.representation, actual.layout) != (
+                    expected.modality,
+                    expected.representation,
+                    expected.layout,
+                ) or (expected.sample_rate is not None and actual.sample_rate != expected.sample_rate):
+                    raise ValueError(f"{context}, artifact={name!r}: expected {expected}, got {actual}")
+        return artifacts
+
+    def _training_output_fields(self, final_res: OmniRequestOutput, *, context: str) -> dict[str, Any]:
+        """Remove only declared training batch axes and preserve algorithm-owned keys."""
+        fields: dict[str, Any] = {"global_steps": self.server.global_steps}
+        for name, source, value in (
+            ("all_latents", "trajectory_latents", final_res.trajectory_latents),
+            ("all_timesteps", "trajectory_timesteps", final_res.trajectory_timesteps),
+        ):
+            if value is not None:
+                fields[name] = _unbatch_training_field(value, context=context, name=source)
+        for metadata_group in _rollout_metadata_groups(final_res.multimodal_output):
+            for key, value in metadata_group.items():
+                if key in fields:
+                    raise ValueError(f"Duplicate rollout metadata field: {key}")
+                fields[key] = _unbatch_training_field(value, context=context, name=key)
+        return fields
+
+    def process_output(
+        self, final_res: OmniRequestOutput | None, params: Any, sampling_params: dict[str, Any]
+    ) -> DiffusionOutput:
+        output_type = _diffusion_output_type(sampling_params)
+        model_config = self.server.model_config
+        pipeline = f"{model_config.architecture}/{model_config.algorithm}" if model_config is not None else "unknown"
+        request_output = final_res
+        if final_res is not None and hasattr(final_res, "request_output"):
+            request_output = final_res.request_output or final_res
+        request_id = request_output.request_id if request_output is not None else "unknown"
+        context = f"pipeline={pipeline}, request_id={request_id}"
+        header = _media_artifact_header(final_res.multimodal_output if final_res is not None else None, context=context)
+        if header is None:
+            if final_res is not None and final_res.images:
                 raise ValueError(
-                    f"request_id={getattr(final_res, 'request_id', 'unknown')}: invalid media_artifacts header"
+                    f"{context}: named media_artifacts declaration required; legacy tensor/tuple output is unsupported"
                 )
-            artifact_payload = {}
-            sources = []
-            specs = artifact_header["specs"]
-            if not isinstance(specs, Mapping) or artifact_header["primary"] not in specs:
-                raise ValueError(f"{context}: invalid named artifact declarations/primary")
-            for key, value in multimodal.items():
-                if key in {"metadata", "audio_sample_rate", "fps", "trajectory"}:
-                    continue
-                if key in ("image", "video", "audio") and isinstance(value, Mapping | list):
-                    if isinstance(value, list):
-                        if len(value) != 1:
-                            raise ValueError(f"{context}: expected one named artifact payload")
-                        value = value[0]
-                    if not isinstance(value, Mapping):
-                        raise ValueError(f"{context}: invalid named {key} payload")
-                    sources.append(value)
-                elif key in specs:
-                    sources.append({key: value})
-                else:
-                    raise ValueError(f"{context}: undeclared multimodal output {key!r}")
-            images = final_res.images or []
-            if images:
-                if len(images) != 1:
-                    raise ValueError(f"{context}: expected one named artifact payload")
-                image_payload = images[0]
-                if not isinstance(image_payload, Mapping):
-                    primary = artifact_header["primary"]
-                    expected_kind = specs[primary]["modality"]
-                    if getattr(final_res, "final_output_type", None) != expected_kind:
-                        raise ValueError(
-                            f"{context}: images fallback requires explicit final_output_type={expected_kind}"
-                        )
-                    image_payload = {primary: image_payload}
-                sources.append(image_payload)
-            for source in sources:
-                for name, tensor in source.items():
-                    if not isinstance(name, str):
-                        raise ValueError(f"{context}: artifact names must be strings, got {name!r}")
-                    if name in artifact_payload and (
-                        getattr(artifact_payload[name], "dtype", None) != getattr(tensor, "dtype", None)
-                        or not _alias_values_match(artifact_payload[name], tensor)
-                    ):
-                        raise ValueError(f"{context}: conflicting artifact={name!r} in multimodal_output and images")
-                    artifact_payload[name] = tensor
-            if not artifact_payload:
-                raise ValueError(f"{context}: expected one named artifact payload")
-        if artifact_header is None and isinstance(multimodal, Mapping) and multimodal.keys() - {"metadata"}:
-            raise ValueError(f"{context}: named media_artifacts declaration required")
-        if artifact_header is None and (final_res is None or not final_res.images):
-            finish_reason = "abort"
-            if final_res is not None:
-                req_out = getattr(final_res, "request_output", None) or final_res
-                if hasattr(req_out, "outputs") and req_out.outputs:
-                    finish_reason = getattr(req_out.outputs[0], "finish_reason", None) or "abort"
-                else:
-                    finish_reason = getattr(req_out, "finish_reason", None) or "abort"
+            finish_reason = _finish_reason(request_output, default="abort")
             stop_reason = self._map_stop_reason(finish_reason)
             logger.debug(
                 "diffusion rollout produced no image (finish_reason=%s); returning %s", finish_reason, stop_reason
             )
             return DiffusionOutput(
-                diffusion_output=torch.empty(
-                    0,
-                    dtype=torch.float32 if output_type == "latent" else torch.uint8,
-                ),
+                diffusion_output=torch.empty(0, dtype=torch.float32 if output_type == "latent" else torch.uint8),
                 log_probs=None,
                 stop_reason=stop_reason,
                 num_preempted=None,
                 extra_fields={"global_steps": self.server.global_steps},
             )
 
-        if artifact_header is None:
-            raise ValueError(
-                f"{context}: named media_artifacts declaration required; legacy tensor/tuple output is unsupported"
-            )
-        diffusion_output = artifact_payload
-        io_spec = self._diffusion_io_spec()
-        artifacts = {}
-        primary_artifact = None
-        audio_sample_rate: Optional[int] = None
-        rollout_audio: Any = None
-        if artifact_header is not None:
-            primary_artifact = artifact_header["primary"]
-            artifacts = artifacts_from_fields(
-                {
-                    ARTIFACT_SPECS: artifact_header["specs"],
-                    PRIMARY_ARTIFACT: primary_artifact,
-                    **{ARTIFACT_PREFIX + name: tensor for name, tensor in diffusion_output.items()},
-                },
-                context=context,
-            )
-            validate_artifacts(
-                artifacts.items(),
-                {name: artifact.spec for name, artifact in artifacts.items()},
-                primary=primary_artifact,
-                context=context,
-                requested=sampling_params.get(
-                    "requested_outputs", (sampling_params.get("extra_args") or {}).get("requested_outputs")
-                ),
-            )
-            preview_name = artifact_header.get("preview")
-            if preview_name is not None and (
-                preview_name not in artifacts
-                or artifacts[preview_name].spec.representation != "decoded"
-                or artifacts[preview_name].spec.modality not in ("image", "video")
-            ):
-                raise ValueError(f"{context}: preview artifact={preview_name!r} must name decoded visual media")
-            primary = artifacts[primary_artifact]
-            expected_representation = "latent" if output_type == "latent" else "decoded"
-            if primary.spec.representation != expected_representation:
-                raise ValueError(
-                    f"{context}, artifact={primary_artifact!r}: expected {expected_representation}, got {primary.spec}"
-                )
-            if io_spec is not None:
-                for name, artifact in artifacts.items():
-                    expected = io_spec.artifacts.get(name)
-                    if expected is None:
-                        raise ValueError(f"{context}: undeclared artifact={name!r}")
-                    actual = artifact.spec
-                    if (actual.modality, actual.representation, actual.layout) != (
-                        expected.modality,
-                        expected.representation,
-                        expected.layout,
-                    ) or (expected.sample_rate is not None and actual.sample_rate != expected.sample_rate):
-                        raise ValueError(f"{context}, artifact={name!r}: expected {expected}, got {actual}")
-            diffusion_output = primary.data
-            if artifact_header.get("audio") is not None:
-                audio_artifact = select_artifact(
-                    artifacts, name=artifact_header["audio"], modality="audio", representation="decoded"
-                )
-                rollout_audio = audio_artifact.data
-                audio_sample_rate = audio_artifact.spec.sample_rate
-
-        if sampling_params.get("logprobs", False):
-            log_probs = _unbatch_training_field(
-                final_res.trajectory_log_probs, context=context, name="trajectory_log_probs"
-            )
-        else:
-            log_probs = None
-
-        extra_fields: dict[str, Any] = {"global_steps": self.server.global_steps}
-        if final_res.trajectory_latents is not None:
-            extra_fields["all_latents"] = _unbatch_training_field(
-                final_res.trajectory_latents, context=context, name="trajectory_latents"
-            )
-        if final_res.trajectory_timesteps is not None:
-            extra_fields["all_timesteps"] = _unbatch_training_field(
-                final_res.trajectory_timesteps, context=context, name="trajectory_timesteps"
-            )
-        for metadata_group in _rollout_metadata_groups(final_res.multimodal_output):
-            for key, value in metadata_group.items():
-                if key in extra_fields:
-                    raise ValueError(f"Duplicate rollout metadata field: {key}")
-                extra_fields[key] = _unbatch_training_field(value, context=context, name=key)
-        if artifacts:
-            kind = artifacts[primary_artifact].spec.modality
-            if extra_fields.get("media_kind", kind) != kind:
-                raise ValueError(f"{context}: media_kind conflicts with primary artifact")
-            extra_fields["media_kind"] = kind
-            if rollout_audio is not None:
-                if "audio" in extra_fields and not torch.equal(torch.as_tensor(extra_fields["audio"]), rollout_audio):
-                    raise ValueError(f"{context}: audio metadata conflicts with named audio artifact")
-                if extra_fields.get("audio_sample_rate", audio_sample_rate) != audio_sample_rate:
-                    raise ValueError(f"{context}: audio_sample_rate conflicts with named audio artifact")
-        if rollout_audio is not None:
-            extra_fields["audio"] = rollout_audio
-            extra_fields["audio_sample_rate"] = audio_sample_rate
-
-        if hasattr(req_output, "outputs") and req_output.outputs:
-            finish_reason = req_output.outputs[0].finish_reason or "stop"
-        elif hasattr(req_output, "finish_reason"):
-            finish_reason = req_output.finish_reason or "stop"
-        else:
-            finish_reason = "stop"
-
-        stop_reason = self._map_stop_reason(finish_reason)
-        num_preempted = self._extract_num_preempted(req_output)
-
+        artifacts = self._parse_media_artifacts(final_res, header, sampling_params, context=context)
+        primary_name = header["primary"]
+        primary = artifacts[primary_name]
+        fields = self._training_output_fields(final_res, context=context)
+        if fields.get("media_kind", primary.spec.modality) != primary.spec.modality:
+            raise ValueError(f"{context}: media_kind conflicts with primary artifact")
+        fields["media_kind"] = primary.spec.modality
+        if header["audio"] is not None:
+            audio = select_artifact(artifacts, name=header["audio"], modality="audio", representation="decoded")
+            if "audio" in fields and not torch.equal(torch.as_tensor(fields["audio"]), audio.data):
+                raise ValueError(f"{context}: audio metadata conflicts with named audio artifact")
+            if fields.get("audio_sample_rate", audio.spec.sample_rate) != audio.spec.sample_rate:
+                raise ValueError(f"{context}: audio_sample_rate conflicts with named audio artifact")
+            fields["audio"] = audio.data
+            fields["audio_sample_rate"] = audio.spec.sample_rate
+        log_probs = (
+            _unbatch_training_field(final_res.trajectory_log_probs, context=context, name="trajectory_log_probs")
+            if sampling_params.get("logprobs", False)
+            else None
+        )
         return DiffusionOutput(
             artifacts=artifacts,
-            primary_artifact=primary_artifact,
-            preview_artifact=artifact_header["preview"],
-            diffusion_output=diffusion_output,
+            primary_artifact=primary_name,
+            preview_artifact=header["preview"],
+            diffusion_output=primary.data,
             log_probs=log_probs,
-            stop_reason=stop_reason,
-            num_preempted=num_preempted,
-            extra_fields=extra_fields,
+            stop_reason=self._map_stop_reason(_finish_reason(request_output, default="stop")),
+            num_preempted=self._extract_num_preempted(request_output),
+            extra_fields=fields,
         )

@@ -28,7 +28,7 @@ from pathlib import Path
 
 import torch
 
-from verl_omni.pipelines.diffusion_rollout_output import quantize_pixels
+from verl_omni.pipelines.diffusion_media_output import quantize_pixels
 from verl_omni.pipelines.rollout_artifacts import MediaArtifact
 from verl_omni.pipelines.rollout_media import MediaSpec
 

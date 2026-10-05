@@ -37,14 +37,11 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.platforms import current_omni_platform
 
-from verl_omni.pipelines.diffusion_rollout_output import (
-    rollout_output,
-    wants_decoded_preview,
-    with_visual_artifacts,
-    wrap_rollout_postprocessor,
-)
+from verl_omni.pipelines.diffusion_media_output import wants_decoded_preview, with_visual_artifacts
+from verl_omni.pipelines.diffusion_rollout_output import rollout_output
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
+from verl_omni.pipelines.rollout_postprocessing import install_rollout_postprocessor
 from verl_omni.pipelines.rollout_request import prompt_ids_from_payload
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 
@@ -53,16 +50,7 @@ from .common import sd3_time_shift, seed_from_prompt_ids
 logger = logging.getLogger(__name__)
 __all__ = ["Wan22DanceGRPOPipelineWithLogProb"]
 
-_WAN_POST_PROCESS_FACTORY = pipeline_wan2_2.get_wan22_post_process_func
-
-
-def get_rollout_post_process_func(od_config):
-    """Postprocess Wan media while preserving rollout metadata."""
-    return wrap_rollout_postprocessor(_WAN_POST_PROCESS_FACTORY(od_config))
-
-
-# vllm-omni resolves the built-in architecture's factory in the engine process.
-pipeline_wan2_2.get_wan22_post_process_func = get_rollout_post_process_func
+install_rollout_postprocessor(pipeline_wan2_2, "get_wan22_post_process_func")
 
 
 def _coalesce_not_none(value, default):

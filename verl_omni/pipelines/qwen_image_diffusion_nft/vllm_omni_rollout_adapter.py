@@ -24,12 +24,8 @@ from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusio
 from vllm_omni.diffusion.utils.size_utils import normalize_min_aligned_size
 from vllm_omni.diffusion.worker.utils import StepRequestState
 
-from verl_omni.pipelines.diffusion_rollout_output import (
-    rollout_output,
-    wants_decoded_preview,
-    with_rollout_data,
-    with_visual_artifacts,
-)
+from verl_omni.pipelines.diffusion_media_output import wants_decoded_preview, with_visual_artifacts
+from verl_omni.pipelines.diffusion_rollout_output import rollout_output, with_rollout_data
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.qwen_image_flow_grpo.common import (
     QwenImageLoRAMixin,

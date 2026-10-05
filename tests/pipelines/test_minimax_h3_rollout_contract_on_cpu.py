@@ -19,6 +19,7 @@ import pytest
 import torch
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+from vllm_omni.outputs import OmniRequestOutput
 
 from verl_omni.pipelines.minimax_h3_diffusion_nft.vllm_omni_rollout_adapter import MiniMaxH3DiffusionNFTPipeline
 from verl_omni.pipelines.minimax_h3_flow_grpo.vllm_omni_rollout_adapter import MiniMaxH3PipelineWithLogProb
@@ -86,13 +87,12 @@ def _make_h3_final_res(monkeypatch, algorithm, output_type="pt", extra_args=None
         result = pipeline.forward(
             SimpleNamespace(requests=[request], prompts=request.prompts, sampling_params=request.sampling_params)
         )
-    return SimpleNamespace(
+    return OmniRequestOutput.from_diffusion(
         images=result.output["payload"]["video"],
         multimodal_output={"metadata": result.output["metadata"]},
         trajectory_latents=result.trajectory_latents,
         trajectory_timesteps=result.trajectory_timesteps,
         trajectory_log_probs=result.trajectory_log_probs,
-        request_output=None,
         request_id="h3-test",
     )
 

@@ -22,9 +22,8 @@ from typing import Literal
 Modality = Literal["image", "video", "audio"]
 
 
-def resolve_is_video(ndim: int, media_kind: str | None) -> bool:
+def resolve_is_video(media_kind: str | None) -> bool:
     """Read the declared modality; rank is never a modality discriminator."""
-    del ndim
     if media_kind is None:
         raise ValueError("Explicit media_kind required, got None")
     if media_kind not in ("image", "video", "audio"):
@@ -38,7 +37,7 @@ def resolve_batch_media_kind(media_kinds: Iterable[str | None]) -> str | None:
     for kind in media_kinds:
         if kind is None:
             continue
-        resolve_is_video(0, kind)
+        resolve_is_video(kind)
         if resolved is not None and resolved != kind:
             raise ValueError(f"Conflicting media kinds in one rollout batch: {resolved!r} and {kind!r}")
         resolved = kind
@@ -55,7 +54,7 @@ def validate_visual_media_batch_rank(ndim: int, media_kind: str | None) -> None:
         raise ValueError(f"Declared media_kind='video' requires a rank-5 batch, got rank {ndim}.")
     if media_kind == "audio":
         raise ValueError("Cannot dump declared audio as a visual generation batch.")
-    resolve_is_video(ndim, media_kind)
+    resolve_is_video(media_kind)
 
 
 @dataclass(frozen=True)

@@ -17,8 +17,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm_omni.outputs import OmniRequestOutput
 
-from verl_omni.pipelines.diffusion_rollout_output import quantize_pixels
+from verl_omni.pipelines.diffusion_media_output import quantize_pixels
 from verl_omni.pipelines.rollout_artifacts import MediaArtifact
 from verl_omni.pipelines.rollout_media import MediaSpec
 from verl_omni.pipelines.rollout_request import OmniRolloutRequest
@@ -30,11 +31,13 @@ from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import 
 def diffusion_strategy():
     server = object.__new__(vLLMOmniHttpServer)
     server.global_steps = 0
+    server.model_config = None
     return DiffusionStrategy(server)
 
 
 def _request_output(artifacts, primary="image_preview", audio=None):
-    return SimpleNamespace(
+    return OmniRequestOutput.from_diffusion(
+        request_id="output-test",
         images=[{name: artifact.data for name, artifact in artifacts.items()}],
         multimodal_output={
             "metadata": {
@@ -136,7 +139,7 @@ def test_latent_output_preserves_native_dtype_and_axes(diffusion_strategy, dtype
 @pytest.mark.parametrize("raw", [torch.zeros(1, 3, 2, 2), (torch.zeros(3, 2, 2), torch.zeros(2, 8))])
 def test_legacy_output_is_not_interpreted_from_shape(diffusion_strategy, raw):
     with pytest.raises(ValueError, match="named media_artifacts declaration required"):
-        diffusion_strategy.process_output(SimpleNamespace(images=[raw], multimodal_output=None), None, {})
+        diffusion_strategy.process_output(OmniRequestOutput.from_diffusion(request_id="legacy", images=[raw]), None, {})
 
 
 @pytest.mark.parametrize(

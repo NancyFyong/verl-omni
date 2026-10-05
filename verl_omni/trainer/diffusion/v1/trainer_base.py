@@ -1568,7 +1568,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         effective_media_kind = previews[0].spec.modality if previews is not None else media_kind
         if previews is None:
             _validate_generation_outputs(outputs)
-            resolve_is_video(outputs.ndim, effective_media_kind)
+            resolve_is_video(effective_media_kind)
             validate_visual_media_batch_rank(outputs.ndim, effective_media_kind)
         if effective_media_kind == "video":
             for audio, audio_sample_rate in zip(

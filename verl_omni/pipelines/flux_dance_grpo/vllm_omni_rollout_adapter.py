@@ -29,14 +29,12 @@ from vllm_omni.diffusion.models.flux.pipeline_flux import FluxPipeline
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
-from verl_omni.pipelines.diffusion_rollout_output import (
-    rollout_output,
-    with_visual_artifacts,
-    wrap_rollout_postprocessor,
-)
+from verl_omni.pipelines.diffusion_media_output import with_visual_artifacts
+from verl_omni.pipelines.diffusion_rollout_output import rollout_output
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.request_batch import requested_outputs_for_batch, split_diffusion_output_by_request
 from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
+from verl_omni.pipelines.rollout_postprocessing import install_rollout_postprocessor
 from verl_omni.pipelines.rollout_request import prompt_ids_from_payload
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 from verl_omni.pipelines.wan22_dance_grpo.common import seed_from_prompt_ids
@@ -49,15 +47,7 @@ FLUX_CLIP_TOKENS_KEY = "clip"
 FLUX_T5_TOKENS_KEY = "t5"
 FLUX_ENCODER_TOKEN_KEYS = (FLUX_CLIP_TOKENS_KEY, FLUX_T5_TOKENS_KEY)
 
-_FLUX_POST_PROCESS_FACTORY = pipeline_flux.get_flux_post_process_func
-
-
-def get_rollout_post_process_func(od_config):
-    """Postprocess generated images while preserving rollout metadata."""
-    return wrap_rollout_postprocessor(_FLUX_POST_PROCESS_FACTORY(od_config))
-
-
-pipeline_flux.get_flux_post_process_func = get_rollout_post_process_func
+install_rollout_postprocessor(pipeline_flux, "get_flux_post_process_func")
 
 
 def _coalesce_not_none(value, default):

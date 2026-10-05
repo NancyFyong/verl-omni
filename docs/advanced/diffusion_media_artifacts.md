@@ -1,6 +1,6 @@
 # Named diffusion media artifacts
 
-Last updated: 09/10/2026.
+Last updated: 10/05/2026.
 
 All registered in-tree diffusion adapters emit named media. The strategy,
 agent loops, rewards and V0/V1 exporters consume declarations rather than
@@ -79,16 +79,19 @@ optimization is claimed for those models.
 
 ## Implementing an adapter
 
-`pipelines/diffusion_rollout_output.py` separates algorithm data from media:
+Output construction and engine compatibility have separate owners:
 
 1. Construct native trajectory fields and `prompt_embeddings` / `rl` groups
-   with `rollout_output` or `with_rollout_data`.
-2. Attach media with `with_visual_artifacts` (batched VAE visuals and native
-   latents), `with_batched_media_artifacts` (explicit B-prefixed streams), or
-   `with_media_artifacts` (one sample).
-3. Ensure the engine's postprocessor preserves the named envelope. Use
-   `wrap_rollout_postprocessor` for a media-only upstream processor; do not run
-   VAE normalization/PIL conversion on already-canonical artifacts a second time.
+   with `rollout_output` or `with_rollout_data` in `pipelines/diffusion_rollout_output.py`.
+2. Attach media using `pipelines/diffusion_media_output.py`: `with_visual_artifacts`
+   for batched VAE visuals and native latents, `with_batched_media_artifacts` for
+   explicit B-prefixed streams, or `with_media_artifacts` for one sample.
+3. Preserve named envelopes using `pipelines/rollout_postprocessing.py`.
+   `install_rollout_postprocessor(upstream_module, factory_name)` wraps the
+   upstream factory once in the engine process. The pinned engine resolves this
+   module-level hook rather than a per-output processor. Ordinary inference
+   delegates to the native processor; named tensors bypass it because the adapter
+   has already decoded and normalized them. No installed package files are edited.
 
 For example, after an image sampler returns packed `BLC` latents and its VAE
 returns floating `BCHW` pixels in `[-1,1]`:
@@ -195,18 +198,17 @@ packing/unpacking, named outputs, per-request splitting and optional preview
 union are CPU-tested with mocked encoders/denoising/VAE. Real FLUX VAE and GPU
 rollout validation remain pending; the earlier GPU matrix does not cover it.
 
-Reproducible GPU checks live under `tests/special_e2e/`:
+Reproducible GPU checks use the existing rollout and model-specific fixtures:
 
-- `check_diffusion_vae_layouts.py --models-json <case-to-local-path.json> --output <report.json>`
+- `tests/special_e2e/check_diffusion_vae_layouts.py --models-json <case-to-local-path.json> --output <report.json>`
   loads actual VAE implementations/local weights, records implementation class,
   parameter count and input/output shapes, and validates canonical conversion.
-- `check_named_diffusion_rollout.py --model <path> --architecture <name> --algorithm <name> --output-dir <dir>`
-  exercises the real engine through production request lowering and output
-  parsing; `--num-requests` and `--step-execution` cover the two batching modes.
-  `--require-request-batch` additionally checks that producer context contains
-  every request ID from a real packed forward. Use `--tokenizer-path` for model
-  layouts such as Boogu's `processor/`, and `--deploy-config` with BAGEL's
-  single-stage deployment recipe rather than its default two-stage AR pipeline.
+- `pytest tests/workers/rollout/rollout_vllm/test_vllm_omni_generate.py -v -s`
+  uses the existing Qwen-Image tiny-random server fixture. Request-level tests
+  check decoded and latent primaries with a requested preview; step-execution
+  tests check named media alongside algorithm-owned training fields. Both paths
+  validate preview conversion for pixel rewards. CPU export tests cover encoding
+  separately; the model-specific trainer smoke recipes remain the full-training checks.
 - Existing training recipes cover actor updates, ordinary agent loops and V1/TQ.
   V1 requires **both** `trainer.use_v1=True` and `transfer_queue.enable=True`;
   invoking `main_diffusion_v1` alone can fall back to V0.

@@ -27,7 +27,8 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-from verl_omni.pipelines.diffusion_rollout_output import quantize_pixels, rollout_output, with_visual_artifacts
+from verl_omni.pipelines.diffusion_media_output import quantize_pixels, with_visual_artifacts
+from verl_omni.pipelines.diffusion_rollout_output import rollout_output
 from verl_omni.pipelines.request_batch import requested_outputs_for_batch, split_diffusion_output_by_request
 from verl_omni.pipelines.rollout_artifacts import (
     ArtifactContractError,
@@ -51,20 +52,20 @@ def _format(native, architecture="QwenImagePipeline", request_id="request"):
 
 
 @pytest.mark.parametrize(
-    "module,factory,architecture,kind,latent_layout",
+    "architecture,kind,latent_layout",
     [
-        ("qwen_image_flow_grpo", "get_rollout_post_process_func", "QwenImagePipeline", "image", "LC"),
-        ("qwen_image_edit_flow_grpo", "get_rollout_post_process_func", "QwenImageEditPlusPipeline", "image", "LC"),
-        ("sd3_flow_grpo", "get_latent_post_process_func", "StableDiffusion3Pipeline", "image", "CHW"),
-        ("flux_dance_grpo", "get_rollout_post_process_func", "FluxPipeline", "image", "LC"),
-        ("boogu_image_flow_grpo", "get_rollout_post_process_func", "BooguImagePipeline", "image", "CHW"),
-        ("wan22_dance_grpo", "get_rollout_post_process_func", "WanPipeline", "video", "CTHW"),
-        ("ltx2_flow_grpo", "get_rollout_post_process_func", "LTX2Pipeline", "video", "CTHW"),
+        ("QwenImagePipeline", "image", "LC"),
+        ("QwenImageEditPlusPipeline", "image", "LC"),
+        ("StableDiffusion3Pipeline", "image", "CHW"),
+        ("FluxPipeline", "image", "LC"),
+        ("BooguImagePipeline", "image", "CHW"),
+        ("WanPipeline", "video", "CTHW"),
+        ("LTX2Pipeline", "video", "CTHW"),
     ],
 )
 @pytest.mark.parametrize("output_type", ["pt", "latent"])
 def test_native_postprocessor_and_formatter_preserve_named_streams(
-    tmp_path, module, factory, architecture, kind, latent_layout, output_type
+    tmp_path, architecture, kind, latent_layout, output_type
 ):
     (tmp_path / "vae").mkdir()
     (tmp_path / "vae/config.json").write_text(
@@ -72,8 +73,11 @@ def test_native_postprocessor_and_formatter_preserve_named_streams(
     )
     (tmp_path / "vocoder").mkdir()
     (tmp_path / "vocoder/config.json").write_text('{"output_sampling_rate": 48000}')
-    adapter = importlib.import_module(f"verl_omni.pipelines.{module}.vllm_omni_rollout_adapter")
-    processor = getattr(adapter, factory)(SimpleNamespace(model=str(tmp_path), output_type="image"))
+    from vllm_omni.diffusion.registry import get_diffusion_post_process_func
+
+    processor = get_diffusion_post_process_func(
+        SimpleNamespace(model=str(tmp_path), model_class_name=architecture, output_type="image")
+    )
     pixels = (
         torch.linspace(-1, 1, 72).reshape(1, 3, 3, 2, 4)
         if kind == "video"
@@ -93,7 +97,7 @@ def test_native_postprocessor_and_formatter_preserve_named_streams(
         context="adapter request",
     )
     assert processor(native.output) is native.output
-    output = DiffusionStrategy(SimpleNamespace(global_steps=1)).process_output(
+    output = DiffusionStrategy(SimpleNamespace(global_steps=1, model_config=None)).process_output(
         _format(native, architecture), None, {"output_type": output_type}
     )
     assert set(output.artifacts) == {f"{kind}_latent", f"{kind}_preview"}
@@ -152,7 +156,7 @@ def test_flux_forward_emits_named_packed_latents_and_optional_batch_preview(outp
     if decode:
         torch.testing.assert_close(pipeline.vae.decode.call_args.args[0], native / 2 + 0.5)
     for index, output in enumerate(outputs):
-        converted = DiffusionStrategy(SimpleNamespace(global_steps=1)).process_output(
+        converted = DiffusionStrategy(SimpleNamespace(global_steps=1, model_config=None)).process_output(
             _format(output, "FluxPipeline", requests[index].request_id), None, {"output_type": output_type}
         )
         artifact = converted.artifacts["image_latent"]
@@ -329,7 +333,7 @@ def test_complementary_engine_sources_are_merged_and_conflicts_fail(conflict):
     row = final.images[0]
     final.multimodal_output["image_latent"] = row["image_latent"]
     final.images = [row["image_preview"]]
-    strategy = DiffusionStrategy(SimpleNamespace(global_steps=1))
+    strategy = DiffusionStrategy(SimpleNamespace(global_steps=1, model_config=None))
     output = strategy.process_output(final, None, {})
     assert set(output.artifacts) == {"image_latent", "image_preview"}
     final.images = [row]
@@ -393,7 +397,7 @@ def test_unbatch_never_silently_discards_training_rows(field):
     else:
         final.multimodal_output["metadata"]["rl"] = {"latents_clean": torch.zeros(3, 2, 16)}
     with pytest.raises(ValueError, match="bad-meta.*expected batch size 1"):
-        DiffusionStrategy(SimpleNamespace(global_steps=1)).process_output(final, None, {})
+        DiffusionStrategy(SimpleNamespace(global_steps=1, model_config=None)).process_output(final, None, {})
 
 
 @pytest.mark.parametrize("output_type", ["unknown", "", False])
@@ -427,7 +431,7 @@ def test_error_provenance_survives_tensor_transport():
         output_type="latent",
         context="adapter",
     )
-    output = DiffusionStrategy(SimpleNamespace(global_steps=1)).process_output(
+    output = DiffusionStrategy(SimpleNamespace(global_steps=1, model_config=None)).process_output(
         _format(native, request_id="trace-me"), None, {"output_type": "latent"}
     )
     fields = artifact_fields(output.artifacts, output.primary_artifact, output.preview_artifact)

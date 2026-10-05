@@ -28,11 +28,8 @@ from vllm_omni.diffusion.models.sd3.pipeline_sd3 import StableDiffusion3Pipeline
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
-from verl_omni.pipelines.diffusion_rollout_output import (
-    rollout_output,
-    with_visual_artifacts,
-    wrap_rollout_postprocessor,
-)
+from verl_omni.pipelines.diffusion_media_output import with_visual_artifacts
+from verl_omni.pipelines.diffusion_rollout_output import rollout_output
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.request_batch import requested_outputs_for_batch
 from verl_omni.pipelines.request_batch import (
@@ -42,6 +39,7 @@ from verl_omni.pipelines.request_batch import (
     split_diffusion_output_by_request as _split_diffusion_output_by_request,
 )
 from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
+from verl_omni.pipelines.rollout_postprocessing import install_rollout_postprocessor
 from verl_omni.pipelines.rollout_request import prompt_ids_from_payload
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 from verl_omni.pipelines.sd3_flow_grpo.common import (
@@ -152,17 +150,7 @@ def _resolve_output_type(sampling_params, default: str) -> Literal["image", "lat
     return _validate_output_type(_coalesce_not_none(output_type, default))
 
 
-_SD3_IMAGE_POST_PROCESS_FUNC = pipeline_sd3.get_sd3_image_post_process_func
-
-
-def get_latent_post_process_func(od_config):
-    """Postprocess SD3 media while preserving rollout metadata."""
-    return wrap_rollout_postprocessor(_SD3_IMAGE_POST_PROCESS_FUNC(od_config))
-
-
-# vLLM-Omni resolves this module-level factory before initializing the custom
-# pipeline, so install the SD3-specific override while registering this adapter.
-pipeline_sd3.get_sd3_image_post_process_func = get_latent_post_process_func
+install_rollout_postprocessor(pipeline_sd3, "get_sd3_image_post_process_func")
 
 
 @VllmOmniPipelineBase.register("StableDiffusion3Pipeline", algorithm="flow_grpo")

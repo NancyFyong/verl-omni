@@ -270,7 +270,7 @@ def dump_generations(
     n = n_full if max_samples is None else min(max_samples, n_full)
     # Prefer the adapter-declared media kind over legacy rank/layout inference.
     validate_visual_media_batch_rank(outputs.ndim, media_kind)
-    is_video = resolve_is_video(outputs.ndim, media_kind)
+    is_video = resolve_is_video(media_kind)
     if previews is None and is_video and outputs.ndim == 5 and outputs.shape[1] == 3 and outputs.shape[2] != 3:
         # Channels-first [N, C, T, H, W] -> [N, T, C, H, W]. Layout normalization
         # is still heuristic; declaring/normalizing it is deferred to the layout PR.

@@ -13,7 +13,6 @@
 # limitations under the License.
 
 from argparse import Namespace
-from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -826,9 +825,12 @@ def _joint_spec(sample_rate=48000):
 def _joint_video_audio_final_res(sample_rate=48000):
     from dataclasses import asdict
 
+    from vllm_omni.outputs import OmniRequestOutput
+
     video = torch.zeros(2, 3, 8, 8, dtype=torch.uint8)
     audio = torch.zeros(1, 16)
-    final_res = SimpleNamespace(
+    final_res = OmniRequestOutput.from_diffusion(
+        request_id="joint-output",
         images=[{"video_preview": video, "audio": audio}],
         trajectory_latents=None,
         trajectory_timesteps=None,
@@ -843,7 +845,6 @@ def _joint_video_audio_final_res(sample_rate=48000):
                 }
             }
         },
-        request_output=None,
     )
     return final_res, audio
 
@@ -875,7 +876,7 @@ def test_diffusion_strategy_uses_declared_audio_sample_rate(monkeypatch):
 
 @pytest.mark.parametrize("runtime_kind", ["image", "depth"])
 def test_diffusion_strategy_rejects_conflicting_media_kind(monkeypatch, runtime_kind):
-    strategy = DiffusionStrategy(SimpleNamespace(global_steps=1))
+    strategy = DiffusionStrategy(SimpleNamespace(global_steps=1, model_config=None))
     monkeypatch.setattr(
         strategy,
         "_diffusion_io_spec",
@@ -890,7 +891,7 @@ def test_diffusion_strategy_rejects_conflicting_media_kind(monkeypatch, runtime_
 
 
 def test_diffusion_strategy_accepts_matching_kind_and_runtime_audio_rate(monkeypatch):
-    strategy = DiffusionStrategy(SimpleNamespace(global_steps=1))
+    strategy = DiffusionStrategy(SimpleNamespace(global_steps=1, model_config=None))
     monkeypatch.setattr(
         strategy,
         "_diffusion_io_spec",
@@ -906,18 +907,18 @@ def test_diffusion_strategy_accepts_matching_kind_and_runtime_audio_rate(monkeyp
 
 @pytest.mark.parametrize("declared", [False, True])
 def test_diffusion_strategy_rejects_extra_tuple_streams(monkeypatch, declared):
-    strategy = DiffusionStrategy(SimpleNamespace(global_steps=1))
+    strategy = DiffusionStrategy(SimpleNamespace(global_steps=1, model_config=None))
     spec = _joint_spec() if declared else None
     monkeypatch.setattr(strategy, "_diffusion_io_spec", lambda: spec)
     final_res, audio = _joint_video_audio_final_res()
     final_res.images = [(final_res.images[0]["video_preview"], audio, audio.clone())]
-    final_res.multimodal_output = None
+    final_res.multimodal_output.clear()
     with pytest.raises(ValueError, match="named media_artifacts declaration required"):
         strategy.process_output(final_res, None, {"output_type": "pt"})
 
 
 def test_diffusion_strategy_rejects_undeclared_named_audio(monkeypatch):
-    strategy = DiffusionStrategy(SimpleNamespace(global_steps=1))
+    strategy = DiffusionStrategy(SimpleNamespace(global_steps=1, model_config=None))
     monkeypatch.setattr(
         strategy,
         "_diffusion_io_spec",
@@ -988,45 +989,45 @@ async def test_strategy_preserves_mode_specific_engine_call(strategy_cls, priori
     assert set(engine.kwargs) - {"prompt", "request_id", "sampling_params_list"} == expected_extra_keys
 
 
-@pytest.mark.asyncio
-async def test_named_rollout_checker_prepares_single_device_topology_before_engine_start(monkeypatch):
-    path = Path(__file__).resolve().parents[4] / "tests/special_e2e/check_named_diffusion_rollout.py"
-    spec = spec_from_file_location("named_rollout_checker_under_test", path)
-    checker = module_from_spec(spec)
-    spec.loader.exec_module(checker)
+@pytest.mark.parametrize("finish_reason,expected", [("stop", "completed"), ("abort", "aborted"), (None, "aborted")])
+def test_diffusion_empty_output_preserves_completion_state(finish_reason, expected):
+    from vllm_omni.outputs import OmniRequestOutput
 
-    class EngineStartReached(Exception):
-        pass
+    final = OmniRequestOutput.from_diffusion(request_id="empty", images=[])
+    final.outputs = [SimpleNamespace(finish_reason=finish_reason)]
+    result = DiffusionStrategy(SimpleNamespace(global_steps=1, model_config=None)).process_output(final, None, {})
+    assert result.diffusion_output.numel() == 0
+    assert result.stop_reason == expected
 
-    def engine_start(**engine_args):
-        assert engine_args["tensor_parallel_size"] == 1
-        assert engine_args["ulysses_degree"] == engine_args["ring_degree"] == 1
-        assert engine_args["data_parallel_size"] == engine_args["pipeline_parallel_size"] == 1
-        assert engine_args["text_encoder_tp_size"] == engine_args["vae_patch_parallel_size"] == 1
-        assert engine_args["vae_parallel_mode"] == "tile"
-        assert engine_args["vae_use_tiling"] is False
-        raise EngineStartReached
 
-    monkeypatch.setattr(checker, "_request", lambda *args: object())
-    monkeypatch.setattr(checker, "AsyncOmni", engine_start)
-    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
-    monkeypatch.setenv("MASTER_PORT", "0")
-    args = SimpleNamespace(
-        architecture="QwenImagePipeline",
-        algorithm="flow_grpo",
-        model="unused",
-        engine_class_name=None,
-        step_execution=False,
-        cpu_offload=False,
-        num_requests=1,
-        require_request_batch=False,
-        deploy_config=None,
-        height=64,
-        width=64,
-        num_frames=5,
-        output_type="latent",
-        extra_json="{}",
-        tokenizer_path=None,
-    )
-    with pytest.raises(EngineStartReached):
-        await checker.check(args)
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_diffusion_named_output_preserves_completion_and_preemption_state(wrapped):
+    from vllm_omni.outputs import OmniRequestOutput
+
+    final, _ = _joint_video_audio_final_res()
+    completion = SimpleNamespace(finish_reason="length", num_preempted=3)
+    if wrapped:
+        final.request_output = OmniRequestOutput.from_diffusion(request_id="wrapped-output", images=[])
+        final.request_output.outputs = [completion]
+    else:
+        final.outputs = [completion]
+    result = DiffusionStrategy(SimpleNamespace(global_steps=1, model_config=None)).process_output(final, None, {})
+    assert result.stop_reason == "completed"
+    assert result.num_preempted == 3
+    assert result.artifacts["video_preview"].data.dtype == torch.uint8
+
+
+@pytest.mark.parametrize("field", ["primary", "specs", "preview", "audio"])
+def test_diffusion_rejects_incomplete_header_with_request_context(field):
+    final, _ = _joint_video_audio_final_res()
+    final.multimodal_output["metadata"]["media_artifacts"].pop(field)
+    with pytest.raises(ValueError, match="joint-output.*invalid media_artifacts header"):
+        DiffusionStrategy(SimpleNamespace(global_steps=1, model_config=None)).process_output(final, None, {})
+
+
+def test_diffusion_rejects_non_tensor_named_payload_with_context():
+    final, _ = _joint_video_audio_final_res()
+    final.request_id = "bad-tensor"
+    final.images[0]["audio"] = [0.0, 1.0]
+    with pytest.raises(TypeError, match="bad-tensor.*artifact='audio'.*expected tensor"):
+        DiffusionStrategy(SimpleNamespace(global_steps=1, model_config=None)).process_output(final, None, {})

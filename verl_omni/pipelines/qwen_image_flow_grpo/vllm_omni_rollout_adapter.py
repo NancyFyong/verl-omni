@@ -28,13 +28,8 @@ from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusio
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
 
-from verl_omni.pipelines.diffusion_rollout_output import (
-    rollout_output,
-    wants_decoded_preview,
-    with_rollout_data,
-    with_visual_artifacts,
-    wrap_rollout_postprocessor,
-)
+from verl_omni.pipelines.diffusion_media_output import wants_decoded_preview, with_visual_artifacts
+from verl_omni.pipelines.diffusion_rollout_output import rollout_output, with_rollout_data
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.request_batch import (
     collate_prompt_mask as _collate_prompt_mask,
@@ -50,6 +45,7 @@ from verl_omni.pipelines.request_batch import (
     split_diffusion_output_by_request as _split_diffusion_output_by_request,
 )
 from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
+from verl_omni.pipelines.rollout_postprocessing import install_rollout_postprocessor
 from verl_omni.pipelines.rollout_request import prompt_ids_from_payload
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 
@@ -57,15 +53,7 @@ from .common import QwenImageLoRAMixin, QwenImageTokenIdPromptMixin, apply_true_
 
 __all__ = ["QwenImagePipelineWithLogProb"]
 
-_QWEN_POST_PROCESS_FACTORY = pipeline_qwen_image.get_qwen_image_post_process_func
-
-
-def get_rollout_post_process_func(od_config):
-    """Leave named media intact; ordinary upstream inference still uses its native processor."""
-    return wrap_rollout_postprocessor(_QWEN_POST_PROCESS_FACTORY(od_config))
-
-
-pipeline_qwen_image.get_qwen_image_post_process_func = get_rollout_post_process_func
+install_rollout_postprocessor(pipeline_qwen_image, "get_qwen_image_post_process_func")
 
 
 @VllmOmniPipelineBase.register("QwenImagePipeline", algorithm="flow_grpo")

@@ -44,7 +44,8 @@ from vllm_omni.diffusion.models.minimax_h3.packed_tokens import (
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
-from verl_omni.pipelines.diffusion_rollout_output import with_batched_media_artifacts, with_rollout_data
+from verl_omni.pipelines.diffusion_media_output import with_batched_media_artifacts
+from verl_omni.pipelines.diffusion_rollout_output import with_rollout_data
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     ref2va_reference_image_short_edge,
     serialize_ref_blocks,

@@ -1,6 +1,6 @@
 # How to Integrate a New Diffusion Model for FlowGRPO Training
 
-Last updated: 09/17/2026.
+Last updated: 10/05/2026.
 
 This guide walks you through everything required to integrate a new diffusion
 model into VeRL-Omni so it can be trained end-to-end with the **FlowGRPO**
@@ -436,7 +436,9 @@ Your subclass must do five things:
      and `negative_prompt_embeds_mask` are placed in `prompt_embeddings`. The diffusion agent loop
      ([`diffusion_agent_loop.py`](../../verl_omni/agent_loop/diffusion_agent_loop.py))
      reads these field names verbatim — **do not rename them**.
-5. **Attach named media artifacts** with `with_visual_artifacts`,
+5. **Attach named media artifacts** from
+   [`diffusion_media_output`](../../verl_omni/pipelines/diffusion_media_output.py)
+   with `with_visual_artifacts`,
    `with_batched_media_artifacts` or `with_media_artifacts`, including both
    `forward` and `post_decode` when step execution is supported. Preserve the
    named envelope through the engine postprocessor; do not return a bare legacy
@@ -458,7 +460,7 @@ Both reward managers reconstruct named artifacts and validate the primary
 projection. Pixel scorers select the decoded preview; latent scoring selects
 `image_latent`. A scorer needing normalized pixels converts locally with
 `.float() / 255.0`, not a second multiplication by 255. See the full
-[named-artifact contract](diffusion_media_artifacts.md) for selectors, requested
+[named-artifact contract](../advanced/diffusion_media_artifacts.md) for selectors, requested
 outputs, batching, transport and fail-fast validation.
 
 (diffusion-io-spec)=
@@ -493,7 +495,7 @@ class MyModelPipelineWithLogProb(MyModelPipeline):
   configuration. LTX BWE can produce 48000 Hz audio, not 24000 Hz.
 - `pipeline.requested_outputs` requires extra named artifacts, e.g.
   `[image_preview]` with `output_type=latent`. It is also available in the model
-  and validation configs. See [named artifacts](diffusion_media_artifacts.md)
+  and validation configs. See [named artifacts](../advanced/diffusion_media_artifacts.md)
   for decoding behavior and batch-union semantics.
 - Subclasses inherit the declaration when they use the same output contract.
 

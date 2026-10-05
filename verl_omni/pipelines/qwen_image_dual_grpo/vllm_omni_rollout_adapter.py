@@ -24,7 +24,8 @@ from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
-from verl_omni.pipelines.diffusion_rollout_output import rollout_output, with_visual_artifacts
+from verl_omni.pipelines.diffusion_media_output import with_visual_artifacts
+from verl_omni.pipelines.diffusion_rollout_output import rollout_output
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.qwen_image_flow_grpo.common import build_img_shapes, coalesce_not_none
 from verl_omni.pipelines.qwen_image_flow_grpo.vllm_omni_rollout_adapter import QwenImagePipelineWithLogProb

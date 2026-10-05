@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from verl_omni.pipelines.diffusion_rollout_output import with_media_artifacts, wrap_rollout_postprocessor
+from verl_omni.pipelines.diffusion_media_output import with_media_artifacts
 from verl_omni.pipelines.rollout_artifacts import (
     MediaArtifact,
     artifact_fields,
@@ -28,6 +28,7 @@ from verl_omni.pipelines.rollout_artifacts import (
     validate_artifacts,
 )
 from verl_omni.pipelines.rollout_media import MediaSpec
+from verl_omni.pipelines.rollout_postprocessing import wrap_rollout_postprocessor
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy
 
 
@@ -135,7 +136,7 @@ def test_named_media_survives_real_upstream_formatter_and_strategy(primary, outp
         output_data=processed,
         postprocess_output=normalized,
     )[0]
-    result = DiffusionStrategy(SimpleNamespace(global_steps=1)).process_output(
+    result = DiffusionStrategy(SimpleNamespace(global_steps=1, model_config=None)).process_output(
         final, None, {"output_type": output_type}
     )
     assert set(result.artifacts) == set(artifacts)
@@ -178,7 +179,7 @@ def test_named_empty_payload_is_not_misreported_as_abort():
         },
     )
     with pytest.raises(ValueError, match="missing-output.*named artifact payload"):
-        DiffusionStrategy(SimpleNamespace(global_steps=1)).process_output(final, None, {})
+        DiffusionStrategy(SimpleNamespace(global_steps=1, model_config=None)).process_output(final, None, {})
 
 
 def test_media_only_postprocessor_does_not_touch_named_payloads():
@@ -197,10 +198,11 @@ def test_requested_outputs_survive_sampling_lowering(nested):
 
     strategy = DiffusionStrategy(
         SimpleNamespace(
+            model_config=None,
             engine=SimpleNamespace(
                 default_sampling_params_list=[None],
                 engine=SimpleNamespace(get_stage_metadata=lambda index: SimpleNamespace(stage_type="diffusion")),
-            )
+            ),
         )
     )
     sampling = {"requested_outputs": ["video_preview", "video_latent"]}
