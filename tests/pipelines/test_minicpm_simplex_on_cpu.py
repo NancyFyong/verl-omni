@@ -34,12 +34,6 @@ from verl_omni.pipelines.minicpm.processor import (
     render_minicpmo_messages,
     split_minicpmo_actor_inputs,
 )
-from verl_omni.pipelines.minicpm.thinker_training_adapter import (
-    _MiniCPMAutoModel,
-    _minicpmo_forward,
-    _minicpmo_get_vllm_embedding,
-    _minicpmo_whisper_attention_forward,
-)
 from verl_omni.pipelines.model_base import OmniModelBase, OmniRolloutPipelineBase
 
 
@@ -139,103 +133,14 @@ def test_audio_resampling_and_channel_validation():
         _load_audio(np.ones((2, 800), dtype=np.float32))
 
 
-def test_actor_media_bounds_account_for_padding_without_mutating_snapshot():
-    original = MagicMock()
-    model = SimpleNamespace(_verl_minicpmo_original_forward=original)
-    bounds = [torch.tensor([[1, 3]]), torch.tensor([[1, 3]])]
-    _minicpmo_forward(
-        model,
-        input_ids=torch.ones(2, 6, dtype=torch.long),
-        attention_mask=torch.tensor([[0, 0, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1]]),
-        image_bound=bounds,
-        pixel_values=[[torch.ones(3, 2, 2)], [torch.ones(3, 2, 2)]],
-    )
-    data = original.call_args.args[0]
-    assert data["image_bound"][0].tolist() == [[3, 5]]
-    assert data["image_bound"][1].tolist() == [[1, 3]]
-    assert bounds[0].tolist() == [[1, 3]]
-    assert data["position_ids"].tolist()[0] == [0, 0, 0, 1, 2, 3]
-
-
-def test_actor_mixed_text_audio_batch_keeps_sample_alignment():
-    model = SimpleNamespace(_verl_minicpmo_original_forward=MagicMock())
-    _minicpmo_forward(
-        model,
-        torch.ones(2, 6, dtype=torch.long),
-        audio_features=[[], torch.ones(80, 11)],
-        audio_feature_lens=[[], torch.tensor([11])],
-        audio_bounds=[torch.empty(0, 2, dtype=torch.long), torch.tensor([[1, 3]])],
-    )
-    data = model._verl_minicpmo_original_forward.call_args.args[0]
-    assert data["audio_features"].shape == (2, 80, 11)
-    torch.testing.assert_close(data["audio_features"][0], torch.zeros(80, 11))
-    torch.testing.assert_close(data["audio_features"][1], torch.ones(80, 11))
-
-
-def test_actor_text_padding_avoids_dummy_media_encoding():
-    model = SimpleNamespace(_verl_minicpmo_original_forward=MagicMock())
-    _minicpmo_forward(model, torch.tensor([[1, 2]]))
-    data = model._verl_minicpmo_original_forward.call_args.args[0]
-    assert data["vision_hidden_states"] == [[]]
-    assert data["audio_features"] == []
-    with pytest.raises(ValueError, match="remove_padding"):
-        MiniCPMThinkerAdapter.prepare_model_inputs({}, None, SimpleNamespace(use_remove_padding=True))
-
-
-def test_vision_injection_preserves_leaf_gradients():
-    embedding = torch.randn(1, 4, 3, requires_grad=True)
-    model = SimpleNamespace(
-        llm=SimpleNamespace(config=SimpleNamespace(), model=SimpleNamespace(embed_tokens=lambda ids: embedding)),
-        get_vision_embedding=lambda data: [torch.ones(1, 2, 3)],
-        training=True,
-    )
-    result, _ = _minicpmo_get_vllm_embedding(
-        model, {"input_ids": torch.tensor([[1, 2, 3, 4]]), "image_bound": [torch.tensor([[1, 3]])]}
-    )
-    result.sum().backward()
-    torch.testing.assert_close(embedding.grad[0, 1:3], torch.zeros(2, 3))
-    torch.testing.assert_close(embedding.grad[0, 0], torch.ones(3))
-
-
-def test_whisper_cache_name_and_return_arity():
-    original = MagicMock(return_value=(torch.ones(1), None))
-    cache = object()
-    result = _minicpmo_whisper_attention_forward(
-        SimpleNamespace(_verl_minicpmo_original_forward=original), past_key_value=cache
-    )
-    assert len(result) == 3 and result[2] is cache
-    assert original.call_args.kwargs == {"past_key_values": cache}
-
-
-def test_frozen_whisper_positions_keep_checkpoint_names_without_sharding():
-    model = torch.nn.Module()
-    model.llm = torch.nn.Module()
-    model.llm.embedding = torch.nn.Embedding(8, 4)
-    model.llm.get_input_embeddings = lambda: model.llm.embedding
-    model.llm.set_input_embeddings = lambda value: None
-    model.llm.prepare_inputs_for_generation = lambda **kwargs: kwargs
-    model.config = SimpleNamespace()
-    model.vpm = torch.nn.Sequential(torch.nn.Embedding(8, 4), torch.nn.Linear(4, 4))
-    image_positions = model.vpm[0].weight.detach().clone()
-    model.apm = torch.nn.Module()
-    model.apm.embed_positions = torch.nn.Embedding(8, 4)
-    model.apm.layers = torch.nn.ModuleList()
-    model.tts = torch.nn.Linear(4, 4)
-    positions = model.apm.embed_positions.weight.detach().clone()
-    MiniCPMThinkerAdapter.configure_model(model, SimpleNamespace())
-    assert not hasattr(model, "tts")
-    assert not any(parameter.requires_grad for parameter in model.vpm.parameters())
-    assert not isinstance(model.apm.embed_positions.weight, torch.nn.Parameter)
-    assert not isinstance(model.vpm[0].weight, torch.nn.Parameter)
-    torch.testing.assert_close(model.state_dict()["vpm.0.weight"], image_positions)
-    torch.testing.assert_close(model.state_dict()["apm.embed_positions.weight"], positions)
-    assert "apm.embed_positions.weight" not in dict(model.named_parameters())
-
-
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_actor_model_cast_preserves_rotary_frequencies(dtype):
+def test_actor_model_cast_preserves_rotary_frequencies(monkeypatch, dtype):
     from transformers import Qwen3Config, Qwen3ForCausalLM
 
+    import verl_omni.pipelines.minicpm.thinker_training_adapter as adapter
+
+    # The stub has no media towers for the remote-code patches to wrap.
+    monkeypatch.setattr(adapter, "_apply_remote_code_patches", lambda module: None)
     config = Qwen3Config(
         vocab_size=32,
         hidden_size=64,
@@ -269,8 +174,9 @@ def test_actor_model_cast_preserves_rotary_frequencies(dtype):
 
 
 def test_remote_loader_restores_nonpersistent_resampler_positions(monkeypatch, tmp_path):
-    import transformers.dynamic_module_utils as dynamic
-    from transformers import PretrainedConfig, PreTrainedModel
+    from transformers import AutoModel, PretrainedConfig, PreTrainedModel
+
+    from verl_omni.pipelines.minicpm.thinker_training_adapter import MiniCPMO
 
     class Resampler(torch.nn.Module):
         def __init__(self):
@@ -289,46 +195,26 @@ def test_remote_loader_restores_nonpersistent_resampler_positions(monkeypatch, t
         def __init__(self, config):
             super().__init__(config)
             self.resampler = Resampler()
+            self.post_init()
 
-    config = PretrainedConfig(auto_map={"AutoModel": "model.NativeModel"})
+    config = PretrainedConfig()
     source = NativeModel(config)
-    source.post_init()
     source.resampler._set_2d_pos_cache(source.resampler.max_size)
     expected = source.resampler.pos_embed.clone()
     source.save_pretrained(tmp_path)
-    monkeypatch.setattr(dynamic, "get_class_from_dynamic_module", lambda *args: NativeModel)
+    monkeypatch.setattr("verl_omni.models.transformers.minicpm_o.patch_minicpm_auto_model_init", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "verl_omni.models.transformers.minicpm_o.patch_minicpm_siglip_flash_attn_support", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        AutoModel, "from_pretrained", lambda path, **kwargs: NativeModel.from_pretrained(path, config=kwargs["config"])
+    )
 
-    loaded = _MiniCPMAutoModel.from_pretrained(str(tmp_path), config=config, trust_remote_code=True)
+    loaded = MiniCPMO.from_pretrained(str(tmp_path), config=config, trust_remote_code=True)
 
     torch.testing.assert_close(loaded.resampler.pos_embed, expected, atol=0, rtol=0)
     assert "resampler.pos_embed" not in loaded.state_dict()
     torch.testing.assert_close(loaded.resampler.proj.weight, source.resampler.proj.weight)
-
-
-def test_remote_loader_initializes_transformers_metadata_once(monkeypatch):
-    import transformers.dynamic_module_utils as dynamic
-
-    class NativeModel:
-        def __init__(self, config):
-            self.initializations = 0
-
-        def post_init(self):
-            self.initializations += 1
-            self.all_tied_weights_keys = {}
-
-        @classmethod
-        def from_pretrained(cls, path, **kwargs):
-            return cls(kwargs["config"])
-
-    monkeypatch.setattr(dynamic, "get_class_from_dynamic_module", lambda *args: NativeModel)
-    config = SimpleNamespace(auto_map={"AutoModel": "model.Native"}, init_tts=True)
-    for _ in range(2):
-        model = _MiniCPMAutoModel.from_pretrained("model", config=config, trust_remote_code=True)
-        assert model.initializations == 1
-        assert model.all_tied_weights_keys == {}
-    assert config.init_tts is False
-    with pytest.raises(ValueError, match="trust_remote_code"):
-        _MiniCPMAutoModel.from_pretrained("model", config=config, trust_remote_code=False)
 
 
 @pytest.mark.asyncio

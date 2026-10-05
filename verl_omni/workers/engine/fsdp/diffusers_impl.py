@@ -37,7 +37,6 @@ from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     FSDPModule,
     MixedPrecisionPolicy,
-    apply_fsdp2,
     fsdp2_clip_grad_norm_,
     fsdp2_load_full_state_dict,
     fsdp_version,
@@ -57,6 +56,7 @@ from verl.utils.py_functional import append_to_dict
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig
 from verl.workers.engine.base import BaseEngine, BaseEngineCtx, EngineRegistry
 from verl.workers.engine.fsdp.utils import create_device_mesh, get_sharding_strategy
+from verl.workers.engine.spec import ShardSpec
 from verl.workers.engine.utils import enable_full_determinism, prepare_micro_batches
 
 from verl_omni.pipelines.model_base import DiffusionModelBase
@@ -67,7 +67,8 @@ from verl_omni.pipelines.utils import (
     prepare_model_inputs,
     prepare_noisy_latents,
 )
-from verl_omni.utils.fsdp_utils import collect_lora_params
+from verl_omni.utils.diffusion_compile import _maybe_compile_repeated_blocks
+from verl_omni.utils.fsdp_utils import apply_fsdp2, collect_lora_params
 from verl_omni.workers.config import DiffusionModelConfig
 from verl_omni.workers.engine.lora_adapter_mixin import LoRAAdapterMixin
 
@@ -347,6 +348,14 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         model_cls = DiffusionModelBase.get_class(self.model_config)
         preserve_fp32_modules = model_cls.preserve_fp32_modules()
 
+        # Adapters may declare frozen subtrees to keep unsharded (fsdp2 only).
+        ignored_names = list(model_cls.get_fsdp_ignored_module_names(self.model_config))
+        if ignored_names and self.engine_config.strategy != "fsdp2":
+            raise NotImplementedError(
+                f"{type(self).__name__}: FSDP2-ignored module names require strategy=fsdp2, "
+                f"got {self.engine_config.strategy!r}."
+            )
+
         # None preserves declared fp32 islands; a real dtype lets FSDP cast
         # forward inputs and flatten parameters using the configured dtype.
         param_dtype = _fsdp_param_dtype(
@@ -415,7 +424,7 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
                 "reshard_after_forward": self.engine_config.reshard_after_forward,
             }
             full_state = module.state_dict()
-            apply_fsdp2(module, fsdp_kwargs, self.engine_config)
+            apply_fsdp2(module, fsdp_kwargs, self.engine_config, ignored_names=ignored_names)
             fsdp2_load_full_state_dict(module, full_state, fsdp_mesh, offload_policy)
         else:
             raise NotImplementedError(f"Unknown strategy {self.engine_config.strategy}")
@@ -496,6 +505,12 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
             module.enable_parallelism(
                 config=ContextParallelConfig(ulysses_degree=sp_size, mesh=self.ulysses_device_mesh)
             )
+
+        # Compile only after all structural/trainability mutations and before
+        # FSDP2 registers its per-block sharding hooks. Diffusers activation
+        # checkpointing calls block.__call__, so recomputation also uses the
+        # compiled regional forward/backward.
+        _maybe_compile_repeated_blocks(module, self.model_config, self.engine_config)
 
         # Load diffusion scheduler
         scheduler = self._build_scheduler()
@@ -964,6 +979,75 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
                 offload_fsdp_model_to_cpu(self.module)
             log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
 
+    def get_per_tensor_param_shard(self, **kwargs):
+        """Like :meth:`get_per_tensor_param`, but yields each rank's *local* shard
+        ``(name, local_flat_shard, ShardSpec)`` instead of all-gathering full
+        tensors. Consumed by the ``omni_delta_sharded`` checkpoint engine, which byte-diffs
+        each rank's shard against a pinned snapshot; non-LoRA base path only. Names
+        match the full export (``convert_weight_keys`` plus the ``transformer.``
+        prefix) so HF coordinates are what the rollout pipelines already load, and
+        the cast rule matches too (DTensors bf16, plain tensors native) so the
+        pinned diff base is bit-identical to the seed sync's full export.
+        """
+        peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
+        if hasattr(peft_model, "peft_config"):
+            raise NotImplementedError(
+                "omni_delta_sharded shard export supports full-weight training only; LoRA runs "
+                "keep the adapter (merge=false) or merged full-weight (merge=true) sync paths."
+            )
+
+        # Staging rule mirrors verl's FSDP engine: FSDP1's sharded state-dict export runs
+        # through the unshard machinery and needs GPU-resident params; FSDP2 state_dict()
+        # only collects DTensor refs and the generator below stages each shard lazily.
+        _needs_staging = fsdp_version(self.module) == 1
+        if _needs_staging and not self._uses_fsdp2_cpu_offload_policy:
+            load_fsdp_model_to_gpu(self.module)
+        params = self.module.state_dict()
+        params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
+        if _needs_staging and self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.module)
+
+        device = get_device_id()
+
+        def _gen():
+            for name, param in params.items():
+                spec = ShardSpec.from_param(param)
+                p = param.to(device, non_blocking=True)
+                # Same cast rule as the full export: DTensors bf16, plain tensors
+                # native dtype. The pinned diff base must be bit-identical to what
+                # the seed (full) export sent the rollout, or steady deltas drift
+                # from the nccl path on FSDP1 / non-DTensor entries.
+                if isinstance(param, DTensor) and p.is_floating_point():
+                    p = p.to(torch.bfloat16, non_blocking=True)
+                local = p.to_local() if hasattr(p, "to_local") else p
+                yield f"transformer.{name}", local.reshape(-1), spec
+
+        return _gen(), None
+
+    def _hf_delta_entry(self, name, spec, place, lidx, lval):
+        """Per-param HF delta entry builder: diffusers params are identity params
+        (weight name == HF name after conversion, coordinates translate directly)."""
+        from verl.workers.engine.utils import _hf_entry_identity
+
+        if spec.to_hf_chunk is not None:
+            raise NotImplementedError(
+                f"{name}: the diffusers engine only handles identity params; "
+                "converter specs belong to the engine that declared them"
+            )
+        return _hf_entry_identity(name, spec, place, lidx, lval)
+
+    def get_per_tensor_param_delta_shard(self, **kwargs):
+        """Yield the delta engine's steady payloads -- FINAL HF-coordinate entries
+        ``(slots, dtype_str, counts, hf_idx, hf_val, gather_group)`` per parameter,
+        byte-diffed against the pinned shard snapshot. Requires a prior
+        :meth:`prime_delta_snapshots` call (the delta engine primes right after the
+        seed sync)."""
+        from verl.workers.engine.utils import hf_delta_export
+
+        self._delta_shard_snap = getattr(self, "_delta_shard_snap", {})
+        gen, _ = self.get_per_tensor_param_shard()
+        return hf_delta_export(gen, self._delta_shard_snap, self._hf_delta_entry), None
+
     def _gradient_sync_context(self, *, is_last_micro_batch: bool):
         """Reuse verl FSDPEngine: skip reduce-scatter until the last accumulation step."""
         from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
@@ -1360,7 +1444,15 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
     def prepare_model_inputs(self, micro_batch: TensorDict, step: int):
         x0 = micro_batch["latents_clean"]
         timestep = micro_batch["train_timesteps"][:, step]
-        t = timestep.float() / 1000.0
+        num_train_timesteps = getattr(self.scheduler.config, "num_train_timesteps", None)
+        if num_train_timesteps is None:
+            raise ValueError(
+                "Converting `train_timesteps` to flow time requires "
+                f"scheduler.config.num_train_timesteps, but {type(self.scheduler).__name__} "
+                "does not define it."
+            )
+        tu.assign_non_tensor(micro_batch, num_train_timesteps=int(num_train_timesteps))
+        t = timestep.float() / float(num_train_timesteps)
         t_expanded = t.view(-1, *([1] * (x0.ndim - 1)))
 
         if micro_batch.get("forward_noise", None) is not None:

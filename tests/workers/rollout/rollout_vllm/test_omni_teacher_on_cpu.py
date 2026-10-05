@@ -108,7 +108,13 @@ def test_teacher_model_loading_inherits_engine_trust_without_overwriting_explici
     import verl_omni.workers.rollout.vllm_rollout.vllm_omni_async_server as module
 
     init = MagicMock(return_value=None)
-    monkeypatch.setattr(module.vLLMReplica, "__init__", init)
+
+    def fake_init(self, *args):
+        init(*args)
+        # The real base __init__ sets self.config, which the SP footprint check reads.
+        self.config = SimpleNamespace()
+
+    monkeypatch.setattr(module.vLLMReplica, "__init__", fake_init)
     monkeypatch.setattr(module.ray, "remote", lambda cls: cls)
     rollout = SimpleNamespace(engine_kwargs={"vllm_omni": {"trust_remote_code": True, "output_mode": "ar"}})
     config = OmegaConf.create({"_target_": "verl.workers.config.HFModelConfig", "path": "teacher"})
@@ -178,7 +184,13 @@ def test_teacher_replica_passes_identity_to_upstream(monkeypatch):
     import verl_omni.workers.rollout.vllm_rollout.vllm_omni_async_server as module
 
     init = MagicMock(return_value=None)
-    monkeypatch.setattr(module.vLLMReplica, "__init__", init)
+
+    def fake_init(self, *args):
+        init(*args)
+        # The real base __init__ sets self.config, which the SP footprint check reads.
+        self.config = SimpleNamespace()
+
+    monkeypatch.setattr(module.vLLMReplica, "__init__", fake_init)
     monkeypatch.setattr(module.ray, "remote", lambda cls: cls)
     replica = vLLMOmniReplica(0, "rollout", "model", 2, is_teacher_model=True, name_suffix="teacher_a")
     init.assert_called_once_with(0, "rollout", "model", 2, False, True, "teacher_a")
