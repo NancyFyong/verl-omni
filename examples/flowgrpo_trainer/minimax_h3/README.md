@@ -68,7 +68,7 @@ Convert the splits to verl-omni parquet files:
 export RAW_PROMPT_DIR=/path/to/raw_prompts
 export DATA_DIR="$HOME/data/vid_prompt/verl_omni"
 
-python3 examples/diffusionnft_trainer/minimax_h3/prepare_t2av_data.py \
+python3 examples/diffusionnft_trainer/minimax_h3/prepare_t2va_data.py \
   --input_dir "$RAW_PROMPT_DIR" \
   --output_dir "$DATA_DIR"
 ```
