@@ -76,7 +76,7 @@ def _iter_tensors(value: Any):
     elif isinstance(value, dict):
         for item in value.values():
             yield from _iter_tensors(item)
-    elif isinstance(value, (list, tuple)):
+    elif isinstance(value, (list | tuple)):
         for item in value:
             yield from _iter_tensors(item)
 
