@@ -14,6 +14,7 @@
 import copy
 import json
 import logging
+import math
 import os
 import tempfile
 from argparse import Namespace
@@ -37,6 +38,7 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 _WORKER_EXTENSION = "verl_omni.workers.rollout.vllm_rollout.utils.vLLMOmniColocateWorkerExtension"
+_SCORED_PROMPT_IDS_KEY = "_verl_omni_scored_prompt_ids"  # popped before the engine call
 
 
 def _drop_none_mapping_values(value: Any) -> Any:
@@ -66,7 +68,6 @@ class ARStrategy(OmniStrategyBase):
         self._rollout_fields_by_request_id: dict[str, dict[str, Any]] = {}
         self._policy_stage_index = 0
         self._policy_sampling_constraints: dict[str, Any] = {}
-        self._single_model_stage: str | None = None
 
     def validate_configs(self) -> None:
         if self.server.config.max_model_len is None:
@@ -131,7 +132,6 @@ class ARStrategy(OmniStrategyBase):
         """Write a deploy config YAML from the adapter's stage topology."""
         adapter_cls.ensure_pipeline_registered(pipeline_mode)
         stages = adapter_cls.build_stage_configs(pipeline_mode=pipeline_mode)
-        self._single_model_stage = getattr(stages[0], "model_stage", None) if len(stages) == 1 else None
         stage_ids = [stage.stage_id for stage in stages]
         policy_stage_id = adapter_cls.policy_stage_id(pipeline_mode=pipeline_mode)
         if policy_stage_id not in stage_ids:
@@ -223,8 +223,6 @@ class ARStrategy(OmniStrategyBase):
             # The generated per-stage deploy config owns model_stage for
             # multi-output pipelines.
             engine_args["model_stage"] = None
-        elif self._single_model_stage is not None:
-            engine_args["model_stage"] = self._single_model_stage
         for timeout_key in ("stage_init_timeout", "init_timeout"):
             timeout_value = getattr(args, timeout_key, None)
             if timeout_value is not None:
@@ -334,6 +332,10 @@ class ARStrategy(OmniStrategyBase):
             prompt.setdefault("multi_modal_data", multi_modal_data)
         if mm_processor_kwargs and not adapter_prepared_prompt:
             prompt.setdefault("mm_processor_kwargs", mm_processor_kwargs)
+        if policy_params.prompt_logprobs is not None:
+            # A teacher scores the request's own ids; the engine re-expands media itself,
+            # so run_generation checks that it scored exactly these.
+            prompt[_SCORED_PROMPT_IDS_KEY] = list(request.prompt.token_ids)
         return prompt, params
 
     async def run_generation(
@@ -344,6 +346,7 @@ class ARStrategy(OmniStrategyBase):
         lora_request: Optional[LoRARequest],
         priority: int,
     ) -> Any:
+        scored_prompt_ids = prompt.pop(_SCORED_PROMPT_IDS_KEY, None)
         generate_kwargs = dict(
             prompt=prompt,
             sampling_params_list=params,
@@ -355,15 +358,22 @@ class ARStrategy(OmniStrategyBase):
             generate_kwargs["output_modalities"] = self._rollout_output_modalities
         generator = self.server.engine.generate(**generate_kwargs)
         if self._rollout_output_modalities is None:
-            return await self._collect_last_output(generator)
-
-        outputs = []
-        async for output in generator:
-            outputs.append(output)
-        if self._rollout_adapter is None:
-            raise RuntimeError("Retaining multiple stage outputs requires a registered rollout adapter.")
-        final_res, rollout_fields = self._rollout_adapter.combine_engine_outputs(outputs, prompt)
-        self._rollout_fields_by_request_id[request_id] = rollout_fields
+            final_res = await self._collect_last_output(generator)
+        else:
+            outputs = []
+            async for output in generator:
+                outputs.append(output)
+            if self._rollout_adapter is None:
+                raise RuntimeError("Retaining multiple stage outputs requires a registered rollout adapter.")
+            final_res, rollout_fields = self._rollout_adapter.combine_engine_outputs(outputs, prompt)
+            self._rollout_fields_by_request_id[request_id] = rollout_fields
+        if scored_prompt_ids is not None and final_res is not None:
+            req_output = getattr(final_res, "request_output", None) or final_res
+            if list(getattr(req_output, "prompt_token_ids", None) or []) != scored_prompt_ids:
+                raise RuntimeError(
+                    "The omni teacher scored a different token sequence than the request carried; "
+                    "its prompt log probabilities would not align with the student's tokens."
+                )
         return final_res
 
     def process_output(
@@ -393,13 +403,13 @@ class ARStrategy(OmniStrategyBase):
         token_ids = req_output.outputs[0].token_ids
         log_probs = None
         policy_params = params[self._policy_stage_index] if isinstance(params, list) else params
-        if getattr(req_output, "prompt_token_ids", None) is not None:
-            extra_fields["rollout_prompt_ids"] = list(req_output.prompt_token_ids)
         num_prompt_logprobs = getattr(policy_params, "prompt_logprobs", None)
         if num_prompt_logprobs is not None:
             if getattr(req_output, "prompt_logprobs", None) is None:
                 raise RuntimeError("The omni teacher did not return requested prompt log probabilities.")
             extract_prompt_logprobs(req_output, num_prompt_logprobs, extra_fields)
+            if not all(math.isfinite(logprob) for row in extra_fields["prompt_logprobs"] for logprob in row):
+                raise RuntimeError("The omni teacher returned non-finite prompt log probabilities.")
         if policy_params.logprobs is not None:
             log_probs = [
                 logprobs[token_ids[index]].logprob for index, logprobs in enumerate(req_output.outputs[0].logprobs)

@@ -161,7 +161,7 @@ class MiniCPMThinkerAdapter(OmniModelBase):
         # Some checkpoints ship the processor without a tokenizer; the parity bind needs one.
         if getattr(processor, "tokenizer", None) is None:
             processor.tokenizer = cls.configure_tokenizer(model_path, model_config)
-        # Binds __call__ / apply_chat_template / dedup_pad_tokens; see prompt_parity.
+        # Binds __call__ / apply_chat_template; see prompt_parity.
         return bind_minicpm_processor(processor)
 
     @classmethod
