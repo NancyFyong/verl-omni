@@ -132,6 +132,16 @@ class TestDumpGenerations:
         assert fallback["audio"] is None
         assert fallback["audio_sample_rate"] is None
 
+    def test_legacy_channels_first_video_is_not_reinterpreted(self, tmp_path):
+        outputs = torch.randint(256, (1, 3, 8, 16, 16), dtype=torch.uint8)  # [N, C, T, H, W]
+        _dump(tmp_path, outputs)
+
+        (row,) = _read_jsonl(tmp_path)
+        assert row["output"] is None
+        assert row["video_export_error"].startswith("ValueError:")
+        fallback = torch.load(row["output_fallback"], weights_only=True)
+        torch.testing.assert_close(fallback["video"], outputs[0])
+
     def test_declared_image_rejects_rank_five_batch_before_layout_guessing(self, tmp_path):
         outputs = torch.zeros(1, 3, 2, 8, 8, dtype=torch.uint8)
 

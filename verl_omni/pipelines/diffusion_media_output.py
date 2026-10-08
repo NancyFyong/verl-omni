@@ -72,7 +72,6 @@ def with_media_artifacts(
         ):
             raise ValueError(f"{context}: preview artifact={preview!r} must be decoded visual media")
     metadata["media_artifacts"] = {
-        "context": context,
         "primary": primary,
         "audio": audio,
         "preview": preview,

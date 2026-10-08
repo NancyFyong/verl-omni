@@ -103,7 +103,7 @@ def test_ltx2_ti2va_default_dataset_forwards_image_without_hf_processor(tmp_path
     server = SimpleNamespace(
         generate=AsyncMock(
             return_value=SimpleNamespace(
-                diffusion_output=torch.zeros(1), log_probs=None, num_preempted=None, extra_fields={}
+                artifacts={}, diffusion_output=torch.zeros(1), log_probs=None, num_preempted=None, extra_fields={}
             )
         )
     )

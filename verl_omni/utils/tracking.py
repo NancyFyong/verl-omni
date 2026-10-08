@@ -213,7 +213,7 @@ def wrap_val_samples_for_wandb(samples, fps=24, output_dir=None, media_kinds=Non
         output_ndim = getattr(out, "ndim", -1)
         is_video = resolve_is_video(media_kind)
         if is_video and output_ndim == 5:
-            # Batched video [B, T, C, H, W], [B, C, T, H, W], or [B, T, H, W, C].
+            # Batched video [B, T, C, H, W]; TCHW is validated below.
             out = out[0]
         if not isinstance(out, MediaArtifact):
             MediaArtifact(

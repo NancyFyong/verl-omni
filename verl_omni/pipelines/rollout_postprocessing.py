@@ -65,10 +65,16 @@ def install_rollout_postprocessor(module: ModuleType, factory_name: str) -> None
     The pinned engine resolves postprocessors from module factories, not pipeline
     instances or individual outputs. Named media is already normalized by adapters.
 
+    The wrapper only exists in the importing process. It takes effect because the
+    pinned engine runs a single-replica diffusion stage inline in the rollout server
+    and resolves the postprocessor before creating executors. A stage launched in
+    another process keeps the native processor.
+
     Args:
         module: Upstream pipeline module consulted by the engine's registry.
         factory_name: Name of its postprocessor factory to wrap in this process.
     """
+    # TODO: Remove once upstream postprocessors pass named rollout envelopes through.
     factory = getattr(module, factory_name)
     if getattr(factory, "_preserves_rollout_output", False) is True:
         return
