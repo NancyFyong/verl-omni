@@ -67,7 +67,6 @@ class _Probe(torch.nn.Module):
 def pp_group(monkeypatch):
     group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
     monkeypatch.setattr(thinker, "get_pp_group", lambda: group)
-    monkeypatch.setattr(compat, "get_pp_group", lambda: group)
     monkeypatch.setattr(thinker.Qwen3MoeLLMModel, "forward", _ORIGINAL_FORWARD)
     return group
 
@@ -133,9 +132,48 @@ def test_patched_forward_compiles_and_preserves_outputs(pp_group, monkeypatch, l
     model = _probe(thinker.Qwen3MoeLLMModel.forward)
     actual = _flatten(_compile(model, args, monkeypatch))
     assert model.hook_calls == 1
+    assert "update" not in model._compiled_bytecode.co_names
     assert actual.keys() == expected.keys()
     for name in expected:
         torch.testing.assert_close(actual[name], expected[name])
+
+
+def test_wrapper_delegates_all_arguments_to_upstream(pp_group, monkeypatch):
+    args = _args()
+    args["intermediate_tensors"] = IntermediateTensors({"hidden_states": torch.ones(3, 4)})
+    args["deepstack_input_embeds"] = IntermediateTensors({"deepstack_input_embeds_0": torch.ones(3, 4)})
+    model = _probe(compat._qwen3_omni_thinker_forward)
+    calls = []
+    result = object()
+
+    def forward(self, **kwargs):
+        calls.append((self, kwargs))
+        return result
+
+    monkeypatch.setattr(compat, "_ORIGINAL_THINKER_FORWARD", forward)
+    assert model.forward(**args) is result
+    assert calls[0][0] is model
+    assert calls[0][1].keys() == args.keys()
+    for name, value in args.items():
+        assert calls[0][1][name] is value
+
+
+@pytest.mark.parametrize("use_dict_update", [True, False])
+def test_wrapper_still_rejects_real_buffer_mutations(pp_group, monkeypatch, use_dict_update):
+    def forward(self, input_ids, **kwargs):
+        if use_dict_update:
+            self._buffers.update({"state": self.state + 1})
+        else:
+            self.state = self.state + 1
+        return input_ids + self.state
+
+    monkeypatch.setattr(compat, "_ORIGINAL_THINKER_FORWARD", forward)
+    model = _probe(compat._qwen3_omni_thinker_forward)
+    model.register_buffer("state", torch.tensor(0.0))
+    with pytest.raises(RuntimeError, match="Assigning / modifying buffers"):
+        _compile(model, _args(capture=False), monkeypatch)
+    assert model.hook_calls == 1
+    assert "update" in model._compiled_bytecode.co_names
 
 
 def test_patch_leaves_an_already_graph_safe_forward_unchanged(pp_group, monkeypatch):
