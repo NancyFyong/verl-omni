@@ -97,7 +97,7 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
             architecture in {"Qwen3OmniMoeForConditionalGeneration", "Qwen3OmniMoeThinkerForConditionalGeneration"}
             for architecture in vllm_config.model_config.architectures
         ):
-            from verl_omni.utils.vllm_omni.qwen3_omni import patch_qwen3_omni_thinker_forward
+            from verl_omni.utils.vllm_omni.patch import patch_qwen3_omni_thinker_forward
 
             patch_qwen3_omni_thinker_forward()
 

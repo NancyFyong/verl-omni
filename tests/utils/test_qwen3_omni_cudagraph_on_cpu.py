@@ -23,7 +23,7 @@ from vllm.config import CUDAGraphMode
 from vllm.sequence import IntermediateTensors
 from vllm_omni.model_executor.models.qwen3_omni import qwen3_omni_moe_thinker as thinker
 
-from verl_omni.utils.vllm_omni import qwen3_omni as compat
+from verl_omni.utils.vllm_omni import patch as compat
 
 _ORIGINAL_FORWARD = thinker.Qwen3MoeLLMModel.forward
 
