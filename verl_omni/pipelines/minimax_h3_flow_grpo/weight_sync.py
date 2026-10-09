@@ -101,18 +101,22 @@ class MiniMaxH3WeightSyncMixin:
             return "transformers_ref"
         return "transformer"
 
-    def encode_prompt(self, *, task: str, prompt: str, **kwargs):
-        """Let upstream encode references while preserving Agent Loop prompt IDs."""
-        prompt_ids = getattr(self, "_h3_prompt_ids", None)
-        if prompt_ids is None:
-            return super().encode_prompt(task=task, prompt=prompt, **kwargs)
+    def encode_prompt(self, prepared):
+        """Encode Agent Loop IDs while letting vLLM-Omni build reference vision spans.
 
-        tokenizer = self.tokenizer
-        self.tokenizer = _PromptTokenOverride(tokenizer, prompt, prompt_ids)
-        try:
-            return super().encode_prompt(task=task, prompt=prompt, **kwargs)
-        finally:
-            self.tokenizer = tokenizer
+        Newer vllm-omni passes a single ``PreparedEncoderInputs`` (prompt text +
+        media + condition labels) instead of ``(task, prompt, image, images)``.
+        """
+        prompt_ids = getattr(self, "_h3_prompt_ids", None)
+        prompt = getattr(prepared, "prompt", None)
+        if prompt_ids is not None and prompt is not None:
+            tokenizer = self.tokenizer
+            self.tokenizer = _PromptTokenOverride(tokenizer, prompt, prompt_ids)
+            try:
+                return super().encode_prompt(prepared)
+            finally:
+                self.tokenizer = tokenizer
+        return super().encode_prompt(prepared)
 
     def _ensure_prompt_text(self, request: Any) -> None:
         """Expose Agent Loop IDs while satisfying upstream's text check."""
