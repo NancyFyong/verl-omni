@@ -60,6 +60,7 @@ __all__ = [
     "prepare_h3_processor_files",
     "ref2va_reference_image_short_edge",
     "validate_ref2va_reference_image_short_edge",
+    "validate_h3_parallel_config",
     "pad_h3_layout_for_ulysses",
     "h3_ulysses_forward",
     "keyframe_indices_to_anchors",
@@ -72,10 +73,12 @@ __all__ = [
     "messages_to_text",
     "MiniMaxH3RolloutWeightSyncMixin",
     "validate_lora_target_modules",
-    "validate_h3_parallel_config",
     "_LORA_STACKED_PARAMS_MAPPING",
     "_LORA_VLLM_TARGET_MODULES",
 ]
+
+
+MINIMAX_H3_TOKEN_ID_NATIVE_KEY = "minimax_h3_token_id_native"
 
 
 def validate_h3_parallel_config(parallel_config: Any) -> None:
@@ -92,9 +95,6 @@ def validate_h3_parallel_config(parallel_config: Any) -> None:
         raise ValueError(f"MiniMax-H3 vae_patch_parallel_size must be 1 or the full DiT group size ({dit_world_size}).")
     if p.text_encoder_tp_size not in (1, dit_world_size) or 8 % p.text_encoder_tp_size:
         raise ValueError("MiniMax-H3 text_encoder_tp_size must be 1 or the full DiT group size and divide 8.")
-
-
-MINIMAX_H3_TOKEN_ID_NATIVE_KEY = "minimax_h3_token_id_native"
 
 
 _H3_FORWARD_PARAMETERS = (
@@ -256,19 +256,38 @@ def ref2va_reference_image_short_edge(value: int | str | None = None) -> Iterato
     """Temporarily apply the Ref2VA image size while serializing concurrent requests."""
     short_edge = validate_ref2va_reference_image_short_edge(value)
 
-    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _reference_image_shape
+    import vllm_omni.model_executor.models.minimax_h3.encoder_processing as _h3_encoder_processing
+    from vllm_omni.model_executor.models.minimax_h3 import preprocessing as _h3_preprocessing
 
-    resize_globals = _reference_image_shape.__globals__
-    constant = "MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE"
-    if constant not in resize_globals:
-        raise RuntimeError("vLLM-Omni no longer exposes the MiniMax H3 reference image size constant.")
+    def _scaled_shape(image: Any) -> tuple[int, int]:
+        width, height = image.size
+        ratio = width / height
+        if not 0.4 <= ratio <= 2.5:
+            raise _h3_preprocessing.OmniClientError(
+                f"reference image aspect ratio must be in [0.4, 2.5], got {width}x{height}"
+            )
+        if min(width, height) < 256 or max(width, height) > 5760:
+            raise _h3_preprocessing.OmniClientError(
+                f"reference image dimensions must be in [256, 5760] pixels, got {width}x{height}"
+            )
+        scale = short_edge / min(width, height)
+        return (
+            _h3_preprocessing._align_multiple(width * scale, _h3_preprocessing.MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
+            _h3_preprocessing._align_multiple(height * scale, _h3_preprocessing.MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
+        )
+
     with _REF_IMAGE_SHAPE_LOCK:
-        original = resize_globals[constant]
-        resize_globals[constant] = short_edge
+        orig_fn = _h3_preprocessing.resolve_minimax_h3_reference_image_shape
+        orig_enc_fn = getattr(_h3_encoder_processing, "resolve_minimax_h3_reference_image_shape", None)
+        _h3_preprocessing.resolve_minimax_h3_reference_image_shape = _scaled_shape
+        if orig_enc_fn is not None:
+            _h3_encoder_processing.resolve_minimax_h3_reference_image_shape = _scaled_shape
         try:
             yield short_edge
         finally:
-            resize_globals[constant] = original
+            _h3_preprocessing.resolve_minimax_h3_reference_image_shape = orig_fn
+            if orig_enc_fn is not None:
+                _h3_encoder_processing.resolve_minimax_h3_reference_image_shape = orig_enc_fn
 
 
 def messages_to_text(messages: Any) -> str:
@@ -844,60 +863,22 @@ class MiniMaxH3RolloutWeightSyncMixin(MiniMaxH3WeightSyncBase):
     _h3_sync_components = ("transformer",)
     _h3_initialize_rope = True
 
-    def encode_prompt(self, *, task: str, prompt: str, image=None, images=None, **kwargs):
-        """Encode Agent Loop IDs while letting vLLM-Omni build reference vision spans."""
-        prompt_ids = getattr(self, "_h3_prompt_ids", None)
-        if prompt_ids is None or task not in {"t2va", "fl2va", "ref2va"}:
-            return super().encode_prompt(task=task, prompt=prompt, image=image, images=images, **kwargs)
+    def encode_prompt(self, prepared):
+        """Encode Agent Loop IDs while letting vLLM-Omni build reference vision spans.
 
-        if task == "ref2va":
-            # Let the upstream pipeline build every reference span; the override keeps the Agent Loop text token IDs.
+        Newer vllm-omni passes a single ``PreparedEncoderInputs`` (prompt text +
+        media + condition labels) instead of ``(task, prompt, image, images)``.
+        """
+        prompt_ids = getattr(self, "_h3_prompt_ids", None)
+        prompt = getattr(prepared, "prompt", None)
+        if prompt_ids is not None and prompt is not None:
             tokenizer = self.tokenizer
             self.tokenizer = _PromptTokenOverride(tokenizer, prompt, prompt_ids)
             try:
-                return super().encode_prompt(task=task, prompt=prompt, image=image, images=images, **kwargs)
+                return super().encode_prompt(prepared)
             finally:
                 self.tokenizer = tokenizer
-
-        from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
-            _broadcast_tensor,
-            _dit_rank_world,
-            minimax_h3_multi_image_presentation,
-        )
-
-        _, rank, _ = _dit_rank_world()
-        hidden = None
-        tags = None
-        ids = None
-        vision_kwargs: dict[str, torch.Tensor] = {}
-        condition_images = list(images) if images is not None else ([image] if image is not None else [])
-        if rank == 0:
-            if task == "t2va":
-                ids = prompt_ids
-                tags = torch.ones(ids.shape[0], dtype=torch.long)
-            else:
-                if not condition_images:
-                    raise ValueError(f"MiniMax H3 {task} requires at least one condition image.")
-                vision = self.processor.image_processor(images=condition_images, return_tensors="pt")
-                image_grid = vision["image_grid_thw"]
-                merge = int(self.processor.image_processor.merge_size) ** 2
-                image_token_counts = [int(grid.prod().item()) // merge for grid in image_grid]
-                prefix_ids, prefix_tags = minimax_h3_multi_image_presentation(
-                    self.tokenizer, prompt="", image_token_counts=image_token_counts
-                )
-                ids = torch.cat([prefix_ids, prompt_ids])
-                tags = torch.cat([prefix_tags, torch.ones(prompt_ids.shape[0], dtype=torch.long)])
-                vision_kwargs = {
-                    "pixel_values": vision["pixel_values"],
-                    "image_grid_thw": image_grid,
-                }
-
-        if rank < self.text_encoder_tp_size:
-            ids = self._distribute_encode_inputs(ids, vision_kwargs)
-            hidden = self._encode_text_hidden(ids, vision_kwargs)
-        hidden = _broadcast_tensor(hidden, dtype=torch.bfloat16, device=self.device)
-        tags = _broadcast_tensor(tags, dtype=torch.long, device=self.device)
-        return hidden, tags
+        return super().encode_prompt(prepared)
 
     def _install_lora_layout(self) -> None:
         self.install_h3_lora_layout()
