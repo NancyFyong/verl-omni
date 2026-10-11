@@ -134,7 +134,8 @@ def test_training_fields_remain_separate_from_media(monkeypatch, algorithm):
     result = _generate(monkeypatch, algorithm)
     if algorithm == "diffusion_nft":
         assert result.extra_fields["latents_clean"].shape == (704,)
-        assert result.extra_fields["train_timesteps"].shape == (9,)
+        # Current vLLM-Omni returns num_steps+1 sigma boundaries; training drops the terminal 0.
+        assert result.extra_fields["train_timesteps"].shape == (10,)
     else:
         assert result.extra_fields["all_latents"].shape == (1, 704)
         torch.testing.assert_close(result.extra_fields["all_next_latents"], torch.full((1, 704), 2.0))
