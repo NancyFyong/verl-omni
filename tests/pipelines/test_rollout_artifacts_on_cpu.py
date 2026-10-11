@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from verl_omni.pipelines.diffusion_media_output import with_media_artifacts
+from verl_omni.pipelines.diffusion_rollout_output import wrap_rollout_postprocessor
 from verl_omni.pipelines.rollout_artifacts import (
     MediaArtifact,
     artifact_fields,
@@ -28,7 +29,6 @@ from verl_omni.pipelines.rollout_artifacts import (
     validate_artifacts,
 )
 from verl_omni.pipelines.rollout_media import MediaSpec
-from verl_omni.pipelines.rollout_postprocessing import wrap_rollout_postprocessor
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy
 
 

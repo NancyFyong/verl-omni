@@ -30,7 +30,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from verl_omni.pipelines.diffusion_media_output import with_visual_artifacts
-from verl_omni.pipelines.diffusion_rollout_output import rollout_output
+from verl_omni.pipelines.diffusion_rollout_output import install_rollout_postprocessor, rollout_output
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.qwen_image_flow_grpo.common import QwenImageTokenIdPromptMixin, coalesce_not_none
 from verl_omni.pipelines.request_batch import (
@@ -47,7 +47,6 @@ from verl_omni.pipelines.request_batch import (
     split_diffusion_output_by_request as _split_diffusion_output_by_request,
 )
 from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
-from verl_omni.pipelines.rollout_postprocessing import install_rollout_postprocessor
 from verl_omni.pipelines.rollout_request import condition_images_from_payload, prompt_ids_from_payload
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 

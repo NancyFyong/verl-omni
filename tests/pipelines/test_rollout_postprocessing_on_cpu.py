@@ -20,7 +20,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from verl_omni.pipelines.rollout_postprocessing import install_rollout_postprocessor
+from verl_omni.pipelines.diffusion_rollout_output import install_rollout_postprocessor
 
 
 def test_factory_installation_is_idempotent_and_scoped_to_selected_module():

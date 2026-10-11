@@ -86,7 +86,8 @@ Output construction and engine compatibility have separate owners:
 2. Attach media using `pipelines/diffusion_media_output.py`: `with_visual_artifacts`
    for batched VAE visuals and native latents, `with_batched_media_artifacts` for
    explicit B-prefixed streams, or `with_media_artifacts` for one sample.
-3. Preserve named envelopes using `pipelines/rollout_postprocessing.py`.
+3. Preserve named envelopes with `install_rollout_postprocessor` in
+   `pipelines/diffusion_rollout_output.py`.
    `install_rollout_postprocessor(upstream_module, factory_name)` wraps the
    upstream factory once in the engine process. The pinned engine resolves this
    module-level hook rather than a per-output processor. Ordinary inference

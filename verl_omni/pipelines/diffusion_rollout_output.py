@@ -16,12 +16,16 @@
 Trajectories use ``DiffusionOutput.trajectory_*``. Prompt embeddings and
 algorithm-specific tensors use the canonical payload/metadata envelope.
 Only ``trajectory_*`` and ``rl`` / ``prompt_embeddings`` reach training; ``metadata=`` does not.
+The postprocessor hook keeps that envelope intact when the pinned engine
+runs a media-only factory after the adapter returns.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import functools
+from collections.abc import Callable, Mapping
 from dataclasses import replace
+from types import ModuleType
 from typing import Any
 
 from vllm_omni.diffusion.data import DiffusionOutput
@@ -109,3 +113,68 @@ def _unwrap_output(output: Any, default_key: str) -> tuple[Any, str, dict[str, A
     if key not in _MEDIA_KEYS:
         raise ValueError("Diffusion output envelope has no media payload.")
     return payload[key], key, dict(output.get("metadata") or {})
+
+
+def wrap_rollout_postprocessor(postprocess: Callable[..., Any]) -> Callable[..., Any]:
+    """Adapt a media-only upstream postprocessor to preserve rollout payload and metadata.
+
+    Args:
+        postprocess: Native processor for tensor media, including its request-level kwargs.
+
+    Returns:
+        Processor that bypasses named artifacts and preserves training metadata.
+    """
+
+    @functools.wraps(postprocess)
+    def wrapped(data: Any, **kwargs: Any) -> Any:
+        if not _is_envelope(data):
+            return postprocess(data, **kwargs)
+
+        payload = data["payload"]
+        metadata = dict(data.get("metadata") or {})
+        if "media_artifacts" in metadata:
+            return data  # Named tensors are already decoded/normalized by the adapter.
+        if len(payload) != 1:
+            raise ValueError("A media-only postprocessor cannot consume multiple payload keys; use named artifacts.")
+        (media_key,) = payload
+        if media_key not in _MEDIA_KEYS:
+            raise ValueError("Diffusion output envelope has no media payload.")
+
+        processed = postprocess(payload[media_key], **kwargs)
+        if _is_envelope(processed):
+            return {
+                "payload": dict(processed["payload"]),
+                "metadata": {**dict(processed.get("metadata") or {}), **metadata},
+            }
+        if isinstance(processed, Mapping):
+            return {"payload": dict(processed), "metadata": metadata}
+        return {"payload": {media_key: processed}, "metadata": metadata}
+
+    return wrapped
+
+
+def install_rollout_postprocessor(module: ModuleType, factory_name: str) -> None:
+    """Wrap one upstream factory once; ordinary inference still uses its native processor.
+
+    The pinned engine resolves postprocessors from module factories, not pipeline
+    instances or individual outputs. Named media is already normalized by adapters.
+
+    The wrapper only exists in the importing process. It takes effect because the
+    pinned engine runs a single-replica diffusion stage inline in the rollout server
+    and resolves the postprocessor before creating executors. A stage launched in
+    another process keeps the native processor.
+
+    Args:
+        module: Upstream pipeline module consulted by the engine's registry.
+        factory_name: Name of its postprocessor factory to wrap in this process.
+    """
+    # TODO: Remove once upstream postprocessors pass named rollout envelopes through.
+    factory = getattr(module, factory_name)
+    if getattr(factory, "_preserves_rollout_output", False) is True:
+        return
+
+    def wrapped_factory(od_config: Any) -> Callable[..., Any]:
+        return wrap_rollout_postprocessor(factory(od_config))
+
+    wrapped_factory._preserves_rollout_output = True
+    setattr(module, factory_name, wrapped_factory)

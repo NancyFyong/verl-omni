@@ -141,7 +141,7 @@ class TestVllmOmniPipelineBaseRegistry:
 
             return image_postprocess
 
-        from verl_omni.pipelines.rollout_postprocessing import install_rollout_postprocessor
+        from verl_omni.pipelines.diffusion_rollout_output import install_rollout_postprocessor
 
         monkeypatch.setattr(
             vllm_omni_rollout_adapter.pipeline_sd3,
