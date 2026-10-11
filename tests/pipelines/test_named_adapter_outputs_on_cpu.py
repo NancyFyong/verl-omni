@@ -27,10 +27,9 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-from verl_omni.pipelines.diffusion_media_output import quantize_pixels, with_visual_artifacts
-from verl_omni.pipelines.diffusion_rollout_output import rollout_output
+from verl_omni.pipelines.diffusion_rollout_output import quantize_pixels, rollout_output, with_visual_artifacts
 from verl_omni.pipelines.request_batch import requested_outputs_for_batch, split_diffusion_output_by_request
-from verl_omni.pipelines.rollout_artifacts import (
+from verl_omni.pipelines.rollout_media import (
     ArtifactContractError,
     artifact_fields,
     artifacts_from_fields,

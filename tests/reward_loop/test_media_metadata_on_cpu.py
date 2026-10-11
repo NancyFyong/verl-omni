@@ -86,8 +86,7 @@ async def test_generated_media_reaches_scorer(monkeypatch, manager_cls, transpor
 @pytest.mark.asyncio
 @pytest.mark.parametrize("manager_cls", [VisualRewardManager, multi.MultiVisualRewardManager])
 async def test_latent_primary_and_decoded_artifacts_reach_real_reward_managers(monkeypatch, manager_cls):
-    from verl_omni.pipelines.rollout_artifacts import MediaArtifact, artifact_fields
-    from verl_omni.pipelines.rollout_media import MediaSpec
+    from verl_omni.pipelines.rollout_media import MediaArtifact, MediaSpec, artifact_fields
     from verl_omni.utils.reward_score.clap import _get_audio
 
     latent = torch.zeros(16, 2, 2, 2, dtype=torch.float16)
@@ -130,8 +129,7 @@ async def test_latent_primary_and_decoded_artifacts_reach_real_reward_managers(m
 async def test_decoded_audio_primary_is_self_describing_not_inferred_from_pixel_config(
     monkeypatch, manager_cls, mismatch
 ):
-    from verl_omni.pipelines.rollout_artifacts import ArtifactContractError, MediaArtifact, artifact_fields
-    from verl_omni.pipelines.rollout_media import MediaSpec
+    from verl_omni.pipelines.rollout_media import ArtifactContractError, MediaArtifact, MediaSpec, artifact_fields
     from verl_omni.utils.reward_score.clap import _get_audio
 
     audio = torch.ones(2, 16)

@@ -53,10 +53,12 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.tracking import ValidationGenerationsLogger
 
-from verl_omni.pipelines.rollout_artifacts import previews_from_batch, validate_audio, validate_previews
 from verl_omni.pipelines.rollout_media import (
+    previews_from_batch,
     resolve_batch_media_kind,
     resolve_is_video,
+    validate_audio,
+    validate_previews,
     validate_visual_media_batch_rank,
 )
 from verl_omni.trainer.config import DiffusionAlgoConfig

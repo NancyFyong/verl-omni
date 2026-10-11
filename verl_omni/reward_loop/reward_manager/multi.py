@@ -23,7 +23,7 @@ from verl import DataProto
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
 from verl.utils.import_utils import load_extern_object
 
-from verl_omni.pipelines.rollout_artifacts import ArtifactContractError
+from verl_omni.pipelines.rollout_media import ArtifactContractError
 from verl_omni.workers.config.reward import get_reward_model_entries, resolve_reward_model_name
 
 from .media import _reward_extra_info

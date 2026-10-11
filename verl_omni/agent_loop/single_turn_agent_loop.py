@@ -196,7 +196,7 @@ class DiffusionSingleTurnAgentLoop(AgentLoopBase):
             metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
 
         if output.artifacts:
-            from verl_omni.pipelines.rollout_artifacts import artifact_fields
+            from verl_omni.pipelines.rollout_media import artifact_fields
 
             fields = artifact_fields(output.artifacts, output.primary_artifact, output.preview_artifact)
             collisions = fields.keys() & output.extra_fields.keys()

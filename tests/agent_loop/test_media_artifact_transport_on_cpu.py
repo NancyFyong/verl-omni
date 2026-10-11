@@ -20,8 +20,7 @@ import torch
 
 from verl_omni.agent_loop.diffusion_agent_loop import DiffusionAgentLoopWorker
 from verl_omni.agent_loop.diffusion_agent_loop_tq import DiffusionAgentLoopWorkerTQ
-from verl_omni.pipelines.rollout_artifacts import MediaArtifact, artifact_fields, previews_from_batch
-from verl_omni.pipelines.rollout_media import MediaSpec
+from verl_omni.pipelines.rollout_media import MediaArtifact, MediaSpec, artifact_fields, previews_from_batch
 from verl_omni.reward_loop.reward_manager.visual import _reward_extra_info
 from verl_omni.trainer.diffusion.v1 import tq_utils
 from verl_omni.utils.reward_score.clap import _get_audio

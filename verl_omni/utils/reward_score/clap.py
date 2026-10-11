@@ -53,7 +53,7 @@ def _get_batching_state() -> _BatchingState:
 
 
 def _get_audio(extra_info: dict) -> tuple[torch.Tensor, int]:
-    from verl_omni.pipelines.rollout_artifacts import ArtifactContractError, select_artifact
+    from verl_omni.pipelines.rollout_media import ArtifactContractError, select_artifact
 
     artifact = select_artifact(
         extra_info.get("media_artifacts", {}), name="audio", modality="audio", representation="decoded"

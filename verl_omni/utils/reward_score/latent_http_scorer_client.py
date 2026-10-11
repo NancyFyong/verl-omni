@@ -50,7 +50,7 @@ def _serialize_request(
     noise_level: float,
     noise_seed: int | None,
 ) -> bytes:
-    from verl_omni.pipelines.rollout_artifacts import ArtifactContractError, select_artifact
+    from verl_omni.pipelines.rollout_media import ArtifactContractError, select_artifact
 
     artifact = select_artifact(
         extra_info.get("media_artifacts", {}), name="image_latent", modality="image", representation="latent"

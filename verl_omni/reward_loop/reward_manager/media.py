@@ -18,7 +18,7 @@ from collections.abc import Mapping
 import numpy as np
 import torch
 
-from verl_omni.pipelines.rollout_artifacts import (
+from verl_omni.pipelines.rollout_media import (
     ARTIFACT_CONTEXT,
     ARTIFACT_PREFIX,
     ARTIFACT_SPECS,

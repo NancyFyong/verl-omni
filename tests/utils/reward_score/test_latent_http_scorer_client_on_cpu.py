@@ -22,8 +22,7 @@ import pytest
 import torch
 from safetensors.torch import load as load_tensors
 
-from verl_omni.pipelines.rollout_artifacts import MediaArtifact
-from verl_omni.pipelines.rollout_media import MediaSpec
+from verl_omni.pipelines.rollout_media import MediaArtifact, MediaSpec
 
 
 def _load_client_module():

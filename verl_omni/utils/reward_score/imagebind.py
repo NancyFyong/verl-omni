@@ -132,7 +132,7 @@ def _preprocess_audio(audio, source_rate: int, device: str) -> torch.Tensor:
 
 
 def _to_tchw(video) -> torch.Tensor:
-    from verl_omni.pipelines.rollout_artifacts import MediaArtifact
+    from verl_omni.pipelines.rollout_media import MediaArtifact
 
     if isinstance(video, MediaArtifact):
         if (video.spec.modality, video.spec.representation) != ("video", "decoded"):
@@ -237,7 +237,7 @@ def compute_score(
     need_audio = mode in {"audio_video", "text_audio", "all"}
     need_video = mode in {"audio_video", "text_video", "all"}
 
-    from verl_omni.pipelines.rollout_artifacts import select_artifact
+    from verl_omni.pipelines.rollout_media import select_artifact
 
     artifacts = extra_info.get("media_artifacts", {})
     if need_video:

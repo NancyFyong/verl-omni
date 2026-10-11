@@ -25,17 +25,17 @@ from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
-from verl_omni.pipelines.rollout_artifacts import (
+from verl_omni.pipelines.rollout_media import (
     ARTIFACT_PREFIX,
     ARTIFACT_SPECS,
     PRIMARY_ARTIFACT,
+    DiffusionIOSpec,
     MediaArtifact,
     artifacts_from_fields,
     requested_artifact_names,
     select_artifact,
     validate_artifacts,
 )
-from verl_omni.pipelines.rollout_media import DiffusionIOSpec
 from verl_omni.pipelines.rollout_request import OmniRolloutRequest, _alias_values_match
 from verl_omni.workers.config import DiffusionModelConfig, DiffusionRolloutConfig
 from verl_omni.workers.rollout.replica import DiffusionOutput

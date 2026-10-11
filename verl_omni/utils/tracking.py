@@ -26,8 +26,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from verl_omni.pipelines.rollout_artifacts import MediaArtifact, validate_audio
-from verl_omni.pipelines.rollout_media import MediaSpec, resolve_is_video
+from verl_omni.pipelines.rollout_media import MediaArtifact, MediaSpec, resolve_is_video, validate_audio
 from verl_omni.utils.reward_score.reward_utils import normalize_video_tensor
 
 logger = logging.getLogger(__name__)

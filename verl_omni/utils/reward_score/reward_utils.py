@@ -36,8 +36,7 @@ def normalize_video_tensor(video: torch.Tensor) -> torch.Tensor:
 
 def visual_reward_frames(solution_image, extra_info: dict, frame_interval: int = 1) -> torch.Tensor:
     """Select decoded visual media and return NCHW frames using declared modality, never rank."""
-    from verl_omni.pipelines.rollout_artifacts import PREVIEW_ARTIFACT, ArtifactContractError, MediaArtifact
-    from verl_omni.pipelines.rollout_media import MediaSpec
+    from verl_omni.pipelines.rollout_media import PREVIEW_ARTIFACT, ArtifactContractError, MediaArtifact, MediaSpec
 
     if isinstance(frame_interval, bool) or not isinstance(frame_interval, int) or frame_interval < 1:
         raise ValueError("frame_interval must be a positive integer")
@@ -71,8 +70,7 @@ def visual_reward_frames(solution_image, extra_info: dict, frame_interval: int =
 
 def image_tensor_to_pil(image: torch.Tensor) -> Image.Image:
     """Convert an explicitly canonical uint8 CHW image to RGB PIL."""
-    from verl_omni.pipelines.rollout_artifacts import MediaArtifact
-    from verl_omni.pipelines.rollout_media import MediaSpec
+    from verl_omni.pipelines.rollout_media import MediaArtifact, MediaSpec
 
     MediaArtifact(MediaSpec("image", "decoded", "CHW"), image).validate(context="PIL conversion", name="image")
     array = image.detach().permute(1, 2, 0).cpu().numpy()

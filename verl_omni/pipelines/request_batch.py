@@ -33,7 +33,7 @@ __all__ = [
 
 def requested_outputs_for_batch(request_batch: Any) -> list[str]:
     """Keep every request's required artifacts when a shared decode serves a packed batch."""
-    from verl_omni.pipelines.rollout_artifacts import requested_artifact_names
+    from verl_omni.pipelines.rollout_media import requested_artifact_names
 
     names = {}
     for request in request_batch.requests:

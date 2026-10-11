@@ -23,8 +23,7 @@ from vllm_omni.outputs import OmniRequestOutput
 
 from verl_omni.pipelines.minimax_h3_diffusion_nft.vllm_omni_rollout_adapter import MiniMaxH3DiffusionNFTPipeline
 from verl_omni.pipelines.minimax_h3_flow_grpo.vllm_omni_rollout_adapter import MiniMaxH3PipelineWithLogProb
-from verl_omni.pipelines.rollout_artifacts import MediaArtifact
-from verl_omni.pipelines.rollout_media import MediaSpec
+from verl_omni.pipelines.rollout_media import MediaArtifact, MediaSpec
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy
 
 

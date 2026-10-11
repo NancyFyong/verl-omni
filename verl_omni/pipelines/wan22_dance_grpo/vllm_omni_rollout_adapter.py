@@ -37,8 +37,12 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.platforms import current_omni_platform
 
-from verl_omni.pipelines.diffusion_media_output import wants_decoded_preview, with_visual_artifacts
-from verl_omni.pipelines.diffusion_rollout_output import install_rollout_postprocessor, rollout_output
+from verl_omni.pipelines.diffusion_rollout_output import (
+    install_rollout_postprocessor,
+    rollout_output,
+    wants_decoded_preview,
+    with_visual_artifacts,
+)
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 from verl_omni.pipelines.rollout_request import prompt_ids_from_payload

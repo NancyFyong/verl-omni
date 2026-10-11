@@ -58,10 +58,13 @@ from verl.utils.py_functional import rename_dict
 from verl.utils.skip import SkipManager
 from verl.utils.tracking import Tracking, ValidationGenerationsLogger
 
-from verl_omni.pipelines.rollout_artifacts import MediaArtifact, previews_from_batch, validate_audio, validate_previews
 from verl_omni.pipelines.rollout_media import (
+    MediaArtifact,
+    previews_from_batch,
     resolve_batch_media_kind,
     resolve_is_video,
+    validate_audio,
+    validate_previews,
     validate_visual_media_batch_rank,
 )
 from verl_omni.trainer.diffusion.diffusion_algos import get_diffusion_loss_fn

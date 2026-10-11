@@ -22,8 +22,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from verl_omni.pipelines.rollout_artifacts import MediaArtifact
-from verl_omni.pipelines.rollout_media import MediaSpec
+from verl_omni.pipelines.rollout_media import MediaArtifact, MediaSpec
 from verl_omni.trainer.diffusion import ray_diffusion_trainer as v0
 from verl_omni.trainer.diffusion.v1.trainer_base import PolicyGradientDiffusionTrainerV1 as V1
 from verl_omni.utils import tracking

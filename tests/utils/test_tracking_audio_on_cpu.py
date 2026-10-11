@@ -110,8 +110,7 @@ def test_video_tensor_to_rgb24_requires_canonical_or_declared_layout(monkeypatch
         "thwc": canonical.permute(0, 2, 3, 1),
     }[layout]
 
-    from verl_omni.pipelines.rollout_artifacts import MediaArtifact
-    from verl_omni.pipelines.rollout_media import MediaSpec
+    from verl_omni.pipelines.rollout_media import MediaArtifact, MediaSpec
 
     if layout != "tchw":
         with pytest.raises(ValueError, match="T, 3, H, W"):

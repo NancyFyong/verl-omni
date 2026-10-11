@@ -19,16 +19,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from verl_omni.pipelines.diffusion_media_output import with_media_artifacts
-from verl_omni.pipelines.diffusion_rollout_output import wrap_rollout_postprocessor
-from verl_omni.pipelines.rollout_artifacts import (
+from verl_omni.pipelines.diffusion_rollout_output import with_media_artifacts, wrap_rollout_postprocessor
+from verl_omni.pipelines.rollout_media import (
     MediaArtifact,
+    MediaSpec,
     artifact_fields,
     artifacts_from_fields,
     select_artifact,
     validate_artifacts,
 )
-from verl_omni.pipelines.rollout_media import MediaSpec
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy
 
 

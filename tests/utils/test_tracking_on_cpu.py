@@ -41,8 +41,7 @@ def _warm_clip(t=8, h=32, w=32):
 
 
 def test_adapter_declared_video_is_exported_without_axis_guessing():
-    from verl_omni.pipelines.rollout_artifacts import MediaArtifact
-    from verl_omni.pipelines.rollout_media import MediaSpec
+    from verl_omni.pipelines.rollout_media import MediaArtifact, MediaSpec
 
     video = _warm_clip(t=5, h=8, w=12).permute(1, 0, 2, 3)
     with pytest.raises(ValueError, match="T, 3, H, W"):

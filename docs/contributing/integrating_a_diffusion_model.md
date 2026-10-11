@@ -436,13 +436,13 @@ Your subclass must do five things:
      and `negative_prompt_embeds_mask` are placed in `prompt_embeddings`. The diffusion agent loop
      ([`diffusion_agent_loop.py`](../../verl_omni/agent_loop/diffusion_agent_loop.py))
      reads these field names verbatim — **do not rename them**.
-5. **Attach named media artifacts** from
-   [`diffusion_media_output`](../../verl_omni/pipelines/diffusion_media_output.py)
-   with `with_visual_artifacts`,
-   `with_batched_media_artifacts` or `with_media_artifacts`, including both
-   `forward` and `post_decode` when step execution is supported. Preserve the
-   named envelope through the engine postprocessor; do not return a bare legacy
-   tensor/tuple from the rollout boundary.
+5. **Attach named media artifacts** with `with_visual_artifacts`,
+   `with_batched_media_artifacts` or `with_media_artifacts` from
+   [`diffusion_rollout_output`](../../verl_omni/pipelines/diffusion_rollout_output.py),
+   alongside `rollout_output` / `with_rollout_data`. Cover both `forward` and
+   `post_decode` when step execution is supported. Preserve the named envelope
+   through the engine postprocessor; do not return a bare legacy tensor or tuple
+   from the rollout boundary.
 
 ### 4.1 Rollout response contract
 

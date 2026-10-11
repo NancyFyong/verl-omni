@@ -171,7 +171,7 @@ def _build_manager(reward_functions: dict) -> MultiVisualRewardManager:
 
 
 def test_optional_reward_does_not_swallow_artifact_contract_errors():
-    from verl_omni.pipelines.rollout_artifacts import ArtifactContractError
+    from verl_omni.pipelines.rollout_media import ArtifactContractError
 
     manager = _build_manager(
         {"audio": {"path": DUMMY_REWARDS_PATH, "name": "reward_requires_audio", "required": False}}

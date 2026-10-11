@@ -23,8 +23,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-from verl_omni.pipelines.rollout_artifacts import ArtifactContractError, MediaArtifact
-from verl_omni.pipelines.rollout_media import MediaSpec
+from verl_omni.pipelines.rollout_media import ArtifactContractError, MediaArtifact, MediaSpec
 
 
 def _load_scorer_module():

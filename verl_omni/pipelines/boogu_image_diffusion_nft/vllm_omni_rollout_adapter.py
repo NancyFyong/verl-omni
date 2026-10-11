@@ -29,8 +29,7 @@ from verl_omni.pipelines.boogu_image_flow_grpo.common import (
     get_boogu_freqs_real,
 )
 from verl_omni.pipelines.boogu_image_flow_grpo.vllm_omni_rollout_adapter import BooguImagePipelineWithLogProb
-from verl_omni.pipelines.diffusion_media_output import with_visual_artifacts
-from verl_omni.pipelines.diffusion_rollout_output import rollout_output
+from verl_omni.pipelines.diffusion_rollout_output import rollout_output, with_visual_artifacts
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.request_batch import requested_outputs_for_batch
 from verl_omni.pipelines.request_batch import split_diffusion_output_by_request as _split_diffusion_output_by_request

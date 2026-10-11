@@ -29,8 +29,11 @@ from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguIma
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
-from verl_omni.pipelines.diffusion_media_output import with_visual_artifacts
-from verl_omni.pipelines.diffusion_rollout_output import install_rollout_postprocessor, rollout_output
+from verl_omni.pipelines.diffusion_rollout_output import (
+    install_rollout_postprocessor,
+    rollout_output,
+    with_visual_artifacts,
+)
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.qwen_image_flow_grpo.common import QwenImageTokenIdPromptMixin, coalesce_not_none
 from verl_omni.pipelines.request_batch import (

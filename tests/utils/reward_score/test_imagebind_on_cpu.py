@@ -21,8 +21,7 @@ from types import ModuleType
 import pytest
 import torch
 
-from verl_omni.pipelines.rollout_artifacts import MediaArtifact
-from verl_omni.pipelines.rollout_media import MediaSpec
+from verl_omni.pipelines.rollout_media import MediaArtifact, MediaSpec
 
 
 def _load_scorer_module():

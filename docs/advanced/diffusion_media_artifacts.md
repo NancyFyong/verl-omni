@@ -9,15 +9,12 @@ The public `generate(**kwargs)` RPC is unchanged.
 
 ## Contract
 
-`pipelines/rollout_media.py` retains `MediaSpec` and `DiffusionIOSpec`:
+`pipelines/rollout_media.py` holds both the declaration and the runtime artifact:
 
 - `MediaSpec(modality, representation, layout, sample_rate=None, fps=None)`.
   Modality is `image`, `video` or `audio`; representation is `latent` or
   `decoded`. **The tensor owns its dtype**, not the configuration.
 - `DiffusionIOSpec(artifacts=...)` maps available artifact names to `MediaSpec`.
-
-`pipelines/rollout_artifacts.py` defines:
-
 - `MediaArtifact(spec, data, context="")`: one sample, with no implicit request
   batch dimension. Context records the pipeline/request for downstream errors.
 - `validate_artifacts`: checks returned versus expected names, duplicates,
@@ -83,10 +80,9 @@ Output construction and engine compatibility have separate owners:
 
 1. Construct native trajectory fields and `prompt_embeddings` / `rl` groups
    with `rollout_output` or `with_rollout_data` in `pipelines/diffusion_rollout_output.py`.
-2. Attach media using `pipelines/diffusion_media_output.py`: `with_visual_artifacts`
-   for batched VAE visuals and native latents, `with_batched_media_artifacts` for
-   explicit B-prefixed streams, or `with_media_artifacts` for one sample.
-3. Preserve named envelopes with `install_rollout_postprocessor` in
+2. Attach media with `with_visual_artifacts`, `with_batched_media_artifacts` or
+   `with_media_artifacts` from the same module.
+3. Preserve named envelopes with `install_rollout_postprocessor`, also in
    `pipelines/diffusion_rollout_output.py`.
    `install_rollout_postprocessor(upstream_module, factory_name)` wraps the
    upstream factory once in the engine process. The pinned engine resolves this

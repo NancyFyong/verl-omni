@@ -19,9 +19,8 @@ import pytest
 import torch
 from vllm_omni.outputs import OmniRequestOutput
 
-from verl_omni.pipelines.diffusion_media_output import quantize_pixels
-from verl_omni.pipelines.rollout_artifacts import MediaArtifact
-from verl_omni.pipelines.rollout_media import MediaSpec
+from verl_omni.pipelines.diffusion_rollout_output import quantize_pixels
+from verl_omni.pipelines.rollout_media import MediaArtifact, MediaSpec
 from verl_omni.pipelines.rollout_request import OmniRolloutRequest
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_async_server import vLLMOmniHttpServer
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy

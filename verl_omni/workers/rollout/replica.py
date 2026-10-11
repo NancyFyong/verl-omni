@@ -21,7 +21,7 @@ from verl.workers.rollout.llm_server import LLMServerManager
 from verl.workers.rollout.replica import RolloutReplicaRegistry
 from verl.workers.rollout.utils import update_prometheus_config
 
-from verl_omni.pipelines.rollout_artifacts import MediaArtifact
+from verl_omni.pipelines.rollout_media import MediaArtifact
 from verl_omni.workers.config import DiffusionRolloutConfig
 from verl_omni.workers.rollout.base import get_rollout_sequence_parallel_size, get_rollout_world_size
 

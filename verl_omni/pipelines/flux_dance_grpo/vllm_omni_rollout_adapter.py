@@ -29,8 +29,11 @@ from vllm_omni.diffusion.models.flux.pipeline_flux import FluxPipeline
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
-from verl_omni.pipelines.diffusion_media_output import with_visual_artifacts
-from verl_omni.pipelines.diffusion_rollout_output import install_rollout_postprocessor, rollout_output
+from verl_omni.pipelines.diffusion_rollout_output import (
+    install_rollout_postprocessor,
+    rollout_output,
+    with_visual_artifacts,
+)
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.request_batch import requested_outputs_for_batch, split_diffusion_output_by_request
 from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec

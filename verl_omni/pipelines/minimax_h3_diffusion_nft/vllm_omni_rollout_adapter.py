@@ -31,8 +31,7 @@ from vllm_omni.diffusion.models.minimax_h3.packed_tokens import (
 from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
 
-from verl_omni.pipelines.diffusion_media_output import with_batched_media_artifacts
-from verl_omni.pipelines.diffusion_rollout_output import with_rollout_data
+from verl_omni.pipelines.diffusion_rollout_output import with_batched_media_artifacts, with_rollout_data
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     AUDIO_ROW_WIDTH,
     MiniMaxH3RolloutWeightSyncMixin,

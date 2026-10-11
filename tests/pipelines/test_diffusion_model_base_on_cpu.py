@@ -152,8 +152,7 @@ class TestVllmOmniPipelineBaseRegistry:
         postprocess = vllm_omni_rollout_adapter.pipeline_sd3.get_sd3_image_post_process_func(od_config=None)
         latent = torch.zeros(1, 16, 2, 2)
         image = torch.zeros(1, 3, 2, 2)
-        from verl_omni.pipelines.diffusion_media_output import with_visual_artifacts
-        from verl_omni.pipelines.diffusion_rollout_output import rollout_output
+        from verl_omni.pipelines.diffusion_rollout_output import rollout_output, with_visual_artifacts
 
         named = with_visual_artifacts(
             rollout_output(media=latent),
