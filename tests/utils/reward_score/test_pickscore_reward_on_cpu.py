@@ -242,6 +242,32 @@ async def test_native_reward_function_computes_score_from_model_output():
 
 
 @pytest.mark.asyncio
+async def test_native_pickscore_accepts_decoded_image_without_media_declaration():
+    class _NativeModelHandle:
+        async def infer(self, prompts, images):
+            assert prompts == ["prompt"]
+            assert isinstance(images[0], Image.Image)
+            return [
+                {
+                    "text_embeddings": torch.tensor([3.0, 4.0]),
+                    "image_embeddings": torch.tensor([0.0, 5.0]),
+                    "logit_scale": torch.tensor(98.0),
+                }
+            ]
+
+    result = await pickscore_reward.compute_score_pickscore_native(
+        data_source="test",
+        solution_image=Image.new("L", (1, 1), 1),
+        ground_truth="prompt",
+        extra_info={},
+        reward_model=_NativeModelHandle(),
+    )
+
+    expected_score = 98.0 * 0.8 / 26.0
+    assert result["score"] == pytest.approx(expected_score)
+
+
+@pytest.mark.asyncio
 async def test_consumer_batches_burst_requests_and_preserves_order(monkeypatch):
     inferencer = _FakeInferencer()
     queue = asyncio.Queue()

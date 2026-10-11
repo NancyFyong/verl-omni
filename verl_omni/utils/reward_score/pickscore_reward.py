@@ -341,6 +341,25 @@ def _to_pil_hwc(image) -> Image.Image:
     return image
 
 
+def _decoded_pickscore_image(solution_image, extra_info: dict | None) -> Image.Image:
+    """Select one decoded image, or accept an already decoded image.
+
+    Named artifacts and ``media_kind`` reject latent responses. Native replica
+    dispatch already holds a decoded image and does not repeat that declaration.
+    """
+    extra_info = extra_info or {}
+    declared = extra_info.get("media_artifacts") is not None or extra_info.get("media_kind") is not None
+    if not declared:
+        return _to_pil_hwc(solution_image)
+
+    from verl_omni.utils.reward_score.reward_utils import visual_reward_frames
+
+    frames = visual_reward_frames(solution_image, extra_info)
+    if len(frames) != 1:
+        raise ValueError("PickScore requires a single decoded image")
+    return _to_pil_hwc(frames[0])
+
+
 def _score_batch(requests) -> list[float | Exception]:
     """Convert and score a batch in a thread so the event loop is never blocked."""
     results = [None] * len(requests)
@@ -449,14 +468,9 @@ async def compute_score_pickscore_native(
     score_divisor: float = 26.0,
 ) -> dict:
     """Compute PickScore from outputs produced by a native named reward model."""
-    from verl_omni.utils.reward_score.reward_utils import visual_reward_frames
-
     del data_source
-    frames = visual_reward_frames(solution_image, extra_info)
-    if len(frames) != 1:
-        raise ValueError("PickScore requires a single decoded image")
     prompt = ground_truth or ""
-    image = _to_pil_hwc(frames[0])
+    image = _decoded_pickscore_image(solution_image, extra_info)
     outputs = await reward_model.infer(prompts=[prompt], images=[image])
     output = outputs[0]
     raw_score = _pairwise_pickscore(
@@ -485,12 +499,8 @@ async def compute_score_pickscore_engine(
     ``logit_scale`` is explicit because vLLM CLIP pooling does not restore the
     PickScore checkpoint's parameter.
     """
-    from verl_omni.utils.reward_score.reward_utils import visual_reward_frames
-
     del data_source
-    frames = visual_reward_frames(solution_image, extra_info)
-    if len(frames) != 1:
-        raise ValueError("PickScore requires a single decoded image")
+    image = _decoded_pickscore_image(solution_image, extra_info)
     if not reward_router_address:
         raise ValueError("PickScore engine reward requires reward_router_address")
     if not model_name:
@@ -499,7 +509,6 @@ async def compute_score_pickscore_engine(
     from verl_omni.utils.reward_score.reward_utils import pil_image_to_base64
 
     prompt = ground_truth or ""
-    image = _to_pil_hwc(frames[0])
     loop = asyncio.get_running_loop()
     image_url = await loop.run_in_executor(None, pil_image_to_base64, image)
     text_payload = {"model": model_name, "input": prompt, "encoding_format": "float"}
