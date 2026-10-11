@@ -177,3 +177,46 @@ async def test_conflicting_generated_media_sources_fail_before_scoring(monkeypat
 
     with pytest.raises(ValueError, match=f"Conflicting rollout media field.*{field}"):
         await _manager(monkeypatch, manager_cls, scorer).run_single(data)
+
+
+@pytest.mark.asyncio
+async def test_gpu_smoke_image_fixture_declares_media_kind(monkeypatch):
+    """The visual-reward GPU smoke fixture is raw uint8 pixels plus an explicit kind."""
+    from verl_omni.pipelines.rollout_media import ArtifactContractError
+    from verl_omni.utils.reward_score.jpeg_compressibility import compute_score
+    from verl_omni.utils.reward_score.reward_utils import visual_reward_frames
+
+    image = torch.randint(0, 256, (3, 8, 8), dtype=torch.uint8)
+    data = DataProto.from_dict(
+        tensors={"responses": image.unsqueeze(0)},
+        non_tensors={
+            "data_source": ["ocr"],
+            "reward_model": [{"ground_truth": "OCR"}],
+            "media_kind": ["image"],
+            "extra_info": [{}],
+        },
+    )
+
+    async def scorer(data_source, solution_image, ground_truth, extra_info, **kwargs):
+        frames = visual_reward_frames(solution_image, extra_info)
+        torch.testing.assert_close(frames, image.unsqueeze(0))
+        assert compute_score(solution_image, extra_info) <= 0
+        return {"score": 0.5, "genrm_response": "OCR"}
+
+    result = await _manager(monkeypatch, VisualRewardManager, scorer).run_single(data)
+    assert result["reward_score"] == 0.5
+
+    undeclared = DataProto.from_dict(
+        tensors={"responses": image.unsqueeze(0)},
+        non_tensors={
+            "data_source": ["ocr"],
+            "reward_model": [{"ground_truth": "OCR"}],
+            "extra_info": [{}],
+        },
+    )
+
+    async def reject(**kwargs):
+        visual_reward_frames(kwargs["solution_image"], kwargs["extra_info"])
+
+    with pytest.raises(ArtifactContractError, match="media_kind"):
+        await _manager(monkeypatch, VisualRewardManager, reject).run_single(undeclared)
