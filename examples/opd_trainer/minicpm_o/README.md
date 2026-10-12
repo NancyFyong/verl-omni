@@ -4,7 +4,7 @@ Last updated: 10/07/2026.
 
 This recipe implements the first, thinker-stage part of [RFC #565](https://github.com/verl-project/verl-omni/issues/565), under [#345](https://github.com/verl-project/verl-omni/issues/345). The student generates a complete text response; a frozen teacher scores the same tokens and verl's on-policy distillation loss updates the student.
 
-It is the [MiniCPM-o GSPO recipe](../../gspo_trainer/README.md#training-with-minicpm-o-45-avqa) plus a `distillation.*` group, the same composition as the [Qwen3-Omni OPD recipe](../../../docs/algo/omni_opd.md). Data loading, prompt parity, rollout, and the actor path are unchanged from GSPO; only the teacher is added.
+It is the [MiniCPM-o GSPO recipe](https://github.com/verl-project/verl-omni/blob/main/examples/gspo_trainer/README.md#training-with-minicpm-o-45-avqa) plus a `distillation.*` group, the same composition as the [Qwen3-Omni OPD recipe](../../../docs/algo/omni_opd.md). Data loading, prompt parity, rollout, and the actor path are unchanged from GSPO; only the teacher is added.
 
 ## Supported scope
 
