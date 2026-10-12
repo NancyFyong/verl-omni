@@ -64,12 +64,13 @@ STUDENT_MODEL="$HOME/models/MiniCPM-o-4_5-Thinker-Noise20" \
 TEACHER_MODEL="$HOME/models/MiniCPM-o-4_5" \
 bash examples/opd_trainer/minicpm_o/run_simplex_opd_lora.sh
 
+DATASET=mmk12 \
 STUDENT_MODEL="$HOME/models/MiniCPM-o-4_5-Thinker-Noise20" \
 TEACHER_MODEL="$HOME/models/MiniCPM-o-4_5" \
-bash examples/opd_trainer/minicpm_o/run_simplex_opd_lora_mmk12.sh
+bash examples/opd_trainer/minicpm_o/run_simplex_opd_lora.sh
 ```
 
-The student uses the GSPO recipe's four GPUs and settings; the teacher adds `TEACHER_GPUS` (default 4) GPUs with `TEACHER_TP` (default 2) per replica on the same node. `TRAIN_FILE` / `VAL_FILE` select other data, and extra CLI arguments override the defaults.
+The student uses the GSPO recipe's four GPUs and settings; the teacher adds `TEACHER_GPUS` (default 4) GPUs with `TEACHER_TP` (default 2) per replica on the same node. `DATASET` (`avqa` by default, or `mmk12`) selects the data and reward; `TRAIN_FILE` / `VAL_FILE` select other data, and extra CLI arguments override the defaults.
 
 The default objective is task reward plus OPD, with `loss_mode=kl` and `use_policy_gradient=true`. For teacher-only OPD, add `distillation.distillation_loss.use_task_rewards=false`. Rewards decode through the GSPO recipe's `minicpm_naive` manager, which keeps MiniCPM's `<answer>` tags.
 

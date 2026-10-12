@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
-# MiniCPM-o 4.5 Thinker on-policy distillation (OPD) on AVQA: the GSPO AVQA recipe
+# MiniCPM-o 4.5 Thinker on-policy distillation (OPD): the GSPO AVQA recipe
 # plus a frozen vllm_omni teacher pool that scores every student rollout.
+#
+# DATASET selects the data and reward (default avqa):
+#   DATASET=avqa   audio/video QA with the AVQA recipe's own data and reward.
+#   DATASET=mmk12  image + text -> text with the rule-based mmk12_reward.py, as in
+#                  the Qwen3-Omni OPD recipe. Prepare the data once:
+#                    pip install math-verify    # required by mmk12_reward.py
+#                    python examples/gspo_trainer/data_process/mmk12.py \
+#                        --local_dataset_path <path_to_raw_mmk12> \
+#                        --local_save_dir ~/data/mmk12
+#                  TRAIN_FILE, VAL_FILE and REWARD_FUNCTION_PATH override the defaults.
 #
 # Student data, actor, and rollout settings come from
 # examples/gspo_trainer/minicpm/run_minicpmo_4_5_thinker_gspo_lora_avqa_v1.sh
@@ -17,6 +27,28 @@ REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../../.." && pwd)
 
 : "${STUDENT_MODEL:?Set STUDENT_MODEL to a MiniCPM-o 4.5 checkpoint}"
 : "${TEACHER_MODEL:?Set TEACHER_MODEL to a frozen checkpoint sharing the student tokenizer}"
+
+DATASET=${DATASET:-avqa}
+case "${DATASET}" in
+    avqa)
+        DATASET_ARGS=()
+        EXPERIMENT_NAME=minicpm_o_4_5_thinker_lora_avqa_opd
+        ;;
+    mmk12)
+        export TRAIN_FILE=${TRAIN_FILE:-"$HOME/data/mmk12/train.parquet"}
+        export VAL_FILE=${VAL_FILE:-"$HOME/data/mmk12/test.parquet"}
+        REWARD_FUNCTION_PATH=${REWARD_FUNCTION_PATH:-"${REPO_ROOT}/verl_omni/utils/reward_score/mmk12_reward.py"}
+        DATASET_ARGS=(
+            reward.custom_reward_function.path="${REWARD_FUNCTION_PATH}"
+            reward.custom_reward_function.name=compute_score
+        )
+        EXPERIMENT_NAME=minicpm_o_4_5_thinker_lora_mmk12_opd
+        ;;
+    *)
+        echo "DATASET must be avqa or mmk12, got '${DATASET}'." >&2
+        exit 1
+        ;;
+esac
 
 TEACHER_GPUS=${TEACHER_GPUS:-4}
 TEACHER_TP=${TEACHER_TP:-2}
@@ -43,5 +75,6 @@ MODEL_PATH="${STUDENT_MODEL}" exec bash "${REPO_ROOT}/examples/gspo_trainer/mini
     distillation.distillation_loss.loss_mode=kl \
     distillation.distillation_loss.use_policy_gradient=true \
     trainer.project_name=opd \
-    trainer.experiment_name=minicpm_o_4_5_thinker_lora_avqa_opd \
+    ${DATASET_ARGS[@]+"${DATASET_ARGS[@]}"} \
+    trainer.experiment_name="${EXPERIMENT_NAME}" \
     "$@"
