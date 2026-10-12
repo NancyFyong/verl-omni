@@ -10,7 +10,7 @@ It is the [MiniCPM-o GSPO recipe](https://github.com/verl-project/verl-omni/blob
 
 - MiniCPM-o **4.5**, text output from the thinker stage.
 - Text, images, and at most one audio clip per prompt.
-- A separate frozen `vllm_omni` teacher pool from the same model family; teacher and student must share the tokenizer and special-token IDs, which is checked before worker allocation.
+- A separate frozen `vllm_omni` teacher pool from the same model family; teacher and student must share the tokenizer and special-token IDs; this is not checked automatically.
 
 Video, multiple audio clips per prompt, talker/codec-policy training, and streaming duplex are not supported. Speech-policy OPD is a separate RFC milestone; streaming duplex is tracked by [#566](https://github.com/verl-project/verl-omni/issues/566).
 

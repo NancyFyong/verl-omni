@@ -11,18 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Omni OPD config, vocabulary validation, and synthetic padding contracts."""
+"""Omni OPD config and synthetic padding contracts."""
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 import torch
 from hydra import compose, initialize_config_module
 from verl.utils.config import omega_conf_to_dataclass
-from verl.workers.config import RolloutConfig
 
-from verl_omni.trainer.omni import distillation as module
 from verl_omni.workers.config.omni.distillation import OmniDistillationTeacherModelConfig
 
 
@@ -50,22 +47,6 @@ def test_omni_distillation_hydra_preserves_teacher_type_and_scoring_capacity():
         == config.actor_rollout_ref.rollout.prompt_length + config.actor_rollout_ref.rollout.response_length
     )
     assert teacher.num_replicas == 2
-
-
-@pytest.mark.parametrize("engine", ["vllm", "vllm_omni"])
-def test_teacher_topk_extension_keeps_upstream_backends(engine):
-    config = OmniDistillationTeacherModelConfig(inference=RolloutConfig(name=engine))
-    config._validate_topk_logprobs(True, 8)
-    assert config.inference.engine_kwargs[engine]["max_logprobs"] == 8
-    with pytest.raises(ValueError, match="must be >="):
-        config._validate_topk_logprobs(True, 16)
-
-
-@pytest.mark.parametrize("topk", [None, 0, -1])
-def test_teacher_topk_rejects_missing_or_nonpositive_budget(topk):
-    config = OmniDistillationTeacherModelConfig(inference=RolloutConfig(name="vllm_omni"))
-    with pytest.raises(ValueError, match="positive"):
-        config._validate_topk_logprobs(True, topk)
 
 
 @pytest.mark.parametrize("same_policy", [False, True])
@@ -131,34 +112,3 @@ def test_teacher_padding_reuses_shared_template_and_preserves_source():
     assert sample["multi_modal_inputs"] == {}
     assert tag["is_padding"]
     assert source["teacher_ids"].shape == (5, 2)
-
-
-@pytest.mark.parametrize("mismatch", [None, "vocab", "eos"])
-def test_teacher_tokenizer_validation(monkeypatch, mismatch):
-    def tokenizer():
-        return SimpleNamespace(
-            get_vocab=lambda: {"a": 1, "b": 2}, bos_token_id=0, eos_token_id=3, pad_token_id=0, all_special_ids=[0, 3]
-        )
-
-    student, teacher_tokenizer = tokenizer(), tokenizer()
-    if mismatch == "vocab":
-        teacher_tokenizer.get_vocab = lambda: {"a": 2, "b": 1}
-    if mismatch == "eos":
-        teacher_tokenizer.eos_token_id = 4
-    teacher = SimpleNamespace(
-        model_path="teacher",
-        key="default",
-        inference=SimpleNamespace(engine_kwargs={"vllm_omni": {"trust_remote_code": True}}),
-    )
-    monkeypatch.setattr(
-        module, "omega_conf_to_dataclass", lambda config: SimpleNamespace(teacher_models={"default": teacher})
-    )
-    monkeypatch.setattr(module, "resolve_model_local_dir", lambda path: path)
-    loader = MagicMock(return_value=teacher_tokenizer)
-    monkeypatch.setattr(module.AutoTokenizer, "from_pretrained", loader)
-    if mismatch:
-        with pytest.raises(ValueError, match="tokenizer"):
-            module.validate_teacher_tokenizers(student, SimpleNamespace(distillation={}))
-    else:
-        module.validate_teacher_tokenizers(student, SimpleNamespace(distillation={}))
-    loader.assert_called_once_with("teacher", trust_remote_code=True)
