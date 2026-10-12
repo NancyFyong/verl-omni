@@ -24,17 +24,7 @@ hf download openbmb/MiniCPM-o-4_5 \
   --local-dir "$HOME/models/MiniCPM-o-4_5"
 ```
 
-Use the original checkpoint as the frozen teacher. To reproduce the noise-perturbed-student setup from [Qwen3-Omni OPD PR #375](https://github.com/verl-project/verl-omni/pull/375) with 20% noise, create a separate student checkpoint:
-
-```bash
-python examples/opd_trainer/minicpm_o/prepare_noised_student.py \
-  --source-model "$HOME/models/MiniCPM-o-4_5" \
-  --output-model "$HOME/models/MiniCPM-o-4_5-Thinker-Noise20" \
-  --noise-ratio 0.20 \
-  --seed 42
-```
-
-The script copies the checkpoint and perturbs only nonzero floating-point `llm.*` tensors, each by a Gaussian direction rescaled to `||ΔW||₂ / ||W||₂ = 0.20` within the checkpoint dtype's rounding. Encoders, processor, and tokenizer stay identical to the teacher, and `noise_manifest.json` records the scope, ratio, and seed. It is diagnostic tooling, not a validated recovery recipe: it perturbs embeddings, MLPs, and norms, while the recipe trains attention LoRA only.
+Use the original checkpoint as the frozen teacher. The student must be a different MiniCPM-o 4.5 checkpoint that shares the teacher's tokenizer and special-token IDs, for example a fine-tuned or otherwise perturbed copy; a student identical to the teacher gives a zero distillation signal. This recipe does not provide a tool for building one.
 
 ## Data
 
@@ -60,12 +50,12 @@ python examples/gspo_trainer/data_process/mmk12.py \
 Run from the repository root; the base GSPO recipe resolves its reward path relative to it.
 
 ```bash
-STUDENT_MODEL="$HOME/models/MiniCPM-o-4_5-Thinker-Noise20" \
+STUDENT_MODEL="$HOME/models/MiniCPM-o-4_5-student" \
 TEACHER_MODEL="$HOME/models/MiniCPM-o-4_5" \
 bash examples/opd_trainer/minicpm_o/run_simplex_opd_lora.sh
 
 DATASET=mmk12 \
-STUDENT_MODEL="$HOME/models/MiniCPM-o-4_5-Thinker-Noise20" \
+STUDENT_MODEL="$HOME/models/MiniCPM-o-4_5-student" \
 TEACHER_MODEL="$HOME/models/MiniCPM-o-4_5" \
 bash examples/opd_trainer/minicpm_o/run_simplex_opd_lora.sh
 ```
