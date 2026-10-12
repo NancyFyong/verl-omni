@@ -26,12 +26,12 @@ from verl_omni.reward_loop.reward_manager.visual import VisualRewardManager
 from verl_omni.trainer.diffusion.v1 import tq_utils
 
 
-def _manager(monkeypatch, manager_cls, scorer):
+def _manager(monkeypatch, manager_cls, scorer, *, required=True):
     config = OmegaConf.create(
         {
             "actor_rollout_ref": {"rollout": {"pipeline": {"output_type": "pt"}}},
             "reward": {
-                "reward_functions": {"audio": {"path": "test", "name": "score", "required": True}},
+                "reward_functions": {"audio": {"path": "test", "name": "score", "required": required}},
                 "reward_model": {"rollout": {}},
             },
         }
@@ -220,3 +220,71 @@ async def test_gpu_smoke_image_fixture_declares_media_kind(monkeypatch):
 
     with pytest.raises(ArtifactContractError, match="media_kind"):
         await _manager(monkeypatch, VisualRewardManager, reject).run_single(undeclared)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("manager_cls", [VisualRewardManager, multi.MultiVisualRewardManager])
+@pytest.mark.parametrize(
+    "projection",
+    [
+        "matching_nan",
+        "matching_infinities",
+        "matching_uint8",
+        "value",
+        "nan_placement",
+        "infinity_sign",
+        "shape",
+        "dtype",
+    ],
+)
+async def test_primary_projection_is_exact_with_matching_nans(monkeypatch, manager_cls, projection):
+    from verl_omni.pipelines.rollout_media import ArtifactContractError, MediaArtifact, MediaSpec, artifact_fields
+
+    primary = torch.tensor([float("nan"), float("inf"), -float("inf"), 1.0, 2.0, 3.0]).reshape(1, 2, 3)
+    if projection == "matching_infinities":
+        primary[0, 0, 0] = 0
+    if projection == "matching_uint8":
+        primary = torch.arange(6, dtype=torch.uint8).reshape(1, 2, 3)
+    response = primary.clone()
+    if projection == "value":
+        response[0, 1, 0] = torch.nextafter(response[0, 1, 0], torch.tensor(float("inf")))
+    elif projection == "nan_placement":
+        response[0, 0, 0] = 1.0
+        response[0, 1, 0] = float("nan")
+    elif projection == "infinity_sign":
+        response[0, 0, 1] = -float("inf")
+    elif projection == "shape":
+        response = response.reshape(1, 3, 2)
+    elif projection == "dtype":
+        response = response.double()
+    representation = "decoded" if primary.dtype == torch.uint8 else "latent"
+    fields = artifact_fields(
+        {"primary": MediaArtifact(MediaSpec("image", representation, "CHW"), primary, context="projection regression")},
+        "primary",
+    )
+    data = DataProto.from_dict(
+        tensors={
+            "responses": response.unsqueeze(0),
+            **{key: value.unsqueeze(0) for key, value in fields.items() if isinstance(value, torch.Tensor)},
+        },
+        non_tensors={
+            "data_source": ["test"],
+            "reward_model": [{"ground_truth": "prompt"}],
+            **{key: [value] for key, value in fields.items() if not isinstance(value, torch.Tensor)},
+        },
+    )
+    calls = []
+
+    async def scorer(solution_image, **kwargs):
+        calls.append(solution_image)
+        return {"score": 1.0}
+
+    manager = _manager(monkeypatch, manager_cls, scorer, required=False)
+    if projection.startswith("matching"):
+        result = await manager.run_single(data)
+        assert result["reward_score"] == 1.0
+        assert len(calls) == 1
+    else:
+        with pytest.raises(ArtifactContractError, match="projection regression.*artifact=.*responses projection"):
+            await manager.run_single(data)
+        assert calls == []

@@ -21,6 +21,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from verl_omni.pipelines.rollout_media import MediaArtifact, MediaSpec
 from verl_omni.trainer.diffusion import ray_diffusion_trainer as v0
@@ -127,6 +128,79 @@ def test_intentionally_absent_preview_skips_dump_without_using_latents(tmp_path,
     dump(context, ["one"], torch.zeros(1, 16, 2, 2), [None], [1], {}, str(tmp_path), previews=[None])
     context._dump_executor.submit.assert_not_called()
     assert not (tmp_path / "1.jsonl").exists()
+
+
+@pytest.mark.parametrize("version", [0, 1])
+def test_intentionally_absent_previews_skip_validation_logging(monkeypatch, version):
+    context = SimpleNamespace(
+        global_steps=1,
+        config=OmegaConf.create({"trainer": {"logger": ["wandb"], "log_val_generations": 2}}),
+        validation_generations_logger=Mock(),
+    )
+    encoder = Mock()
+    wrapper = Mock()
+    media_logger = Mock()
+    validate_outputs = Mock()
+    monkeypatch.setattr(tracking, "_export_video", encoder)
+    monkeypatch.setattr(v0, "wrap_val_samples_for_wandb", wrapper)
+    monkeypatch.setattr(v0, "log_wandb_media", media_logger)
+    monkeypatch.setattr(v0, "_validate_generation_outputs", validate_outputs)
+    log = v0.BaseRayDiffusionTrainer._maybe_log_val_generations if version == 0 else V1._maybe_log_val_generations
+    latents = torch.zeros(2, 16, 2, 2, dtype=torch.bfloat16)
+
+    log(context, ["one", "two"], latents, [1, 2], previews=[None, None])
+
+    encoder.assert_not_called()
+    wrapper.assert_not_called()
+    media_logger.assert_not_called()
+    context.validation_generations_logger.log.assert_not_called()
+    validate_outputs.assert_not_called()
+
+
+@pytest.mark.parametrize("version", [0, 1])
+def test_partially_absent_previews_still_fail_validation_logging(monkeypatch, version):
+    context = SimpleNamespace(
+        global_steps=1,
+        config=OmegaConf.create({"trainer": {"logger": ["wandb"], "log_val_generations": 2}}),
+        validation_generations_logger=Mock(),
+    )
+    encoder = Mock()
+    monkeypatch.setattr(tracking, "_export_video", encoder)
+    preview = MediaArtifact(MediaSpec("image", "decoded", "CHW"), torch.zeros(3, 2, 2, dtype=torch.uint8))
+    log = v0.BaseRayDiffusionTrainer._maybe_log_val_generations if version == 0 else V1._maybe_log_val_generations
+
+    with pytest.raises(ValueError, match="Preview sample=1 is missing"):
+        log(context, ["one", "two"], torch.zeros(2, 16, 2, 2), [1, 2], previews=[preview, None])
+
+    encoder.assert_not_called()
+    context.validation_generations_logger.log.assert_not_called()
+
+
+@pytest.mark.parametrize("version", [0, 1])
+@pytest.mark.parametrize("invalid_audio", [torch.zeros(1, 2, 8), torch.zeros(1, 8)])
+def test_capped_dump_validates_audio_for_unretained_rows(monkeypatch, tmp_path, version, invalid_audio):
+    context = SimpleNamespace(global_steps=1, _dump_executor=Mock())
+    encoder = Mock()
+    monkeypatch.setattr(v0, "_export_video", encoder)
+    dump = v0.BaseRayDiffusionTrainer._dump_generations if version == 0 else V1._dump_generations
+    sample_rates = [32000, 32000 if invalid_audio.ndim == 3 else 0]
+    with pytest.raises(ValueError, match="audio"):
+        dump(
+            context,
+            ["one", "two"],
+            torch.zeros(2, 4, 3, 2, 2, dtype=torch.uint8),
+            [None, None],
+            [1, 2],
+            {},
+            str(tmp_path),
+            max_samples=1,
+            media_kind="video",
+            audios=[torch.zeros(1, 8), invalid_audio],
+            audio_sample_rates=sample_rates,
+        )
+    encoder.assert_not_called()
+    context._dump_executor.submit.assert_not_called()
+    assert not (tmp_path / "1").exists()
 
 
 @pytest.mark.parametrize("version", [0, 1])

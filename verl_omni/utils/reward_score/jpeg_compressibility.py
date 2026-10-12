@@ -54,9 +54,13 @@ def compute_score(solution_image, extra_info=None):
 
     Args:
         solution_image: the solution image or video, in shape (C, H, W) or (N, C, H, W).
+        extra_info: artifact declarations or explicit ``media_kind``/``fps`` metadata.
+
+    Returns:
+        The first frame's score; video rewards do not average across frames.
     """
     from verl_omni.utils.reward_score.reward_utils import visual_reward_frames
 
     frames = visual_reward_frames(solution_image, extra_info or {})
     scores = jpeg_compressibility()(frames, None)[0]
-    return float(scores.mean())
+    return float(scores[0])

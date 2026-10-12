@@ -19,8 +19,10 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-from verl_omni.pipelines.diffusion_rollout_output import install_rollout_postprocessor
+from verl_omni.pipelines.diffusion_rollout_output import install_rollout_postprocessor, wants_decoded_preview
+from verl_omni.pipelines.rollout_media import ArtifactContractError
 
 
 def test_factory_installation_is_idempotent_and_scoped_to_selected_module():
@@ -71,3 +73,36 @@ def test_factory_wrapper_preserves_request_sampling_signature_and_training_metad
 def test_unknown_factory_is_not_silently_ignored():
     with pytest.raises(AttributeError, match="missing_factory"):
         install_rollout_postprocessor(ModuleType("upstream_pipeline"), "missing_factory")
+
+
+@pytest.mark.parametrize("output_type", ["latent", "pt"])
+@pytest.mark.parametrize(
+    "requested", ["image_preview", {"image_preview": True}, [7], ["image_preview", "image_preview"]]
+)
+def test_preview_decode_gate_rejects_malformed_requested_outputs(output_type, requested):
+    sampling = OmniDiffusionSamplingParams(extra_args={"requested_outputs": requested})
+    with pytest.raises(ArtifactContractError, match="requested_outputs"):
+        wants_decoded_preview(output_type, sampling)
+
+
+@pytest.mark.parametrize(
+    "output_type,requested,expected",
+    [
+        ("latent", None, False),
+        ("latent", [], False),
+        ("latent", ["image_preview"], True),
+        ("latent", ["video_preview"], False),
+        ("pt", [], True),
+    ],
+)
+def test_preview_decode_gate_honors_valid_explicit_selection(output_type, requested, expected):
+    sampling = OmniDiffusionSamplingParams(extra_args={"requested_outputs": requested})
+    assert wants_decoded_preview(output_type, sampling) is expected
+
+
+def test_preview_decode_gate_honors_packed_request_union():
+    sampling = OmniDiffusionSamplingParams(extra_args={"requested_outputs": []})
+    assert wants_decoded_preview("latent", sampling, requested=["image_preview"])
+    assert not wants_decoded_preview("latent", sampling, requested=["video_preview"])
+    with pytest.raises(ArtifactContractError, match="requested_outputs"):
+        wants_decoded_preview("pt", sampling, requested="image_preview")

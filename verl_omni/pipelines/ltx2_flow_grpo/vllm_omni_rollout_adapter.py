@@ -446,7 +446,9 @@ class LTX23PipelineWithLogProb(LTX2Pipeline):
         if self._artifact_decode:
             specs.update(
                 {
-                    "video_preview": MediaSpec("video", "decoded", "TCHW", fps=request.sampling_params.frame_rate),
+                    "video_preview": MediaSpec(
+                        "video", "decoded", "TCHW", fps=request.sampling_params.resolved_frame_rate
+                    ),
                     "audio": MediaSpec("audio", "decoded", "CT", sample_rate=audio_sample_rate),
                 }
             )

@@ -1,6 +1,6 @@
 # Named diffusion media artifacts
 
-Last updated: 10/05/2026.
+Last updated: 10/12/2026.
 
 All registered in-tree diffusion adapters emit named media. The strategy,
 agent loops, rewards and V0/V1 exporters consume declarations rather than
@@ -207,8 +207,9 @@ Reproducible GPU checks use the existing rollout and model-specific fixtures:
   validate preview conversion for pixel rewards. CPU export tests cover encoding
   separately; the model-specific trainer smoke recipes remain the full-training checks.
 - Existing training recipes cover actor updates, ordinary agent loops and V1/TQ.
-  V1 requires **both** `trainer.use_v1=True` and `transfer_queue.enable=True`;
-  invoking `main_diffusion_v1` alone can fall back to V0.
+  `main_diffusion_v1` force-enables TransferQueue before worker initialization;
+  `transfer_queue.enable=True` need not be supplied separately. This entrypoint
+  falls back to V0 only when `trainer.use_v1=False` is configured.
 
 Set `CUDA_VISIBLE_DEVICES` explicitly and do not stop unrelated Ray/GPU jobs.
 Tiny-model plumbing, real-VAE layout verification and full-model training quality

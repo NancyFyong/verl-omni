@@ -342,15 +342,13 @@ def _to_pil_hwc(image) -> Image.Image:
 
 
 def _decoded_pickscore_image(solution_image, extra_info: dict | None) -> Image.Image:
-    """Select one decoded image, or accept an already decoded image.
+    """Select one explicitly declared decoded image.
 
-    Named artifacts and ``media_kind`` reject latent responses. Native replica
-    dispatch already holds a decoded image and does not repeat that declaration.
+    Named artifacts and ``media_kind`` reject latent responses. The native
+    replica dispatch supplies an already-converted image, so it uses the
+    internal batching path instead of this declaration check.
     """
     extra_info = extra_info or {}
-    declared = extra_info.get("media_artifacts") is not None or extra_info.get("media_kind") is not None
-    if not declared:
-        return _to_pil_hwc(solution_image)
 
     from verl_omni.utils.reward_score.reward_utils import visual_reward_frames
 

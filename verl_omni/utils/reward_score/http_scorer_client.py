@@ -94,7 +94,7 @@ async def compute_score(
 
     from verl_omni.utils.reward_score.reward_utils import visual_reward_frames
 
-    frames = visual_reward_frames(solution_image, kwargs.get("extra_info") or {"media_kind": "image"})
+    frames = visual_reward_frames(solution_image, kwargs.get("extra_info") or {})
     if len(frames) != 1:
         raise ValueError("HTTP image scorer requires one decoded image")
     loop = asyncio.get_running_loop()

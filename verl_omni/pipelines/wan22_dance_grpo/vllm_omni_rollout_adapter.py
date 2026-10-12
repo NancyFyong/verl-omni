@@ -103,8 +103,8 @@ class Wan22DanceGRPOPipelineWithLogProb(Wan22Pipeline):
     Registered under ``("WanPipeline", "dance_grpo")``.
     """
 
-    #: Declares the primary rollout media stream so downstream consumers read
-    #: the modality from the adapter instead of inferring it from tensor rank.
+    #: Declares the named artifacts available to a request, so consumers select
+    #: one by name instead of inferring modality from tensor rank or channel size.
     diffusion_io_spec = DiffusionIOSpec(
         artifacts={
             "video_preview": MediaSpec("video", "decoded", "TCHW"),
@@ -690,7 +690,7 @@ class Wan22DanceGRPOPipelineWithLogProb(Wan22Pipeline):
             latents = latents / latents_std + latents_mean
             output = self.vae.decode(latents, return_dict=False)[0]
 
-        fps = sampling_params.frame_rate
+        fps = sampling_params.resolved_frame_rate
         if output is not None and sampling_params.enable_frame_interpolation:
             output, multiplier = pipeline_wan2_2.interpolate_video_tensor(
                 output,

@@ -51,6 +51,25 @@ def batch_items(values: Any, batch_size: int, name: str) -> list[Any]:
     return [values] * batch_size
 
 
+def validate_audio_batch(audios: Any, rates: Any, count: int, *, context: str) -> tuple[list[Any], list[Any]]:
+    """Normalize audio/sample-rate pairs and validate every CT waveform before retention.
+
+    Args:
+        audios: Optional CT waveforms, as a batch or per-sample sequence.
+        rates: Optional scalar or per-sample sample rates.
+        count: Full sample count before export limits are applied.
+        context: Description included in waveform validation errors.
+
+    Returns:
+        Validated per-sample waveforms and sample rates.
+    """
+    audios = batch_items(audios, count, "audio")
+    rates = batch_items(rates, count, "audio_sample_rate")
+    for audio, rate in zip(audios, rates, strict=True):
+        validate_audio(audio, rate, context=context)
+    return audios, rates
+
+
 def _write_wav(audio: Any, sample_rate: Any, path: Path) -> None:
     waveform = torch.as_tensor(audio).detach().cpu().float()
     while waveform.ndim > 2 and waveform.shape[0] == 1:
@@ -59,8 +78,6 @@ def _write_wav(audio: Any, sample_rate: Any, path: Path) -> None:
         waveform = waveform.unsqueeze(0)
     elif waveform.ndim != 2:
         raise ValueError(f"Expected audio shape [T] or [C, T], got {tuple(waveform.shape)}.")
-    if waveform.shape[0] > 8 and waveform.shape[1] <= 8:
-        waveform = waveform.transpose(0, 1)
     if waveform.shape[0] > 2:
         waveform = waveform.mean(dim=0, keepdim=True)
 
@@ -181,9 +198,8 @@ def _export_video(
 def wrap_val_samples_for_wandb(samples, fps=24, output_dir=None, media_kinds=None):
     """Wrap validation samples and prepare top-level ``wandb`` media.
 
-    Declared ``media_kinds`` decide whether each output is an image or video;
-    tensor rank is retained only as a compatibility fallback. Video outputs in
-    ``[T, C, H, W]``, ``[C, T, H, W]``, or ``[T, H, W, C]`` layouts are encoded
+    Declared ``media_kinds`` or artifact specs decide whether each output is an
+    image or video. Video outputs are normalized to ``[T, C, H, W]`` and encoded
     to mp4 and passed to ``wandb.Video`` by path. Provide ``output_dir`` to keep
     the media available for asynchronous upload; otherwise a temp dir is
     returned for cleanup. Optional tuple elements four and five carry audio and

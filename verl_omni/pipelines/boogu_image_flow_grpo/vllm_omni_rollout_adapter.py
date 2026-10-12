@@ -118,8 +118,8 @@ class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipel
 
     supports_request_batch = True
 
-    #: Declares the primary rollout media stream so downstream consumers read
-    #: the modality from the adapter instead of inferring it from tensor rank.
+    #: Declares the named artifacts available to a request, so consumers select
+    #: one by name instead of inferring modality from tensor rank or channel size.
     diffusion_io_spec = DiffusionIOSpec(
         artifacts={
             "image_preview": MediaSpec("image", "decoded", "CHW"),

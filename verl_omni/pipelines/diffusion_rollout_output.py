@@ -33,7 +33,14 @@ import torch
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-from verl_omni.pipelines.rollout_media import MediaArtifact, MediaSpec, select_artifact, validate_artifacts
+from verl_omni.pipelines.rollout_media import (
+    MediaArtifact,
+    MediaSpec,
+    is_decoded_visual,
+    requested_artifact_names,
+    select_artifact,
+    validate_artifacts,
+)
 
 _MEDIA_KEYS = frozenset(("image", "video", "output", "audio"))
 
@@ -173,7 +180,8 @@ def install_rollout_postprocessor(module: ModuleType, factory_name: str) -> None
         module: Upstream pipeline module consulted by the engine's registry.
         factory_name: Name of its postprocessor factory to wrap in this process.
     """
-    # TODO: Remove once upstream postprocessors pass named rollout envelopes through.
+    # TODO (NancyFyong, verl-project/verl-omni#403): Remove once upstream postprocessors
+    # pass named rollout envelopes through without wrapping their factories.
     factory = getattr(module, factory_name)
     if getattr(factory, "_preserves_rollout_output", False) is True:
         return
@@ -224,11 +232,7 @@ def with_media_artifacts(
         select_artifact(normalized, name=audio, modality="audio", representation="decoded")
     if preview is not None:
         artifact = normalized.get(preview)
-        if (
-            artifact is None
-            or artifact.spec.representation != "decoded"
-            or artifact.spec.modality not in ("image", "video")
-        ):
+        if not is_decoded_visual(artifact):
             raise ValueError(f"{context}: preview artifact={preview!r} must be decoded visual media")
     metadata["media_artifacts"] = {
         "primary": primary,
@@ -304,7 +308,11 @@ def with_batched_media_artifacts(
 
 
 def wants_decoded_preview(
-    output_type: str, sampling_params: OmniDiffusionSamplingParams, *, modality: str = "image"
+    output_type: str,
+    sampling_params: OmniDiffusionSamplingParams,
+    *,
+    modality: str = "image",
+    requested: list[str] | None = None,
 ) -> bool:
     """Honor explicit preview requests even when the primary output is latent.
 
@@ -312,12 +320,15 @@ def wants_decoded_preview(
         output_type: Requested primary representation, including ``latent``.
         sampling_params: Request sampling parameters carrying ``requested_outputs`` in extra_args.
         modality: Visual modality whose named preview is checked.
+        requested: Optional union of artifact names from a packed request batch.
 
     Returns:
         Whether decoded media is needed for the primary or an explicitly requested preview.
     """
-    requested = (sampling_params.extra_args or {}).get("requested_outputs") or []
-    return output_type != "latent" or f"{modality}_preview" in requested
+    if requested is None:
+        requested = (sampling_params.extra_args or {}).get("requested_outputs")
+    names = requested_artifact_names(requested, context="preview decode")
+    return output_type != "latent" or f"{modality}_preview" in names
 
 
 def quantize_pixels(decoded: torch.Tensor, pixel_range: str, *, context: str) -> torch.Tensor:

@@ -47,8 +47,8 @@ def _coalesce_not_none(value, default):
 class QwenImageDPOPipeline(QwenImageLoRAMixin, QwenImagePipeline):
     """Rollout pipeline that returns DPO training tensors with generated images."""
 
-    #: Declares the primary rollout media stream so downstream consumers read
-    #: the modality from the adapter instead of inferring it from tensor rank.
+    #: Declares the named artifacts available to a request, so consumers select
+    #: one by name instead of inferring modality from tensor rank or channel size.
     diffusion_io_spec = DiffusionIOSpec(
         artifacts={
             "image_preview": MediaSpec("image", "decoded", "CHW"),

@@ -40,15 +40,26 @@ def _validate_visual_response(response_visual, config, *, is_validate: bool, ext
         if primary not in artifacts:
             raise ArtifactContractError(f"Reward entry requires an explicit primary artifact, got {primary!r}")
         artifact = artifacts[primary]
-        if (
-            not isinstance(response_visual, torch.Tensor)
-            or response_visual.dtype != artifact.data.dtype
-            or response_visual.shape != artifact.data.shape
-            or not torch.equal(response_visual, artifact.data)
+        if not isinstance(response_visual, torch.Tensor) or (
+            response_visual.dtype != artifact.data.dtype or response_visual.shape != artifact.data.shape
         ):
             raise ArtifactContractError(
                 f"{artifact.context}, artifact={primary!r}: responses projection does not match declared primary"
             )
+        try:
+            # Exact values, but NaN positions match and the device is not part of the contract.
+            torch.testing.assert_close(
+                response_visual,
+                artifact.data,
+                rtol=0,
+                atol=0,
+                equal_nan=True,
+                check_device=False,
+            )
+        except AssertionError as error:
+            raise ArtifactContractError(
+                f"{artifact.context}, artifact={primary!r}: responses projection does not match declared primary"
+            ) from error
         return
     rollout_config = config.actor_rollout_ref.rollout
     pipeline_config = rollout_config.val_kwargs.pipeline if is_validate else rollout_config.pipeline

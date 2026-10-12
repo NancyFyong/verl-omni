@@ -33,6 +33,7 @@ from vllm_omni.diffusion.models.ltx2.ltx2_guidance import LTXGuidanceExecutor
 from vllm_omni.diffusion.models.ltx2.ltx2_latents import LTXAVState
 from vllm_omni.diffusion.models.ltx2.ltx2_recipes import LTXPhaseRecipe
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 from verl_omni.pipelines.ltx2_flow_grpo.agent_loop import LTX2DiffusionSingleTurnAgentLoop, _messages_to_text
 from verl_omni.pipelines.ltx2_flow_grpo.common import (
@@ -953,7 +954,8 @@ def test_ltx2_rollout_forward_attaches_trajectory_and_metadata() -> None:
     req.num_reqs = 1
     req.requests = [
         SimpleNamespace(
-            request_id="ltx", sampling_params=SimpleNamespace(output_type="pt", extra_args={}, frame_rate=24)
+            request_id="ltx",
+            sampling_params=OmniDiffusionSamplingParams(output_type="pt", extra_args={}, frame_rate=24),
         )
     ]
     pipeline.distributed_video_decode = False

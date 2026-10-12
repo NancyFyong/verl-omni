@@ -171,6 +171,22 @@ class MediaArtifact:
         return replace(self, spec=replace(self.spec, layout=target), data=data)
 
 
+def is_decoded_visual(artifact: MediaArtifact | None) -> bool:
+    """Return whether an artifact declares a decoded image or video preview.
+
+    Args:
+        artifact: A validated artifact, or None for an absent selection.
+
+    Returns:
+        Whether its declared representation and modality support visual previews.
+    """
+    return (
+        artifact is not None
+        and artifact.spec.representation == "decoded"
+        and artifact.spec.modality in ("image", "video")
+    )
+
+
 def requested_artifact_names(requested: Any, *, context: str) -> list[str]:
     """Validate output selection without interpreting strings/dicts as name sequences."""
     if requested is None:
@@ -220,11 +236,7 @@ def artifact_fields(artifacts: Mapping[str, MediaArtifact], primary: str, previe
     """Flatten tensors into regular TensorDict fields; metadata contains no tensors."""
     if primary not in artifacts:
         raise ValueError(f"Primary artifact {primary!r} is absent")
-    if preview is not None and (
-        preview not in artifacts
-        or artifacts[preview].spec.representation != "decoded"
-        or artifacts[preview].spec.modality not in ("image", "video")
-    ):
+    if preview is not None and not is_decoded_visual(artifacts.get(preview)):
         raise ValueError(f"Preview artifact={preview!r} must name decoded visual media")
     for name, artifact in artifacts.items():
         artifact.validate(context="artifact transport", name=name)
@@ -267,20 +279,6 @@ def artifacts_from_fields(fields: Mapping[str, Any], *, context: str) -> dict[st
     )
 
 
-def validate_visual_batch(outputs: torch.Tensor, media_kind: str, *, fps: float, context: str) -> None:
-    """Validate the canonical batched tensor API before starting best-effort media I/O."""
-    if media_kind not in ("image", "video"):
-        raise ArtifactContractError(f"{context}: expected visual media_kind, got {media_kind!r}")
-    layout = "CHW" if media_kind == "image" else "TCHW"
-    if outputs.ndim != len(layout) + 1:
-        raise ArtifactContractError(
-            f"{context}: expected canonical batched {media_kind}, got shape={tuple(outputs.shape)}"
-        )
-    spec = MediaSpec(media_kind, "decoded", layout, fps=fps if media_kind == "video" else None)
-    for index, output in enumerate(outputs):
-        MediaArtifact(spec, output).validate(context=context, name=f"preview_{index}")
-
-
 def validate_audio(audio: Any, sample_rate: Any, *, context: str) -> None:
     """Validate the explicitly CT audio projection; no batch/axis or sample-rate fallback."""
     if audio is not None:
@@ -304,7 +302,7 @@ def validate_previews(previews: list[MediaArtifact] | None, count: int) -> list[
         if not isinstance(preview, MediaArtifact):
             raise ValueError(f"Preview sample={i} is missing; cannot substitute a response/latent")
         preview.validate(context=f"preview sample={i}", name="preview")
-        if preview.spec.representation != "decoded" or preview.spec.modality not in ("image", "video"):
+        if not is_decoded_visual(preview):
             raise ValueError(f"Preview sample={i}: expected decoded visual media, got {preview.spec}")
     if len({preview.spec.modality for preview in previews}) != 1:
         raise ValueError("Cannot export a mixed image/video preview batch")
@@ -332,7 +330,7 @@ def previews_from_batch(batch: Any) -> list[MediaArtifact] | None:
         if name not in artifacts:
             raise ValueError(f"media export sample={i}: requested decoded preview {name!r} is absent")
         artifact = artifacts[name]
-        if artifact.spec.representation != "decoded" or artifact.spec.modality not in ("image", "video"):
+        if not is_decoded_visual(artifact):
             raise ValueError(f"media export sample={i}, artifact={name!r}: expected decoded visual preview")
         previews.append(artifact)
     return previews

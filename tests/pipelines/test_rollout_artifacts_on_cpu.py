@@ -225,3 +225,51 @@ def test_preview_selection_never_falls_back_to_latent():
             modality="video",
             representation="decoded",
         )
+
+
+def _parse_named_media(sampling, preview="video_preview"):
+    artifacts = _artifacts()
+    header = {
+        "primary": "video_latent",
+        "preview": preview,
+        "audio": "audio",
+        "specs": {name: asdict(artifact.spec) for name, artifact in artifacts.items()},
+    }
+    final = SimpleNamespace(
+        images=[], multimodal_output={"video": {name: artifact.data for name, artifact in artifacts.items()}}
+    )
+    strategy = DiffusionStrategy(SimpleNamespace(model_config=None))
+    return strategy._parse_media_artifacts(final, header, sampling, context="pipeline=test, request_id=req")
+
+
+def test_strategy_normalizes_each_artifact_once(monkeypatch):
+    calls = []
+    normalize = MediaArtifact.normalized
+
+    def record_normalization(self, *, context, name):
+        calls.append(name)
+        return normalize(self, context=context, name=name)
+
+    monkeypatch.setattr(MediaArtifact, "normalized", record_normalization)
+    artifacts = _parse_named_media({"output_type": "latent", "requested_outputs": ["video_preview"]})
+    assert sorted(calls) == sorted(artifacts)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_strategy_still_rejects_requested_but_absent_artifacts(nested):
+    selection = {"requested_outputs": ["missing_preview"]}
+    sampling = {"output_type": "latent", **({"extra_args": selection} if nested else selection)}
+    with pytest.raises(ValueError, match="requested artifacts absent"):
+        _parse_named_media(sampling)
+
+
+@pytest.mark.parametrize("requested", ["video_preview", ["video_preview", "video_preview"]])
+def test_strategy_still_validates_requested_name_sequences(requested):
+    with pytest.raises(ValueError, match="requested_outputs"):
+        _parse_named_media({"output_type": "latent", "requested_outputs": requested})
+
+
+@pytest.mark.parametrize("preview", ["video_latent", "audio", "missing_preview"])
+def test_strategy_preview_must_be_a_present_decoded_visual(preview):
+    with pytest.raises(ValueError, match="decoded visual"):
+        _parse_named_media({"output_type": "latent"}, preview=preview)

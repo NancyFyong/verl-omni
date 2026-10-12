@@ -29,12 +29,13 @@ from verl_omni.pipelines.rollout_media import (
     ARTIFACT_PREFIX,
     ARTIFACT_SPECS,
     PRIMARY_ARTIFACT,
+    ArtifactContractError,
     DiffusionIOSpec,
     MediaArtifact,
     artifacts_from_fields,
+    is_decoded_visual,
     requested_artifact_names,
     select_artifact,
-    validate_artifacts,
 )
 from verl_omni.pipelines.rollout_request import OmniRolloutRequest, _alias_values_match
 from verl_omni.workers.config import DiffusionModelConfig, DiffusionRolloutConfig
@@ -444,21 +445,17 @@ class DiffusionStrategy(OmniStrategyBase):
             },
             context=context,
         )
-        validate_artifacts(
-            artifacts.items(),
-            {name: artifact.spec for name, artifact in artifacts.items()},
-            primary=primary_name,
-            context=context,
-            requested=sampling_params.get(
+        requested = requested_artifact_names(
+            sampling_params.get(
                 "requested_outputs", (sampling_params.get("extra_args") or {}).get("requested_outputs")
             ),
+            context=context,
         )
+        absent = set(requested) - artifacts.keys()
+        if absent:
+            raise ArtifactContractError(f"{context}: requested artifacts absent: {sorted(absent)}")
         preview_name = header["preview"]
-        if preview_name is not None and (
-            preview_name not in artifacts
-            or artifacts[preview_name].spec.representation != "decoded"
-            or artifacts[preview_name].spec.modality not in ("image", "video")
-        ):
+        if preview_name is not None and not is_decoded_visual(artifacts.get(preview_name)):
             raise ValueError(f"{context}: preview artifact={preview_name!r} must name decoded visual media")
         primary = artifacts[primary_name]
         expected_representation = "latent" if _diffusion_output_type(sampling_params) == "latent" else "decoded"

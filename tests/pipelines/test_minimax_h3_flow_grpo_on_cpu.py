@@ -23,6 +23,7 @@ import torch
 from tensordict import TensorDict
 from vllm_omni.diffusion.data import DiffusionOutput as VllmDiffusionOutput
 from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import MINIMAX_H3_TOKEN_ID_NATIVE_KEY
 from verl_omni.pipelines.minimax_h3_flow_grpo.agent_loop import MiniMaxH3DiffusionSingleTurnAgentLoop
@@ -153,7 +154,7 @@ def test_rollout_output_reaches_actor_and_replays_joint_transition(monkeypatch) 
     request = SimpleNamespace(
         request_id="h3-contract",
         prompt={"prompt_token_ids": [1, 2]},
-        sampling_params=SimpleNamespace(
+        sampling_params=OmniDiffusionSamplingParams(
             extra_args={MINIMAX_H3_TOKEN_ID_NATIVE_KEY: True},
             frame_rate=24,
             output_type="pt",

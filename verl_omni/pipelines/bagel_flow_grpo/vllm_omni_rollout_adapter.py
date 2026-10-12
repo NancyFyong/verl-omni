@@ -245,8 +245,8 @@ def _pick_sde_window(
 class BagelPipelineWithLogProb(BagelPipeline):
     """BAGEL pipeline variant for RL rollouts with verl-omni."""
 
-    #: Declares the primary rollout media stream so downstream consumers read
-    #: the modality from the adapter instead of inferring it from tensor rank.
+    #: Declares the named artifacts available to a request, so consumers select
+    #: one by name instead of inferring modality from tensor rank or channel size.
     diffusion_io_spec = DiffusionIOSpec(
         artifacts={
             "image_preview": MediaSpec("image", "decoded", "CHW"),

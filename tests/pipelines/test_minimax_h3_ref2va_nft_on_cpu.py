@@ -21,6 +21,7 @@ import pytest
 import torch
 from PIL import Image
 from tensordict import TensorDict
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     AUDIO_ROW_WIDTH,
@@ -451,7 +452,7 @@ def test_ref2va_rollout_publishes_fixed_size_reference_replay_fields(monkeypatch
     )
     request = MagicMock(
         prompts=[{"prompt_token_ids": [1, 2]}],
-        sampling_params=SimpleNamespace(
+        sampling_params=OmniDiffusionSamplingParams(
             num_outputs_per_prompt=1,
             frame_rate=24,
             output_type="pt",

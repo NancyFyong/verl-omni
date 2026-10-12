@@ -57,7 +57,6 @@ from verl_omni.pipelines.rollout_media import (
     previews_from_batch,
     resolve_batch_media_kind,
     resolve_is_video,
-    validate_audio,
     validate_previews,
     validate_visual_media_batch_rank,
 )
@@ -93,6 +92,7 @@ from verl_omni.utils.tracking import (
     _export_video,
     batch_items,
     log_wandb_media,
+    validate_audio_batch,
     wrap_val_samples_for_wandb,
 )
 from verl_omni.workers.config.reward import reward_is_enabled, reward_role_required, streaming_reward_enabled
@@ -276,10 +276,7 @@ def dump_generations(
     is_video = resolve_is_video(media_kind)
 
     if is_video:
-        audios = batch_items(audios, n_full, "audio")
-        audio_sample_rates = batch_items(audio_sample_rates, n_full, "audio_sample_rate")
-        for audio, audio_sample_rate in zip(audios, audio_sample_rates, strict=True):
-            validate_audio(audio, audio_sample_rate, context="generation dump")
+        audios, audio_sample_rates = validate_audio_batch(audios, audio_sample_rates, n_full, context="generation dump")
 
     try:
         os.makedirs(visual_folder, exist_ok=True)
@@ -651,6 +648,8 @@ class BaseRayDiffusionTrainer(ABC):
         if generations_to_log == 0 or len(inputs) == 0:
             return
         previews = validate_previews(previews, len(inputs))
+        if previews == []:
+            return
         if previews is not None:
             outputs = previews
             media_kinds = [preview.spec.modality for preview in previews]

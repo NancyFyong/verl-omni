@@ -246,7 +246,10 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
             },
             specs={
                 "video_preview": MediaSpec(
-                    "video", "decoded", "THWC", fps=24 if sampling.frame_rate is None else sampling.frame_rate
+                    "video",
+                    "decoded",
+                    "THWC",
+                    fps=24 if sampling.resolved_frame_rate is None else sampling.resolved_frame_rate,
                 ),
                 "audio": MediaSpec("audio", "decoded", "CT", sample_rate=32000),
                 "video_latent": MediaSpec("video", "latent", "CTHW"),

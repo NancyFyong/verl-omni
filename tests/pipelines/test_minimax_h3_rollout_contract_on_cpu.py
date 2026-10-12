@@ -19,6 +19,7 @@ import pytest
 import torch
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 from verl_omni.pipelines.minimax_h3_diffusion_nft.vllm_omni_rollout_adapter import MiniMaxH3DiffusionNFTPipeline
@@ -27,7 +28,7 @@ from verl_omni.pipelines.rollout_media import MediaArtifact, MediaSpec
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy
 
 
-def _make_h3_final_res(monkeypatch, algorithm, output_type="pt", extra_args=None, fps=24):
+def _make_h3_final_res(monkeypatch, algorithm, output_type="pt", extra_args=None, fps=24, sampling_kwargs=None):
     video = torch.zeros(1, 5, 8, 12, 3, dtype=torch.uint8)
     audio = torch.ones(1, 2, 320)
     video_latent = torch.ones(1, 24, 2, 2, 2, dtype=torch.float16)
@@ -40,8 +41,8 @@ def _make_h3_final_res(monkeypatch, algorithm, output_type="pt", extra_args=None
     request = SimpleNamespace(
         request_id="h3-test",
         prompts=[{"prompt": "H3 prompt"}],
-        sampling_params=SimpleNamespace(
-            frame_rate=fps,
+        sampling_params=OmniDiffusionSamplingParams(
+            **({"frame_rate": fps, "fps": None} if sampling_kwargs is None else sampling_kwargs),
             output_type=output_type,
             extra_args=extra_args or {},
             num_outputs_per_prompt=1,
@@ -96,11 +97,11 @@ def _make_h3_final_res(monkeypatch, algorithm, output_type="pt", extra_args=None
     )
 
 
-def _generate(monkeypatch, algorithm="diffusion_nft", output_type="pt", extra_args=None, fps=24):
+def _generate(monkeypatch, algorithm="diffusion_nft", output_type="pt", extra_args=None, fps=24, sampling_kwargs=None):
     server = SimpleNamespace(
         global_steps=3, model_config=SimpleNamespace(architecture="MiniMaxH3Pipeline", algorithm=algorithm)
     )
-    final_res = _make_h3_final_res(monkeypatch, algorithm, output_type, extra_args, fps)
+    final_res = _make_h3_final_res(monkeypatch, algorithm, output_type, extra_args, fps, sampling_kwargs)
     return DiffusionStrategy(server).process_output(
         final_res,
         None,
@@ -239,3 +240,18 @@ def test_dump_rejects_undeclared_extra_batch_axis(tmp_path):
             dump_path=str(tmp_path),
             media_kind="video",
         )
+
+
+@pytest.mark.parametrize("algorithm", ["diffusion_nft", "flow_grpo"])
+@pytest.mark.parametrize(
+    "sampling_kwargs,expected",
+    [
+        ({"fps": 30}, 30),
+        ({"fps": 30, "frame_rate": 23.976}, 23.976),
+        ({"fps": 29.97}, 29.97),
+        ({"fps": None, "frame_rate": None}, 24),
+    ],
+)
+def test_h3_forward_emits_resolved_frame_rate(monkeypatch, algorithm, sampling_kwargs, expected):
+    result = _generate(monkeypatch, algorithm, sampling_kwargs=sampling_kwargs)
+    assert result.artifacts["video_preview"].spec.fps == pytest.approx(expected)

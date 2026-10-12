@@ -63,7 +63,6 @@ from verl_omni.pipelines.rollout_media import (
     previews_from_batch,
     resolve_batch_media_kind,
     resolve_is_video,
-    validate_audio,
     validate_previews,
     validate_visual_media_batch_rank,
 )
@@ -104,7 +103,7 @@ from verl_omni.trainer.diffusion.v1.tq_utils import (
     put_dataproto_fields_to_tq,
     sort_diffusion_tq_keys,
 )
-from verl_omni.utils.tracking import batch_items
+from verl_omni.utils.tracking import batch_items, validate_audio_batch
 from verl_omni.workers.config.reward import (
     reward_is_enabled,
     reward_pool_is_separate,
@@ -1576,12 +1575,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             resolve_is_video(effective_media_kind)
             validate_visual_media_batch_rank(outputs.ndim, effective_media_kind)
         if effective_media_kind == "video":
-            for audio, audio_sample_rate in zip(
-                batch_items(audios, len(inputs), "audio"),
-                batch_items(audio_sample_rates, len(inputs), "audio_sample_rate"),
-                strict=True,
-            ):
-                validate_audio(audio, audio_sample_rate, context="generation dump")
+            validate_audio_batch(audios, audio_sample_rates, len(inputs), context="generation dump")
         self._drain_dump_futures()
         if self._dump_futures:
             logger.warning("Skipping media dump at step %s: previous dump is still running", self.global_steps)

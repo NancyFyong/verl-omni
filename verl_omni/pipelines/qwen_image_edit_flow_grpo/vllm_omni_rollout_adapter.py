@@ -121,8 +121,8 @@ def _condition_images_for_prompt_encoding(custom_prompt: dict) -> list[Any]:
 class QwenImageEditPlusPipelineWithLogProb(QwenImageLoRAMixin, QwenImageTokenIdPromptMixin, QwenImageEditPlusPipeline):
     """Qwen-Image-Edit-Plus rollout pipeline for FlowGRPO."""
 
-    #: Declares the primary rollout media stream so downstream consumers read
-    #: the modality from the adapter instead of inferring it from tensor rank.
+    #: Declares the named artifacts available to a request, so consumers select
+    #: one by name instead of inferring modality from tensor rank or channel size.
     diffusion_io_spec = DiffusionIOSpec(
         artifacts={
             "image_preview": MediaSpec("image", "decoded", "CHW"),
