@@ -873,3 +873,39 @@ def test_actor_rejects_non_replayable_rollout_contract_before_transformer(
     # prepare_model_inputs only validates and reshapes data; a bad rollout must
     # never invoke the model or defer the error until the expensive forward.
     module.assert_not_called()
+
+
+def test_meta_placeholder_output_returns_preserved_rollout_result(monkeypatch) -> None:
+    """A non-replying offload rank carries a placeholder, so the rollout result is returned as is."""
+    trajectory = _trajectory()
+    pipeline = object.__new__(MiniMaxH3PipelineWithLogProb)
+    pipeline.tokenizer = MagicMock()
+    pipeline._flow_grpo_trajectory = trajectory
+    request = SimpleNamespace(
+        request_id="h3-meta",
+        prompt={"prompt_token_ids": [1, 2]},
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={MINIMAX_H3_TOKEN_ID_NATIVE_KEY: True},
+            frame_rate=24,
+            output_type="pt",
+            max_sequence_length=2,
+            num_outputs_per_prompt=1,
+        ),
+    )
+    request_batch = SimpleNamespace(
+        requests=[request],
+        prompts=[request.prompt],
+        sampling_params=request.sampling_params,
+    )
+
+    def fake_forward(*args):
+        pipeline._flow_grpo_final_latents = (torch.zeros(1, 24, 2, 4, 4), torch.zeros(2, 32, 8))
+        pipeline._flow_grpo_trajectory = trajectory
+        return VllmDiffusionOutput(output=torch.empty(1, device="meta"))
+
+    with patch.object(MiniMaxH3Pipeline, "forward", side_effect=fake_forward):
+        rollout_output = pipeline.forward(request_batch)
+
+    assert pipeline._flow_grpo_final_latents is None
+    assert "media_artifacts" not in rollout_output.output.get("metadata", {})
+    torch.testing.assert_close(rollout_output.trajectory_latents, trajectory["all_latents"])

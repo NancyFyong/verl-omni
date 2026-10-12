@@ -262,17 +262,20 @@ def dump_generations(
     if previews == []:
         return
     if previews is not None:
-        outputs = torch.stack([preview.data for preview in previews])
+        # Previews are already validated and normalized; stacking them would abort the
+        # dump when one sample's resolution or frame count differs from another's.
+        batch_ndim = previews[0].data.ndim + 1
         media_kind = previews[0].spec.modality
         n_full = len(previews)
     else:
         _validate_generation_outputs(outputs)
+        batch_ndim = outputs.ndim
         n_full = outputs.shape[0]
     visual_folder = os.path.join(dump_path, f"{global_steps}")
 
     n = n_full if max_samples is None else min(max_samples, n_full)
     # Prefer the adapter-declared media kind over legacy rank/layout inference.
-    validate_visual_media_batch_rank(outputs.ndim, media_kind)
+    validate_visual_media_batch_rank(batch_ndim, media_kind)
     is_video = resolve_is_video(media_kind)
 
     if is_video:
@@ -306,7 +309,7 @@ def dump_generations(
                 if isinstance(fallback_audio, torch.Tensor):
                     fallback_audio = fallback_audio.detach().cpu()
                 fallback = {
-                    "video": outputs[i].detach().cpu(),
+                    "video": (previews[i].data if previews is not None else outputs[i]).detach().cpu(),
                     "audio": fallback_audio,
                     "audio_sample_rate": audio_sample_rates[i],
                 }

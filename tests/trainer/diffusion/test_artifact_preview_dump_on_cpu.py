@@ -265,3 +265,44 @@ def test_v1_dump_queue_is_bounded_and_does_not_retain_full_batch_storage(tmp_pat
     future.set_result(None)
     context._drain_dump_futures()
     assert context._dump_futures == []
+
+
+@pytest.mark.parametrize("version", [0, 1])
+def test_mixed_preview_shapes_do_not_abort_the_dump(monkeypatch, tmp_path, version):
+    """Media export is best-effort; differing preview shapes must be recorded, not raised."""
+    captured = []
+
+    def export(output, path, **kwargs):
+        captured.append(output)
+        Path(path).write_bytes(b"video")
+
+    monkeypatch.setattr(v0, "_export_video", export)
+    previews = [
+        MediaArtifact(MediaSpec("video", "decoded", "TCHW", fps=12), torch.zeros(3, 3, 4, 5, dtype=torch.uint8)),
+        MediaArtifact(MediaSpec("video", "decoded", "TCHW", fps=12), torch.zeros(2, 3, 2, 2, dtype=torch.uint8)),
+    ]
+    args = dict(
+        inputs=["one", "two"],
+        outputs=torch.randn(2, 16, 2, 2, 2, dtype=torch.bfloat16),
+        gts=[None, None],
+        scores=[1, 2],
+        reward_extra_infos_dict={},
+        dump_path=str(tmp_path),
+        media_kind="video",
+        previews=previews,
+    )
+    context = SimpleNamespace(global_steps=5)
+    if version == 0:
+        v0.BaseRayDiffusionTrainer._dump_generations(context, **args)
+    else:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            context._dump_executor = executor
+            context._dump_futures = []
+            context._drain_dump_futures = lambda: None
+            V1._dump_generations(context, **args)
+            for future, _ in context._dump_futures:
+                future.result()
+
+    assert len(captured) == 2
+    assert [item.data.shape for item in captured] == [(3, 3, 4, 5), (2, 3, 2, 2)]
+    assert (tmp_path / "5.jsonl").is_file()

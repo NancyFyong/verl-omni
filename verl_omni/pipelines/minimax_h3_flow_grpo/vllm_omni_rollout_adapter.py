@@ -614,6 +614,9 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
             raise RuntimeError("MiniMax H3 rollout did not capture final native latents")
         video_latent, audio_latent = self._flow_grpo_final_latents
         self._flow_grpo_final_latents = None
+        if has_meta_output:
+            # A non-replying offload rank carries a placeholder, not servable media.
+            return result
         video, audio = output.output
         sampling = req.sampling_params
         extra_args = sampling.extra_args or {}
