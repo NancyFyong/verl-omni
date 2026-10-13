@@ -58,12 +58,13 @@ def _dump_image_previews(tmp_path, version, latents, previews, max_samples=None)
 @pytest.mark.parametrize("version", [0, 1])
 @pytest.mark.parametrize("latent_shape", [(2, 16), (2, 16, 2, 2)])
 @pytest.mark.parametrize("max_samples", [None, 1])
-def test_latent_primary_dumps_decoded_image_previews(tmp_path, version, latent_shape, max_samples):
+@pytest.mark.parametrize("channels", [1, 3, 4])
+def test_latent_primary_dumps_decoded_image_previews(tmp_path, version, latent_shape, max_samples, channels):
     latents = torch.randn(latent_shape, dtype=torch.bfloat16)
     before = latents.clone()
     previews = [
-        MediaArtifact(MediaSpec("image", "decoded", "CHW"), torch.full((3, 4, 5), 37, dtype=torch.uint8)),
-        MediaArtifact(MediaSpec("image", "decoded", "HWC"), torch.full((2, 3, 3), 211, dtype=torch.uint8)),
+        MediaArtifact(MediaSpec("image", "decoded", "CHW"), torch.full((channels, 4, 5), 37, dtype=torch.uint8)),
+        MediaArtifact(MediaSpec("image", "decoded", "HWC"), torch.full((2, 3, channels), 211, dtype=torch.uint8)),
     ]
     rows = _dump_image_previews(tmp_path, version, latents, previews, max_samples)
     assert len(rows) == (2 if max_samples is None else max_samples)

@@ -177,6 +177,8 @@ class StableDiffusion3PipelineWithLogProb(SD3TokenIdPromptMixin, StableDiffusion
     """
 
     supports_request_batch = True
+    #: Also return the final latents as ``latents_clean`` when the output type is not ``both``.
+    emit_clean_latents = False
 
     diffusion_io_spec = DiffusionIOSpec(
         artifacts={
@@ -523,7 +525,7 @@ class StableDiffusion3PipelineWithLogProb(SD3TokenIdPromptMixin, StableDiffusion
         self._current_timestep = None
         output = self._decode_latents(latents, "image") if decode else None
         rl = {}
-        if output_type == "both":
+        if output_type == "both" or self.emit_clean_latents:
             rl["latents_clean"] = latents.float()
 
         result = rollout_output(
