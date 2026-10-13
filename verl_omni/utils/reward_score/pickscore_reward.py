@@ -440,12 +440,7 @@ async def compute_score_pickscore(
     device: str | None = None,
     **kwargs,
 ) -> dict:
-    from verl_omni.utils.reward_score.reward_utils import visual_reward_frames
-
-    frames = visual_reward_frames(solution_image, extra_info)
-    if len(frames) != 1:
-        raise ValueError("PickScore requires a single decoded image")
-    solution_image = frames[0]
+    solution_image = _decoded_pickscore_image(solution_image, extra_info)
     await _ensure_consumer(device)
 
     prompt = ground_truth if ground_truth else ""

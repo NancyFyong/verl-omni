@@ -44,7 +44,11 @@ from vllm_omni.diffusion.models.minimax_h3.packed_tokens import (
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
-from verl_omni.pipelines.diffusion_rollout_output import with_batched_media_artifacts, with_rollout_data
+from verl_omni.pipelines.diffusion_rollout_output import (
+    contains_meta_tensor,
+    with_batched_media_artifacts,
+    with_rollout_data,
+)
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     ref2va_reference_image_short_edge,
     serialize_ref_blocks,
@@ -68,17 +72,6 @@ from .common import (
 from .weight_sync import MiniMaxH3WeightSyncMixin
 
 __all__ = ["MiniMaxH3PipelineWithLogProb"]
-
-
-def _iter_tensors(value: Any):
-    if isinstance(value, torch.Tensor):
-        yield value
-    elif isinstance(value, dict):
-        for item in value.values():
-            yield from _iter_tensors(item)
-    elif isinstance(value, (list | tuple)):
-        for item in value:
-            yield from _iter_tensors(item)
 
 
 def _pad_first_dim(value: torch.Tensor, target: int) -> torch.Tensor:
@@ -597,7 +590,7 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
         replay_fields = tuple(key for key in replay_fields if key in trajectory)
         # With model-level CPU offload, vLLM-Omni leaves a meta placeholder on ranks that do not reply;
         # DiffusionOutput(to_cpu=True) cannot copy it. The trajectory tensors above are already on CPU.
-        has_meta_output = any(isinstance(item, torch.Tensor) and item.is_meta for item in _iter_tensors(output.output))
+        has_meta_output = contains_meta_tensor(output.output)
         result = with_rollout_data(
             output,
             trajectory_latents=trajectory["all_latents"],

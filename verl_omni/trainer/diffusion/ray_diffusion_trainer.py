@@ -252,7 +252,8 @@ def dump_generations(
 ):
     """Dump samples to disk as media files plus a JSONL index.
 
-    ``outputs`` is a batch of images ``[N, C, H, W]`` (-> ``{i}.jpg``) or videos
+    Named decoded ``previews`` take precedence over ``outputs``. Legacy ``outputs``
+    is a batch of images ``[N, C, H, W]`` (-> ``{i}.jpg``) or videos
     ``[N, T, C, H, W]`` (-> ``{i}.mp4`` at ``fps``). ``max_samples`` caps how many
     are written (``None`` = all). Optional generated audio is muxed into video files.
     Failed video exports are preserved as ``{i}.pt`` fallback payloads when possible.
@@ -333,12 +334,13 @@ def dump_generations(
             else:
                 output_paths.append(video_path)
     else:
-        images_pil = outputs[:n].cpu().permute(0, 2, 3, 1).numpy()
-        for i, image in enumerate(images_pil):
+        for i in range(n):
             image_path = os.path.join(visual_folder, f"{i}.jpg")
             try:
+                pixels = previews[i].data if previews is not None else outputs[i]
+                image = pixels.detach().cpu().permute(1, 2, 0).numpy()
                 Image.fromarray(image).save(image_path)
-            except (OSError, ValueError) as error:
+            except (OSError, TypeError, ValueError, RuntimeError) as error:
                 image_export_errors[i] = f"{type(error).__name__}: {error}"
                 sys_logger.warning("Failed to export rollout image at step %s sample %s: %s", global_steps, i, error)
                 output_paths.append(None)

@@ -31,7 +31,11 @@ from vllm_omni.diffusion.models.minimax_h3.packed_tokens import (
 from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
 
-from verl_omni.pipelines.diffusion_rollout_output import with_batched_media_artifacts, with_rollout_data
+from verl_omni.pipelines.diffusion_rollout_output import (
+    contains_meta_tensor,
+    with_batched_media_artifacts,
+    with_rollout_data,
+)
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import (
     AUDIO_ROW_WIDTH,
     MiniMaxH3RolloutWeightSyncMixin,
@@ -223,6 +227,7 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
                 }
             )
 
+        has_meta_output = contains_meta_tensor(output.output)
         result = with_rollout_data(
             output,
             prompt_embeddings={
@@ -230,8 +235,11 @@ class MiniMaxH3DiffusionNFTPipeline(MiniMaxH3RolloutWeightSyncMixin, MiniMaxH3Pi
                 "prompt_embeds_mask": prompt_embeds_mask,
             },
             rl=rl,
-            to_cpu=True,
+            to_cpu=not has_meta_output,
         )
+        if has_meta_output:
+            # Non-replying offload ranks retain training data without exporting placeholder media.
+            return result
         video, audio = output.output
         sampling = request.sampling_params
         extra_args = sampling.extra_args or {}

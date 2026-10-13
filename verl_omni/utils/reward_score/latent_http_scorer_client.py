@@ -137,9 +137,8 @@ async def compute_score(
 ) -> dict:
     """Score one SD3.5 clean latent with an external DRM server.
 
-    With ``output_type=latent``, the clean latent is provided through
-    ``solution_image``. With ``output_type=both``, it is read from
-    ``extra_info["latents_clean"]``. Prompt embeddings are reused from the
+    The clean latent is selected from the named ``image_latent`` artifact in
+    ``extra_info["media_artifacts"]``. Prompt embeddings are reused from the
     rollout and remain exactly aligned with generation.
     """
     del ground_truth, kwargs

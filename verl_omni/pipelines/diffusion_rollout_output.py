@@ -45,6 +45,17 @@ from verl_omni.pipelines.rollout_media import (
 _MEDIA_KEYS = frozenset(("image", "video", "output", "audio"))
 
 
+def contains_meta_tensor(value: Any) -> bool:
+    """Detect offloaded placeholder tensors in a nested rollout output."""
+    if isinstance(value, torch.Tensor):
+        return value.is_meta
+    if isinstance(value, Mapping):
+        return any(contains_meta_tensor(item) for item in value.values())
+    if isinstance(value, (list | tuple)):
+        return any(contains_meta_tensor(item) for item in value)
+    return False
+
+
 def rollout_output(
     *,
     media: Any,

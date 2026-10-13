@@ -13,6 +13,7 @@
 # limitations under the License.
 """A latent response can be scored while an independently named preview is dumped."""
 
+import json
 import sys
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -22,11 +23,78 @@ from unittest.mock import Mock
 import pytest
 import torch
 from omegaconf import OmegaConf
+from PIL import Image
 
 from verl_omni.pipelines.rollout_media import MediaArtifact, MediaSpec
 from verl_omni.trainer.diffusion import ray_diffusion_trainer as v0
 from verl_omni.trainer.diffusion.v1.trainer_base import PolicyGradientDiffusionTrainerV1 as V1
 from verl_omni.utils import tracking
+
+
+def _dump_image_previews(tmp_path, version, latents, previews, max_samples=None):
+    context = SimpleNamespace(global_steps=5)
+    dump = v0.BaseRayDiffusionTrainer._dump_generations if version == 0 else V1._dump_generations
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        context._dump_executor = executor
+        context._dump_futures = []
+        context._drain_dump_futures = lambda: None
+        dump(
+            context,
+            inputs=["one", "two"],
+            outputs=latents,
+            gts=[None, None],
+            scores=[1, 2],
+            reward_extra_infos_dict={},
+            dump_path=str(tmp_path),
+            max_samples=max_samples,
+            previews=previews,
+        )
+        for future, _ in context._dump_futures:
+            future.result()
+
+    return [json.loads(line) for line in (tmp_path / "5.jsonl").read_text().splitlines()]
+
+
+@pytest.mark.parametrize("version", [0, 1])
+@pytest.mark.parametrize("latent_shape", [(2, 16), (2, 16, 2, 2)])
+@pytest.mark.parametrize("max_samples", [None, 1])
+def test_latent_primary_dumps_decoded_image_previews(tmp_path, version, latent_shape, max_samples):
+    latents = torch.randn(latent_shape, dtype=torch.bfloat16)
+    before = latents.clone()
+    previews = [
+        MediaArtifact(MediaSpec("image", "decoded", "CHW"), torch.full((3, 4, 5), 37, dtype=torch.uint8)),
+        MediaArtifact(MediaSpec("image", "decoded", "HWC"), torch.full((2, 3, 3), 211, dtype=torch.uint8)),
+    ]
+    rows = _dump_image_previews(tmp_path, version, latents, previews, max_samples)
+    assert len(rows) == (2 if max_samples is None else max_samples)
+    for row, size, value in zip(rows, [(5, 4), (3, 2)], [37, 211], strict=False):
+        with Image.open(row["output"]) as image:
+            assert image.size == size
+            assert image.getpixel((0, 0)) == (value, value, value)
+    torch.testing.assert_close(latents, before)
+
+
+@pytest.mark.parametrize("version", [0, 1])
+def test_image_conversion_failure_is_recorded_per_sample(monkeypatch, tmp_path, version):
+    original_numpy = torch.Tensor.numpy
+    calls = 0
+
+    def numpy(tensor):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("simulated image conversion failure")
+        return original_numpy(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "numpy", numpy)
+    previews = [
+        MediaArtifact(MediaSpec("image", "decoded", "CHW"), torch.zeros(3, 2, 2, dtype=torch.uint8)) for _ in range(2)
+    ]
+    rows = _dump_image_previews(tmp_path, version, None, previews)
+    assert rows[0]["output"] is None
+    assert rows[0]["image_export_error"] == "RuntimeError: simulated image conversion failure"
+    assert Path(rows[1]["output"]).is_file()
+    assert rows[1]["image_export_error"] is None
 
 
 @pytest.mark.parametrize("version", [0, 1])

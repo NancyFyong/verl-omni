@@ -28,14 +28,23 @@ from verl_omni.pipelines.rollout_media import MediaArtifact, MediaSpec
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy
 
 
-def _make_h3_final_res(monkeypatch, algorithm, output_type="pt", extra_args=None, fps=24, sampling_kwargs=None):
+def _make_h3_rollout_output(
+    monkeypatch,
+    algorithm,
+    output_type="pt",
+    extra_args=None,
+    fps=24,
+    sampling_kwargs=None,
+    placeholder=None,
+    device="cpu",
+):
     video = torch.zeros(1, 5, 8, 12, 3, dtype=torch.uint8)
     audio = torch.ones(1, 2, 320)
-    video_latent = torch.ones(1, 24, 2, 2, 2, dtype=torch.float16)
-    audio_latent = torch.full((2, 32, 8), 2, dtype=torch.bfloat16)
-    prompt_embeds = torch.ones(1, 5, 8)
+    video_latent = torch.ones(1, 24, 2, 2, 2, dtype=torch.float16, device=device)
+    audio_latent = torch.full((2, 32, 8), 2, dtype=torch.bfloat16, device=device)
+    prompt_embeds = torch.ones(1, 5, 8, device=device)
     latent_meta = torch.tensor([[2, 16, 2, 2, 2, 8]])
-    joint = torch.ones(1, 704)
+    joint = torch.ones(1, 704, device=device)
     pipeline_cls = MiniMaxH3DiffusionNFTPipeline if algorithm == "diffusion_nft" else MiniMaxH3PipelineWithLogProb
     pipeline = object.__new__(pipeline_cls)
     request = SimpleNamespace(
@@ -78,7 +87,7 @@ def _make_h3_final_res(monkeypatch, algorithm, output_type="pt", extra_args=None
                 "prompt_embeds": prompt_embeds,
                 "prompt_embeds_mask": torch.ones(1, 5, dtype=torch.long),
             }
-        return DiffusionOutput(output=(video, audio))
+        return DiffusionOutput(output=(video, audio) if placeholder is None else placeholder)
 
     monkeypatch.setattr(MiniMaxH3Pipeline, "forward", forward)
     if algorithm == "diffusion_nft":
@@ -87,7 +96,20 @@ def _make_h3_final_res(monkeypatch, algorithm, output_type="pt", extra_args=None
         result = pipeline.forward(
             SimpleNamespace(requests=[request], prompts=request.prompts, sampling_params=request.sampling_params)
         )
-    return OmniRequestOutput.from_diffusion(
+    assert pipeline._h3_prompt_ids is None
+    if algorithm == "diffusion_nft":
+        assert pipeline._nft_capture is None
+    else:
+        assert pipeline._flow_grpo_final_latents is None
+    return result
+
+
+def _generate(monkeypatch, algorithm="diffusion_nft", output_type="pt", extra_args=None, fps=24, sampling_kwargs=None):
+    server = SimpleNamespace(
+        global_steps=3, model_config=SimpleNamespace(architecture="MiniMaxH3Pipeline", algorithm=algorithm)
+    )
+    result = _make_h3_rollout_output(monkeypatch, algorithm, output_type, extra_args, fps, sampling_kwargs)
+    final_res = OmniRequestOutput.from_diffusion(
         images=result.output["payload"]["video"],
         multimodal_output={"metadata": result.output["metadata"]},
         trajectory_latents=result.trajectory_latents,
@@ -95,18 +117,39 @@ def _make_h3_final_res(monkeypatch, algorithm, output_type="pt", extra_args=None
         trajectory_log_probs=result.trajectory_log_probs,
         request_id="h3-test",
     )
-
-
-def _generate(monkeypatch, algorithm="diffusion_nft", output_type="pt", extra_args=None, fps=24, sampling_kwargs=None):
-    server = SimpleNamespace(
-        global_steps=3, model_config=SimpleNamespace(architecture="MiniMaxH3Pipeline", algorithm=algorithm)
-    )
-    final_res = _make_h3_final_res(monkeypatch, algorithm, output_type, extra_args, fps, sampling_kwargs)
     return DiffusionStrategy(server).process_output(
         final_res,
         None,
         {"output_type": (extra_args or {}).get("output_type", output_type), "logprobs": algorithm == "flow_grpo"},
     )
+
+
+@pytest.mark.parametrize("algorithm", ["diffusion_nft", "flow_grpo"])
+@pytest.mark.parametrize(
+    "placeholder",
+    [
+        torch.empty(1, device="meta"),
+        (torch.zeros(1), torch.empty(1, device="meta")),
+        {"video": [torch.empty(1, device="meta")]},
+    ],
+    ids=["bare-meta", "tuple-meta", "mapping-list-meta"],
+)
+def test_meta_placeholder_preserves_training_output(monkeypatch, algorithm, placeholder):
+    result = _make_h3_rollout_output(monkeypatch, algorithm, placeholder=placeholder)
+    assert result.output["payload"]["image"] is placeholder
+    metadata = result.output["metadata"]
+    assert "media_artifacts" not in metadata
+    torch.testing.assert_close(metadata["prompt_embeddings"]["prompt_embeds"], torch.ones(1, 5, 8))
+    torch.testing.assert_close(metadata["rl"]["latent_meta"], torch.tensor([[2, 16, 2, 2, 2, 8]]))
+    if algorithm == "diffusion_nft":
+        torch.testing.assert_close(
+            metadata["rl"]["latents_clean"], torch.cat([torch.ones(1, 192), torch.full((1, 512), 2.0)], dim=1)
+        )
+        assert metadata["rl"]["train_timesteps"].shape == (1, 10)
+    else:
+        torch.testing.assert_close(result.trajectory_latents, torch.ones(1, 1, 704))
+        torch.testing.assert_close(result.trajectory_timesteps, torch.tensor([[0.25]]))
+        torch.testing.assert_close(result.trajectory_log_probs, torch.tensor([[0.4]]))
 
 
 @pytest.mark.parametrize("algorithm", ["diffusion_nft", "flow_grpo"])
