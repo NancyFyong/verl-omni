@@ -16,8 +16,8 @@
 import pytest
 import torch
 from PIL import Image
-
 from test_artifact_preview_dump_on_cpu import _dump_image_previews
+
 from verl_omni.pipelines.rollout_media import MediaArtifact, MediaSpec
 
 

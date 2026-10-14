@@ -15,7 +15,6 @@
 
 import pytest
 import torch
-
 from test_minimax_h3_rollout_contract_on_cpu import _make_h3_rollout_output
 
 
