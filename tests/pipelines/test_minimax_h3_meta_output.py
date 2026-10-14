@@ -16,7 +16,7 @@
 import pytest
 import torch
 
-from tests.pipelines.test_minimax_h3_rollout_contract_on_cpu import _make_h3_rollout_output
+from test_minimax_h3_rollout_contract_on_cpu import _make_h3_rollout_output
 
 
 @pytest.mark.parametrize("algorithm", ["diffusion_nft", "flow_grpo"])
