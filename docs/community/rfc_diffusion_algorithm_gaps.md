@@ -1,14 +1,14 @@
-# [RFC] Call for contributions: DiffusionOPSD (P0) & AWM (P1) for diffusion post-training
+# [RFC] Call for contributions: DiffusionOPSD & AWM for diffusion post-training
 
-Last updated: 10/15/2026.
+Last updated: 10/16/2026.
 
 We'd love your help bringing new post-training algorithms into verl-omni. The shortlist below is published work with runnable reference code, and each fits the loss registry and recipe structure already in the repo — so a contribution is a focused PR, not a research project.
 
-**DiffusionOPSD is P0 and AWM is P1.** Treat this as suggestions, not a closed menu — other algorithms are welcome too, and a short RFC is a good way to start. If one of these catches your eye, please comment on the RFC issue first so we can coordinate.
+Treat this as suggestions, not a closed menu — other algorithms are welcome too, and a short RFC is a good way to start. If one of these catches your eye, please comment on the RFC issue first so we can coordinate.
 
 ---
 
-## 1. [P0] DiffusionOPSD — On-Policy Self-Distillation in Diffusion Models
+## 1. DiffusionOPSD — On-Policy Self-Distillation in Diffusion Models
 
 **Paper:** [arXiv 2608.24646](https://arxiv.org/abs/2608.24646) · **Code:** [worldbench/DiffusionOPSD](https://github.com/worldbench/DiffusionOPSD) · **Site:** [diffusionopsd.github.io](https://diffusionopsd.github.io/)
 
@@ -16,7 +16,7 @@ Turns an image-level reward into explicit clean-prediction targets at sampled lo
 
 The paper reports the best held-out score in 19 of 20 reward-matched settings across SD3.5-M and Z-Image-Turbo, with 40%–63% lower GPU-hours than DiffusionNFT.
 
-## 2. [P1] AWM — Advantage Weighted Matching
+## 2. AWM — Advantage Weighted Matching
 
 **Paper:** [arXiv 2509.25050](https://arxiv.org/abs/2509.25050) · **Code:** [X-GenGroup/Flow-Factory](https://github.com/X-GenGroup/Flow-Factory)
 
