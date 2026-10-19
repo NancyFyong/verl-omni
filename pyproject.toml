@@ -199,6 +199,7 @@ verl_omni = [
 [tool.uv]
 override-dependencies = [
     "accelerate>=1.14.0",
+    "diffusers>=0.41.0",
     "kernels==0.16.0",
     "transformers>=5.13.0,<=5.14.1",
 ]
