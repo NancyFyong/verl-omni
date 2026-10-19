@@ -52,12 +52,13 @@ esac
 
 TEACHER_GPUS=${TEACHER_GPUS:-4}
 TEACHER_TP=${TEACHER_TP:-2}
-if (( TEACHER_TP <= 0 || TEACHER_GPUS % TEACHER_TP != 0 )); then
+if (( TEACHER_GPUS <= 0 || TEACHER_TP <= 0 )) || (( TEACHER_GPUS % TEACHER_TP != 0 )); then
     echo "TEACHER_GPUS (${TEACHER_GPUS}) must be a positive multiple of TEACHER_TP (${TEACHER_TP})." >&2
     exit 1
 fi
 
 MODEL_PATH="${STUDENT_MODEL}" exec bash "${REPO_ROOT}/examples/gspo_trainer/minicpm/run_minicpmo_4_5_thinker_gspo_lora_avqa_v1.sh" \
+    actor_rollout_ref.model.use_remove_padding=false \
     distillation.enabled=true \
     distillation.nnodes=1 \
     distillation.n_gpus_per_node="${TEACHER_GPUS}" \
