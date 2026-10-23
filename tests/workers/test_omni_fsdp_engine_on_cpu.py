@@ -15,7 +15,7 @@
 
 Loads ``omni_impl.py`` via ``importlib`` with pre-mocked ``sys.modules`` to
 bypass ``vllm_omni`` (CUDA-only). Verifies registration, import sources,
-``_build_module`` dispatch, LoRA dtype handling, and merged-weight streaming.
+``_build_module`` dispatch, LoRA dtype handling, and export delegation.
 """
 
 import ast
@@ -193,7 +193,7 @@ def test_engine_registered_via_decorator():
                     kwargs_found += 1
             if kw.arg == "device" and isinstance(kw.value, ast.List):
                 vals = [e.value for e in kw.value.elts if isinstance(e, ast.Constant)]
-                if set(vals) == {"cuda", "npu"}:
+                if set(vals) == {"cuda", "npu", "xpu"}:
                     kwargs_found += 1
         assert kwargs_found >= 2, (
             f"@EngineRegistry.register missing expected kwargs (model_type/backend/device); found {kwargs_found}/3"
@@ -216,7 +216,7 @@ def test_engine_registered_for_fsdp_and_fsdp2_backends():
 
     for backend in ("fsdp", "fsdp2"):
         assert backend in omni_registry, f"'{backend}' not registered for omni_model; registered: {list(omni_registry)}"
-        for device in ("cuda", "npu"):
+        for device in ("cuda", "npu", "xpu"):
             entry = omni_registry[backend].get(device)
             assert entry is not None, f"No engine for omni_model/{backend}/{device}"
             assert entry.__name__ == "OmniFSDPEngine", (
@@ -336,24 +336,20 @@ def test_weight_sync_uses_actor_compute_dtype(mixed_precision, expected_dtype):
     omni_impl = _get_omni_impl_module()
     engine = object.__new__(omni_impl.OmniFSDPEngine)
     engine.engine_config = types.SimpleNamespace(mixed_precision=mixed_precision)
-    tensor = torch.tensor([1.0001], dtype=torch.float32)
+    engine.module = MagicMock()
+    engine.model_config = _make_mock_model_config()
+    engine._uses_fsdp2_cpu_offload_policy = True
+    engine._is_offload_param = False
+    engine._qat_enabled = False
 
-    synced = engine._cast_dtensor_weight_for_sync(tensor)
+    with (
+        patch.object(omni_impl, "log_gpu_memory_usage"),
+        patch.object(omni_impl, "export_lora_for_sync", return_value=(iter(()), None)) as export,
+    ):
+        engine.get_per_tensor_param(base_sync_done=True)
 
-    assert synced.dtype is expected_dtype
-    torch.testing.assert_close(synced, tensor.to(expected_dtype), atol=0, rtol=0)
-
-
-def test_weight_sync_keeps_integer_dtensor_buffers():
-    omni_impl = _get_omni_impl_module()
-    tensor = torch.tensor([1, 2], dtype=torch.int64)
-
-    engine = object.__new__(omni_impl.OmniFSDPEngine)
-    engine.engine_config = types.SimpleNamespace(mixed_precision=None)
-    synced = engine._cast_dtensor_weight_for_sync(tensor)
-
-    assert synced is tensor
-    assert synced.dtype is torch.int64
+    assert export.call_args.kwargs["full_weight_dtype"] is expected_dtype
+    assert export.call_args.kwargs["is_diffusers"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -362,12 +358,11 @@ def test_weight_sync_keeps_integer_dtensor_buffers():
 
 
 def test_uses_verl_omni_collect_lora_params():
-    """``omni_impl.collect_lora_params`` is ``verl_omni.utils.fsdp_utils`` (not verl)."""
+    """The shared export uses ``verl_omni.utils.fsdp_utils`` collect (not verl's)."""
+    import verl_omni.workers.engine.lora_export as lora_export
     from verl_omni.utils.fsdp_utils import collect_lora_params as expected_func
 
-    omni_impl = _get_omni_impl_module()
-
-    assert omni_impl.collect_lora_params is expected_func, "omni_impl.collect_lora_params is not the verl_omni copy"
+    assert lora_export.collect_lora_params is expected_func, "lora_export.collect_lora_params is not the verl_omni copy"
 
 
 def test_collect_lora_params_import_not_from_verl():
@@ -637,128 +632,6 @@ def test_build_lora_module_skips_when_lora_dtype_none():
 
 
 # ---------------------------------------------------------------------------
-# ``_merged_lora_per_tensor_param`` streams merged weights
-# ---------------------------------------------------------------------------
-
-
-def _make_toy_module():
-    """Return a simple module with predictable ``state_dict``."""
-
-    class ToyModule(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = torch.nn.Parameter(torch.tensor([3.0, 4.0]))
-            self.bias = torch.nn.Parameter(torch.tensor([0.5]))
-
-    return ToyModule()
-
-
-def test_merged_lora_per_tensor_param_yields_name_param_tuples():
-    """``_merged_lora_per_tensor_param`` yields ``(name, param)`` tuples."""
-    omni_impl = _get_omni_impl_module()
-    module = _make_toy_module()
-
-    with (
-        patch.object(omni_impl, "merged_lora_context", MagicMock()),
-        patch.object(omni_impl, "normalize_peft_param_name", side_effect=lambda state: state),
-        patch.object(omni_impl, "convert_weight_keys", side_effect=lambda state, model: state),
-        patch.object(omni_impl, "log_gpu_memory_usage", MagicMock()),
-        patch.object(omni_impl, "get_device_id", return_value=torch.device("cpu")),
-    ):
-        engine = object.__new__(omni_impl.OmniFSDPEngine)
-        engine.module = module
-        engine._is_offload_param = False
-
-        merged_weights = dict(engine._merged_lora_per_tensor_param())
-
-        assert "weight" in merged_weights
-        assert "bias" in merged_weights
-        assert torch.equal(merged_weights["weight"], module.weight.data)
-        assert torch.equal(merged_weights["bias"], module.bias.data)
-
-
-def test_merged_lora_per_tensor_param_offload_on_finally():
-    """``offload_fsdp_model_to_cpu`` called in ``finally`` when offload enabled."""
-    omni_impl = _get_omni_impl_module()
-    module = _make_toy_module()
-    offload_calls = []
-
-    with (
-        patch.object(omni_impl, "merged_lora_context", MagicMock()),
-        patch.object(omni_impl, "normalize_peft_param_name", side_effect=lambda state: state),
-        patch.object(omni_impl, "convert_weight_keys", side_effect=lambda state, model: state),
-        patch.object(omni_impl, "log_gpu_memory_usage", MagicMock()),
-        patch.object(omni_impl, "get_device_id", return_value=torch.device("cpu")),
-        patch.object(
-            omni_impl,
-            "offload_fsdp_model_to_cpu",
-            side_effect=lambda m: offload_calls.append(m),
-        ),
-    ):
-        engine = object.__new__(omni_impl.OmniFSDPEngine)
-        engine.module = module
-        engine._is_offload_param = True
-
-        merged_weights = list(engine._merged_lora_per_tensor_param())
-
-        assert len(merged_weights) == 2  # weight + bias
-        assert len(offload_calls) == 1
-        assert offload_calls[0] is module
-
-
-def test_merged_lora_per_tensor_param_skip_offload_when_false():
-    """``offload_fsdp_model_to_cpu`` NOT called when ``_is_offload_param=False``."""
-    omni_impl = _get_omni_impl_module()
-    module = _make_toy_module()
-
-    with (
-        patch.object(omni_impl, "merged_lora_context", MagicMock()),
-        patch.object(omni_impl, "normalize_peft_param_name", side_effect=lambda state: state),
-        patch.object(omni_impl, "convert_weight_keys", side_effect=lambda state, model: state),
-        patch.object(omni_impl, "log_gpu_memory_usage", MagicMock()),
-        patch.object(omni_impl, "get_device_id", return_value=torch.device("cpu")),
-        patch.object(omni_impl, "offload_fsdp_model_to_cpu") as mock_offload,
-    ):
-        engine = object.__new__(omni_impl.OmniFSDPEngine)
-        engine.module = module
-        engine._is_offload_param = False
-
-        list(engine._merged_lora_per_tensor_param())
-        mock_offload.assert_not_called()
-
-
-def test_merged_lora_per_tensor_param_with_lora_context_manager():
-    """``merged_lora_context`` entered with ``backup_adapters=True``."""
-    omni_impl = _get_omni_impl_module()
-    module = _make_toy_module()
-
-    entered = []
-
-    @contextmanager
-    def fake_merged_context(actor, backup_adapters=True):
-        entered.append((actor, backup_adapters))
-        yield
-
-    with (
-        patch.object(omni_impl, "merged_lora_context", fake_merged_context),
-        patch.object(omni_impl, "normalize_peft_param_name", side_effect=lambda state: state),
-        patch.object(omni_impl, "convert_weight_keys", side_effect=lambda state, model: state),
-        patch.object(omni_impl, "log_gpu_memory_usage", MagicMock()),
-        patch.object(omni_impl, "get_device_id", return_value=torch.device("cpu")),
-    ):
-        engine = object.__new__(omni_impl.OmniFSDPEngine)
-        engine.module = module
-        engine._is_offload_param = False
-
-        list(engine._merged_lora_per_tensor_param())
-
-        assert len(entered) == 1
-        actor, backup = entered[0]
-        assert actor is module
-        assert backup is True
-
-
-# ---------------------------------------------------------------------------
 # Direct preference forward lifecycle
 # ---------------------------------------------------------------------------
 
@@ -868,6 +741,7 @@ class TestAdapterNameForwarding:
         engine = object.__new__(omni_impl.OmniFSDPEngine)
         engine.module = module
         engine.model_config = _make_mock_model_config()
+        engine.engine_config = types.SimpleNamespace(mixed_precision=None)
         engine._uses_fsdp2_cpu_offload_policy = True
         engine._is_offload_param = False
         engine._qat_enabled = False
@@ -878,10 +752,12 @@ class TestAdapterNameForwarding:
             captured["adapter_name"] = adapter_name
             return {"w": torch.zeros(1)}
 
+        import verl_omni.workers.engine.lora_export as lora_export
+
         with (
             patch.object(omni_impl, "log_gpu_memory_usage", MagicMock()),
-            patch.object(omni_impl, "collect_lora_params", side_effect=fake_collect),
-            patch.object(omni_impl, "convert_weight_keys", side_effect=lambda params, module: params),
+            patch.object(lora_export, "collect_lora_params", side_effect=fake_collect),
+            patch.object(lora_export, "convert_weight_keys", side_effect=lambda params, module: params),
         ):
             per_tensor_param, peft_config = engine.get_per_tensor_param(base_sync_done=True, adapter_name="old")
 
