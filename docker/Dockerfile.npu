@@ -181,7 +181,7 @@ RUN git clone \
     python3 -m pip install --no-deps -e . \
         --extra-index-url ${ASCEND_PIP_INDEX_URL} \
         --extra-index-url ${PYTORCH_CPU_INDEX_URL} \
-    && python3 -m pip install Levenshtein
+    && python3 -m pip install diffusers==0.41.0 Levenshtein
 
 RUN python3 -m pip install --force-reinstall \
         torch==2.10.0+cpu \
