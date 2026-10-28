@@ -95,7 +95,7 @@ def _install_fa3_probe(monkeypatch):
 
 
 @pytest.mark.parametrize("with_mask", [False, True])
-def test_diffusers_varlen_preparation_passes_unbacked_max_to_fa3(monkeypatch, original_helpers, with_mask):
+def test_diffusers_varlen_preparation_max_seqlen_k_backing_matches_mask(monkeypatch, original_helpers, with_mask):
     _install_fa3_probe(monkeypatch)
     _FA3_MAX_SEQLEN_K_VALUES.clear()
     torch._dynamo.reset()
